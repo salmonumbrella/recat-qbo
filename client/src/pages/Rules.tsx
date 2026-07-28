@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
 import type { RuleDto, RuleTestResult } from '@recat/shared';
+import { isUsableTaxCodeDto } from '@recat/shared';
 import { rules as rulesApi } from '../lib/api';
 import type { RuleBody } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
@@ -87,7 +88,7 @@ const delStyle: CSSProperties = {
 const MATCH_DEBOUNCE_MS = 500;
 
 export default function Rules() {
-  const { activeCompanyId, accounts, tags, toast } = useApp();
+  const { activeCompanyId, accounts, tags, taxReadiness, toast } = useApp();
 
   const [ruleList, setRuleList] = useState<RuleDto[]>([]);
   // Bumped per rule when a matchText PATCH fails, so the (uncontrolled) input
@@ -396,6 +397,16 @@ export default function Rules() {
           const tagNames = rule.tagIds
             .map((id) => tagById.get(id)?.name)
             .filter((n): n is string => Boolean(n));
+          const taxReferenceInvalid =
+            rule.taxCodeQboId !== null &&
+            (
+              taxReadiness?.status !== 'ready' ||
+              !taxReadiness.taxCodes.some(
+                (code) =>
+                  code.qboId === rule.taxCodeQboId &&
+                  isUsableTaxCodeDto(code),
+              )
+            );
           return (
             <div
               key={rule.id}
@@ -540,6 +551,19 @@ export default function Rules() {
                   ×
                 </button>
               </span>
+              {taxReferenceInvalid && (
+                <span
+                  role="alert"
+                  style={{
+                    gridColumn: '2 / -1',
+                    color: 'var(--erT)',
+                    fontSize: 12.5,
+                  }}
+                >
+                  Tax reference unavailable: {rule.taxCode ?? rule.taxCodeQboId}. This rule will not
+                  apply tax until the reference is valid again.
+                </span>
+              )}
             </div>
           );
         })}

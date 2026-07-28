@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AuditEntryDto } from '@recat/shared';
-import { AUDIT_CSV_HEADER, buildAuditCsv, csvEscape } from './audit.js';
+import {
+  AUDIT_CSV_HEADER,
+  buildAuditCsv,
+  csvEscape,
+  writeAudit,
+} from './audit.js';
 
 function entry(overrides: Partial<AuditEntryDto> = {}): AuditEntryDto {
   return {
@@ -63,5 +68,108 @@ describe('buildAuditCsv', () => {
     // Quoted newline stays inside the quoted field; naive line count is header + 2
     // but a CSV parser sees exactly one record. Assert the quoting is present.
     expect(csv).toContain('"Split:\nOffice / Meals"');
+  });
+});
+
+describe('writeAudit mutation metadata', () => {
+  it('stores only bounded normalized references, request ID, and outcome', async () => {
+    const create = vi.fn(async () => undefined);
+    await writeAudit(
+      { auditEntry: { create } } as never,
+      {
+        companyId: 'company-generic',
+        actorId: 'actor-generic',
+        actorLabel: 'Generic User',
+        txnId: 'transaction-generic',
+        payee: 'Generic Supplier',
+        amount: -10.5,
+        action: 'posted',
+        before: 'Holding',
+        after: 'Prepared purchase',
+        payload: {
+          accessToken: 'must-not-survive',
+          body: { secret: 'must-not-survive' },
+        },
+        mutation: {
+          requestId: ' request-generic ',
+          outcome: 'VERIFIED',
+          references: {
+            operation: 'recategorize',
+            qboType: 'Purchase',
+            qboId: ' purchase-generic ',
+            accountQboIds: ['expense-b', 'expense-a', 'expense-a'],
+            taxCodeQboIds: ['tax-generic'],
+          },
+        },
+      },
+    );
+
+    expect(create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        payload: {
+          requestId: 'request-generic',
+          outcome: 'VERIFIED',
+          references: {
+            operation: 'recategorize',
+            qboType: 'Purchase',
+            qboId: 'purchase-generic',
+            accountQboIds: ['expense-a', 'expense-b'],
+            taxCodeQboIds: ['tax-generic'],
+          },
+        },
+      }),
+    });
+    expect(JSON.stringify(create.mock.calls[0]?.[0])).not.toMatch(
+      /accessToken|must-not-survive|secret|SyncToken|beforeSnapshot|requestPayload/,
+    );
+  });
+
+  it('truncates references to 128 characters and caps each reference list at 50', async () => {
+    const create = vi.fn(async () => undefined);
+    const longReference = `reference-${'x'.repeat(200)}`;
+    await writeAudit(
+      { auditEntry: { create } } as never,
+      {
+        companyId: 'company-generic',
+        actorLabel: 'Generic User',
+        payee: 'Generic Supplier',
+        amount: -10.5,
+        action: 'posted',
+        before: 'Holding',
+        after: 'Prepared purchase',
+        mutation: {
+          requestId: `request-${'r'.repeat(200)}`,
+          outcome: 'VERIFIED',
+          references: {
+            operation: 'recategorize',
+            qboType: 'Purchase',
+            qboId: longReference,
+            accountQboIds: Array.from(
+              { length: 60 },
+              (_value, index) => `${String(index).padStart(2, '0')}-${longReference}`,
+            ),
+            taxCodeQboIds: Array.from(
+              { length: 55 },
+              (_value, index) => `${String(index).padStart(2, '0')}-tax-${'t'.repeat(180)}`,
+            ),
+          },
+        },
+      },
+    );
+
+    const payload = create.mock.calls[0]?.[0].data.payload as {
+      requestId: string;
+      references: {
+        qboId: string;
+        accountQboIds: string[];
+        taxCodeQboIds: string[];
+      };
+    };
+    expect(payload.requestId).toHaveLength(128);
+    expect(payload.references.qboId).toHaveLength(128);
+    expect(payload.references.accountQboIds).toHaveLength(50);
+    expect(payload.references.taxCodeQboIds).toHaveLength(50);
+    expect(payload.references.accountQboIds.every((reference) => reference.length <= 128)).toBe(true);
+    expect(payload.references.taxCodeQboIds.every((reference) => reference.length <= 128)).toBe(true);
   });
 });

@@ -7,11 +7,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { SplitDto, TransactionDto, TxnStatus } from '@recat/shared';
+import type {
+  ActiveCategorizationAttemptDto,
+  CategorizationMutationOutcome,
+  CategorizationMutationResult,
+  SplitDto,
+  StageCategorizationBody,
+  StagedCategorization,
+  TaxCalculation,
+  TransactionDto,
+  TxnStatus,
+} from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import {
   ApiError,
   companies as companiesApi,
+  createCategorizationRequestId,
   rules as rulesApi,
   transactions as txnApi,
 } from '../lib/api';
@@ -24,13 +35,14 @@ import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
 import RulePrompt from '../components/RulePrompt';
+import TaxCodePicker from '../components/TaxCodePicker';
 
 // ---------------------------------------------------------------------------
 // Prototype-state mapping & small helpers
 // ---------------------------------------------------------------------------
 
 /** Server TxnStatus → prototype row state. */
-type UiState = 'pending' | 'posting' | 'posted' | 'dry' | 'error';
+type UiState = 'pending' | 'posting' | 'posted' | 'dry' | 'error' | 'reverted';
 
 const STATE_OF: Partial<Record<TxnStatus, UiState>> = {
   PENDING: 'pending',
@@ -38,6 +50,7 @@ const STATE_OF: Partial<Record<TxnStatus, UiState>> = {
   POSTED: 'posted',
   DRY_RUN: 'dry',
   ERROR: 'error',
+  REVERTED: 'reverted',
 };
 
 /** Search words per state — prototype's statusWords map. */
@@ -47,6 +60,7 @@ const STATUS_WORDS: Record<UiState, string> = {
   posted: 'posted',
   dry: 'dry run',
   error: 'error failed',
+  reverted: 'reverted',
 };
 
 type SortKey = 'date' | 'payee' | 'amt' | 'acct' | 'cat' | 'status';
@@ -104,6 +118,79 @@ interface RulePromptState {
   categoryQboId: string | null;
 }
 
+interface TaxMutationState {
+  kind: 'commit' | 'undo';
+  requestId: string;
+  attemptStatus: ActiveCategorizationAttemptDto['status'] | null;
+  outcome: CategorizationMutationOutcome | 'PENDING';
+  busy: boolean;
+  phase: 'idle' | 'writing' | 'reconciling' | 'resolving';
+  resolution: 'known' | 'resolving' | 'unresolved';
+  reconciled: boolean;
+}
+
+interface TaxRowState {
+  taxCalculation: TaxCalculation;
+  taxCodeQboId: string | null;
+  staged: StagedCategorization | null;
+  staging: boolean;
+  stagingRequestId: number | null;
+  reloadRequired: boolean;
+  version: number;
+  stagedVersion: number | null;
+  mutation: TaxMutationState | null;
+}
+
+function initialTaxState(t: TransactionDto): TaxRowState {
+  const taxCodeQboId = t.taxCodeQboId ?? null;
+  const isSplit = !!(t.splits && t.splits.length);
+  return {
+    taxCalculation:
+      isSplit && (
+        t.taxCalculation === 'TaxInclusive' ||
+        t.taxCalculation === 'TaxExcluded' ||
+        t.taxCalculation === 'NotApplicable'
+      )
+        ? t.taxCalculation
+        : taxCodeQboId === null
+        ? 'NotApplicable'
+        : t.taxCalculation === 'TaxExcluded'
+          ? 'TaxExcluded'
+          : 'TaxInclusive',
+    taxCodeQboId,
+    staged: null,
+    staging: false,
+    stagingRequestId: null,
+    reloadRequired: false,
+    version: 0,
+    stagedVersion: null,
+    mutation: t.activeCategorizationAttempt === null
+      ? null
+      : {
+          kind: t.activeCategorizationAttempt.operation === 'restore' ? 'undo' : 'commit',
+          requestId: t.activeCategorizationAttempt.requestId,
+          attemptStatus: t.activeCategorizationAttempt.status,
+          outcome: t.activeCategorizationAttempt.status === 'UNCERTAIN' ? 'UNCERTAIN' : 'IN_PROGRESS',
+          busy: false,
+          phase: 'idle',
+          resolution: 'known',
+          reconciled: false,
+        },
+  };
+}
+
+function exactCents(value: number): number | null {
+  const cents = Math.round(value * 100);
+  return Number.isSafeInteger(cents) && Math.abs(value * 100 - cents) < 0.000001
+    ? cents
+    : null;
+}
+
+function centsLabel(cents: number): string {
+  const sign = cents < 0 ? '−' : cents > 0 ? '+' : '';
+  return `${sign}$${(Math.abs(cents) / 100).toFixed(2)}`;
+}
+
 // ---------------------------------------------------------------------------
 
 export default function Queue() {
@@ -116,6 +203,7 @@ export default function Queue() {
     refreshCompanies,
     dryRun,
     tagsRequired,
+    taxReadiness,
     toast,
   } = useApp();
   const navigate = useNavigate();
@@ -137,12 +225,64 @@ export default function Queue() {
   const [rulePrompt, setRulePrompt] = useState<RulePromptState | null>(null);
   const [splitEditId, setSplitEditId] = useState<string | null>(null);
   const [bulkCat, setBulkCat] = useState<string | null>(null);
+  const [taxRows, setTaxRows] = useState<Record<string, TaxRowState>>({});
+  const taxVersionsRef = useRef<Record<string, number>>({});
+  const stageRequestSequenceRef = useRef(0);
+  const stageRequestTokensRef = useRef<Record<string, number>>({});
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia('(max-width: 640px)').matches,
   );
   const [, setClock] = useState(0); // re-render for 'last synced …'
 
+  const taxState = useCallback(
+    (t: TransactionDto): TaxRowState => taxRows[t.id] ?? initialTaxState(t),
+    [taxRows],
+  );
+
+  const updateTaxState = useCallback(
+    (t: TransactionDto, updater: (state: TaxRowState) => TaxRowState) => {
+      setTaxRows((prev) => {
+        const current = prev[t.id] ?? initialTaxState(t);
+        return { ...prev, [t.id]: updater(current) };
+      });
+    },
+    [],
+  );
+
+  const hasActiveMutation = useCallback(
+    (t: TransactionDto): boolean => {
+      const mutation = taxState(t).mutation;
+      return mutation !== null && (
+        mutation.attemptStatus === 'PREPARED' ||
+        mutation.attemptStatus === 'COMMITTING' ||
+        mutation.attemptStatus === 'UNCERTAIN' ||
+        mutation.outcome === 'PENDING' ||
+        mutation.outcome === 'IN_PROGRESS' ||
+        mutation.outcome === 'UNCERTAIN' ||
+        mutation.resolution !== 'known'
+      );
+    },
+    [taxState],
+  );
+
+  const invalidateTaxStage = useCallback(
+    (t: TransactionDto, patch: Partial<Pick<TaxRowState, 'taxCalculation' | 'taxCodeQboId'>> = {}) => {
+      const nextVersion = (taxVersionsRef.current[t.id] ?? 0) + 1;
+      taxVersionsRef.current[t.id] = nextVersion;
+      updateTaxState(t, (current) => ({
+        ...current,
+        ...patch,
+        staged: null,
+        stagedVersion: null,
+        version: nextVersion,
+      }));
+    },
+    [updateTaxState],
+  );
+
   const aliveRef = useRef(true);
+  const activeCompanyIdRef = useRef(activeCompanyId);
+  activeCompanyIdRef.current = activeCompanyId;
   useEffect(() => {
     aliveRef.current = true;
     return () => {
@@ -225,6 +365,12 @@ export default function Queue() {
     [accounts],
   );
 
+  const taxReadyFor = useCallback(
+    (t: TransactionDto): boolean =>
+      t.qboType === 'Purchase' && taxReadiness?.status === 'ready',
+    [taxReadiness],
+  );
+
   // Category options: real categories only — no bank/credit-card accounts,
   // never the watched holding accounts, and no catch-all accounts (which are
   // holding accounts by convention even when unwatched). Matches the
@@ -257,7 +403,7 @@ export default function Queue() {
     const q = search.toLowerCase();
     const list = rows.filter((t) => {
       const state = STATE_OF[t.status];
-      if (!state) return false; // SUPERSEDED / REVERTED never render
+      if (!state) return false; // SUPERSEDED rows never render
       if (acct !== 'all' && t.bankAccount !== acct) return false;
       if (!q) return true;
       const hay = [
@@ -313,16 +459,24 @@ export default function Queue() {
   // ---- selection ----
   const selIds = useMemo(() => Object.keys(sel).filter((k) => sel[k]), [sel]);
   const selPend = useMemo(
-    () => selIds.filter((id) => rows.find((r) => r.id === id)?.status === 'PENDING'),
-    [selIds, rows],
+    () => selIds.filter((id) => {
+      const row = rows.find((candidate) => candidate.id === id);
+      return row?.status === 'PENDING' && !hasActiveMutation(row);
+    }),
+    [selIds, rows, hasActiveMutation],
   );
   const selReady = useMemo(
     () =>
       selPend.filter((id) => {
         const t = rows.find((r) => r.id === id);
-        return !!t && !!t.category && !(tagsRequired && t.tagIds.length === 0);
+        return (
+          !!t &&
+          !taxReadyFor(t) &&
+          !!t.category &&
+          !(tagsRequired && t.tagIds.length === 0)
+        );
       }),
-    [selPend, rows, tagsRequired],
+    [selPend, rows, tagsRequired, taxReadyFor],
   );
 
   // ---- picker options (suggested pinned first) ----
@@ -374,18 +528,25 @@ export default function Queue() {
 
   const doOpenSplit = useCallback(
     (id: string) => {
+      const row = rows.find((candidate) => candidate.id === id);
+      if (!row || hasActiveMutation(row)) return;
       openSplit();
       setSplitEditId(id);
     },
-    [openSplit],
+    [rows, hasActiveMutation, openSplit],
   );
 
   /** Assign a category: server merges matching rule tags — use the returned dto. */
   const categorizeTo = useCallback(
     (t: TransactionDto, name: string) => {
+      if (hasActiveMutation(t)) return;
       const prev = { category: t.category, categoryQboId: t.categoryQboId };
       const categoryQboId = qboIdOf(name);
       patchRow(t.id, { category: name, categoryQboId }); // optimistic
+      if (taxReadyFor(t)) {
+        invalidateTaxStage(t);
+        return;
+      }
       txnApi
         .categorize(t.id, { category: name, categoryQboId, tagIds: t.tagIds })
         .then((dto) => {
@@ -396,7 +557,15 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [qboIdOf, patchRow, updateRow, toast],
+    [
+      hasActiveMutation,
+      qboIdOf,
+      patchRow,
+      taxReadyFor,
+      invalidateTaxStage,
+      updateRow,
+      toast,
+    ],
   );
 
   const pickChoose = useCallback(
@@ -417,11 +586,522 @@ export default function Queue() {
     [picker, closePicker, selPend, rows, categorizeTo],
   );
 
+  const stageBodyFor = useCallback(
+    (t: TransactionDto, state: TaxRowState): StageCategorizationBody | null => {
+      const taxCalculation: TaxCalculation =
+        t.splits && t.splits.length > 0
+          ? state.taxCalculation
+          : state.taxCodeQboId === null
+            ? 'NotApplicable'
+            : state.taxCalculation === 'TaxExcluded'
+              ? 'TaxExcluded'
+              : 'TaxInclusive';
+      const sourceLines = t.splits && t.splits.length > 0
+        ? t.splits.map((split) => ({
+            amount: split.amount,
+            categoryQboId: split.categoryQboId ?? qboIdOf(split.category),
+            taxCodeQboId: split.taxCodeQboId ?? null,
+            memo: split.memo,
+            tagIds: split.tagIds,
+          }))
+        : [{
+            amount: t.amount,
+            categoryQboId: t.categoryQboId ?? (t.category ? qboIdOf(t.category) : null),
+            taxCodeQboId: state.taxCodeQboId,
+            memo: undefined,
+            tagIds: t.tagIds,
+          }];
+
+      const lines: StageCategorizationBody['lines'] = [];
+      for (const line of sourceLines) {
+        const grossCents = exactCents(line.amount);
+        if (grossCents === null || !line.categoryQboId) return null;
+        if (taxCalculation !== 'NotApplicable' && line.taxCodeQboId === null) return null;
+        lines.push({
+          grossCents,
+          categoryQboId: line.categoryQboId,
+          taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
+          ...(line.memo ? { memo: line.memo } : {}),
+          tagIds: [...line.tagIds],
+        });
+      }
+      return {
+        expectedRevision: t.revision,
+        taxCalculation,
+        lines,
+        tagIds: [...t.tagIds],
+      };
+    },
+    [qboIdOf],
+  );
+
+  const stageTax = useCallback(
+    (t: TransactionDto) => {
+      if (hasActiveMutation(t)) return;
+      const current = taxState(t);
+      const body = stageBodyFor(t, current);
+      if (!body) {
+        toast('Choose a valid category and purchase tax for every line');
+        return;
+      }
+      const capturedVersion = taxVersionsRef.current[t.id] ?? current.version;
+      const stagingRequestId = ++stageRequestSequenceRef.current;
+      stageRequestTokensRef.current[t.id] = stagingRequestId;
+      updateTaxState(t, (state) => ({
+        ...state,
+        staging: true,
+        stagingRequestId,
+        reloadRequired: false,
+        staged: null,
+        stagedVersion: null,
+      }));
+      txnApi
+        .stageCategorization(t.id, body)
+        .then((staged) => {
+          if (!aliveRef.current) return;
+          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
+          delete stageRequestTokensRef.current[t.id];
+          const isCurrentVersion =
+            (taxVersionsRef.current[t.id] ?? 0) === capturedVersion;
+          setTaxRows((prev) => {
+            const latest = prev[t.id] ?? initialTaxState(t);
+            if (latest.stagingRequestId !== stagingRequestId) return prev;
+            if (!isCurrentVersion || latest.version !== capturedVersion) {
+              return {
+                ...prev,
+                [t.id]: {
+                  ...latest,
+                  staging: false,
+                  stagingRequestId: null,
+                  reloadRequired: false,
+                  staged: null,
+                  stagedVersion: null,
+                },
+              };
+            }
+            return {
+              ...prev,
+              [t.id]: {
+                ...latest,
+                staging: false,
+                stagingRequestId: null,
+                reloadRequired: false,
+                staged,
+                stagedVersion: capturedVersion,
+                mutation: null,
+              },
+            };
+          });
+          patchRow(t.id, {
+            revision: staged.revision,
+            ...(isCurrentVersion ? { taxCalculation: staged.taxCalculation } : {}),
+          });
+        })
+        .catch((error) => {
+          if (!aliveRef.current) return;
+          if (stageRequestTokensRef.current[t.id] !== stagingRequestId) return;
+          delete stageRequestTokensRef.current[t.id];
+          const staleRevision = error instanceof ApiError && error.code === 'STALE_REVISION';
+          updateTaxState(t, (state) =>
+            state.stagingRequestId === stagingRequestId
+              ? {
+                  ...state,
+                  staging: false,
+                  stagingRequestId: null,
+                  reloadRequired: staleRevision,
+                }
+              : state,
+          );
+          if (staleRevision && activeCompanyId) {
+            fetchAllTxns(activeCompanyId)
+              .then((all) => {
+                if (!aliveRef.current) return;
+                setRows(all);
+                delete taxVersionsRef.current[t.id];
+                setTaxRows((prev) => {
+                  const next = { ...prev };
+                  delete next[t.id];
+                  return next;
+                });
+                toast('The transaction changed. Loaded the latest version.');
+              })
+              .catch((reloadError) => {
+                if (!aliveRef.current) return;
+                toast(`${errText(reloadError)}. Reload the page before previewing again.`);
+              });
+            return;
+          }
+          toast(errText(error));
+        });
+    },
+    [
+      taxState,
+      hasActiveMutation,
+      stageBodyFor,
+      updateTaxState,
+      patchRow,
+      toast,
+      activeCompanyId,
+      fetchAllTxns,
+    ],
+  );
+
+  const recordTaxMutation = useCallback(
+    (
+      t: TransactionDto,
+      result: CategorizationMutationResult,
+      mutation: TaxMutationState,
+      reconciled: boolean,
+    ) => {
+      patchRow(t.id, {
+        status: result.status,
+        error: result.error ?? null,
+      });
+      updateTaxState(t, (state) => ({
+        ...state,
+        mutation: {
+          ...mutation,
+          attemptStatus:
+            result.outcome === 'UNCERTAIN'
+              ? 'UNCERTAIN'
+              : result.outcome === 'IN_PROGRESS'
+                ? 'COMMITTING'
+                : null,
+          outcome: result.outcome,
+          busy: false,
+          phase: 'idle',
+          resolution: 'known',
+          reconciled,
+        },
+      }));
+    },
+    [patchRow, updateTaxState],
+  );
+
+  const recordTaxMutationFailure = useCallback(
+    (
+      t: TransactionDto,
+      error: unknown,
+      mutation: TaxMutationState,
+    ) => {
+      if (
+        error instanceof ApiError &&
+        error.mutationResult?.transactionId === t.id &&
+        error.mutationResult.requestId === mutation.requestId
+      ) {
+        recordTaxMutation(t, error.mutationResult, mutation, false);
+        return;
+      }
+      if (error instanceof ApiError && error.code !== undefined) {
+        patchRow(t.id, { status: t.status, error: t.error });
+        updateTaxState(t, (state) => ({ ...state, mutation: null }));
+        toast(error.message);
+        return;
+      }
+      recordTaxMutation(
+        t,
+        {
+          transactionId: t.id,
+          requestId: mutation.requestId,
+          ok: false,
+          status: 'ERROR',
+          outcome: 'UNCERTAIN',
+        },
+        mutation,
+        false,
+      );
+    },
+    [patchRow, updateTaxState, recordTaxMutation, toast],
+  );
+
+  const commitTax = useCallback(
+    (t: TransactionDto) => {
+      const current = taxState(t);
+      if (
+        !current.staged ||
+        current.stagedVersion === null ||
+        current.stagedVersion !== current.version ||
+        current.staging
+      ) return;
+      const totals = current.staged.totals;
+      if (!window.confirm(
+        [
+          'Post this categorization to QuickBooks?',
+          `Subtotal ${centsLabel(totals.subtotalCents)}`,
+          `Tax ${centsLabel(totals.taxCents)}`,
+          `Total ${centsLabel(totals.totalCents)}`,
+        ].join('\n'),
+      )) return;
+      const requestId = createCategorizationRequestId();
+      const mutation: TaxMutationState = {
+        kind: 'commit',
+        requestId,
+        attemptStatus: null,
+        outcome: 'PENDING',
+        busy: true,
+        phase: 'writing',
+        resolution: 'known',
+        reconciled: false,
+      };
+      updateTaxState(t, (state) => ({ ...state, mutation }));
+      patchRow(t.id, { status: 'POSTING', error: null });
+      txnApi
+        .commitCategorization(t.id, current.staged.revision, requestId)
+        .then((result) => {
+          if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
+        })
+        .catch((error) => {
+          if (!aliveRef.current) return;
+          recordTaxMutationFailure(t, error, mutation);
+        });
+    },
+    [taxState, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
+  );
+
+  const reconcileTax = useCallback(
+    (t: TransactionDto, retry: boolean) => {
+      const current = taxState(t);
+      const mutation = current.mutation;
+      if (!mutation || mutation.busy) return;
+      updateTaxState(t, (state) => ({
+        ...state,
+        mutation: state.mutation
+          ? { ...state.mutation, busy: true, phase: 'reconciling' }
+          : null,
+      }));
+      const request = retry ? txnApi.retryCategorization : txnApi.reconcileCategorization;
+      request(t.id, mutation.requestId)
+        .then((result) => {
+          if (aliveRef.current) recordTaxMutation(t, result, mutation, true);
+        })
+        .catch(() => {
+          if (!aliveRef.current) return;
+          updateTaxState(t, (state) => ({
+            ...state,
+            mutation: state.mutation
+              ? { ...state.mutation, busy: false, phase: 'idle' }
+              : null,
+          }));
+          toast('Could not verify the QuickBooks result. Try reconciliation again.');
+        });
+    },
+    [taxState, updateTaxState, recordTaxMutation, toast],
+  );
+
+  const resumePreparedTax = useCallback(
+    (t: TransactionDto) => {
+      const current = taxState(t);
+      const mutation = current.mutation;
+      if (!mutation || mutation.attemptStatus !== 'PREPARED' || mutation.busy) return;
+      const resumed: TaxMutationState = {
+        ...mutation,
+        busy: true,
+        phase: 'writing',
+        resolution: 'known',
+      };
+      updateTaxState(t, (state) => ({ ...state, mutation: resumed }));
+      const request = mutation.kind === 'undo'
+        ? txnApi.undoCategorization(t.id, mutation.requestId)
+        : txnApi.commitCategorization(t.id, t.revision, mutation.requestId);
+      request
+        .then((result) => {
+          if (aliveRef.current) recordTaxMutation(t, result, resumed, false);
+        })
+        .catch((error) => {
+          if (!aliveRef.current) return;
+          if (
+            error instanceof ApiError &&
+            error.code !== undefined &&
+            !(
+              error.mutationResult?.transactionId === t.id &&
+              error.mutationResult.requestId === mutation.requestId
+            )
+          ) {
+            updateTaxState(t, (state) => ({
+              ...state,
+              mutation:
+                state.mutation?.requestId === mutation.requestId
+                  ? { ...state.mutation, busy: false, phase: 'idle' }
+                  : state.mutation,
+            }));
+            toast(error.message);
+            return;
+          }
+          if (
+            error instanceof ApiError &&
+            error.mutationResult?.transactionId === t.id &&
+            error.mutationResult.requestId === mutation.requestId
+          ) {
+            recordTaxMutation(t, error.mutationResult, resumed, false);
+            return;
+          }
+          const companyId = activeCompanyId;
+          if (!companyId) {
+            updateTaxState(t, (state) => ({
+              ...state,
+              mutation:
+                state.mutation?.requestId === mutation.requestId
+                  ? {
+                      ...state.mutation,
+                      busy: false,
+                      phase: 'idle',
+                      resolution: 'unresolved',
+                    }
+                  : state.mutation,
+            }));
+            return;
+          }
+          updateTaxState(t, (state) => ({
+            ...state,
+            mutation:
+              state.mutation?.requestId === mutation.requestId
+                ? {
+                    ...state.mutation,
+                    busy: true,
+                    phase: 'resolving',
+                    resolution: 'resolving',
+                  }
+                : state.mutation,
+          }));
+          void (async () => {
+            const stillCurrent = () =>
+              aliveRef.current && activeCompanyIdRef.current === companyId;
+            const markUnresolved = () => {
+              if (!stillCurrent()) return;
+              updateTaxState(t, (state) => ({
+                ...state,
+                mutation:
+                  state.mutation?.requestId === mutation.requestId
+                    ? {
+                        ...state.mutation,
+                        busy: false,
+                        phase: 'idle',
+                        resolution: 'unresolved',
+                      }
+                    : state.mutation,
+              }));
+            };
+
+            let freshRows: TransactionDto[];
+            try {
+              freshRows = await fetchAllTxns(companyId);
+            } catch {
+              markUnresolved();
+              return;
+            }
+            if (!stillCurrent()) return;
+            const fresh = freshRows.find((row) => row.id === t.id);
+            if (!fresh) {
+              markUnresolved();
+              return;
+            }
+            const activeAttempt = fresh.activeCategorizationAttempt;
+            if (activeAttempt) {
+              const expectedOperation = mutation.kind === 'undo' ? 'restore' : 'recategorize';
+              if (
+                activeAttempt.requestId !== mutation.requestId ||
+                activeAttempt.operation !== expectedOperation
+              ) {
+                markUnresolved();
+                return;
+              }
+              setRows(freshRows);
+              updateTaxState(fresh, (state) => ({
+                ...state,
+                mutation: {
+                  ...mutation,
+                  attemptStatus: activeAttempt.status,
+                  outcome:
+                    activeAttempt.status === 'UNCERTAIN'
+                      ? 'UNCERTAIN'
+                      : 'IN_PROGRESS',
+                  busy: false,
+                  phase: 'idle',
+                  resolution: 'known',
+                  reconciled: false,
+                },
+              }));
+              return;
+            }
+
+            setRows(freshRows);
+            try {
+              const replay = mutation.kind === 'undo'
+                ? txnApi.undoCategorization(t.id, mutation.requestId)
+                : txnApi.commitCategorization(t.id, t.revision, mutation.requestId);
+              const result = await replay;
+              if (!stillCurrent()) return;
+              recordTaxMutation(fresh, result, {
+                ...mutation,
+                resolution: 'known',
+              }, false);
+            } catch (replayError) {
+              if (
+                stillCurrent() &&
+                replayError instanceof ApiError &&
+                replayError.mutationResult?.transactionId === fresh.id &&
+                replayError.mutationResult.requestId === mutation.requestId
+              ) {
+                recordTaxMutation(fresh, replayError.mutationResult, {
+                  ...mutation,
+                  resolution: 'known',
+                }, false);
+                return;
+              }
+              markUnresolved();
+            }
+          })();
+        });
+    },
+    [
+      taxState,
+      updateTaxState,
+      recordTaxMutation,
+      activeCompanyId,
+      fetchAllTxns,
+      toast,
+    ],
+  );
+
+  const undoTax = useCallback(
+    (t: TransactionDto) => {
+      if (!window.confirm(
+        'Undo this categorization in QuickBooks?\nThis will restore the original Purchase exactly.',
+      )) return;
+      const requestId = createCategorizationRequestId();
+      const mutation: TaxMutationState = {
+        kind: 'undo',
+        requestId,
+        attemptStatus: null,
+        outcome: 'PENDING',
+        busy: true,
+        phase: 'writing',
+        resolution: 'known',
+        reconciled: false,
+      };
+      updateTaxState(t, (state) => ({ ...state, mutation }));
+      txnApi
+        .undoCategorization(t.id, requestId)
+        .then((result) => {
+          if (aliveRef.current) recordTaxMutation(t, result, mutation, false);
+        })
+        .catch((error) => {
+          if (!aliveRef.current) return;
+          recordTaxMutationFailure(t, error, mutation);
+        });
+    },
+    [updateTaxState, recordTaxMutation, recordTaxMutationFailure],
+  );
+
   const doPost = useCallback(
     (id: string) => {
       const t0 = rows.find((t) => t.id === id);
       const hasSplit = !!(t0 && t0.splits && t0.splits.length);
-      if (!t0 || !(t0.category || hasSplit)) return;
+      if (!t0 || hasActiveMutation(t0) || !(t0.category || hasSplit)) return;
+      if (taxReadyFor(t0)) {
+        commitTax(t0);
+        return;
+      }
       // Mirror the server guard: split txns need a tag on every split;
       // unsplit txns need at least one row-level tag.
       const effTags = hasSplit
@@ -463,7 +1143,16 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [rows, tagsRequired, patchRow, updateRow, toast],
+    [
+      rows,
+      hasActiveMutation,
+      taxReadyFor,
+      commitTax,
+      tagsRequired,
+      patchRow,
+      updateRow,
+      toast,
+    ],
   );
 
   const undoPost = useCallback(
@@ -515,11 +1204,16 @@ export default function Queue() {
 
   const toggleTag = useCallback(
     (t: TransactionDto, tagId: string) => {
+      if (hasActiveMutation(t)) return;
       const prev = t.tagIds;
       const next = t.tagIds.includes(tagId)
         ? t.tagIds.filter((i) => i !== tagId)
         : [...t.tagIds, tagId];
       patchRow(t.id, { tagIds: next }); // optimistic
+      if (taxReadyFor(t)) {
+        invalidateTaxStage(t);
+        return;
+      }
       txnApi
         .categorize(t.id, { tagIds: next })
         .then((dto) => {
@@ -530,11 +1224,12 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [patchRow, updateRow, toast],
+    [hasActiveMutation, patchRow, taxReadyFor, invalidateTaxStage, updateRow, toast],
   );
 
   const saveSplit = useCallback(
-    (t: TransactionDto, lines: SplitLineDraft[]) => {
+    (t: TransactionDto, lines: SplitLineDraft[], taxCalculation?: TaxCalculation) => {
+      if (hasActiveMutation(t)) return;
       const sign = t.amount < 0 ? -1 : 1;
       const splits: SplitDto[] = lines.map((l) => {
         const amount = Math.round((parseFloat(l.amt) || 0) * 100) / 100;
@@ -544,12 +1239,21 @@ export default function Queue() {
           category: l.cat,
           ...(categoryQboId ? { categoryQboId } : {}),
           tagIds: [...l.tags],
+          ...(l.memo ? { memo: l.memo } : {}),
+          taxCodeQboId: l.taxCodeQboId,
         };
       });
       const prev = { category: t.category, categoryQboId: t.categoryQboId, splits: t.splits };
       setSplitEditId(null);
       patchRow(t.id, { category: null, categoryQboId: null, splits }); // optimistic
       toast('Split saved — ready to post');
+      if (taxReadyFor(t)) {
+        invalidateTaxStage(t, {
+          taxCalculation: taxCalculation ?? 'NotApplicable',
+          taxCodeQboId: null,
+        });
+        return;
+      }
       txnApi
         .categorize(t.id, { category: null, categoryQboId: null, splits })
         .then((dto) => {
@@ -560,7 +1264,15 @@ export default function Queue() {
           toast(errText(e));
         });
     },
-    [qboIdOf, patchRow, updateRow, toast],
+    [
+      hasActiveMutation,
+      qboIdOf,
+      patchRow,
+      taxReadyFor,
+      invalidateTaxStage,
+      updateRow,
+      toast,
+    ],
   );
 
   const syncNow = useCallback(async () => {
@@ -582,8 +1294,14 @@ export default function Queue() {
   const bulkPost = useCallback(async () => {
     if (!activeCompanyId) return;
     if (!selReady.length) {
+      const hasTaxReadySelection = selPend.some((id) => {
+        const selected = rows.find((row) => row.id === id);
+        return selected ? taxReadyFor(selected) : false;
+      });
       toast(
-        tagsRequired
+        hasTaxReadySelection
+          ? 'Tax-ready purchases must be previewed and posted individually'
+          : tagsRequired
           ? 'Selection needs a category and at least one tag each'
           : 'Pick a category for the selection first',
       );
@@ -620,7 +1338,16 @@ export default function Queue() {
       if (!fresh.some((r) => ids.includes(r.id) && r.status === 'POSTING')) break;
       await new Promise((res) => setTimeout(res, 1200));
     }
-  }, [activeCompanyId, selReady, tagsRequired, fetchAllTxns, toast]);
+  }, [
+    activeCompanyId,
+    selReady,
+    selPend,
+    rows,
+    taxReadyFor,
+    tagsRequired,
+    fetchAllTxns,
+    toast,
+  ]);
 
   const createRule = useCallback(() => {
     if (!activeCompanyId || !rulePrompt) return;
@@ -710,14 +1437,18 @@ export default function Queue() {
       e.preventDefault();
       setActiveIdx(Math.max(i - 1, 0));
     } else if (e.key === 'x') {
-      setSel((s) => ({ ...s, [cur.id]: !s[cur.id] }));
+      if (!hasActiveMutation(cur)) {
+        setSel((s) => ({ ...s, [cur.id]: !s[cur.id] }));
+      }
     } else if (e.key === 'c') {
       e.preventDefault();
-      if (cur.status === 'PENDING') openPicker(cur.id);
+      if (cur.status === 'PENDING' && !hasActiveMutation(cur)) openPicker(cur.id);
     } else if (e.key === 't') {
       e.preventDefault();
-      setTagPicker((tp) => (tp === cur.id ? null : cur.id));
-      setPicker(null);
+      if (!hasActiveMutation(cur)) {
+        setTagPicker((tp) => (tp === cur.id ? null : cur.id));
+        setPicker(null);
+      }
     } else if (e.key === 'Enter') {
       // Splits count as categorized — doPost's own guards handle the rest.
       if (cur.status === 'PENDING' && (cur.category || (cur.splits && cur.splits.length))) {
@@ -747,13 +1478,17 @@ export default function Queue() {
 
   const splitTxn = splitEditId !== null ? rows.find((r) => r.id === splitEditId) ?? null : null;
 
-  const allSel = vis.length > 0 && vis.every((t) => sel[t.id] || t.status !== 'PENDING');
+  const allSel =
+    vis.length > 0 &&
+    vis.every((t) => sel[t.id] || t.status !== 'PENDING' || hasActiveMutation(t));
   const toggleAll = () => {
-    const anyOff = vis.some((t) => t.status === 'PENDING' && !sel[t.id]);
+    const anyOff = vis.some(
+      (t) => t.status === 'PENDING' && !hasActiveMutation(t) && !sel[t.id],
+    );
     setSel((prev) => {
       const next = { ...prev };
       vis.forEach((t) => {
-        if (t.status === 'PENDING') next[t.id] = anyOff;
+        if (t.status === 'PENDING' && !hasActiveMutation(t)) next[t.id] = anyOff;
       });
       return next;
     });
@@ -834,7 +1569,7 @@ export default function Queue() {
 
   const onOpenPicker = (v: RowView) => (e: ReactMouseEvent) => {
     e.stopPropagation();
-    if (v.t.status !== 'PENDING') return;
+    if (v.t.status !== 'PENDING' || hasActiveMutation(v.t)) return;
     if (v.t.splits && v.t.splits.length) {
       doOpenSplit(v.t.id);
     } else {
@@ -844,6 +1579,7 @@ export default function Queue() {
 
   const onTagBtn = (t: TransactionDto) => (e: ReactMouseEvent) => {
     e.stopPropagation();
+    if (hasActiveMutation(t)) return;
     setTagPicker((tp) => (tp === t.id ? null : t.id));
     setPicker(null);
   };
@@ -904,7 +1640,263 @@ export default function Queue() {
         </span>
       ));
 
-  const statusCell = (v: RowView, mobile: boolean) => (
+  const taxControls = (t: TransactionDto) => {
+    if (!taxReadyFor(t) || t.status !== 'PENDING' || (!t.category && !(t.splits && t.splits.length))) {
+      return null;
+    }
+    const state = taxState(t);
+    const isSplit = !!(t.splits && t.splits.length);
+    const locked = hasActiveMutation(t);
+    const canStage =
+      stageBodyFor(t, state) !== null &&
+      !state.staging &&
+      !state.reloadRequired &&
+      !locked;
+    return (
+      <span
+        style={{
+          display: 'grid',
+          gridTemplateColumns: isSplit ? '1fr auto' : 'minmax(130px,1fr) minmax(120px,1fr) auto',
+          gap: 6,
+          alignItems: 'end',
+          marginTop: 8,
+        }}
+      >
+        {!isSplit && (
+          <TaxCodePicker
+            id={`tax-code-${t.id}`}
+            label={`Purchase tax for ${t.payee}`}
+            readiness={taxReadiness}
+            value={state.taxCodeQboId}
+            disabled={locked}
+            onChange={(taxCodeQboId) => {
+              if (locked) return;
+              patchRow(t.id, {
+                taxCodeQboId,
+                taxCode:
+                  taxReadiness?.taxCodes.find((code) => code.qboId === taxCodeQboId)?.name ?? null,
+              });
+              invalidateTaxStage(t, {
+                taxCodeQboId,
+                taxCalculation:
+                  taxCodeQboId === null
+                    ? 'NotApplicable'
+                    : state.taxCalculation === 'TaxExcluded'
+                      ? 'TaxExcluded'
+                      : 'TaxInclusive',
+              });
+            }}
+          />
+        )}
+        {state.taxCodeQboId !== null ||
+        (isSplit && state.taxCalculation !== 'NotApplicable') ? (
+          <span style={{ display: 'block' }}>
+            <label
+              htmlFor={`tax-calculation-${t.id}`}
+              style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
+            >
+              Tax calculation for {t.payee}
+            </label>
+            <select
+              id={`tax-calculation-${t.id}`}
+              className="select"
+              value={state.taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
+              disabled={locked}
+              onChange={(event) => {
+                if (locked) return;
+                invalidateTaxStage(t, {
+                  taxCalculation: event.target.value as TaxCalculation,
+                });
+              }}
+              style={{ width: '100%' }}
+            >
+              <option value="TaxInclusive">Tax inclusive</option>
+              <option value="TaxExcluded">Tax exclusive</option>
+            </select>
+          </span>
+        ) : (
+          <span style={{ fontSize: 12, color: 'var(--mut)', paddingBottom: 8 }}>
+            No tax selected
+          </span>
+        )}
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={!canStage}
+          onClick={() => stageTax(t)}
+          style={{ opacity: canStage ? 1 : 0.45, whiteSpace: 'nowrap' }}
+        >
+          {state.staging ? 'Calculating…' : 'Preview tax'}
+        </button>
+        {state.staged && state.stagedVersion === state.version && (
+          <span
+            style={{
+              gridColumn: '1 / -1',
+              display: 'flex',
+              gap: 10,
+              color: 'var(--mut)',
+              fontSize: 12,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span>Subtotal {centsLabel(state.staged.totals.subtotalCents)}</span>
+            <span>Tax {centsLabel(state.staged.totals.taxCents)}</span>
+            <span>Total {centsLabel(state.staged.totals.totalCents)}</span>
+          </span>
+        )}
+      </span>
+    );
+  };
+
+  const taxStatusCell = (v: RowView, mobile: boolean) => {
+    const state = taxState(v.t);
+    const mutation = state.mutation;
+    const validStage =
+      state.staged !== null &&
+      state.stagedVersion !== null &&
+      state.stagedVersion === state.version &&
+      !state.staging;
+    const buttonStyle: CSSProperties = {
+      fontSize: 13.5,
+      fontWeight: 600,
+      color: '#fff',
+      background: 'var(--acc)',
+      border: 'none',
+      borderRadius: 7,
+      padding: mobile ? '9px 16px' : '7px 16px',
+      cursor: validStage ? 'pointer' : 'default',
+      font: 'inherit',
+      opacity: validStage ? 1 : 0.45,
+    };
+
+    if (mutation?.busy) {
+      return (
+        <span style={{ color: 'var(--amT)', fontSize: 12.5, fontWeight: 600 }}>
+          {mutation.phase === 'resolving'
+            ? 'Checking write status…'
+            : mutation.phase === 'reconciling'
+            ? 'Verifying…'
+            : mutation.kind === 'undo'
+              ? 'Undoing…'
+              : 'Posting…'}
+        </span>
+      );
+    }
+    if (mutation?.resolution === 'unresolved') {
+      return (
+        <span style={{ color: 'var(--erT)', fontSize: 12 }}>
+          Write status unresolved — reload required
+        </span>
+      );
+    }
+    if (mutation?.attemptStatus === 'PREPARED') {
+      return (
+        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, alignItems: 'center' }}>
+          <span style={{ color: 'var(--amT)', fontSize: 12 }}>
+            Prepared — not sent
+          </span>
+          <button className="btn-ghost" onClick={() => resumePreparedTax(v.t)}>
+            {mutation.kind === 'undo' ? 'Resume undo' : 'Resume post'}
+          </button>
+        </span>
+      );
+    }
+    if (mutation?.outcome === 'UNCERTAIN' || mutation?.outcome === 'IN_PROGRESS') {
+      return (
+        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, alignItems: 'center' }}>
+          <span style={{ color: 'var(--erT)', fontSize: 12 }}>
+            Verify in QuickBooks — outcome uncertain
+          </span>
+          <span style={{ display: 'inline-flex', gap: 7 }}>
+            <button className="btn-ghost" onClick={() => reconcileTax(v.t, false)}>
+              Reconcile
+            </button>
+            <button className="btn-ghost" onClick={() => reconcileTax(v.t, true)}>
+              Retry verification
+            </button>
+          </span>
+        </span>
+      );
+    }
+    if (mutation?.kind === 'undo' && mutation.outcome === 'VERIFIED') {
+      return <span className="pill-ok">Reverted ✓</span>;
+    }
+    if (v.t.status === 'REVERTED') {
+      return <span className="pill-ok">Reverted ✓</span>;
+    }
+    if (
+      mutation?.kind === 'commit' &&
+      (mutation.outcome === 'VERIFIED' || mutation.outcome === 'DRY_RUN')
+    ) {
+      return (
+        <>
+          <span className={mutation.outcome === 'DRY_RUN' ? 'pill-am' : 'pill-ok'}>
+            {mutation.outcome === 'DRY_RUN'
+              ? 'Dry run — verified'
+              : mutation.reconciled
+                ? 'Verified in QuickBooks ✓'
+                : 'Posted — verified ✓'}
+          </span>
+          {mutation.outcome === 'VERIFIED' && (
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                undoTax(v.t);
+              }}
+              className="hov-ink"
+              style={{ border: 'none', background: 'none', color: 'var(--fnt)', cursor: 'pointer' }}
+            >
+              Undo
+            </button>
+          )}
+        </>
+      );
+    }
+    if (v.t.status === 'POSTED') {
+      return (
+        <>
+          <span className="pill-ok">Posted — verified ✓</span>
+          {v.canUndo && (
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                undoTax(v.t);
+              }}
+              className="hov-ink"
+              style={{ border: 'none', background: 'none', color: 'var(--fnt)', cursor: 'pointer' }}
+            >
+              Undo
+            </button>
+          )}
+        </>
+      );
+    }
+    if (mutation?.outcome === 'RETRYABLE' || mutation?.outcome === 'UNCHANGED') {
+      return <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>;
+    }
+    if (v.t.status === 'PENDING') {
+      return (
+        <button
+          disabled={!validStage}
+          onClick={(event) => {
+            event.stopPropagation();
+            commitTax(v.t);
+          }}
+          style={buttonStyle}
+        >
+          Post
+        </button>
+      );
+    }
+    return null;
+  };
+
+  const statusCell = (v: RowView, mobile: boolean) => {
+    const usesTaxLifecycle =
+      v.t.qboType === 'Purchase' &&
+      (taxReadyFor(v.t) || v.t.taxCalculation !== null || taxState(v.t).mutation !== null);
+    if (usesTaxLifecycle) return taxStatusCell(v, mobile);
+    return (
     <>
       {v.ready && (
         <button
@@ -1034,7 +2026,8 @@ export default function Queue() {
         </button>
       )}
     </>
-  );
+    );
+  };
 
   const errLine = (v: RowView, marginTop: number) =>
     errOpenId === v.t.id && v.state === 'error' ? (
@@ -1122,6 +2115,25 @@ export default function Queue() {
         </div>
       </div>
 
+      {taxReadiness?.status !== 'ready' && (
+        <div
+          role="status"
+          style={{
+            marginBottom: 12,
+            border: '1px solid var(--bd2)',
+            borderRadius: 8,
+            padding: '9px 12px',
+            color: 'var(--mut)',
+            fontSize: 13,
+          }}
+        >
+          {taxReadiness === null
+            ? 'Purchase tax availability is unavailable. The existing no-tax category, tag, and post workflow remains available.'
+            : taxReadiness.reason ??
+              'Purchase tax is unavailable. The existing no-tax category, tag, and post workflow remains available.'}
+        </div>
+      )}
+
       {/* desktop table */}
       {!isMobile && (
         <div
@@ -1188,6 +2200,7 @@ export default function Queue() {
                   <input
                     type="checkbox"
                     checked={!!sel[t.id]}
+                    disabled={hasActiveMutation(t)}
                     onChange={() => setSel((s) => ({ ...s, [t.id]: !s[t.id] }))}
                     onClick={stopMouse}
                     onMouseDown={stopMouse}
@@ -1234,6 +2247,7 @@ export default function Queue() {
                       <button
                         onClick={onTagBtn(t)}
                         onMouseDown={stopMouse}
+                        disabled={hasActiveMutation(t)}
                         data-tip="Tags live only in Recat — never written to QuickBooks"
                         className="hov-dash"
                         style={{
@@ -1260,6 +2274,7 @@ export default function Queue() {
                         />
                       )}
                     </span>
+                    {taxControls(t)}
                     {v.mate && (
                       <span
                         style={{
@@ -1302,6 +2317,7 @@ export default function Queue() {
                     <button
                       onClick={onOpenPicker(v)}
                       onMouseDown={stopMouse}
+                      disabled={hasActiveMutation(t)}
                       className="hov-brd"
                       style={{
                         flex: 1,
@@ -1348,6 +2364,7 @@ export default function Queue() {
                           doOpenSplit(t.id);
                         }}
                         onMouseDown={stopMouse}
+                        disabled={hasActiveMutation(t)}
                         data-tip="Split this transaction across multiple categories"
                         data-tip-align="right"
                         className="hov-dash"
@@ -1411,6 +2428,7 @@ export default function Queue() {
                   <input
                     type="checkbox"
                     checked={!!sel[t.id]}
+                    disabled={hasActiveMutation(t)}
                     onChange={() => setSel((s) => ({ ...s, [t.id]: !s[t.id] }))}
                     onClick={stopMouse}
                     onMouseDown={stopMouse}
@@ -1467,6 +2485,7 @@ export default function Queue() {
                   <button
                     onClick={onTagBtn(t)}
                     onMouseDown={stopMouse}
+                    disabled={hasActiveMutation(t)}
                     style={{
                       fontSize: 11.5,
                       fontWeight: 600,
@@ -1490,6 +2509,7 @@ export default function Queue() {
                     />
                   )}
                 </span>
+                {taxControls(t)}
                 {v.mate && (
                   <span
                     style={{ display: 'block', fontSize: 12.5, color: 'var(--mut)', marginTop: 8 }}
@@ -1514,6 +2534,7 @@ export default function Queue() {
                     <button
                       onClick={onOpenPicker(v)}
                       onMouseDown={stopMouse}
+                      disabled={hasActiveMutation(t)}
                       style={{
                         width: '100%',
                         boxSizing: 'border-box',
@@ -1542,6 +2563,7 @@ export default function Queue() {
                         doOpenSplit(t.id);
                       }}
                       onMouseDown={stopMouse}
+                      disabled={hasActiveMutation(t)}
                       data-tip="Split across multiple categories"
                       style={{
                         border: '1px solid var(--bd)',
@@ -1660,8 +2682,9 @@ export default function Queue() {
           txn={splitTxn}
           tags={tags}
           catOpts={catOpts}
+          taxReadiness={taxReadiness}
           onClose={() => setSplitEditId(null)}
-          onSave={(lines) => saveSplit(splitTxn, lines)}
+          onSave={(lines, taxCalculation) => saveSplit(splitTxn, lines, taxCalculation)}
         />
       )}
     </div>

@@ -3,7 +3,12 @@
 // those lines — everything else on the entity survives verbatim.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { QboAuthError } from './types.js';
+import {
+  QboAuthError,
+  QboRequestTimeout,
+  QboSyncTokenConflict,
+  type QboPreparedWrite,
+} from './types.js';
 import {
   RealQboClient,
   exchangeAuthCode,
@@ -226,6 +231,182 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       AccountBasedExpenseLineDetail: { AccountRef: { value: '17' } },
     });
     expect(JSON.stringify(body)).not.toMatch(/TaxCodeRef|TaxAmount|TaxInclusiveAmt/);
+  });
+
+  it('sends the exact prepared Purchase JSON once with QBO request metadata', async () => {
+    const body: RawPurchase = {
+      Id: 'PURCHASE_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 10,
+      PrivateNote: 'generic private note',
+      AccountRef: { value: 'ACCOUNT_PAYMENT' },
+      CurrencyRef: { value: 'CAD' },
+      ExchangeRate: 1.25,
+      GlobalTaxCalculation: 'TaxInclusive',
+      TxnTaxDetail: { TotalTax: 0.48 },
+      Line: [{
+        Amount: 9.52,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'ACCOUNT_CATEGORY' },
+          TaxCodeRef: { value: 'TAX_CODE_STANDARD' },
+          TaxAmount: 0.48,
+          TaxInclusiveAmt: 10,
+        },
+      }],
+    };
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: body.Id,
+      requestId: 'REQUEST/GENERIC',
+      requestHash: 'hash-generic',
+      body,
+      before: {} as QboPreparedWrite['before'],
+      expected: {} as QboPreparedWrite['expected'],
+    } satisfies QboPreparedWrite;
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Purchase: { ...body, SyncToken: '8' },
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '8',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/purchase?requestid=REQUEST%2FGENERIC&minorversion=75',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([
+    [
+      'conflict',
+      new Response(JSON.stringify({
+        Fault: { Error: [{ code: '5010', Message: 'stale generic object' }] },
+      }), { status: 400 }),
+      QboSyncTokenConflict,
+    ],
+    [
+      'auth',
+      new Response(JSON.stringify({
+        Fault: { Error: [{ Message: 'generic auth failure' }] },
+      }), { status: 401 }),
+      QboAuthError,
+    ],
+  ] as const)('maps prepared-write %s outcomes without retrying', async (_case, response, errorType) => {
+    const fetchMock = vi.fn().mockResolvedValue(response);
+    vi.stubGlobal('fetch', fetchMock);
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
+      before: {} as QboPreparedWrite['before'],
+      expected: {} as QboPreparedWrite['expected'],
+    } satisfies QboPreparedWrite;
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(errorType);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps a prepared-write transport timeout without retrying', async () => {
+    const timeout = new DOMException('generic timeout', 'TimeoutError');
+    const fetchMock = vi.fn().mockRejectedValue(timeout);
+    vi.stubGlobal('fetch', fetchMock);
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
+      before: {} as QboPreparedWrite['before'],
+      expected: {} as QboPreparedWrite['expected'],
+    } satisfies QboPreparedWrite;
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(QboRequestTimeout);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['AbortError', 'TimeoutError'] as const)(
+    'maps a prepared-write response-body %s without retrying',
+    async (name) => {
+      const response = {
+        ok: true,
+        status: 200,
+        text: vi.fn().mockRejectedValue(new DOMException('generic body timeout', name)),
+      } as unknown as Response;
+      const fetchMock = vi.fn().mockResolvedValue(response);
+      vi.stubGlobal('fetch', fetchMock);
+      const prepared = {
+        operation: 'recategorize',
+        qboType: 'Purchase',
+        qboId: 'PURCHASE_GENERIC',
+        requestId: 'REQUEST_GENERIC',
+        requestHash: 'hash-generic',
+        body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
+        before: {} as QboPreparedWrite['before'],
+        expected: {} as QboPreparedWrite['expected'],
+      } satisfies QboPreparedWrite;
+
+      await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(
+        QboRequestTimeout,
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response.text).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('maps an undici connect timeout without retrying', async () => {
+    const timeout = new TypeError('generic transport failure', {
+      cause: { code: 'UND_ERR_CONNECT_TIMEOUT' },
+    });
+    const fetchMock = vi.fn().mockRejectedValue(timeout);
+    vi.stubGlobal('fetch', fetchMock);
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
+      before: {} as QboPreparedWrite['before'],
+      expected: {} as QboPreparedWrite['expected'],
+    } satisfies QboPreparedWrite;
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toBeInstanceOf(QboRequestTimeout);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a malformed successful prepared-write response', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({})));
+    vi.stubGlobal('fetch', fetchMock);
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body: { Id: 'PURCHASE_GENERIC', SyncToken: '7', Line: [] },
+      before: {} as QboPreparedWrite['before'],
+      expected: {} as QboPreparedWrite['expected'],
+    } satisfies QboPreparedWrite;
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toThrow(
+      /prepared write response/i,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

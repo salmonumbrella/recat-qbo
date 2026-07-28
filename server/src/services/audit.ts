@@ -10,6 +10,25 @@ import { prisma } from '../lib/prisma.js';
 /** Either the root client or an interactive-transaction client. */
 export type PrismaTransactionClientOrPrisma = PrismaClient | Prisma.TransactionClient;
 
+export type MutationAuditOutcome =
+  | 'DRY_RUN'
+  | 'VERIFIED'
+  | 'UNCERTAIN'
+  | 'UNCHANGED'
+  | 'RETRYABLE';
+
+export interface MutationAuditInput {
+  requestId: string;
+  outcome: MutationAuditOutcome;
+  references: {
+    operation: 'recategorize' | 'restore';
+    qboType: string;
+    qboId: string;
+    accountQboIds: string[];
+    taxCodeQboIds: string[];
+  };
+}
+
 export interface AuditInput {
   companyId: string;
   /** userId, or null/undefined for system actions */
@@ -26,9 +45,49 @@ export interface AuditInput {
   after: string;
   /** exact QBO request body (dry-run keeps it too) */
   payload?: unknown;
+  /**
+   * Tax-aware durable writes use a strict metadata allowlist. When present,
+   * legacy `payload` is ignored so prepared bodies, snapshots, SyncTokens,
+   * credentials, and raw errors cannot enter the audit log.
+   */
+  mutation?: MutationAuditInput;
+}
+
+const MAX_AUDIT_REFERENCE_LENGTH = 128;
+const MAX_AUDIT_REFERENCES = 50;
+
+function boundedReference(value: string): string {
+  return value.trim().slice(0, MAX_AUDIT_REFERENCE_LENGTH);
+}
+
+function normalizedReferences(values: string[]): string[] {
+  return [...new Set(values.map(boundedReference).filter((value) => value !== ''))]
+    .sort()
+    .slice(0, MAX_AUDIT_REFERENCES);
+}
+
+export function normalizeMutationAuditMetadata(entry: MutationAuditInput): {
+  requestId: string;
+  outcome: MutationAuditOutcome;
+  references: MutationAuditInput['references'];
+} {
+  return {
+    requestId: boundedReference(entry.requestId),
+    outcome: entry.outcome,
+    references: {
+      operation: entry.references.operation,
+      qboType: boundedReference(entry.references.qboType),
+      qboId: boundedReference(entry.references.qboId),
+      accountQboIds: normalizedReferences(entry.references.accountQboIds),
+      taxCodeQboIds: normalizedReferences(entry.references.taxCodeQboIds),
+    },
+  };
 }
 
 export async function writeAudit(tx: PrismaTransactionClientOrPrisma, entry: AuditInput): Promise<void> {
+  const payload = entry.mutation === undefined
+    ? entry.payload
+    : normalizeMutationAuditMetadata(entry.mutation);
   await tx.auditEntry.create({
     data: {
       companyId: entry.companyId,
@@ -40,7 +99,7 @@ export async function writeAudit(tx: PrismaTransactionClientOrPrisma, entry: Aud
       action: entry.action,
       before: entry.before,
       after: entry.after,
-      payload: entry.payload === undefined ? undefined : (entry.payload as Prisma.InputJsonValue),
+      payload: payload === undefined ? undefined : (payload as Prisma.InputJsonValue),
     },
   });
 }

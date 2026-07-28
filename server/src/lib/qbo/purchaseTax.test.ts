@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  QboPurchasePreparationError,
   PurchaseTaxError,
   calculatePurchaseLine,
   calculatePurchaseTransaction as calculatePurchaseTransactionRaw,
+  preparePurchaseRecategorization,
+  preparePurchaseRestore,
 } from './purchaseTax.js';
+import { QboSyncTokenConflict, type QboPurchaseSnapshot, type RawPurchase } from './types.js';
+import type { StagedCategorization } from '@recat/shared';
 
 const reference = {
   codes: [
@@ -503,5 +508,602 @@ describe('calculatePurchaseTransaction', () => {
         { ...reference, companyId: referenceCompanyId } as never,
       ),
     ).toEqual({ eligible: false, reason: 'TAX_COMPANY_MISMATCH' });
+  });
+});
+
+const TAX_CODE_STANDARD = 'TAX_CODE_STANDARD';
+const HOLDING_ACCOUNT = 'ACCOUNT_HOLDING';
+
+function completePurchase(overrides: Partial<RawPurchase> = {}): RawPurchase {
+  return {
+    Id: 'PURCHASE_GENERIC',
+    SyncToken: '7',
+    TxnDate: '2026-07-01',
+    TotalAmt: 15,
+    PaymentType: 'CreditCard',
+    DocNumber: 'DOC_GENERIC',
+    PrivateNote: 'private generic note',
+    EntityRef: { value: 'ENTITY_GENERIC', name: 'Generic Entity' },
+    AccountRef: { value: 'ACCOUNT_PAYMENT', name: 'Generic Payment Account' },
+    CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+    ExchangeRate: 1.25,
+    GlobalTaxCalculation: 'TaxInclusive',
+    TxnTaxDetail: { TotalTax: 0.75, TaxLine: [{ Amount: 0.75 }] },
+    status: 'Active',
+    MetaData: { CreateTime: '2026-07-01T00:00:00Z' },
+    Line: [
+      {
+        Id: 'LINE_HOLDING',
+        Amount: 10,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        Description: 'holding line',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: HOLDING_ACCOUNT, name: 'Generic Holding' },
+          CustomerRef: { value: 'CUSTOMER_OLD', name: 'Generic Customer' },
+          ClassRef: { value: 'CLASS_OLD', name: 'Generic Class' },
+          TaxCodeRef: { value: 'TAX_CODE_OLD' },
+          TaxAmount: 0.5,
+          TaxInclusiveAmt: 10,
+        },
+      },
+      {
+        Id: 'LINE_UNTOUCHED',
+        Amount: 5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        Description: 'untouched line',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'ACCOUNT_UNTOUCHED', name: 'Generic Untouched' },
+          CustomerRef: { value: 'CUSTOMER_UNTOUCHED', name: 'Generic Customer' },
+          ClassRef: { value: 'CLASS_UNTOUCHED', name: 'Generic Class' },
+          TaxCodeRef: { value: TAX_CODE_STANDARD },
+          TaxAmount: 0.25,
+        },
+        CustomField: [{ Name: 'Generic field', StringValue: 'preserve me' }],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function snapshotFor(raw = completePurchase()): QboPurchaseSnapshot {
+  const sign = raw.Credit === true ? 1 : -1;
+  return {
+    qboId: raw.Id,
+    syncToken: raw.SyncToken,
+    totalCents: sign * 1_500,
+    accountQboId: 'ACCOUNT_PAYMENT',
+    date: '2026-07-01',
+    direction: sign === 1 ? 'refund' : 'purchase',
+    globalTaxCalculation: 'TaxInclusive',
+    totalTaxCents: sign * 75,
+    lines: [
+      {
+        id: 'LINE_HOLDING',
+        amountCents: sign * 1_000,
+        description: 'holding line',
+        accountQboId: HOLDING_ACCOUNT,
+        customerQboId: 'CUSTOMER_OLD',
+        classQboId: 'CLASS_OLD',
+        taxCodeQboId: 'TAX_CODE_OLD',
+        taxAmountCents: sign * 50,
+        taxInclusiveCents: sign * 1_000,
+      },
+      {
+        id: 'LINE_UNTOUCHED',
+        amountCents: sign * 500,
+        description: 'untouched line',
+        accountQboId: 'ACCOUNT_UNTOUCHED',
+        customerQboId: 'CUSTOMER_UNTOUCHED',
+        classQboId: 'CLASS_UNTOUCHED',
+        taxCodeQboId: TAX_CODE_STANDARD,
+        taxAmountCents: sign * 25,
+        taxInclusiveCents: null,
+      },
+    ],
+  };
+}
+
+function staged(
+  taxCalculation: StagedCategorization['taxCalculation'] = 'TaxInclusive',
+): StagedCategorization {
+  return {
+    transactionId: '00000000-0000-4000-8000-000000000001',
+    revision: 2,
+    taxCalculation,
+    totals: { subtotalCents: -952, taxCents: -48, totalCents: -1_000 },
+    lines: [
+      {
+        idx: 0,
+        subtotalCents: -952,
+        taxCents: -48,
+        totalCents: -1_000,
+        categoryQboId: 'ACCOUNT_CATEGORY',
+        taxCodeQboId: taxCalculation === 'NotApplicable' ? null : TAX_CODE_STANDARD,
+        memo: 'generic memo',
+      },
+    ],
+    tagIds: [],
+  };
+}
+
+function prepare(
+  raw = completePurchase(),
+  categorization = staged(),
+  before = snapshotFor(raw),
+) {
+  return preparePurchaseRecategorization({
+    current: raw,
+    holdingAccountQboIds: [HOLDING_ACCOUNT],
+    staged: categorization,
+    before,
+    requestId: 'REQUEST_GENERIC',
+  });
+}
+
+describe('preparePurchaseRecategorization', () => {
+  it('prepares an exact tax-inclusive full Purchase body and expected snapshot', () => {
+    const raw = completePurchase();
+    const prepared = prepare(raw);
+    const {
+      TxnTaxDetail: _staleTax,
+      status: _cdcStatus,
+      ...writeable
+    } = raw;
+
+    expect(prepared).toMatchObject({
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_GENERIC',
+      before: snapshotFor(raw),
+      expected: {
+        qboId: 'PURCHASE_GENERIC',
+        totalCents: -1_500,
+        accountQboId: 'ACCOUNT_PAYMENT',
+        date: '2026-07-01',
+        direction: 'purchase',
+        globalTaxCalculation: 'TaxInclusive',
+        totalTaxCents: -73,
+        targetLines: [{
+          id: null,
+          amountCents: -952,
+          description: 'generic memo',
+          accountQboId: 'ACCOUNT_CATEGORY',
+          customerQboId: null,
+          classQboId: null,
+          taxCodeQboId: TAX_CODE_STANDARD,
+          taxAmountCents: -48,
+          taxInclusiveCents: -1_000,
+        }],
+      },
+    });
+    expect(prepared.body).toEqual({
+      ...writeable,
+      SyncToken: '7',
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [
+        raw.Line![1],
+        {
+          Amount: 9.52,
+          DetailType: 'AccountBasedExpenseLineDetail',
+          Description: 'generic memo',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: 'ACCOUNT_CATEGORY' },
+            TaxCodeRef: { value: TAX_CODE_STANDARD },
+            TaxAmount: 0.48,
+            TaxInclusiveAmt: 10,
+          },
+        },
+      ],
+    });
+    expect(prepared.body.EntityRef).toEqual(raw.EntityRef);
+    expect(prepared.body.AccountRef).toEqual(raw.AccountRef);
+    expect(prepared.body.DocNumber).toBe(raw.DocNumber);
+    expect(prepared.body.PrivateNote).toBe(raw.PrivateNote);
+    expect(prepared.body.PaymentType).toBe(raw.PaymentType);
+    expect(prepared.body.CurrencyRef).toEqual(raw.CurrencyRef);
+    expect(prepared.body.ExchangeRate).toBe(raw.ExchangeRate);
+    expect(prepared.body.Line![0]).toEqual(raw.Line![1]);
+    expect(prepared.body).not.toHaveProperty('TxnTaxDetail');
+    expect(prepared.body).not.toHaveProperty('status');
+    expect(prepared.body.Line!.some((line) =>
+      line.AccountBasedExpenseLineDetail?.AccountRef?.value === HOLDING_ACCOUNT,
+    )).toBe(false);
+    expect(prepared.requestHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.body)).toBe(true);
+  });
+
+  it.each([
+    ['TaxExcluded', undefined],
+    ['TaxInclusive', 10],
+  ] as const)('emits exact %s tax fields', (taxCalculation, inclusiveAmount) => {
+    const raw = completePurchase({ GlobalTaxCalculation: taxCalculation });
+    const prepared = prepare(raw, staged(taxCalculation), {
+      ...snapshotFor(raw),
+      globalTaxCalculation: taxCalculation,
+    });
+    const detail = prepared.body.Line![1]!.AccountBasedExpenseLineDetail;
+    expect(detail).toEqual({
+      AccountRef: { value: 'ACCOUNT_CATEGORY' },
+      TaxCodeRef: { value: TAX_CODE_STANDARD },
+      TaxAmount: 0.48,
+      ...(inclusiveAmount === undefined ? {} : { TaxInclusiveAmt: inclusiveAmount }),
+    });
+    expect(prepared.body.GlobalTaxCalculation).toBe(taxCalculation);
+  });
+
+  it('proves preserved tax from the aggregate and rejects unprovable or mode-changing shapes', () => {
+    const aggregateBacked = completePurchase({
+      Line: [
+        completePurchase().Line![0]!,
+        {
+          ...completePurchase().Line![1]!,
+          AccountBasedExpenseLineDetail: {
+            ...completePurchase().Line![1]!.AccountBasedExpenseLineDetail,
+            TaxAmount: undefined,
+          },
+        },
+      ],
+    });
+    const aggregateBefore: QboPurchaseSnapshot = {
+      ...snapshotFor(aggregateBacked),
+      lines: [
+        snapshotFor(aggregateBacked).lines[0]!,
+        { ...snapshotFor(aggregateBacked).lines[1]!, taxAmountCents: null },
+      ],
+    };
+
+    expect(prepare(aggregateBacked, staged(), aggregateBefore).expected.totalTaxCents).toBe(-73);
+
+    const unprovable = {
+      ...aggregateBacked,
+      Line: [
+        {
+          ...aggregateBacked.Line![0]!,
+          AccountBasedExpenseLineDetail: {
+            ...aggregateBacked.Line![0]!.AccountBasedExpenseLineDetail,
+            TaxAmount: undefined,
+          },
+        },
+        aggregateBacked.Line![1]!,
+      ],
+    };
+    const unprovableBefore: QboPurchaseSnapshot = {
+      ...aggregateBefore,
+      lines: [
+        { ...aggregateBefore.lines[0]!, taxAmountCents: null },
+        aggregateBefore.lines[1]!,
+      ],
+    };
+    expect(() => prepare(unprovable, staged(), unprovableBefore)).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({
+        code: 'QBO_PURCHASE_UNSUPPORTED',
+      }),
+    );
+
+    expect(() => prepare(completePurchase(), staged('TaxExcluded'))).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({
+        code: 'QBO_PURCHASE_UNSUPPORTED',
+      }),
+    );
+
+    const inconsistentAggregate = completePurchase({
+      TxnTaxDetail: { TotalTax: 0.8 },
+    });
+    expect(() => prepare(
+      inconsistentAggregate,
+      staged(),
+      {
+        ...snapshotFor(inconsistentAggregate),
+        totalTaxCents: -80,
+      },
+    )).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({
+        code: 'QBO_PURCHASE_UNSUPPORTED',
+      }),
+    );
+  });
+
+  it('prepares split cents exactly and preserves signed refunds', () => {
+    const raw = completePurchase({ Credit: true });
+    const before = snapshotFor(raw);
+    const splitStage: StagedCategorization = {
+      ...staged(),
+      totals: { subtotalCents: 952, taxCents: 48, totalCents: 1_000 },
+      lines: [
+        {
+          idx: 0,
+          subtotalCents: 571,
+          taxCents: 29,
+          totalCents: 600,
+          categoryQboId: 'ACCOUNT_CATEGORY_A',
+          taxCodeQboId: TAX_CODE_STANDARD,
+          memo: null,
+        },
+        {
+          idx: 1,
+          subtotalCents: 381,
+          taxCents: 19,
+          totalCents: 400,
+          categoryQboId: 'ACCOUNT_CATEGORY_B',
+          taxCodeQboId: TAX_CODE_STANDARD,
+          memo: 'generic second memo',
+        },
+      ],
+    };
+
+    const prepared = prepare(raw, splitStage, before);
+
+    expect(prepared.body.Line!.slice(1)).toEqual([
+      {
+        Amount: 5.71,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'ACCOUNT_CATEGORY_A' },
+          TaxCodeRef: { value: TAX_CODE_STANDARD },
+          TaxAmount: 0.29,
+          TaxInclusiveAmt: 6,
+        },
+      },
+      {
+        Amount: 3.81,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        Description: 'generic second memo',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'ACCOUNT_CATEGORY_B' },
+          TaxCodeRef: { value: TAX_CODE_STANDARD },
+          TaxAmount: 0.19,
+          TaxInclusiveAmt: 4,
+        },
+      },
+    ]);
+    expect(prepared.expected).toMatchObject({
+      direction: 'refund',
+      totalTaxCents: 73,
+      targetLines: [
+        { amountCents: 571, taxAmountCents: 29, taxInclusiveCents: 600 },
+        { amountCents: 381, taxAmountCents: 19, taxInclusiveCents: 400 },
+      ],
+    });
+  });
+
+  it('hashes the normalized body deterministically despite object insertion order', () => {
+    const raw = completePurchase();
+    const reordered = {
+      Line: raw.Line,
+      MetaData: raw.MetaData,
+      TxnTaxDetail: raw.TxnTaxDetail,
+      GlobalTaxCalculation: raw.GlobalTaxCalculation,
+      ExchangeRate: raw.ExchangeRate,
+      CurrencyRef: raw.CurrencyRef,
+      AccountRef: raw.AccountRef,
+      EntityRef: raw.EntityRef,
+      PrivateNote: raw.PrivateNote,
+      DocNumber: raw.DocNumber,
+      PaymentType: raw.PaymentType,
+      TotalAmt: raw.TotalAmt,
+      TxnDate: raw.TxnDate,
+      SyncToken: raw.SyncToken,
+      Id: raw.Id,
+    } as RawPurchase;
+
+    expect(prepare(raw).requestHash).toBe(prepare(reordered).requestHash);
+  });
+
+  it('rejects unsupported shapes, drift, missing references, unsafe cents, and stale tokens', () => {
+    expect(() => prepare(completePurchase({ Line: undefined }))).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_PURCHASE_UNSUPPORTED' }),
+    );
+    expect(() => prepare(completePurchase({ TotalAmt: 16 }))).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_STATE_DRIFT' }),
+    );
+    expect(() => prepare(completePurchase(), {
+      ...staged(),
+      lines: [{ ...staged().lines[0]!, categoryQboId: '' }],
+    })).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+    );
+    const missingPaymentAccount = completePurchase({ AccountRef: undefined });
+    expect(() => prepare(
+      missingPaymentAccount,
+      staged(),
+      { ...snapshotFor(missingPaymentAccount), accountQboId: null },
+    )).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
+    );
+    expect(() => prepare(completePurchase(), {
+      ...staged(),
+      lines: [{ ...staged().lines[0]!, subtotalCents: Number.MAX_SAFE_INTEGER }],
+    })).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_AMOUNT_UNSAFE' }),
+    );
+    expect(() => prepare(
+      completePurchase({ SyncToken: '8' }),
+      staged(),
+      snapshotFor(completePurchase()),
+    )).toThrowError(QboSyncTokenConflict);
+  });
+
+  it('rejects contradictory staged tax signs and NotApplicable tax cents', () => {
+    for (const invalid of [
+      {
+        ...staged(),
+        totals: { subtotalCents: -1_100, taxCents: 100, totalCents: -1_000 },
+        lines: [{
+          ...staged().lines[0]!,
+          subtotalCents: -1_100,
+          taxCents: 100,
+          totalCents: -1_000,
+        }],
+      },
+      {
+        ...staged('NotApplicable'),
+        totals: { subtotalCents: -900, taxCents: -100, totalCents: -1_000 },
+        lines: [{
+          ...staged('NotApplicable').lines[0]!,
+          subtotalCents: -900,
+          taxCents: -100,
+          totalCents: -1_000,
+        }],
+      },
+    ] satisfies StagedCategorization[]) {
+      expect(() => prepare(completePurchase(), invalid)).toThrowError(
+        expect.objectContaining<QboPurchasePreparationError>({
+          code: 'QBO_PURCHASE_UNSUPPORTED',
+        }),
+      );
+    }
+
+    const refund = completePurchase({ Credit: true });
+    expect(() => prepare(refund, {
+      ...staged(),
+      totals: { subtotalCents: 1_100, taxCents: -100, totalCents: 1_000 },
+      lines: [{
+        ...staged().lines[0]!,
+        subtotalCents: 1_100,
+        taxCents: -100,
+        totalCents: 1_000,
+      }],
+    }, snapshotFor(refund))).toThrowError(
+      expect.objectContaining<QboPurchasePreparationError>({
+        code: 'QBO_PURCHASE_UNSUPPORTED',
+      }),
+    );
+  });
+});
+
+describe('preparePurchaseRestore', () => {
+  it('restores the exact before snapshot target with the current SyncToken', () => {
+    const original = prepare();
+    const current: RawPurchase = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: { TotalTax: 0.73 },
+      Line: [
+        original.body.Line![0]!,
+        {
+          Id: 'LINE_QBO_ASSIGNED',
+          ...original.body.Line![1]!,
+        },
+      ],
+    };
+
+    const restore = preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_GENERIC',
+    });
+
+    expect(restore).toMatchObject({
+      operation: 'restore',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+      requestId: 'REQUEST_RESTORE_GENERIC',
+      before: original.before,
+      expected: {
+        globalTaxCalculation: 'TaxInclusive',
+        totalTaxCents: -75,
+        targetLines: [{
+          id: 'LINE_HOLDING',
+          amountCents: -1_000,
+          accountQboId: HOLDING_ACCOUNT,
+          customerQboId: 'CUSTOMER_OLD',
+          classQboId: 'CLASS_OLD',
+          taxCodeQboId: 'TAX_CODE_OLD',
+          taxAmountCents: -50,
+          taxInclusiveCents: -1_000,
+        }],
+      },
+    });
+    expect(restore.body.SyncToken).toBe('8');
+    expect(restore.body.Line).toEqual([
+      {
+        Id: 'LINE_HOLDING',
+        Amount: 10,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        Description: 'holding line',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: HOLDING_ACCOUNT },
+          CustomerRef: { value: 'CUSTOMER_OLD' },
+          ClassRef: { value: 'CLASS_OLD' },
+          TaxCodeRef: { value: 'TAX_CODE_OLD' },
+          TaxAmount: 0.5,
+          TaxInclusiveAmt: 10,
+        },
+      },
+      current.Line![0],
+    ]);
+  });
+
+  it('rejects current Purchase drift and unsupported restore shapes', () => {
+    const original = prepare();
+    expect(() => preparePurchaseRestore({
+      current: { ...original.body, SyncToken: '8', TotalAmt: 16 },
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_GENERIC',
+    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_STATE_DRIFT' }));
+    expect(() => preparePurchaseRestore({
+      current: { ...original.body, SyncToken: '8', Line: undefined },
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_GENERIC',
+    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({ code: 'QBO_PURCHASE_UNSUPPORTED' }));
+  });
+
+  it('reserves untouched line identities before matching colliding restore targets', () => {
+    const raw = completePurchase({
+      TotalAmt: 19.52,
+      TxnTaxDetail: { TotalTax: 0.98 },
+      Line: [
+        completePurchase().Line![0]!,
+        {
+          Id: 'LINE_UNTOUCHED',
+          Amount: 9.52,
+          DetailType: 'AccountBasedExpenseLineDetail',
+          Description: 'generic memo',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: 'ACCOUNT_CATEGORY' },
+            TaxCodeRef: { value: TAX_CODE_STANDARD },
+            TaxAmount: 0.48,
+            TaxInclusiveAmt: 10,
+          },
+        },
+      ],
+    });
+    const before: QboPurchaseSnapshot = {
+      ...snapshotFor(raw),
+      totalCents: -1_952,
+      totalTaxCents: -98,
+      lines: [
+        snapshotFor(raw).lines[0]!,
+        {
+          id: 'LINE_UNTOUCHED',
+          amountCents: -952,
+          description: 'generic memo',
+          accountQboId: 'ACCOUNT_CATEGORY',
+          customerQboId: null,
+          classQboId: null,
+          taxCodeQboId: TAX_CODE_STANDARD,
+          taxAmountCents: -48,
+          taxInclusiveCents: -1_000,
+        },
+      ],
+    };
+    const original = prepare(raw, staged(), before);
+    const current: RawPurchase = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: { TotalTax: 0.96 },
+      Line: [
+        original.body.Line![0]!,
+        { Id: 'LINE_TARGET_ASSIGNED', ...original.body.Line![1]! },
+      ],
+    };
+
+    expect(() => preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_COLLISION',
+    })).not.toThrow();
   });
 });

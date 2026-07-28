@@ -15,15 +15,19 @@
 
 import {
   QboAuthError,
+  QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
   type QboAccountTxn,
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
+  type QboPreparedWrite,
   type QboStatement,
   type QboStatementRow,
   type QboPurchaseSnapshot,
+  type RawPurchase,
+  type RawPurchaseLine,
   type QboTaxCodeInfo,
   type QboTaxProfile,
   type QboTaxRateInfo,
@@ -32,9 +36,16 @@ import {
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
+import type { StagedCategorization } from '@recat/shared';
 import { classifyIntuitOAuthBody } from './diagnostics.js';
 import { moneyToCents } from '../../services/tax/model.js';
-import { isSupportedTaxRateValue } from './purchaseTax.js';
+import {
+  isSupportedTaxRateValue,
+  preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
+  preparePurchaseRestore as preparePurchaseRestoreBody,
+} from './purchaseTax.js';
+
+export type { RawPurchase, RawPurchaseLine } from './types.js';
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -43,6 +54,7 @@ const OAUTH_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revo
 const OAUTH_SCOPE = 'com.intuit.quickbooks.accounting';
 const MINOR_VERSION = '75';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+const PREPARED_WRITE_TIMEOUT_MS = 30_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
 
@@ -79,40 +91,6 @@ interface RawAccount {
   Classification?: string; // Asset | Liability | Equity | Revenue | Expense
   AccountType?: string; // Bank | Credit Card | Cost of Goods Sold | Expense | Income | ...
   Active?: boolean;
-}
-
-export interface RawPurchaseLine {
-  Id?: string;
-  Amount?: number;
-  Description?: string;
-  DetailType?: string;
-  AccountBasedExpenseLineDetail?: {
-    AccountRef?: QboRef;
-    CustomerRef?: QboRef;
-    ClassRef?: QboRef;
-    TaxCodeRef?: QboRef;
-    TaxAmount?: number;
-    TaxInclusiveAmt?: number;
-  };
-}
-
-export interface RawPurchase {
-  Id: string;
-  SyncToken: string;
-  TxnDate?: string;
-  TotalAmt?: number;
-  /** true = refund/credit — money coming back in */
-  Credit?: boolean;
-  PaymentType?: string;
-  DocNumber?: string;
-  PrivateNote?: string;
-  EntityRef?: QboRef;
-  /** the bank / credit-card account the purchase was paid from */
-  AccountRef?: QboRef;
-  Line?: RawPurchaseLine[];
-  GlobalTaxCalculation?: string;
-  TxnTaxDetail?: { TotalTax?: number };
-  status?: string; // CDC: 'Deleted'
 }
 
 export interface RawPreferences {
@@ -960,6 +938,59 @@ export class RealQboClient implements QboClient {
     return (text ? JSON.parse(text) : {}) as T;
   }
 
+  /**
+   * Prepared mutations are already the durable retry unit. Send their exact
+   * body once and surface an ambiguous timeout to the lifecycle caller.
+   */
+  private async requestPreparedWrite(prepared: QboPreparedWrite): Promise<{ Purchase?: RawPurchase }> {
+    const accessToken = await this.ensureFreshToken();
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      PREPARED_WRITE_TIMEOUT_MS,
+    );
+    try {
+      const res = await fetch(
+        `${this.base}/purchase?requestid=${encodeURIComponent(prepared.requestId)}&minorversion=${MINOR_VERSION}`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(prepared.body),
+          signal: controller.signal,
+        },
+      );
+      const text = await res.text();
+      if (!res.ok) throw this.toError(res.status, text);
+      return (text ? JSON.parse(text) : {}) as { Purchase?: RawPurchase };
+    } catch (error) {
+      const cause = error instanceof Error
+        ? (error as Error & { cause?: unknown }).cause
+        : undefined;
+      const causeCode =
+        typeof cause === 'object' &&
+        cause !== null &&
+        'code' in cause &&
+        typeof cause.code === 'string'
+          ? cause.code
+          : '';
+      if (
+        controller.signal.aborted ||
+        (error instanceof DOMException &&
+          (error.name === 'TimeoutError' || error.name === 'AbortError')) ||
+        (error instanceof TypeError && causeCode.includes('TIMEOUT'))
+      ) {
+        throw new QboRequestTimeout();
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private toError(status: number, bodyText: string): Error {
     let fault: QboFaultBody = {};
     try {
@@ -1046,6 +1077,53 @@ export class RealQboClient implements QboClient {
       if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
       throw err;
     }
+  }
+
+  async preparePurchaseRecategorization(
+    txn: QboTxn,
+    staged: StagedCategorization,
+    before: QboPurchaseSnapshot,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    if (txn.qboType !== 'Purchase') {
+      throw new Error('Prepared tax-aware writes support Purchase transactions only.');
+    }
+    return preparePurchaseRecategorizationBody({
+      current: txn.raw as RawPurchase,
+      holdingAccountQboIds: [...this.holdingIds],
+      staged,
+      before,
+      requestId,
+    });
+  }
+
+  async sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
+    const response = await this.requestPreparedWrite(prepared);
+    if (
+      typeof response.Purchase?.SyncToken !== 'string' ||
+      response.Purchase.SyncToken.trim() === ''
+    ) {
+      throw new Error('QuickBooks prepared write response omitted the updated Purchase SyncToken.');
+    }
+    return {
+      ok: true,
+      newSyncToken: response.Purchase.SyncToken,
+    };
+  }
+
+  async preparePurchaseRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    if (txn.qboType !== 'Purchase') {
+      throw new Error('Prepared restore supports Purchase transactions only.');
+    }
+    return preparePurchaseRestoreBody({
+      current: txn.raw as RawPurchase,
+      prepared,
+      requestId,
+    });
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {
