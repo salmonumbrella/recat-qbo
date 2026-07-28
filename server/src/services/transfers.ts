@@ -16,76 +16,29 @@ import type { AuditAction, TxnStatus } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import type { QboClient, QboTxn } from '../lib/qbo/types.js';
 import type { Actor } from './writeback.js';
+import {
+  isTransferPair,
+  MAX_TRANSFER_DISCOVERY_TRANSACTIONS,
+  pairTransfers,
+  transferCandidates,
+  TransferDiscoveryOverflowError,
+  type PairTransferStats,
+  type PairableTxn,
+} from './transferCandidates.js';
+
+export {
+  isTransferPair,
+  MAX_TRANSFER_DISCOVERY_TRANSACTIONS,
+  pairTransfers,
+  transferCandidates,
+  TransferDiscoveryOverflowError,
+  type PairTransferStats,
+  type PairableTxn,
+} from './transferCandidates.js';
 
 // ---------------------------------------------------------------------------
 // Pure pairing logic (unit-tested)
 // ---------------------------------------------------------------------------
-
-export interface PairableTxn {
-  id: string;
-  /** signed; + = money in */
-  amount: number;
-  bankAccount: string;
-  date: Date;
-}
-
-const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
-
-export function isTransferPair(a: PairableTxn, b: PairableTxn): boolean {
-  return (
-    a.amount !== 0 &&
-    Math.abs(Math.abs(a.amount) - Math.abs(b.amount)) < 0.005 &&
-    Math.sign(a.amount) !== Math.sign(b.amount) &&
-    a.bankAccount !== b.bankAccount &&
-    Math.abs(a.date.getTime() - b.date.getTime()) <= THREE_DAYS_MS
-  );
-}
-
-/**
- * Greedy pairing in date order; each txn pairs at most once. The returned map
- * contains both directions (txnId → counterpartId and back).
- */
-export function pairTransfers(txns: PairableTxn[]): Map<string, string> {
-  const pairs = new Map<string, string>();
-  const used = new Set<string>();
-  const sorted = [...txns].sort((a, b) => a.date.getTime() - b.date.getTime());
-  for (let i = 0; i < sorted.length; i++) {
-    const a = sorted[i];
-    if (!a || used.has(a.id)) continue;
-    for (let j = i + 1; j < sorted.length; j++) {
-      const b = sorted[j];
-      if (!b || used.has(b.id)) continue;
-      if (isTransferPair(a, b)) {
-        pairs.set(a.id, b.id);
-        pairs.set(b.id, a.id);
-        used.add(a.id);
-        used.add(b.id);
-        break;
-      }
-    }
-  }
-  return pairs;
-}
-
-// ---------------------------------------------------------------------------
-// Candidates
-// ---------------------------------------------------------------------------
-
-/** txnId → counterpart txnId, among uncategorized PENDING txns. */
-export async function transferCandidates(companyId: string): Promise<Map<string, string>> {
-  const rows = await prisma.transaction.findMany({
-    // Uncategorized = no single category staged AND no split lines staged.
-    where: { companyId, status: 'PENDING', category: null, splitLines: { none: {} } },
-    select: { id: true, amount: true, bankAccount: true, date: true },
-  });
-  const pairable: PairableTxn[] = rows.map((r) => ({
-    id: r.id,
-    amount: Number(r.amount),
-    bankAccount: r.bankAccount,
-    date: r.date,
-  }));
-  return pairTransfers(pairable);
-}
 
 // ---------------------------------------------------------------------------
 // Recording

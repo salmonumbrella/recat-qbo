@@ -46,6 +46,7 @@ model User {
   magicLinks      MagicLinkToken[]
   sessions        Session[]
   memberships     Membership[]
+  mcpTokens       McpToken[]
 }
 
 /// Per-company role (handoff §5 matrix, scoped per specs.md §2).
@@ -76,6 +77,35 @@ model Session {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   expiresAt DateTime
   createdAt DateTime @default(now())
+}
+
+model McpToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  digest     String    @unique @db.Char(64)
+  prefix     String    @db.VarChar(12)
+  label      String    @db.VarChar(80)
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  @@index([userId, createdAt])
+}
+
+// Append-only security events. The app exposes create-only service access.
+model SecurityAuditEvent {
+  id            String   @id @default(uuid())
+  // Immutable attribution scalar: deliberately no User FK, so account deletion
+  // cannot erase or rewrite the original actor ID.
+  actorUserId   String
+  action        String   @db.VarChar(64)
+  subjectId     String   @db.VarChar(64)
+  subjectPrefix String   @db.VarChar(16)
+  at            DateTime @default(now())
+
+  @@index([actorUserId, at])
 }
 
 model Company {

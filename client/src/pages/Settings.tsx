@@ -20,6 +20,7 @@ import HoverButton from './settings/HoverButton';
 import SuggestionsCard from './settings/SuggestionsCard';
 import TeamCard from './settings/TeamCard';
 import TaxCard from './settings/TaxCard';
+import McpTokensCard from './settings/McpTokensCard';
 import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
@@ -146,6 +147,8 @@ export default function Settings() {
       }}
     >
       <div className="page-title">Settings</div>
+
+      <McpTokensCard />
 
       {activeCompany && (
         <>

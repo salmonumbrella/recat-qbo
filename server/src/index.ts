@@ -29,12 +29,54 @@ import {
 } from './routes/transactions.js';
 import { usersRouter } from './routes/users.js';
 import { webhooksRouter } from './routes/webhooks.js';
+import { mcpTokensRouter } from './routes/mcpTokens.js';
+import { createRecatBearerAuth, createRecatTokenVerifier } from './mcp/auth.js';
+import { createMcpHttpGuards } from './mcp/httpGuards.js';
+import {
+  BoundedRateLimiter,
+  createRateLimitMiddleware,
+  mcpIpRateLimitKey,
+  mcpTokenRateLimitKey,
+} from './mcp/rateLimit.js';
+import { createRecatMcpRequestHandler } from './mcp/server.js';
+import { MCP_SCHEMA_BOUNDS } from './mcp/schemaBounds.js';
 
 const app = express();
 app.set('trust proxy', compileTrustedProxy(env.TRUSTED_PROXY_IPS));
 app.disable('x-powered-by');
 
 app.use(cookieParser());
+
+const mcpIpLimiter = new BoundedRateLimiter({
+  limit: 120,
+  windowMs: 60_000,
+  maxKeys: 10_000,
+});
+const mcpTokenLimiter = new BoundedRateLimiter({
+  limit: 600,
+  windowMs: 60_000,
+  maxKeys: 10_000,
+});
+app.use(
+  '/mcp',
+  ...createMcpHttpGuards({
+    appUrl: env.APP_URL,
+    additionalHosts: isProd
+      ? []
+      : [`${new URL(env.APP_URL).hostname}:${env.PORT}`],
+    maxBodyBytes: MCP_SCHEMA_BOUNDS.maxInputBytes,
+  }),
+  createRateLimitMiddleware({
+    limiter: mcpIpLimiter,
+    key: mcpIpRateLimitKey,
+  }),
+  createRecatBearerAuth(createRecatTokenVerifier()),
+  createRateLimitMiddleware({
+    limiter: mcpTokenLimiter,
+    key: mcpTokenRateLimitKey,
+  }),
+  createRecatMcpRequestHandler(),
+);
 
 // Webhooks need the raw body for HMAC verification — mounted before
 // express.json (the router applies express.raw itself).
@@ -64,6 +106,7 @@ app.use('/api/companies', companiesRouter);
 app.use('/api/transactions', transactionActionsRouter);
 app.use('/api/instance', instanceRouter);
 app.use('/api/setup', setupRouter);
+app.use('/api/me/mcp-tokens', mcpTokensRouter);
 app.use('/api/me', meRouter);
 
 // Unknown API/auth routes get a JSON 404 rather than the SPA fallback.
