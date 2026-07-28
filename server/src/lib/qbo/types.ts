@@ -5,7 +5,7 @@
 // the exact same sync/write-back paths as production. Which implementation a
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
-import type { QboDiagnosticCode } from '@recat/shared';
+import type { QboDiagnosticCode, StagedCategorization } from '@recat/shared';
 
 export interface QboTokenSet {
   accessToken: string;
@@ -106,6 +106,76 @@ export interface QboPurchaseSnapshot {
   }[];
 }
 
+export interface QboRef {
+  value: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface RawPurchaseLine {
+  Id?: string;
+  Amount?: number;
+  Description?: string;
+  DetailType?: string;
+  AccountBasedExpenseLineDetail?: {
+    AccountRef?: QboRef;
+    CustomerRef?: QboRef;
+    ClassRef?: QboRef;
+    TaxCodeRef?: QboRef;
+    TaxAmount?: number;
+    TaxInclusiveAmt?: number;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+/** Complete QBO Purchase update shape. Unknown fields are retained verbatim. */
+export interface RawPurchase {
+  Id: string;
+  SyncToken: string;
+  TxnDate?: string;
+  TotalAmt?: number;
+  Credit?: boolean;
+  PaymentType?: string;
+  DocNumber?: string;
+  PrivateNote?: string;
+  EntityRef?: QboRef;
+  AccountRef?: QboRef;
+  CurrencyRef?: QboRef;
+  ExchangeRate?: number;
+  Line?: RawPurchaseLine[];
+  GlobalTaxCalculation?: string;
+  TxnTaxDetail?: {
+    TotalTax?: number;
+    [key: string]: unknown;
+  };
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface QboPurchaseExpectedState {
+  qboId: string;
+  totalCents: number;
+  accountQboId: string | null;
+  date: string;
+  direction: QboPurchaseSnapshot['direction'];
+  globalTaxCalculation: string | null;
+  totalTaxCents: number | null;
+  targetLines: QboPurchaseSnapshot['lines'];
+  untouchedLineHashes: string[];
+}
+
+export interface QboPreparedWrite {
+  operation: 'recategorize' | 'restore';
+  qboType: 'Purchase';
+  qboId: string;
+  requestId: string;
+  requestHash: string;
+  body: RawPurchase;
+  before: QboPurchaseSnapshot;
+  expected: QboPurchaseExpectedState;
+}
+
 /** One normalized row of a QBO-computed financial statement (values in dollars). */
 export interface QboStatementRow {
   label: string;
@@ -174,6 +244,15 @@ export class QboAuthError extends Error {
   }
 }
 
+export class QboRequestTimeout extends Error {
+  code = 'QBO_TIMEOUT' as const;
+
+  constructor(message = 'QuickBooks did not confirm the prepared write before the request timed out.') {
+    super(message);
+    this.name = 'QboRequestTimeout';
+  }
+}
+
 /**
  * Per-realm QuickBooks client. Token persistence is the caller's job: every
  * method may refresh tokens; `onTokensRefreshed` fires so the caller can
@@ -193,6 +272,21 @@ export interface QboClient {
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
   fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null>;
+
+  preparePurchaseRecategorization(
+    txn: QboTxn,
+    staged: StagedCategorization,
+    before: QboPurchaseSnapshot,
+    requestId: string,
+  ): Promise<QboPreparedWrite>;
+
+  sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult>;
+
+  preparePurchaseRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPreparedWrite>;
 
   /**
    * All txns (Purchase/Deposit/JournalEntry) with a line posting to any of the

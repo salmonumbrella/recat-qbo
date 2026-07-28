@@ -125,8 +125,12 @@ model Transaction {
   amount         Decimal   @db.Decimal(14, 2) // signed; + = money in
   bankAccount    String
   status         TxnStatus @default(PENDING)
+  revision       Int       @default(0)
   category       String? // chosen category display name (single-category case)
   categoryQboId  String? // chosen QBO account id (single-category case)
+  taxCalculation String?
+  taxCode        String?
+  taxCodeQboId   String?
   splitLines     SplitLine[] // when present, replaces category (multi-category)
   suggestion     Json? // { category, categoryQboId?, source: 'rule'|'history'|'ai', ruleId? }
   errorCode      String?
@@ -137,6 +141,7 @@ model Transaction {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   txnTags        TxnTag[]
+  qboMutationAttempts QboMutationAttempt[]
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
@@ -182,6 +187,8 @@ model SplitLine {
   amount        Decimal        @db.Decimal(14, 2) // signed, same sign as the txn
   category      String
   categoryQboId String?
+  taxCode       String?
+  taxCodeQboId  String?
   memo          String?
   tags          SplitLineTag[]
 
@@ -217,6 +224,9 @@ model Rule {
   matchText     String
   category      String // category display name
   categoryQboId String?
+  taxCalculation String?
+  taxCode        String?
+  taxCodeQboId   String?
   autoPost      Boolean   @default(false)
   createdById   String?
   createdAt     DateTime  @default(now())
@@ -317,6 +327,41 @@ model SyncLog {
   at        DateTime @default(now())
 
   @@index([companyId, at])
+}
+
+model QboEntityLease {
+  companyId      String
+  qboType        String
+  qboId          String
+  owner          String
+  leaseExpiresAt DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@id([companyId, qboType, qboId])
+  @@index([leaseExpiresAt])
+}
+
+model QboMutationAttempt {
+  id                String      @id @default(uuid())
+  transactionId     String
+  transaction       Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  requestId         String      @unique
+  operation         String
+  status            String
+  expectedRevision  Int
+  expectedSyncToken String
+  requestHash       String
+  requestPayload    Json
+  beforeSnapshot    Json
+  responseSnapshot  Json?
+  verification      Json?
+  errorCode         String?
+  errorMessage      String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  @@index([transactionId, status])
 }
 
 model AppConfig {

@@ -4,14 +4,22 @@
 
 import { useState } from 'react';
 import type { MouseEvent } from 'react';
-import type { TagDto, TransactionDto } from '@recat/shared';
+import type {
+  TagDto,
+  TaxCalculation,
+  TaxReadinessDto,
+  TransactionDto,
+} from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
+import TaxCodePicker from './TaxCodePicker';
 
 export interface SplitLineDraft {
   amt: string;
   cat: string;
   tags: string[];
+  memo: string;
+  taxCodeQboId: string | null;
 }
 
 export interface SplitCatOpt {
@@ -25,17 +33,27 @@ export default function SplitEditor({
   txn,
   tags,
   catOpts,
+  taxReadiness = null,
   onClose,
   onSave,
 }: {
   txn: TransactionDto;
   tags: TagDto[];
   catOpts: SplitCatOpt[];
+  taxReadiness?: TaxReadinessDto | null;
   onClose: () => void;
-  onSave: (lines: SplitLineDraft[]) => void;
+  onSave: (lines: SplitLineDraft[], taxCalculation?: TaxCalculation) => void;
 }) {
   const { toast } = useApp();
   const total = Math.abs(txn.amount);
+  const taxEnabled = txn.qboType === 'Purchase' && taxReadiness?.status === 'ready';
+  const [taxCalculation, setTaxCalculation] = useState<TaxCalculation>(
+    txn.taxCalculation === 'TaxExcluded'
+      ? 'TaxExcluded'
+      : txn.taxCalculation === 'TaxInclusive'
+        ? 'TaxInclusive'
+        : 'NotApplicable',
+  );
 
   // Prototype openSplit(): existing splits load as-is; a categorized (or blank)
   // row seeds line 1 = full amount with current cat/tags + line 2 = 0.00.
@@ -45,17 +63,32 @@ export default function SplitEditor({
           amt: Math.abs(sp.amount).toFixed(2),
           cat: sp.category,
           tags: [...sp.tagIds],
+          memo: sp.memo ?? '',
+          taxCodeQboId: sp.taxCodeQboId ?? null,
         }))
       : [
-          { amt: total.toFixed(2), cat: txn.category ?? '', tags: [...txn.tagIds] },
-          { amt: '0.00', cat: '', tags: [] },
+          {
+            amt: total.toFixed(2),
+            cat: txn.category ?? '',
+            tags: [...txn.tagIds],
+            memo: txn.memo ?? '',
+            taxCodeQboId: txn.taxCodeQboId ?? null,
+          },
+          { amt: '0.00', cat: '', tags: [], memo: '', taxCodeQboId: null },
         ],
   );
 
   const sum = draft.reduce((a, l) => a + (parseFloat(l.amt) || 0), 0);
   const remain = total - sum;
+  const selectedTaxCount = draft.filter((line) => line.taxCodeQboId !== null).length;
+  const validTax =
+    !taxEnabled ||
+    selectedTaxCount === 0 ||
+    (selectedTaxCount === draft.length && taxCalculation !== 'NotApplicable');
   const valid =
-    Math.abs(remain) < 0.005 && draft.every((l) => l.cat && (parseFloat(l.amt) || 0) > 0);
+    Math.abs(remain) < 0.005 &&
+    draft.every((l) => l.cat && (parseFloat(l.amt) || 0) > 0) &&
+    validTax;
 
   const upd = (i: number, patch: Partial<SplitLineDraft>) =>
     setDraft((d) => d.map((l, j) => (j === i ? { ...l, ...patch } : l)));
@@ -106,11 +139,31 @@ export default function SplitEditor({
         <div style={{ fontSize: 13.5, color: 'var(--mut)', margin: '4px 0 16px' }}>
           {txn.payee} · {fmtMoney(txn.amount)} — assign every dollar to a category.
         </div>
+        {taxEnabled && (
+          <span style={{ display: 'block', marginBottom: 12 }}>
+            <label
+              htmlFor={`split-tax-calculation-${txn.id}`}
+              style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
+            >
+              Tax calculation for split
+            </label>
+            <select
+              id={`split-tax-calculation-${txn.id}`}
+              className="select"
+              value={taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
+              onChange={(event) => setTaxCalculation(event.target.value as TaxCalculation)}
+            >
+              <option value="TaxInclusive">Tax inclusive</option>
+              <option value="TaxExcluded">Tax exclusive</option>
+            </select>
+          </span>
+        )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {draft.map((l, i) => (
             <div key={i} style={{ border: '1px solid var(--bd2)', borderRadius: 9, padding: '12px 14px' }}>
               <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                 <input
+                  aria-label={`Amount for split line ${i + 1}`}
                   value={l.amt}
                   onChange={(e) => upd(i, { amt: e.target.value })}
                   className="foc-acc"
@@ -129,6 +182,7 @@ export default function SplitEditor({
                   }}
                 />
                 <select
+                  aria-label={`Category for split line ${i + 1}`}
                   value={l.cat}
                   onChange={(e) => upd(i, { cat: e.target.value })}
                   style={{
@@ -168,6 +222,45 @@ export default function SplitEditor({
                   ×
                 </button>
               </div>
+              {taxEnabled && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
+                    gap: 10,
+                    marginTop: 9,
+                  }}
+                >
+                  <span style={{ display: 'block' }}>
+                    <label
+                      htmlFor={`split-memo-${txn.id}-${i}`}
+                      style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
+                    >
+                      Memo for split line {i + 1}
+                    </label>
+                    <input
+                      id={`split-memo-${txn.id}-${i}`}
+                      className="input"
+                      value={l.memo}
+                      maxLength={500}
+                      onChange={(event) => upd(i, { memo: event.target.value })}
+                      style={{ width: '100%', boxSizing: 'border-box' }}
+                    />
+                  </span>
+                  <TaxCodePicker
+                    id={`split-tax-code-${txn.id}-${i}`}
+                    label={`Purchase tax for split line ${i + 1}`}
+                    readiness={taxReadiness}
+                    value={l.taxCodeQboId}
+                    onChange={(taxCodeQboId) => {
+                      upd(i, { taxCodeQboId });
+                      if (taxCodeQboId !== null && taxCalculation === 'NotApplicable') {
+                        setTaxCalculation('TaxInclusive');
+                      }
+                    }}
+                  />
+                </div>
+              )}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 9 }}>
                 {tags.map((tag) => {
                   const on = l.tags.includes(tag.id);
@@ -216,7 +309,13 @@ export default function SplitEditor({
             onClick={() =>
               setDraft((d) => [
                 ...d,
-                { amt: remain > 0 ? remain.toFixed(2) : '0.00', cat: '', tags: [] },
+                {
+                  amt: remain > 0 ? remain.toFixed(2) : '0.00',
+                  cat: '',
+                  tags: [],
+                  memo: '',
+                  taxCodeQboId: null,
+                },
               ])
             }
             className="hov-dash"
@@ -259,10 +358,21 @@ export default function SplitEditor({
           <button
             onClick={() => {
               if (!valid) {
-                toast('Assign the full amount and pick a category on every line');
+                toast(
+                  validTax
+                    ? 'Assign the full amount and pick a category on every line'
+                    : 'Blank No tax is valid only when every split line is No tax. Use an explicit supported non-tax code to mix treatments.',
+                );
                 return;
               }
-              onSave(draft);
+              if (taxEnabled) {
+                onSave(
+                  draft,
+                  selectedTaxCount === 0 ? 'NotApplicable' : taxCalculation,
+                );
+              } else {
+                onSave(draft);
+              }
             }}
             className="hov-acc"
             style={{

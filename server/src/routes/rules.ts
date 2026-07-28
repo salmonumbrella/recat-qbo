@@ -46,7 +46,7 @@ function scopedCompany(req: { company?: Company }): Company {
   return req.company;
 }
 
-function toRuleDto(rule: RuleRow): RuleDto {
+export function toRuleDto(rule: RuleRow): RuleDto {
   return {
     id: rule.id,
     companyId: rule.companyId,
@@ -55,6 +55,9 @@ function toRuleDto(rule: RuleRow): RuleDto {
     matchText: rule.matchText,
     category: rule.category,
     categoryQboId: rule.categoryQboId,
+    taxCalculation: rule.taxCalculation as RuleDto['taxCalculation'],
+    taxCode: rule.taxCode,
+    taxCodeQboId: rule.taxCodeQboId,
     tagIds: rule.ruleTags.map((rt) => rt.tagId),
     autoPost: rule.autoPost,
     createdAt: rule.createdAt.toISOString(),

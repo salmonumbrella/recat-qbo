@@ -9,6 +9,8 @@ import type {
   AuthMethodsDto,
   CategorizeBody,
   CompanyDto,
+  CategorizationMutationResult,
+  CommitCategorizationBody,
   ConnectMode,
   CompanyPatchBody,
   CustomReportDto,
@@ -21,11 +23,14 @@ import type {
   QboEnv,
   QboPreflightDto,
   Role,
+  ReconcileCategorizationBody,
   RuleDto,
   RuleTestResult,
   SavedReportConfig,
   SavedReportDto,
   SessionDto,
+  StageCategorizationBody,
+  StagedCategorization,
   LogTagsBody,
   StatementDrilldownDto,
   TransactionLogDto,
@@ -37,6 +42,7 @@ import type {
   TeamMemberDto,
   TransactionDto,
   TxnStatus,
+  UndoCategorizationBody,
   UserDto,
   ApiError as ApiErrorBody,
 } from '@recat/shared';
@@ -44,13 +50,80 @@ import type {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
+  readonly mutationResult: CategorizationMutationResult | undefined;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    mutationResult?: CategorizationMutationResult,
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.mutationResult = mutationResult;
   }
+}
+
+const MUTATION_STATUSES: readonly TxnStatus[] = [
+  'PENDING',
+  'POSTING',
+  'POSTED',
+  'DRY_RUN',
+  'ERROR',
+  'SUPERSEDED',
+  'REVERTED',
+];
+const MUTATION_OUTCOMES: readonly CategorizationMutationResult['outcome'][] = [
+  'VERIFIED',
+  'UNCERTAIN',
+  'IN_PROGRESS',
+  'UNCHANGED',
+  'DRY_RUN',
+  'RETRYABLE',
+];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_MUTATION_ERROR_CODE_LENGTH = 120;
+const MAX_MUTATION_ERROR_MESSAGE_LENGTH = 500;
+
+function boundedMutationResult(value: unknown): CategorizationMutationResult | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.transactionId !== 'string' ||
+    !UUID_PATTERN.test(candidate.transactionId) ||
+    typeof candidate.requestId !== 'string' ||
+    !UUID_PATTERN.test(candidate.requestId) ||
+    typeof candidate.ok !== 'boolean' ||
+    typeof candidate.status !== 'string' ||
+    !MUTATION_STATUSES.includes(candidate.status as TxnStatus) ||
+    typeof candidate.outcome !== 'string' ||
+    !MUTATION_OUTCOMES.includes(candidate.outcome as CategorizationMutationResult['outcome'])
+  ) {
+    return undefined;
+  }
+  const result: CategorizationMutationResult = {
+    transactionId: candidate.transactionId,
+    requestId: candidate.requestId,
+    ok: candidate.ok,
+    status: candidate.status as TxnStatus,
+    outcome: candidate.outcome as CategorizationMutationResult['outcome'],
+  };
+  if (candidate.error !== undefined) {
+    if (typeof candidate.error !== 'object' || candidate.error === null) return undefined;
+    const error = candidate.error as Record<string, unknown>;
+    if (
+      typeof error.code !== 'string' ||
+      error.code.length === 0 ||
+      error.code.length > MAX_MUTATION_ERROR_CODE_LENGTH ||
+      typeof error.message !== 'string' ||
+      error.message.length === 0 ||
+      error.message.length > MAX_MUTATION_ERROR_MESSAGE_LENGTH
+    ) return undefined;
+    result.error = { code: error.code, message: error.message };
+  }
+  return result;
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -63,14 +136,23 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   if (!res.ok) {
     let message = res.statusText || `Request failed (${res.status})`;
     let code: string | undefined;
+    let mutationResult: CategorizationMutationResult | undefined;
     try {
-      const data = (await res.json()) as Partial<ApiErrorBody>;
-      if (typeof data.error === 'string') message = data.error;
-      if (typeof data.code === 'string') code = data.code;
+      const data = await res.json() as unknown;
+      if (typeof data === 'object' && data !== null) {
+        const errorBody = data as Partial<ApiErrorBody>;
+        if (typeof errorBody.error === 'string') message = errorBody.error;
+        if (typeof errorBody.code === 'string') code = errorBody.code;
+      }
+      mutationResult = boundedMutationResult(data);
+      if (mutationResult?.error) {
+        message = mutationResult.error.message;
+        code = mutationResult.error.code;
+      }
     } catch {
       // non-JSON error body — keep the status text
     }
-    throw new ApiError(res.status, message, code);
+    throw new ApiError(res.status, message, code, mutationResult);
   }
   const text = await res.text();
   return (text ? JSON.parse(text) : undefined) as T;
@@ -83,6 +165,29 @@ export const api = {
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   del: <T>(path: string) => request<T>('DELETE', path),
 };
+
+/** Generate once at the start of a user mutation and retain it across retries. */
+export function createCategorizationRequestId(): string {
+  const secureCrypto = globalThis.crypto;
+  if (secureCrypto && typeof secureCrypto.randomUUID === 'function') {
+    return secureCrypto.randomUUID();
+  }
+  if (!secureCrypto || typeof secureCrypto.getRandomValues !== 'function') {
+    throw new Error('Secure random UUID generation is unavailable.');
+  }
+  const bytes = new Uint8Array(16);
+  secureCrypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-');
+}
 
 type QueryValue = string | number | boolean | readonly string[] | undefined;
 
@@ -254,6 +359,38 @@ export const transactions = {
   /** Stage category/splits/tags — no QBO write. */
   categorize: (id: string, body: CategorizeBody) =>
     api.post<TransactionDto>(`/api/transactions/${id}/categorize`, body),
+  /** Strict revision-bound tax-aware staging. */
+  stageCategorization: (id: string, body: StageCategorizationBody) =>
+    api.post<StagedCategorization>(`/api/transactions/${id}/categorization/stage`, body),
+  /** A new operation gets a new ID; callers retain it if the outcome needs reconciliation. */
+  commitCategorization: (
+    id: string,
+    expectedRevision: CommitCategorizationBody['expectedRevision'],
+    requestId: CommitCategorizationBody['requestId'],
+  ) =>
+    api.post<CategorizationMutationResult>(
+      `/api/transactions/${id}/categorization/commit`,
+      { expectedRevision, requestId } satisfies CommitCategorizationBody,
+    ),
+  /** Reconciliation and retry always reuse the possibly-written attempt's ID. */
+  reconcileCategorization: (id: string, requestId: ReconcileCategorizationBody['requestId']) =>
+    api.post<CategorizationMutationResult>(
+      `/api/transactions/${id}/categorization/reconcile`,
+      { requestId } satisfies ReconcileCategorizationBody,
+    ),
+  retryCategorization: (id: string, requestId: ReconcileCategorizationBody['requestId']) =>
+    api.post<CategorizationMutationResult>(
+      `/api/transactions/${id}/categorization/retry`,
+      { requestId } satisfies ReconcileCategorizationBody,
+    ),
+  undoCategorization: (
+    id: string,
+    requestId: UndoCategorizationBody['requestId'],
+  ) =>
+    api.post<CategorizationMutationResult>(
+      `/api/transactions/${id}/categorization/undo`,
+      { requestId } satisfies UndoCategorizationBody,
+    ),
   /** 202 — returns the txn in POSTING; poll list (or SSE later) for the outcome. */
   post: (id: string) => api.post<TransactionDto>(`/api/transactions/${id}/post`),
   undo: (id: string) => api.post<TransactionDto>(`/api/transactions/${id}/undo`),

@@ -1,0 +1,943 @@
+import cookieParser from 'cookie-parser';
+import express, { type Express } from 'express';
+import request from 'supertest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { errorMiddleware } from '../lib/http.js';
+import {
+  companyTransactionsRouter,
+  transactionActionsRouter,
+  transactionDtos,
+} from './transactions.js';
+
+const COMPANY_ID = '00000000-0000-4000-8000-000000000010';
+const OTHER_COMPANY_ID = '00000000-0000-4000-8000-000000000020';
+const TRANSACTION_ID = '00000000-0000-4000-8000-000000000030';
+const OTHER_TRANSACTION_ID = '00000000-0000-4000-8000-000000000031';
+const TAG_ID = '00000000-0000-4000-8000-000000000001';
+const LINE_TAG_ID = '00000000-0000-4000-8000-000000000002';
+const REQUEST_ID = '00000000-0000-4000-8000-000000000040';
+const UNDO_REQUEST_ID = '00000000-0000-4000-8000-000000000041';
+
+const mocks = vi.hoisted(() => ({
+  bulkPost: vi.fn(),
+  commitStagedCategorization: vi.fn(),
+  companyFindUnique: vi.fn(),
+  membershipFindUnique: vi.fn(),
+  mutationAttemptFindUnique: vi.fn(),
+  postTransaction: vi.fn(),
+  qboAccountFindFirst: vi.fn(),
+  reconcileMutationAttempt: vi.fn(),
+  retryError: vi.fn(),
+  ruleFindMany: vi.fn(),
+  ruleTagFindMany: vi.fn(),
+  sessionFindUnique: vi.fn(),
+  splitLineDtos: vi.fn(),
+  stageCategorization: vi.fn(),
+  suggestForMany: vi.fn(),
+  transactionFindMany: vi.fn(),
+  transactionFindUnique: vi.fn(),
+  transactionCount: vi.fn(),
+  transactionUpdate: vi.fn(),
+  transferCandidates: vi.fn(),
+  txnTagCreate: vi.fn(),
+  txnTagDeleteMany: vi.fn(),
+  txnTagUpsert: vi.fn(),
+  tagFindMany: vi.fn(),
+  undoCategorization: vi.fn(),
+  undoPost: vi.fn(),
+  userFindMany: vi.fn(),
+  validateSplits: vi.fn(),
+}));
+
+vi.mock('../lib/prisma.js', () => ({
+  prisma: {
+    company: { findUnique: mocks.companyFindUnique },
+    membership: { findUnique: mocks.membershipFindUnique },
+    qboAccount: { findFirst: mocks.qboAccountFindFirst },
+    qboMutationAttempt: { findUnique: mocks.mutationAttemptFindUnique },
+    rule: { findMany: mocks.ruleFindMany },
+    ruleTag: { findMany: mocks.ruleTagFindMany },
+    session: { findUnique: mocks.sessionFindUnique },
+    tag: { findMany: mocks.tagFindMany },
+    transaction: {
+      count: mocks.transactionCount,
+      findMany: mocks.transactionFindMany,
+      findUnique: mocks.transactionFindUnique,
+      update: mocks.transactionUpdate,
+    },
+    txnTag: {
+      create: mocks.txnTagCreate,
+      deleteMany: mocks.txnTagDeleteMany,
+      upsert: mocks.txnTagUpsert,
+    },
+    user: { findMany: mocks.userFindMany },
+  },
+}));
+
+vi.mock('../services/categorization.js', () => ({
+  stageCategorization: mocks.stageCategorization,
+}));
+
+vi.mock('../services/writeback.js', () => ({
+  bulkPost: mocks.bulkPost,
+  commitStagedCategorization: mocks.commitStagedCategorization,
+  postTransaction: mocks.postTransaction,
+  reconcileMutationAttempt: mocks.reconcileMutationAttempt,
+  retryError: mocks.retryError,
+  splitLineDtos: mocks.splitLineDtos,
+  undoCategorization: mocks.undoCategorization,
+  undoPost: mocks.undoPost,
+  validateSplits: mocks.validateSplits,
+}));
+
+vi.mock('../services/suggestions.js', () => ({
+  ruleSuggestion: vi.fn(() => null),
+  suggestForMany: mocks.suggestForMany,
+}));
+
+vi.mock('../services/transfers.js', () => ({
+  recordTransfer: vi.fn(),
+  transferCandidates: mocks.transferCandidates,
+}));
+
+function testApp(): Express {
+  const app = express();
+  app.use(cookieParser());
+  app.use(express.json());
+  app.use('/api/companies/:companyId/transactions', companyTransactionsRouter);
+  app.use('/api/transactions', transactionActionsRouter);
+  app.use(errorMiddleware);
+  return app;
+}
+
+const sessionHeaders = { Cookie: 'recat_session=transaction-route-test' };
+let role: 'viewer' | 'categorizer' | 'admin' = 'categorizer';
+
+const transactionRow = {
+  id: TRANSACTION_ID,
+  companyId: COMPANY_ID,
+  qboId: 'PURCHASE_GENERIC',
+  qboType: 'Purchase',
+  qboSyncToken: '7',
+  date: new Date('2026-07-27T00:00:00.000Z'),
+  payee: 'Generic supplier',
+  memo: null,
+  amount: -10.5,
+  bankAccount: 'Generic bank',
+  status: 'PENDING',
+  revision: 1,
+  category: null,
+  categoryQboId: null,
+  taxCalculation: 'TaxInclusive',
+  taxCode: 'Standard tax',
+  taxCodeQboId: 'TAX_CODE_STANDARD',
+  suggestion: null,
+  errorCode: null,
+  errorMessage: null,
+  postedAt: null,
+  postedByUserId: null,
+  splitLines: [],
+  txnTags: [],
+  qboMutationAttempts: [],
+};
+
+const stageBody = {
+  expectedRevision: 0,
+  taxCalculation: 'TaxInclusive',
+  lines: [{
+    grossCents: -1050,
+    categoryQboId: 'EXPENSE_ACCOUNT',
+    taxCodeQboId: 'TAX_CODE_STANDARD',
+    memo: 'Prepared purchase',
+    tagIds: [LINE_TAG_ID],
+  }],
+  tagIds: [TAG_ID],
+};
+
+const stagedResult = {
+  transactionId: TRANSACTION_ID,
+  revision: 1,
+  taxCalculation: 'TaxInclusive',
+  totals: { subtotalCents: -1000, taxCents: -50, totalCents: -1050 },
+  lines: [{
+    idx: 0,
+    subtotalCents: -1000,
+    taxCents: -50,
+    totalCents: -1050,
+    categoryQboId: 'EXPENSE_ACCOUNT',
+    taxCodeQboId: 'TAX_CODE_STANDARD',
+    memo: 'Prepared purchase',
+    tagIds: [LINE_TAG_ID],
+  }],
+  tagIds: [TAG_ID],
+};
+
+const verifiedResult = {
+  transactionId: TRANSACTION_ID,
+  requestId: REQUEST_ID,
+  ok: true,
+  status: 'POSTED',
+  outcome: 'VERIFIED',
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  role = 'categorizer';
+  mocks.sessionFindUnique.mockResolvedValue({
+    expiresAt: new Date(Date.now() + 60_000),
+    user: {
+      id: 'transaction-route-user',
+      email: 'categorizer@example.test',
+      name: 'Generic categorizer',
+      isInstanceAdmin: false,
+      memberships: [],
+    },
+  });
+  mocks.membershipFindUnique.mockImplementation(
+    async ({ where }: { where: { userId_companyId: { companyId: string } } }) =>
+      where.userId_companyId.companyId === COMPANY_ID ? { role } : null,
+  );
+  mocks.transactionFindUnique.mockResolvedValue(transactionRow);
+  mocks.transactionCount.mockResolvedValue(1);
+  mocks.companyFindUnique.mockResolvedValue({ id: COMPANY_ID, disconnectedAt: null });
+  mocks.mutationAttemptFindUnique.mockResolvedValue({ transactionId: TRANSACTION_ID });
+  mocks.stageCategorization.mockResolvedValue(stagedResult);
+  mocks.commitStagedCategorization.mockResolvedValue(verifiedResult);
+  mocks.reconcileMutationAttempt.mockResolvedValue(verifiedResult);
+  mocks.undoCategorization.mockResolvedValue({
+    ...verifiedResult,
+    requestId: UNDO_REQUEST_ID,
+    status: 'REVERTED',
+  });
+  mocks.transactionUpdate.mockResolvedValue(transactionRow);
+  mocks.tagFindMany.mockResolvedValue([{ id: TAG_ID }]);
+  mocks.qboAccountFindFirst.mockResolvedValue({ qboId: 'EXPENSE_ACCOUNT' });
+  mocks.ruleFindMany.mockResolvedValue([]);
+  mocks.ruleTagFindMany.mockResolvedValue([]);
+  mocks.txnTagDeleteMany.mockResolvedValue({ count: 0 });
+  mocks.txnTagCreate.mockResolvedValue({});
+  mocks.txnTagUpsert.mockResolvedValue({});
+  mocks.userFindMany.mockResolvedValue([]);
+  mocks.suggestForMany.mockResolvedValue([]);
+  mocks.transferCandidates.mockResolvedValue(new Map());
+  mocks.splitLineDtos.mockReturnValue(null);
+  mocks.validateSplits.mockReturnValue({ ok: true });
+});
+
+describe('tax-aware categorization action routes', () => {
+  it('exposes the current revision and staged transaction tax identity for reloads', async () => {
+    mocks.splitLineDtos.mockReturnValue(null);
+
+    const [dto] = await transactionDtos(
+      COMPANY_ID,
+      [transactionRow as never],
+      new Map(),
+    );
+
+    expect(dto).toMatchObject({
+      revision: 1,
+      taxCalculation: 'TaxInclusive',
+      taxCode: 'Standard tax',
+      taxCodeQboId: 'TAX_CODE_STANDARD',
+    });
+  });
+
+  it('exposes only a bounded unresolved mutation summary on a transaction DTO', async () => {
+    const [dto] = await transactionDtos(
+      COMPANY_ID,
+      [{
+        ...transactionRow,
+        status: 'ERROR',
+        qboMutationAttempts: [{
+          requestId: REQUEST_ID,
+          operation: 'recategorize',
+          status: 'UNCERTAIN',
+          expectedRevision: 1,
+          requestHash: 'INTERNAL_HASH',
+          requestPayload: { internal: 'payload' },
+          beforeSnapshot: { internal: 'before' },
+          errorMessage: 'internal error detail',
+        }],
+      } as never],
+      new Map(),
+    );
+
+    expect(dto?.activeCategorizationAttempt).toEqual({
+      requestId: REQUEST_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+    });
+    expect(JSON.stringify(dto?.activeCategorizationAttempt)).not.toMatch(
+      /hash|payload|snapshot|error|internal/i,
+    );
+  });
+
+  it.each(['recategorize', 'restore'] as const)(
+    'exposes a bounded PREPARED %s summary for exact-request resume',
+    async (operation) => {
+      const [dto] = await transactionDtos(
+        COMPANY_ID,
+        [{
+          ...transactionRow,
+          qboMutationAttempts: [{
+            requestId: REQUEST_ID,
+            operation,
+            status: 'PREPARED',
+            requestHash: 'INTERNAL_HASH',
+            requestPayload: { internal: 'payload' },
+            beforeSnapshot: { internal: 'before' },
+            errorMessage: 'internal error detail',
+          }],
+        } as never],
+        new Map(),
+      );
+
+      expect(dto?.activeCategorizationAttempt).toEqual({
+        requestId: REQUEST_ID,
+        operation,
+        status: 'PREPARED',
+      });
+      expect(JSON.stringify(dto?.activeCategorizationAttempt)).not.toMatch(
+        /hash|payload|snapshot|error|internal/i,
+      );
+    },
+  );
+
+  it.each([
+    ['malformed', 'not-a-request-id'],
+    ['oversized', `00000000-0000-4000-8000-${'0'.repeat(200)}`],
+  ])(
+    'drops a %s legacy mutation request ID instead of exposing a raw attempt',
+    async (_label, requestId) => {
+      const [dto] = await transactionDtos(
+        COMPANY_ID,
+        [{
+          ...transactionRow,
+          status: 'ERROR',
+          qboMutationAttempts: [{
+            requestId,
+            operation: 'recategorize',
+            status: 'UNCERTAIN',
+          }],
+        } as never],
+        new Map(),
+      );
+
+      expect(dto?.activeCategorizationAttempt).toBeNull();
+    },
+  );
+
+  it('loads at most the latest reconcilable attempt with an allowlisted relation select', async () => {
+    mocks.transactionFindMany.mockResolvedValue([{
+      ...transactionRow,
+      qboMutationAttempts: [],
+    }]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      include: expect.objectContaining({
+        qboMutationAttempts: {
+          where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            requestId: true,
+            operation: true,
+            status: true,
+          },
+        },
+      }),
+    }));
+  });
+
+  it('maps the legacy tax-ready Purchase guard to a stable conflict response', async () => {
+    mocks.postTransaction.mockRejectedValue({
+      name: 'WritebackLifecycleError',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+      message: 'internal detail',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/post`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Tax-ready Purchases must use staged categorization.',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('blocks direct legacy categorization for a tax-ready Purchase before local mutation', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: null,
+      taxSupportStatus: 'ready',
+      taxUsingSalesTax: true,
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Generic prepared expense',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+      });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Tax-ready Purchases must use staged categorization.',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(mocks.qboAccountFindFirst).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('maps the legacy tax-ready Purchase undo guard without mutating locally', async () => {
+    mocks.undoPost.mockRejectedValue({
+      name: 'WritebackLifecycleError',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+      message: 'internal detail',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/undo`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Tax-ready Purchases must use staged categorization.',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each(['categorizer', 'admin'] as const)(
+    'lets a %s stage and passes the normalized proposal unchanged',
+    async (allowedRole) => {
+      role = allowedRole;
+
+      const response = await request(testApp())
+        .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+        .set(sessionHeaders)
+        .send(stageBody);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(stagedResult);
+      expect(mocks.stageCategorization).toHaveBeenCalledWith({
+        transactionId: TRANSACTION_ID,
+        companyId: COMPANY_ID,
+        expectedRevision: 0,
+        proposal: {
+          taxCalculation: stageBody.taxCalculation,
+          lines: stageBody.lines,
+          tagIds: stageBody.tagIds,
+        },
+      });
+    },
+  );
+
+  it('allowlists the complete nested stage response and drops internal fields', async () => {
+    mocks.stageCategorization.mockResolvedValue({
+      ...stagedResult,
+      rawPayload: { privateNote: 'secret top-level payload' },
+      token: 'secret-token',
+      stack: 'internal stack',
+      totals: {
+        ...stagedResult.totals,
+        snapshot: { secret: 'nested totals snapshot' },
+      },
+      lines: [{
+        ...stagedResult.lines[0],
+        beforeSnapshot: { secret: 'line snapshot' },
+        rawPayload: { secret: 'line payload' },
+        token: 'line-secret-token',
+      }],
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(stagedResult);
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /rawPayload|privateNote|snapshot|token|stack|secret/i,
+    );
+  });
+
+  it('fails closed when a stage response does not match the path transaction', async () => {
+    mocks.stageCategorization.mockResolvedValue({
+      ...stagedResult,
+      transactionId: OTHER_TRANSACTION_ID,
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'Internal server error' });
+  });
+
+  it('rejects a viewer before staging', async () => {
+    role = 'viewer';
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ code: 'FORBIDDEN' });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it('returns the same bounded 404 for nonexistent and other-company nonmember transactions', async () => {
+    mocks.transactionFindUnique.mockResolvedValueOnce(null);
+    const nonexistent = await request(testApp())
+      .post(`/api/transactions/${OTHER_TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+    mocks.transactionFindUnique.mockResolvedValueOnce({
+      ...transactionRow,
+      id: OTHER_TRANSACTION_ID,
+      companyId: OTHER_COMPANY_ID,
+    });
+
+    const otherCompany = await request(testApp())
+      .post(`/api/transactions/${OTHER_TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(nonexistent.status).toBe(404);
+    expect(otherCompany.status).toBe(404);
+    expect(nonexistent.body).toEqual({
+      error: 'Transaction not found',
+      code: 'TRANSACTION_NOT_FOUND',
+    });
+    expect(otherCompany.body).toEqual(nonexistent.body);
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it('rejects a disconnected company before staging', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: new Date('2026-07-27T00:00:00.000Z'),
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This company is disconnected from QuickBooks.',
+      code: 'COMPANY_DISCONNECTED',
+    });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it('checks authorization before disclosing that a company is disconnected', async () => {
+    role = 'viewer';
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: new Date('2026-07-27T00:00:00.000Z'),
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ code: 'FORBIDDEN' });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unknown total', { ...stageBody, totalCents: -1050 }],
+    ['unsafe revision', { ...stageBody, expectedRevision: Number.MAX_SAFE_INTEGER + 1 }],
+    ['too many lines', { ...stageBody, lines: Array.from({ length: 21 }, () => stageBody.lines[0]) }],
+    ['empty lines', { ...stageBody, lines: [] }],
+    ['unsafe cents', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], grossCents: Number.MAX_SAFE_INTEGER + 1 }],
+    }],
+    ['long account reference', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], categoryQboId: 'A'.repeat(121) }],
+    }],
+    ['long tax reference', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], taxCodeQboId: 'T'.repeat(121) }],
+    }],
+    ['long memo', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], memo: 'M'.repeat(501) }],
+    }],
+    ['duplicate line tags', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], tagIds: [LINE_TAG_ID, LINE_TAG_ID] }],
+    }],
+    ['too many transaction tags', {
+      ...stageBody,
+      tagIds: Array.from(
+        { length: 51 },
+        (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      ),
+    }],
+    ['unknown line field', {
+      ...stageBody,
+      lines: [{ ...stageBody.lines[0], clientTaxCents: -50 }],
+    }],
+  ])('strictly rejects %s before staging', async (_name, body) => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(body);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({ code: 'VALIDATION' });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it('maps a cross-company line tag service rejection without leaking details', async () => {
+    mocks.stageCategorization.mockRejectedValue({
+      name: 'CategorizationError',
+      code: 'INVALID_TAG',
+      message: 'secret-bearing internal lookup detail',
+      stack: 'internal stack',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: 'One or more tags are unavailable for this company.',
+      code: 'INVALID_TAG',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('secret-bearing');
+    expect(JSON.stringify(response.body)).not.toContain('stack');
+  });
+
+  it('maps stable tax-reference failures to a bounded client response', async () => {
+    mocks.stageCategorization.mockRejectedValue({
+      name: 'CategorizationError',
+      code: 'TAX_CODE_MALFORMED',
+      message: 'unsafe tax reference detail',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: 'A selected tax code is unsupported.',
+      code: 'TAX_CODE_MALFORMED',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('unsafe');
+  });
+
+  it('maps an active staging attempt to a stable bounded resume conflict', async () => {
+    mocks.stageCategorization.mockRejectedValue({
+      name: 'CategorizationError',
+      code: 'MUTATION_BLOCKED',
+      message: 'internal attempt identity and payload detail',
+      stack: 'internal stack',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This transaction has a prepared write that must be resumed or verified.',
+      code: 'MUTATION_BLOCKED',
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/identity|payload|stack/i);
+  });
+
+  it('rechecks permission and forwards the revision/request-bound commit', async () => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(verifiedResult);
+    expect(mocks.commitStagedCategorization).toHaveBeenCalledWith({
+      transactionId: TRANSACTION_ID,
+      companyId: COMPANY_ID,
+      expectedRevision: 1,
+      requestId: REQUEST_ID,
+      actor: { id: 'transaction-route-user', label: 'Generic categorizer' },
+    });
+  });
+
+  it('returns the service-recorded result for a duplicate request ID', async () => {
+    const app = testApp();
+    const first = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+    const duplicate = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(first.body).toEqual(verifiedResult);
+    expect(duplicate.body).toEqual(verifiedResult);
+    expect(mocks.commitStagedCategorization).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays a recorded commit result after disconnect without a route connection veto', async () => {
+    const app = testApp();
+    const first = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: new Date('2026-07-27T00:00:00.000Z'),
+    });
+
+    const duplicate = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(first.status).toBe(200);
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.body).toEqual(verifiedResult);
+    expect(mocks.commitStagedCategorization).toHaveBeenCalledTimes(2);
+  });
+
+  it('delegates a disconnected new commit so the lifecycle service can reject it', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: new Date('2026-07-27T00:00:00.000Z'),
+    });
+    mocks.commitStagedCategorization.mockRejectedValue({
+      name: 'WritebackLifecycleError',
+      code: 'COMPANY_DISCONNECTED',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+    expect(mocks.commitStagedCategorization).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps a transaction scope race from the commit service to a stable 404', async () => {
+    mocks.commitStagedCategorization.mockRejectedValue({
+      name: 'WritebackLifecycleError',
+      code: 'TRANSACTION_NOT_FOUND',
+      message: 'internal transaction identity',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({
+      error: 'Transaction not found.',
+      code: 'TRANSACTION_NOT_FOUND',
+    });
+  });
+
+  it.each([
+    ['unknown commit field', { expectedRevision: 1, requestId: REQUEST_ID, force: true }],
+    ['invalid request ID', { expectedRevision: 1, requestId: 'REQUEST_GENERIC' }],
+    ['unsafe expected revision', { expectedRevision: 2_147_483_647, requestId: REQUEST_ID }],
+  ])('strictly rejects %s', async (_name, body) => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send(body);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({ code: 'VALIDATION' });
+    expect(mocks.commitStagedCategorization).not.toHaveBeenCalled();
+  });
+
+  it('returns a bounded uncertain response with only stable verification guidance', async () => {
+    mocks.commitStagedCategorization.mockResolvedValue({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+      error: {
+        code: 'QBO_WRITE_UNCERTAIN',
+        message: 'raw service payload token=secret',
+        rawPayload: { token: 'secret' },
+      },
+      beforeSnapshot: { privateNote: 'secret' },
+      stack: 'internal stack',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+      error: {
+        code: 'QBO_WRITE_UNCERTAIN',
+        message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+      },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/payload|snapshot|token|stack|secret/i);
+  });
+
+  it('delegates an unresolved retry to reconciliation and never the legacy reset', async () => {
+    mocks.reconcileMutationAttempt.mockResolvedValue({
+      ...verifiedResult,
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/retry`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+
+    expect(response.status).toBe(200);
+    expect(mocks.reconcileMutationAttempt).toHaveBeenCalledWith({
+      requestId: REQUEST_ID,
+      actor: { id: 'transaction-route-user', label: 'Generic categorizer' },
+    });
+    expect(mocks.retryError).not.toHaveBeenCalled();
+  });
+
+  it('rejects a reconcile request scoped to another transaction before service mutation', async () => {
+    mocks.mutationAttemptFindUnique.mockResolvedValue({ transactionId: OTHER_TRANSACTION_ID });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/reconcile`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ code: 'ATTEMPT_NOT_FOUND' });
+    expect(mocks.reconcileMutationAttempt).not.toHaveBeenCalled();
+  });
+
+  it('uses a strict Recat UUID for undo and forwards only scoped service input', async () => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/undo`)
+      .set(sessionHeaders)
+      .send({ requestId: UNDO_REQUEST_ID });
+
+    expect(response.status).toBe(200);
+    expect(mocks.undoCategorization).toHaveBeenCalledWith({
+      transactionId: TRANSACTION_ID,
+      companyId: COMPANY_ID,
+      requestId: UNDO_REQUEST_ID,
+      actor: { id: 'transaction-route-user', label: 'Generic categorizer' },
+    });
+  });
+
+  it('replays a recorded undo result after disconnect without a route connection veto', async () => {
+    const app = testApp();
+    const first = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/undo`)
+      .set(sessionHeaders)
+      .send({ requestId: UNDO_REQUEST_ID });
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: new Date('2026-07-27T00:00:00.000Z'),
+    });
+
+    const duplicate = await request(app)
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/undo`)
+      .set(sessionHeaders)
+      .send({ requestId: UNDO_REQUEST_ID });
+
+    expect(first.status).toBe(200);
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.body).toEqual({
+      ...verifiedResult,
+      requestId: UNDO_REQUEST_ID,
+      status: 'REVERTED',
+    });
+    expect(mocks.undoCategorization).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the legacy unavailable-tax category/tag staging request compatible', async () => {
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Prepared purchases',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        tagIds: [TAG_ID],
+      });
+
+    expect(response.status).toBe(200);
+    expect(mocks.transactionUpdate).toHaveBeenCalled();
+    expect(mocks.txnTagCreate).toHaveBeenCalledWith({
+      data: { txnId: TRANSACTION_ID, tagId: TAG_ID },
+    });
+    expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unsupported readiness', 'Purchase', 'unsupported', true],
+    ['setup-incomplete readiness', 'Purchase', 'needs_setup', true],
+    ['tax disabled', 'Purchase', 'ready', false],
+    ['non-Purchase transaction', 'Deposit', 'ready', true],
+  ] as const)('preserves direct legacy categorization for %s', async (
+    _case,
+    qboType,
+    taxSupportStatus,
+    taxUsingSalesTax,
+  ) => {
+    mocks.transactionFindUnique.mockResolvedValue({ ...transactionRow, qboType });
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: null,
+      taxSupportStatus,
+      taxUsingSalesTax,
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Generic prepared expense',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+      });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(mocks.transactionUpdate).toHaveBeenCalled();
+  });
+});

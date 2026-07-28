@@ -1,5 +1,15 @@
-import type { TaxCalculation } from '@recat/shared';
-import type { QboTaxCodeInfo, QboTaxRateInfo } from './types.js';
+import { createHash } from 'node:crypto';
+import type { StagedCategorization, TaxCalculation } from '@recat/shared';
+import {
+  QboSyncTokenConflict,
+  type QboPreparedWrite,
+  type QboPurchaseExpectedState,
+  type QboPurchaseSnapshot,
+  type QboTaxCodeInfo,
+  type QboTaxRateInfo,
+  type RawPurchase,
+  type RawPurchaseLine,
+} from './types.js';
 
 /** Largest percentage exactly storable by Prisma Decimal(9,6). */
 export const MAX_SUPPORTED_TAX_RATE_PERCENT = 999.999999;
@@ -395,4 +405,577 @@ export function calculatePurchaseLine(
     netCents: toSafeCents(netCents),
     taxCents: toSafeCents(taxCents),
   };
+}
+
+export type QboPurchasePreparationCode =
+  | 'QBO_AMOUNT_UNSAFE'
+  | 'QBO_PURCHASE_UNSUPPORTED'
+  | 'QBO_REFERENCE_MISSING'
+  | 'QBO_STATE_DRIFT';
+
+export class QboPurchasePreparationError extends Error {
+  constructor(
+    public readonly code: QboPurchasePreparationCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'QboPurchasePreparationError';
+  }
+}
+
+const MAX_EXACT_MONEY_CENTS = Math.floor(Number.MAX_SAFE_INTEGER / 100);
+
+function preparationError(code: QboPurchasePreparationCode, message: string): never {
+  throw new QboPurchasePreparationError(code, message);
+}
+
+function exactCents(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return preparationError('QBO_AMOUNT_UNSAFE', 'Purchase money must be a finite number.');
+  }
+  const scaled = value * 100;
+  const cents = Math.round(scaled);
+  if (
+    !Number.isSafeInteger(cents) ||
+    Math.abs(cents) > MAX_EXACT_MONEY_CENTS ||
+    Math.abs(scaled - cents) > 1e-7
+  ) {
+    return preparationError('QBO_AMOUNT_UNSAFE', 'Purchase money is not representable as exact safe cents.');
+  }
+  return cents;
+}
+
+function moneyFromCents(cents: number): number {
+  if (!Number.isSafeInteger(cents) || Math.abs(cents) > MAX_EXACT_MONEY_CENTS) {
+    return preparationError('QBO_AMOUNT_UNSAFE', 'Prepared Purchase cents exceed the exact money range.');
+  }
+  const money = Math.abs(cents) / 100;
+  if (exactCents(money) !== Math.abs(cents)) {
+    return preparationError('QBO_AMOUNT_UNSAFE', 'Prepared Purchase cents cannot be serialized exactly.');
+  }
+  return money;
+}
+
+function safeCentSum(values: readonly number[]): number {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || Math.abs(value) > MAX_EXACT_MONEY_CENTS) {
+      return preparationError('QBO_AMOUNT_UNSAFE', 'Prepared Purchase cents are unsafe.');
+    }
+    total += value;
+    if (!Number.isSafeInteger(total) || Math.abs(total) > MAX_EXACT_MONEY_CENTS) {
+      return preparationError('QBO_AMOUNT_UNSAFE', 'Prepared Purchase cent total is unsafe.');
+    }
+  }
+  return total;
+}
+
+function requiredIdentity(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return preparationError('QBO_REFERENCE_MISSING', `Purchase ${label} is missing.`);
+  }
+  return value;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(',')}}`;
+}
+
+function normalizedClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+  }
+  return value;
+}
+
+function requestHash(body: RawPurchase): string {
+  return createHash('sha256').update(canonicalJson(body)).digest('hex');
+}
+
+function purchaseSign(raw: RawPurchase): 1 | -1 {
+  return raw.Credit === true ? 1 : -1;
+}
+
+function snapshotLine(raw: RawPurchaseLine, sign: 1 | -1): QboPurchaseSnapshot['lines'][number] {
+  const detail = raw.AccountBasedExpenseLineDetail;
+  return {
+    id: raw.Id ?? null,
+    amountCents: sign * exactCents(raw.Amount ?? 0),
+    description: raw.Description ?? null,
+    accountQboId: detail?.AccountRef?.value ?? null,
+    customerQboId: detail?.CustomerRef?.value ?? null,
+    classQboId: detail?.ClassRef?.value ?? null,
+    taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
+    taxAmountCents: detail?.TaxAmount === undefined ? null : sign * exactCents(detail.TaxAmount),
+    taxInclusiveCents:
+      detail?.TaxInclusiveAmt === undefined ? null : sign * exactCents(detail.TaxInclusiveAmt),
+  };
+}
+
+function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
+  if (
+    typeof raw !== 'object' ||
+    raw === null ||
+    !Array.isArray(raw.Line) ||
+    typeof raw.Id !== 'string' ||
+    raw.Id.trim() === '' ||
+    typeof raw.SyncToken !== 'string' ||
+    raw.SyncToken.trim() === '' ||
+    typeof raw.TxnDate !== 'string' ||
+    raw.TxnDate.trim() === '' ||
+    raw.TotalAmt === undefined
+  ) {
+    return preparationError(
+      'QBO_PURCHASE_UNSUPPORTED',
+      'Purchase is missing a complete identity, date, total, SyncToken, or Line array.',
+    );
+  }
+  const sign = purchaseSign(raw);
+  const accountQboId = requiredIdentity(raw.AccountRef?.value, 'payment account reference');
+  const provableLineTaxCents = raw.Line.map((line): number | null => {
+    const detail = line.AccountBasedExpenseLineDetail;
+    if (detail?.TaxAmount !== undefined) return exactCents(detail.TaxAmount);
+    return detail?.TaxCodeRef?.value === undefined ? 0 : null;
+  });
+  const derivedTotalTaxCents =
+    raw.GlobalTaxCalculation === undefined ||
+    provableLineTaxCents.some((tax) => tax === null)
+      ? null
+      : safeCentSum(provableLineTaxCents as number[]);
+  return {
+    qboId: raw.Id,
+    syncToken: raw.SyncToken,
+    totalCents: sign * exactCents(raw.TotalAmt),
+    accountQboId,
+    date: raw.TxnDate,
+    direction: sign === 1 ? 'refund' : 'purchase',
+    globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
+    totalTaxCents:
+      raw.TxnTaxDetail?.TotalTax === undefined
+        ? derivedTotalTaxCents === null
+          ? null
+          : sign * derivedTotalTaxCents
+        : sign * exactCents(raw.TxnTaxDetail.TotalTax),
+    lines: raw.Line.map((line) => snapshotLine(line, sign)),
+  };
+}
+
+function canonicalSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
+  return JSON.stringify([
+    line.id,
+    line.amountCents,
+    line.description,
+    line.accountQboId,
+    line.customerQboId,
+    line.classQboId,
+    line.taxCodeQboId,
+    line.taxAmountCents,
+    line.taxInclusiveCents,
+  ]);
+}
+
+function targetSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
+  return JSON.stringify([
+    line.amountCents,
+    line.description,
+    line.accountQboId,
+    line.customerQboId,
+    line.classQboId,
+    line.taxCodeQboId,
+    line.taxAmountCents,
+    line.taxInclusiveCents,
+  ]);
+}
+
+function assertSnapshotEqualsBefore(actual: QboPurchaseSnapshot, before: QboPurchaseSnapshot): void {
+  if (actual.syncToken !== before.syncToken) throw new QboSyncTokenConflict();
+  const comparableActual = { ...actual, syncToken: undefined };
+  const comparableBefore = { ...before, syncToken: undefined };
+  if (canonicalJson(comparableActual) !== canonicalJson(comparableBefore)) {
+    preparationError('QBO_STATE_DRIFT', 'Purchase changed after its before snapshot was stored.');
+  }
+}
+
+function expectedBase(
+  snapshot: QboPurchaseSnapshot,
+  globalTaxCalculation: string | null,
+  totalTaxCents: number | null,
+): Omit<QboPurchaseExpectedState, 'targetLines' | 'untouchedLineHashes'> {
+  return {
+    qboId: snapshot.qboId,
+    totalCents: snapshot.totalCents,
+    accountQboId: snapshot.accountQboId,
+    date: snapshot.date,
+    direction: snapshot.direction,
+    globalTaxCalculation,
+    totalTaxCents,
+  };
+}
+
+function stagedLineToRaw(
+  line: StagedCategorization['lines'][number],
+  taxCalculation: StagedCategorization['taxCalculation'],
+): RawPurchaseLine {
+  const accountQboId = requiredIdentity(line.categoryQboId, 'category account reference');
+  if (line.idx < 0 || !Number.isSafeInteger(line.idx)) {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'Purchase split indexes must be non-negative integers.');
+  }
+  const detail: NonNullable<RawPurchaseLine['AccountBasedExpenseLineDetail']> = {
+    AccountRef: { value: accountQboId },
+  };
+  if (taxCalculation !== 'NotApplicable') {
+    detail.TaxCodeRef = {
+      value: requiredIdentity(line.taxCodeQboId, 'tax code reference'),
+    };
+    detail.TaxAmount = moneyFromCents(line.taxCents);
+    if (taxCalculation === 'TaxInclusive') {
+      detail.TaxInclusiveAmt = moneyFromCents(line.totalCents);
+    }
+  } else if (line.taxCodeQboId !== null) {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'NotApplicable Purchase lines cannot carry a tax code.');
+  }
+  return {
+    Amount: moneyFromCents(line.subtotalCents),
+    DetailType: 'AccountBasedExpenseLineDetail',
+    ...(line.memo === null ? {} : { Description: line.memo }),
+    AccountBasedExpenseLineDetail: detail,
+  };
+}
+
+function stagedLineToSnapshot(
+  line: StagedCategorization['lines'][number],
+  taxCalculation: StagedCategorization['taxCalculation'],
+): QboPurchaseSnapshot['lines'][number] {
+  return {
+    id: null,
+    amountCents: line.subtotalCents,
+    description: line.memo,
+    accountQboId: line.categoryQboId,
+    customerQboId: null,
+    classQboId: null,
+    taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
+    taxAmountCents: taxCalculation === 'NotApplicable' ? null : line.taxCents,
+    taxInclusiveCents:
+      taxCalculation === 'TaxInclusive' ? line.totalCents : null,
+  };
+}
+
+function assertStagedAmounts(
+  staged: StagedCategorization,
+  current: QboPurchaseSnapshot,
+  holdingLineIndexes: readonly number[],
+): void {
+  if (staged.lines.length === 0) {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'Prepared Purchase requires at least one split line.');
+  }
+  const orderedIndexes = staged.lines.map((line) => line.idx);
+  if (orderedIndexes.some((idx, position) => idx !== position)) {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'Prepared Purchase split indexes must be contiguous.');
+  }
+  const expectedSign = current.direction === 'refund' ? 1 : -1;
+  for (const line of staged.lines) {
+    safeCentSum([line.subtotalCents, line.taxCents, line.totalCents]);
+    if (safeCentSum([line.subtotalCents, line.taxCents]) !== line.totalCents) {
+      preparationError('QBO_STATE_DRIFT', 'Prepared Purchase split tax cents do not balance.');
+    }
+    if (
+      Math.sign(line.subtotalCents) !== expectedSign ||
+      (line.taxCents !== 0 && Math.sign(line.taxCents) !== expectedSign)
+    ) {
+      preparationError(
+        'QBO_PURCHASE_UNSUPPORTED',
+        'Prepared Purchase subtotal and tax cents must follow the transaction direction.',
+      );
+    }
+    if (staged.taxCalculation === 'NotApplicable' && line.taxCents !== 0) {
+      preparationError('QBO_PURCHASE_UNSUPPORTED', 'NotApplicable Purchase lines must have zero tax cents.');
+    }
+  }
+  const totals = {
+    subtotalCents: safeCentSum(staged.lines.map((line) => line.subtotalCents)),
+    taxCents: safeCentSum(staged.lines.map((line) => line.taxCents)),
+    totalCents: safeCentSum(staged.lines.map((line) => line.totalCents)),
+  };
+  if (canonicalJson(totals) !== canonicalJson(staged.totals)) {
+    preparationError('QBO_STATE_DRIFT', 'Prepared Purchase totals do not match its split lines.');
+  }
+  const holdingTotal = safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
+  if (holdingTotal !== staged.totals.totalCents) {
+    preparationError('QBO_STATE_DRIFT', 'Prepared Purchase total changed from the holding-account amount.');
+  }
+  if (staged.lines.some((line) => Math.sign(line.totalCents) !== expectedSign)) {
+    preparationError('QBO_STATE_DRIFT', 'Prepared Purchase split direction changed.');
+  }
+}
+
+export function preparePurchaseRecategorization(args: {
+  current: RawPurchase;
+  holdingAccountQboIds: readonly string[];
+  staged: StagedCategorization;
+  before: QboPurchaseSnapshot;
+  requestId: string;
+}): QboPreparedWrite {
+  requiredIdentity(args.requestId, 'request id');
+  if (args.holdingAccountQboIds.length === 0) {
+    preparationError('QBO_REFERENCE_MISSING', 'Purchase holding-account references are missing.');
+  }
+  const holdingIds = new Set(args.holdingAccountQboIds.map((id) => requiredIdentity(id, 'holding account reference')));
+  const current = snapshotFromRaw(args.current);
+  assertSnapshotEqualsBefore(current, args.before);
+
+  const holdingLineIndexes: number[] = [];
+  const keptRawLines: RawPurchaseLine[] = [];
+  const keptSnapshotLines: QboPurchaseSnapshot['lines'] = [];
+  for (const [index, rawLine] of args.current.Line!.entries()) {
+    const accountQboId = rawLine.AccountBasedExpenseLineDetail?.AccountRef?.value;
+    if (accountQboId !== undefined && holdingIds.has(accountQboId)) {
+      if (
+        rawLine.DetailType !== 'AccountBasedExpenseLineDetail' ||
+        rawLine.Amount === undefined ||
+        accountQboId.trim() === ''
+      ) {
+        preparationError('QBO_PURCHASE_UNSUPPORTED', 'Holding Purchase line has an unsupported shape.');
+      }
+      exactCents(rawLine.Amount);
+      holdingLineIndexes.push(index);
+    } else {
+      keptRawLines.push(rawLine);
+      keptSnapshotLines.push(current.lines[index]!);
+    }
+  }
+  if (holdingLineIndexes.length === 0) {
+    preparationError('QBO_STATE_DRIFT', 'Purchase no longer has an eligible holding-account line.');
+  }
+  assertStagedAmounts(args.staged, current, holdingLineIndexes);
+
+  const keptTaxBearing = keptSnapshotLines.some(
+    (line) =>
+      line.taxCodeQboId !== null ||
+      line.taxAmountCents !== null ||
+      line.taxInclusiveCents !== null,
+  );
+  if (
+    keptTaxBearing &&
+    args.staged.taxCalculation !== current.globalTaxCalculation
+  ) {
+    preparationError(
+      'QBO_PURCHASE_UNSUPPORTED',
+      'Purchase tax mode cannot change while untouched tax-bearing lines remain.',
+    );
+  }
+  const newRawLines = args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
+  const newSnapshotLines = args.staged.lines.map((line) =>
+    stagedLineToSnapshot(line, args.staged.taxCalculation));
+  const provenTaxCents = (
+    line: QboPurchaseSnapshot['lines'][number],
+  ): number | null =>
+    line.taxAmountCents ?? (line.taxCodeQboId === null ? 0 : null);
+  const replacedTax = holdingLineIndexes.map((index) => provenTaxCents(current.lines[index]!));
+  const keptTax = keptSnapshotLines.map(provenTaxCents);
+  if (
+    current.totalTaxCents !== null &&
+    replacedTax.every((tax) => tax !== null) &&
+    keptTax.every((tax) => tax !== null) &&
+    current.totalTaxCents !==
+      safeCentSum([...(replacedTax as number[]), ...(keptTax as number[])])
+  ) {
+    preparationError(
+      'QBO_PURCHASE_UNSUPPORTED',
+      'Purchase aggregate tax does not match its provable line taxes.',
+    );
+  }
+  let keptTaxCents: number;
+  if (current.totalTaxCents !== null && replacedTax.every((tax) => tax !== null)) {
+    keptTaxCents = safeCentSum([
+      current.totalTaxCents,
+      -safeCentSum(replacedTax as number[]),
+    ]);
+  } else if (keptTax.every((tax) => tax !== null)) {
+    keptTaxCents = safeCentSum(keptTax as number[]);
+  } else {
+    preparationError(
+      'QBO_PURCHASE_UNSUPPORTED',
+      'Purchase tax for untouched lines cannot be proven exactly.',
+    );
+  }
+  const totalTaxCents = safeCentSum([keptTaxCents, args.staged.totals.taxCents]);
+  const {
+    TxnTaxDetail: _staleTaxDetail,
+    status: _cdcStatus,
+    ...writeable
+  } = args.current;
+  const body: RawPurchase = normalizedClone({
+    ...writeable,
+    SyncToken: current.syncToken,
+    Line: [...keptRawLines, ...newRawLines],
+    GlobalTaxCalculation: args.staged.taxCalculation,
+  });
+  const prepared: QboPreparedWrite = {
+    operation: 'recategorize',
+    qboType: 'Purchase',
+    qboId: current.qboId,
+    requestId: args.requestId,
+    requestHash: requestHash(body),
+    body,
+    before: normalizedClone(args.before),
+    expected: {
+      ...expectedBase(current, args.staged.taxCalculation, totalTaxCents),
+      targetLines: newSnapshotLines,
+      untouchedLineHashes: keptSnapshotLines.map(canonicalSnapshotLine),
+    },
+  };
+  return deepFreeze(prepared);
+}
+
+function assertExpectedCurrent(
+  expected: QboPurchaseExpectedState,
+  actual: QboPurchaseSnapshot,
+): number[] {
+  if (
+    actual.qboId !== expected.qboId ||
+    actual.totalCents !== expected.totalCents ||
+    actual.accountQboId !== expected.accountQboId ||
+    actual.date !== expected.date ||
+    actual.direction !== expected.direction ||
+    actual.globalTaxCalculation !== expected.globalTaxCalculation ||
+    actual.totalTaxCents !== expected.totalTaxCents
+  ) {
+    return preparationError('QBO_STATE_DRIFT', 'Purchase fields drifted before restore preparation.');
+  }
+  const remaining = actual.lines.map((line, index) => ({ line, index }));
+  for (const untouchedHash of expected.untouchedLineHashes) {
+    const index = remaining.findIndex(
+      ({ line }) => canonicalSnapshotLine(line) === untouchedHash,
+    );
+    if (index === -1) {
+      return preparationError('QBO_STATE_DRIFT', 'Untouched Purchase lines drifted before restore.');
+    }
+    remaining.splice(index, 1);
+  }
+  const targetIndexes: number[] = [];
+  for (const target of expected.targetLines) {
+    const index = remaining.findIndex(({ line }) => targetSnapshotLine(line) === targetSnapshotLine(target));
+    if (index === -1) {
+      return preparationError('QBO_STATE_DRIFT', 'Prepared Purchase target line drifted before restore.');
+    }
+    targetIndexes.push(remaining[index]!.index);
+    remaining.splice(index, 1);
+  }
+  if (remaining.length !== 0) {
+    return preparationError('QBO_STATE_DRIFT', 'Unexpected Purchase lines appeared before restore.');
+  }
+  return targetIndexes;
+}
+
+function beforeTargetLines(prepared: QboPreparedWrite): QboPurchaseSnapshot['lines'] {
+  const remaining = [...prepared.before.lines];
+  for (const untouchedHash of prepared.expected.untouchedLineHashes) {
+    const index = remaining.findIndex((line) => canonicalSnapshotLine(line) === untouchedHash);
+    if (index === -1) {
+      return preparationError('QBO_PURCHASE_UNSUPPORTED', 'Stored before snapshot cannot identify restore target lines.');
+    }
+    remaining.splice(index, 1);
+  }
+  if (remaining.length === 0) {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'Stored before snapshot has no restore target lines.');
+  }
+  return remaining;
+}
+
+function snapshotLineToRaw(line: QboPurchaseSnapshot['lines'][number]): RawPurchaseLine {
+  const accountQboId = requiredIdentity(line.accountQboId, 'restore account reference');
+  const detail: NonNullable<RawPurchaseLine['AccountBasedExpenseLineDetail']> = {
+    AccountRef: { value: accountQboId },
+    ...(line.customerQboId === null ? {} : { CustomerRef: { value: line.customerQboId } }),
+    ...(line.classQboId === null ? {} : { ClassRef: { value: line.classQboId } }),
+    ...(line.taxCodeQboId === null ? {} : { TaxCodeRef: { value: line.taxCodeQboId } }),
+    ...(line.taxAmountCents === null ? {} : { TaxAmount: moneyFromCents(line.taxAmountCents) }),
+    ...(line.taxInclusiveCents === null
+      ? {}
+      : { TaxInclusiveAmt: moneyFromCents(line.taxInclusiveCents) }),
+  };
+  return {
+    ...(line.id === null ? {} : { Id: line.id }),
+    Amount: moneyFromCents(line.amountCents),
+    DetailType: 'AccountBasedExpenseLineDetail',
+    ...(line.description === null ? {} : { Description: line.description }),
+    AccountBasedExpenseLineDetail: detail,
+  };
+}
+
+function restoreLinesInBeforeOrder(
+  before: QboPurchaseSnapshot,
+  keptRaw: readonly RawPurchaseLine[],
+  keptSnapshot: readonly QboPurchaseSnapshot['lines'][number][],
+): RawPurchaseLine[] {
+  const untouched = keptSnapshot.map((snapshot, index) => ({
+    hash: canonicalSnapshotLine(snapshot),
+    raw: keptRaw[index]!,
+  }));
+  return before.lines.map((line) => {
+    const hash = canonicalSnapshotLine(line);
+    const untouchedIndex = untouched.findIndex((candidate) => candidate.hash === hash);
+    if (untouchedIndex === -1) return snapshotLineToRaw(line);
+    const [match] = untouched.splice(untouchedIndex, 1);
+    return match!.raw;
+  });
+}
+
+export function preparePurchaseRestore(args: {
+  current: RawPurchase;
+  prepared: QboPreparedWrite;
+  requestId: string;
+}): QboPreparedWrite {
+  requiredIdentity(args.requestId, 'request id');
+  if (args.prepared.operation !== 'recategorize' || args.prepared.qboType !== 'Purchase') {
+    preparationError('QBO_PURCHASE_UNSUPPORTED', 'Only a prepared Purchase recategorization can be restored.');
+  }
+  const current = snapshotFromRaw(args.current);
+  const targetIndexes = new Set(assertExpectedCurrent(args.prepared.expected, current));
+  const targetsBefore = beforeTargetLines(args.prepared);
+  const keptRaw = args.current.Line!.filter((_line, index) => !targetIndexes.has(index));
+  const keptSnapshot = current.lines.filter((_line, index) => !targetIndexes.has(index));
+  const restoredLines = restoreLinesInBeforeOrder(args.prepared.before, keptRaw, keptSnapshot);
+  const {
+    TxnTaxDetail: _staleTaxDetail,
+    status: _cdcStatus,
+    ...writeable
+  } = args.current;
+  const body: RawPurchase = normalizedClone({
+    ...writeable,
+    SyncToken: current.syncToken,
+    Line: restoredLines,
+    GlobalTaxCalculation: args.prepared.before.globalTaxCalculation ?? undefined,
+  });
+  const prepared: QboPreparedWrite = {
+    operation: 'restore',
+    qboType: 'Purchase',
+    qboId: current.qboId,
+    requestId: args.requestId,
+    requestHash: requestHash(body),
+    body,
+    before: normalizedClone(args.prepared.before),
+    expected: {
+      ...expectedBase(
+        args.prepared.before,
+        args.prepared.before.globalTaxCalculation,
+        args.prepared.before.totalTaxCents,
+      ),
+      targetLines: normalizedClone(targetsBefore),
+      untouchedLineHashes: keptSnapshot.map(canonicalSnapshotLine),
+    },
+  };
+  return deepFreeze(prepared);
 }
