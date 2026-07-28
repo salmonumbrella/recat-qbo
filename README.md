@@ -120,12 +120,7 @@ docker compose exec app npm run login-link -- admin@example.com
 ```
 
 The link expires in 15 minutes and can be used only once. It is created by the
-same token service as emailed links. For a container named
-`recat-qbo_web_1`, the equivalent command is:
-
-```bash
-sudo docker exec recat-qbo_web_1 npm run login-link -- vladimir@wanver.shop
-```
+same token service as emailed links.
 
 For Umbrel and other LAN deployments, you can also enable a conventional local
 administrator login:
