@@ -122,6 +122,17 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
       });
     }
 
+    // Tax references are auxiliary to transaction sync. Their own service
+    // persists a safe not-ready diagnostic on failure; preserve the successful
+    // transaction sync while surfacing that state in this run's message.
+    let taxDiagnostic: string | null = null;
+    try {
+      const { refreshTaxReference } = await import('./tax/reference.js');
+      await refreshTaxReference(companyId);
+    } catch {
+      taxDiagnostic = 'Tax reference refresh failed.';
+    }
+
     const holdingIds = jsonStringArray(company.holdingAccountIds);
     const firstHoldingId = holdingIds[0];
     const holdingName = accounts.find((a) => a.qboId === firstHoldingId)?.name ?? 'Holding account';
@@ -266,6 +277,7 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
     // ---- 7. bookkeeping ----
     await prisma.company.update({ where: { id: companyId }, data: { lastSyncedAt: startedAt } });
     let message = buildMessage(created, dropped, autoPosted, accounts.length);
+    if (taxDiagnostic) message += ` — ${taxDiagnostic}`;
     if (autoPostFailures.length > 0) {
       message += ` — ${plural(autoPostFailures.length, 'auto-post failure')} (${autoPostFailures[0]})`;
     }

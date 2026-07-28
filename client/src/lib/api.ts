@@ -32,6 +32,7 @@ import type {
   StatementDto,
   SuggestionSetting,
   SyncMode,
+  TaxReadinessDto,
   TagDto,
   TeamMemberDto,
   TransactionDto,
@@ -360,6 +361,19 @@ export const qboDiagnostics = {
   preflight: () => api.post<QboPreflightDto>('/api/instance/qbo/preflight'),
   testConnection: (companyId: string) =>
     api.post<QboConnectionTestDto>(`/api/companies/${companyId}/test-connection`),
+};
+
+export interface TaxRefreshResponse {
+  readiness: TaxReadinessDto;
+  refreshed: boolean;
+}
+
+/** Cached purchase-tax readiness (viewer+). */
+export const tax = {
+  get: (companyId: string) => api.get<TaxReadinessDto>(`/api/companies/${companyId}/tax`),
+  /** Force a fresh QBO reference read (company admin only); it never writes QBO tax settings. */
+  refresh: (companyId: string) =>
+    api.post<TaxRefreshResponse>(`/api/companies/${companyId}/tax/refresh`),
 };
 
 /** Instance-level user management — instance admins only. */

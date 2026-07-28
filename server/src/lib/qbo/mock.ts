@@ -18,6 +18,10 @@ import {
   type QboClient,
   type QboCompanyInfo,
   type QboStatement,
+  type QboPurchaseSnapshot,
+  type QboTaxCodeInfo,
+  type QboTaxProfile,
+  type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
   type QboWriteResult,
@@ -81,6 +85,10 @@ export interface MockRealm {
   legalName: string;
   accounts: MockAccount[];
   txns: MockTxnEntity[];
+  taxProfile: QboTaxProfile;
+  taxCodes: QboTaxCodeInfo[];
+  taxRates: QboTaxRateInfo[];
+  purchaseSnapshots: QboPurchaseSnapshot[];
   transfers: MockTransfer[];
   nextId: number;
 }
@@ -178,6 +186,10 @@ function buildHarborRealm(): MockRealm {
     legalName: 'Harbor & Main Coffee Co.',
     accounts,
     txns: seeds.map((s) => seedTxn(s, HOLDING)),
+    taxProfile: { usingSalesTax: false, partnerTaxEnabled: null },
+    taxCodes: [],
+    taxRates: [],
+    purchaseSnapshots: [],
     transfers: [],
     nextId: 1000,
   };
@@ -216,6 +228,91 @@ function buildBluebirdRealm(): MockRealm {
     legalName: 'Bluebird Salon LLC',
     accounts,
     txns: seeds.map((s) => seedTxn(s, HOLDING)),
+    taxProfile: { usingSalesTax: true, partnerTaxEnabled: false },
+    taxRates: [
+      { qboId: 'GST5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
+      { qboId: 'PST7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
+    ],
+    taxCodes: [
+      {
+        qboId: 'GST',
+        name: 'GST',
+        description: 'Goods and services tax',
+        active: true,
+        taxable: true,
+        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        sourceUpdatedAt: null,
+      },
+      {
+        qboId: 'GST-PST',
+        name: 'GST + PST',
+        description: null,
+        active: true,
+        taxable: true,
+        purchaseRates: [
+          { taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'PST7', taxTypeApplicable: 'TaxOnAmount' },
+        ],
+        sourceUpdatedAt: null,
+      },
+      {
+        qboId: 'OLD-GST',
+        name: 'Old GST',
+        description: null,
+        active: false,
+        taxable: true,
+        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        sourceUpdatedAt: null,
+      },
+    ],
+    purchaseSnapshots: [
+      {
+        qboId: '14',
+        syncToken: '0',
+        totalCents: -21430,
+        accountQboId: '1',
+        date: '2026-07-10',
+        direction: 'purchase',
+        globalTaxCalculation: 'TaxExcluded',
+        totalTaxCents: -2572,
+        lines: [
+          {
+            id: '1',
+            amountCents: -21430,
+            description: 'Color stock',
+            accountQboId: '3',
+            customerQboId: 'customer-1',
+            classQboId: 'class-1',
+            taxCodeQboId: 'UNKNOWN-PURCHASE-TAX',
+            taxAmountCents: -2572,
+            taxInclusiveCents: null,
+          },
+        ],
+      },
+      {
+        qboId: 'refund-14',
+        syncToken: '0',
+        totalCents: 21430,
+        accountQboId: '1',
+        date: '2026-07-11',
+        direction: 'refund',
+        globalTaxCalculation: 'TaxExcluded',
+        totalTaxCents: 2572,
+        lines: [
+          {
+            id: '1',
+            amountCents: 21430,
+            description: 'Returned color stock',
+            accountQboId: '3',
+            customerQboId: 'customer-1',
+            classQboId: 'class-1',
+            taxCodeQboId: 'GST',
+            taxAmountCents: 2572,
+            taxInclusiveCents: null,
+          },
+        ],
+      },
+    ],
     transfers: [],
     nextId: 1000,
   };
@@ -226,6 +323,84 @@ function buildRealms(): Map<string, MockRealm> {
     [MOCK_REALM_HARBOR, buildHarborRealm()],
     [MOCK_REALM_BLUEBIRD, buildBluebirdRealm()],
   ]);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isPersistedLine(value: unknown): value is MockLine {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.amount === 'number' &&
+    Number.isFinite(value.amount) &&
+    typeof value.accountQboId === 'string' &&
+    (value.memo === undefined || typeof value.memo === 'string')
+  );
+}
+
+function isPersistedTxn(value: unknown): value is MockTxnEntity {
+  return (
+    isRecord(value) &&
+    typeof value.qboId === 'string' &&
+    typeof value.qboType === 'string' &&
+    typeof value.syncToken === 'number' &&
+    Number.isSafeInteger(value.syncToken) &&
+    typeof value.date === 'string' &&
+    typeof value.payee === 'string' &&
+    (value.memo === undefined || typeof value.memo === 'string') &&
+    typeof value.amount === 'number' &&
+    Number.isFinite(value.amount) &&
+    typeof value.bankAccountQboId === 'string' &&
+    Array.isArray(value.lines) &&
+    value.lines.every(isPersistedLine) &&
+    typeof value.lastUpdated === 'string' &&
+    (value.deleted === undefined || typeof value.deleted === 'boolean')
+  );
+}
+
+function isPersistedTransfer(value: unknown): value is MockTransfer {
+  return (
+    isRecord(value) &&
+    typeof value.qboId === 'string' &&
+    typeof value.amount === 'number' &&
+    Number.isFinite(value.amount) &&
+    typeof value.fromAccountQboId === 'string' &&
+    typeof value.toAccountQboId === 'string' &&
+    typeof value.date === 'string' &&
+    (value.memo === undefined || typeof value.memo === 'string') &&
+    typeof value.lastUpdated === 'string'
+  );
+}
+
+/**
+ * Migrate persisted demo mutations onto the current fixture shape. Fixture
+ * metadata is deliberately not persisted state: retaining the current values
+ * lets additive fields survive upgrades from older AppConfig JSON.
+ */
+export function mergePersistedMockRealm(current: MockRealm, persisted: unknown): MockRealm {
+  if (!isRecord(persisted)) return current;
+
+  const txns =
+    Array.isArray(persisted.txns) && persisted.txns.every(isPersistedTxn)
+      ? persisted.txns
+      : current.txns;
+  const transfers =
+    Array.isArray(persisted.transfers) && persisted.transfers.every(isPersistedTransfer)
+      ? persisted.transfers
+      : current.transfers;
+  const nextId =
+    typeof persisted.nextId === 'number' &&
+    Number.isSafeInteger(persisted.nextId) &&
+    persisted.nextId >= 0
+      ? persisted.nextId
+      : current.nextId;
+
+  if (txns === current.txns && transfers === current.transfers && nextId === current.nextId) {
+    return current;
+  }
+  return { ...current, txns, transfers, nextId };
 }
 
 // Module-level singleton — one fake Intuit per server process. Mutations are
@@ -250,7 +425,10 @@ export async function ensureMockRealmsHydrated(): Promise<void> {
     const { prisma } = await import('../prisma.js');
     for (const realmId of [MOCK_REALM_HARBOR, MOCK_REALM_BLUEBIRD]) {
       const row = await prisma.appConfig.findUnique({ where: { key: realmKey(realmId) } });
-      if (row) realms.set(realmId, JSON.parse(row.value) as MockRealm);
+      const current = realms.get(realmId);
+      if (row && current) {
+        realms.set(realmId, mergePersistedMockRealm(current, JSON.parse(row.value)));
+      }
     }
   } catch (err) {
     console.warn('[mock-qbo] could not hydrate persisted realm state:', err);
@@ -396,6 +574,27 @@ export class MockQboClient implements QboClient {
       accountType: a.accountType,
       active: true,
     }));
+  }
+
+  async getTaxProfile(): Promise<QboTaxProfile> {
+    await ensureMockRealmsHydrated();
+    return { ...this.realm.taxProfile };
+  }
+
+  async listTaxCodes(): Promise<QboTaxCodeInfo[]> {
+    await ensureMockRealmsHydrated();
+    return this.realm.taxCodes.map((code) => ({ ...code, purchaseRates: code.purchaseRates.map((rate) => ({ ...rate })) }));
+  }
+
+  async listTaxRates(): Promise<QboTaxRateInfo[]> {
+    await ensureMockRealmsHydrated();
+    return this.realm.taxRates.map((rate) => ({ ...rate }));
+  }
+
+  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+    await ensureMockRealmsHydrated();
+    const snapshot = this.realm.purchaseSnapshots.find((purchase) => purchase.qboId === qboId);
+    return snapshot ? { ...snapshot, lines: snapshot.lines.map((line) => ({ ...line })) } : null;
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {
