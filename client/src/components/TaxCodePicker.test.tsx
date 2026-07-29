@@ -16,6 +16,7 @@ const READY: TaxReadinessDto = {
       active: true,
       taxable: true,
       combinedPurchaseRate: 5,
+      combinedSalesRate: null,
     },
     {
       qboId: 'TAX_CODE_INACTIVE',
@@ -23,6 +24,7 @@ const READY: TaxReadinessDto = {
       active: false,
       taxable: true,
       combinedPurchaseRate: 7,
+      combinedSalesRate: null,
     },
     {
       qboId: 'TAX_CODE_UNSUPPORTED',
@@ -30,8 +32,20 @@ const READY: TaxReadinessDto = {
       active: true,
       taxable: true,
       combinedPurchaseRate: null,
+      combinedSalesRate: null,
+    },
+    {
+      qboId: 'TAX_CODE_EXPLICIT_NONE',
+      name: 'Explicit non-tax treatment',
+      active: true,
+      taxable: false,
+      combinedPurchaseRate: null,
+      combinedSalesRate: null,
     },
   ],
+  salesStatus: 'needs_setup',
+  salesReason: null,
+  salesTaxCodes: [],
 };
 
 describe('TaxCodePicker', () => {
@@ -52,6 +66,7 @@ describe('TaxCodePicker', () => {
     expect(picker).toHaveTextContent('Standard purchase tax');
     expect(picker).not.toHaveTextContent('Inactive purchase tax');
     expect(picker).not.toHaveTextContent('Unsupported purchase tax');
+    expect(picker).not.toHaveTextContent('Explicit non-tax treatment');
 
     await userEvent.selectOptions(picker, 'TAX_CODE_STANDARD');
     expect(onChange).toHaveBeenCalledWith('TAX_CODE_STANDARD');
@@ -70,6 +85,9 @@ describe('TaxCodePicker', () => {
           usingSalesTax: false,
           refreshedAt: null,
           taxCodes: [],
+          salesStatus: 'unsupported',
+          salesReason: 'Sales tax is disabled.',
+          salesTaxCodes: [],
         }}
         value={null}
         onChange={vi.fn()}
@@ -95,5 +113,37 @@ describe('TaxCodePicker', () => {
     expect(screen.getByLabelText('Purchase tax')).toBeDisabled();
     expect(screen.getByText(/tax availability is unavailable/i)).toBeInTheDocument();
     expect(screen.queryByText('Standard purchase tax')).not.toBeInTheDocument();
+  });
+
+  it('uses sales readiness and sales tax codes when requested', async () => {
+    const onChange = vi.fn();
+    render(
+      <TaxCodePicker
+        id="sales-tax-code"
+        label="Sales tax"
+        direction="sales"
+        readiness={{
+          ...READY,
+          salesStatus: 'ready',
+          salesReason: null,
+          salesTaxCodes: [{
+            qboId: 'SALES_TAX_CODE',
+            name: 'Standard sales tax',
+            active: true,
+            taxable: true,
+            combinedPurchaseRate: null,
+            combinedSalesRate: 5,
+          }],
+        }}
+        value={null}
+        onChange={onChange}
+      />,
+    );
+
+    const picker = screen.getByLabelText('Sales tax');
+    expect(picker).toHaveTextContent('Standard sales tax');
+    expect(picker).not.toHaveTextContent('Standard purchase tax');
+    await userEvent.selectOptions(picker, 'SALES_TAX_CODE');
+    expect(onChange).toHaveBeenCalledWith('SALES_TAX_CODE');
   });
 });

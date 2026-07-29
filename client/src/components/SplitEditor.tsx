@@ -12,7 +12,8 @@ import type {
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
-import TaxCodePicker from './TaxCodePicker';
+import TaxCodePicker, { usableTaxCodesForDirection } from './TaxCodePicker';
+import type { TaxDirection } from './TaxCodePicker';
 
 export interface SplitLineDraft {
   amt: string;
@@ -46,7 +47,17 @@ export default function SplitEditor({
 }) {
   const { toast } = useApp();
   const total = Math.abs(txn.amount);
-  const taxEnabled = txn.qboType === 'Purchase' && taxReadiness?.status === 'ready';
+  const taxDirection: TaxDirection | null = txn.qboType === 'Purchase'
+    ? 'purchase'
+    : txn.qboType === 'Deposit'
+      ? 'sales'
+      : null;
+  const taxEnabled = taxDirection !== null && (
+    taxDirection === 'purchase'
+      ? taxReadiness?.status === 'ready'
+      : taxReadiness?.salesStatus === 'ready'
+  );
+  const taxLabel = taxDirection === 'sales' ? 'Sales tax' : 'Purchase tax';
   const [taxCalculation, setTaxCalculation] = useState<TaxCalculation>(
     txn.taxCalculation === 'TaxExcluded'
       ? 'TaxExcluded'
@@ -81,10 +92,22 @@ export default function SplitEditor({
   const sum = draft.reduce((a, l) => a + (parseFloat(l.amt) || 0), 0);
   const remain = total - sum;
   const selectedTaxCount = draft.filter((line) => line.taxCodeQboId !== null).length;
+  const usableTaxCodeIds = new Set(
+    taxDirection === null
+      ? []
+      : usableTaxCodesForDirection(taxReadiness, taxDirection).map((code) => code.qboId),
+  );
+  const hasInvalidTaxCode = taxEnabled && draft.some(
+    (line) => line.taxCodeQboId !== null && !usableTaxCodeIds.has(line.taxCodeQboId),
+  );
   const validTax =
     !taxEnabled ||
     selectedTaxCount === 0 ||
-    (selectedTaxCount === draft.length && taxCalculation !== 'NotApplicable');
+    (
+      selectedTaxCount === draft.length &&
+      taxCalculation !== 'NotApplicable' &&
+      !hasInvalidTaxCode
+    );
   const valid =
     Math.abs(remain) < 0.005 &&
     draft.every((l) => l.cat && (parseFloat(l.amt) || 0) > 0) &&
@@ -249,8 +272,9 @@ export default function SplitEditor({
                   </span>
                   <TaxCodePicker
                     id={`split-tax-code-${txn.id}-${i}`}
-                    label={`Purchase tax for split line ${i + 1}`}
+                    label={`${taxLabel} for split line ${i + 1}`}
                     readiness={taxReadiness}
+                    direction={taxDirection ?? 'purchase'}
                     value={l.taxCodeQboId}
                     onChange={(taxCodeQboId) => {
                       upd(i, { taxCodeQboId });
@@ -359,9 +383,11 @@ export default function SplitEditor({
             onClick={() => {
               if (!valid) {
                 toast(
-                  validTax
+                  hasInvalidTaxCode
+                    ? `Select a usable ${taxLabel.toLowerCase()} code for every taxed split line.`
+                    : validTax
                     ? 'Assign the full amount and pick a category on every line'
-                    : 'Blank No tax is valid only when every split line is No tax. Use an explicit supported non-tax code to mix treatments.',
+                    : 'Use a supported taxable code on every split line, or choose No tax on every split line.',
                 );
                 return;
               }

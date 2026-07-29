@@ -3,6 +3,7 @@ import type { StagedCategorization, TaxCalculation } from '@recat/shared';
 import {
   QboSyncTokenConflict,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboPurchaseExpectedState,
   type QboPurchaseSnapshot,
   type QboTaxCodeInfo,
@@ -38,6 +39,7 @@ export type PurchaseTaxIneligibilityReason =
   | 'TAX_CODE_UNAVAILABLE'
   | 'TAX_CODE_INACTIVE'
   | 'TAX_CODE_MALFORMED'
+  | 'TAX_CODE_PURCHASE_ONLY'
   | 'TAX_CODE_SALES_ONLY'
   | 'TAX_RATE_UNAVAILABLE'
   | 'TAX_RATE_INACTIVE'
@@ -119,6 +121,15 @@ interface ResolvedTaxLine {
   treatment: PurchaseTaxTreatment;
 }
 
+type TaxDirection = 'purchase' | 'sales';
+
+function componentsForDirection(
+  code: { purchaseRates?: unknown; salesRates?: unknown },
+  direction: TaxDirection,
+): unknown {
+  return direction === 'purchase' ? code.purchaseRates : code.salesRates;
+}
+
 function isRuntimeRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -129,6 +140,7 @@ function isNonEmptyIdentity(value: unknown): value is string {
 
 function runtimeReferenceFailure(
   reference: unknown,
+  direction: TaxDirection,
 ): 'TAX_CODE_MALFORMED' | 'TAX_RATE_MALFORMED' | null {
   if (!isRuntimeRecord(reference) || !Array.isArray(reference.codes) || !Array.isArray(reference.rates)) {
     return 'TAX_CODE_MALFORMED';
@@ -139,11 +151,11 @@ function runtimeReferenceFailure(
       !isNonEmptyIdentity(code.qboId) ||
       typeof code.active !== 'boolean' ||
       (code.taxable !== null && typeof code.taxable !== 'boolean') ||
-      !Array.isArray(code.purchaseRates)
+      !Array.isArray(componentsForDirection(code, direction))
     ) {
       return 'TAX_CODE_MALFORMED';
     }
-    for (const component of code.purchaseRates) {
+    for (const component of componentsForDirection(code, direction) as unknown[]) {
       if (
         !isRuntimeRecord(component) ||
         !isNonEmptyIdentity(component.taxRateQboId) ||
@@ -170,6 +182,7 @@ function resolveTaxLine(
   input: PurchaseTaxLineInput,
   taxCalculation: TaxCalculation,
   reference: { codes: QboTaxCodeInfo[]; rates: QboTaxRateInfo[] },
+  direction: TaxDirection,
 ): ResolvedTaxLine | PurchaseTaxIneligibilityReason {
   if (!isNonEmptyIdentity(input.taxCodeQboId)) return 'TAX_CODE_MALFORMED';
   const code = reference.codes.find((candidate) => candidate.qboId === input.taxCodeQboId);
@@ -177,19 +190,22 @@ function resolveTaxLine(
   if (!isNonEmptyIdentity(code.qboId) || typeof code.active !== 'boolean') return 'TAX_CODE_MALFORMED';
   if (!code.active) return 'TAX_CODE_INACTIVE';
   if (code.taxable === null) return 'TAX_CODE_MALFORMED';
-  if (!Array.isArray(code.purchaseRates)) return 'TAX_CODE_MALFORMED';
+  const components = componentsForDirection(code, direction);
+  if (!Array.isArray(components)) return 'TAX_CODE_MALFORMED';
 
   if (code.taxable === false) {
-    if (code.purchaseRates.length !== 0) return 'TAX_CODE_MALFORMED';
+    if (components.length !== 0) return 'TAX_CODE_MALFORMED';
     if (input.nonTaxTreatment === undefined) return 'TAX_TREATMENT_AMBIGUOUS';
     return { rateQboId: null, rate: null, treatment: input.nonTaxTreatment };
   }
 
   if (taxCalculation === 'NotApplicable') return 'TAX_CODE_MALFORMED';
   if (code.taxable !== true) return 'TAX_CODE_MALFORMED';
-  if (code.purchaseRates.length === 0) return 'TAX_CODE_SALES_ONLY';
-  if (code.purchaseRates.length !== 1) return 'TAX_RATE_UNSUPPORTED';
-  const component = code.purchaseRates[0];
+  if (components.length === 0) {
+    return direction === 'purchase' ? 'TAX_CODE_SALES_ONLY' : 'TAX_CODE_PURCHASE_ONLY';
+  }
+  if (components.length !== 1) return 'TAX_RATE_UNSUPPORTED';
+  const component = components[0];
   if (
     !isRuntimeRecord(component) ||
     !isNonEmptyIdentity(component.taxRateQboId) ||
@@ -269,6 +285,264 @@ function allocateExcludedTax(
   return null;
 }
 
+const MAX_TAX_EXCLUSIVE_INVERSE_LINES = 20;
+
+interface TaxExclusiveCandidate {
+  netMagnitude: bigint;
+  bonus: 0 | 1;
+  remainder: bigint;
+  index: number;
+}
+
+type TaxExclusiveGroupInverse =
+  | { outcome: 'none' }
+  | { outcome: 'unique'; netMagnitudes: bigint[] }
+  | { outcome: 'multiple' };
+
+function exactMonotoneInverse(
+  target: bigint,
+  valueAt: (candidate: bigint) => bigint,
+): bigint | null {
+  let low = 0n;
+  let high = target;
+  while (low <= high) {
+    const middle = (low + high) / 2n;
+    const value = valueAt(middle);
+    if (value === target) return middle;
+    if (value < target) low = middle + 1n;
+    else high = middle - 1n;
+  }
+  return null;
+}
+
+function priorityCompare(
+  left: Pick<TaxExclusiveCandidate, 'remainder' | 'index'>,
+  right: Pick<TaxExclusiveCandidate, 'remainder' | 'index'>,
+): number {
+  if (left.remainder !== right.remainder) {
+    return left.remainder > right.remainder ? -1 : 1;
+  }
+  return left.index - right.index;
+}
+
+function inverseGroup(
+  targetMagnitudes: readonly bigint[],
+  indexes: readonly number[],
+  rate: { numerator: bigint; denominator: bigint },
+): TaxExclusiveGroupInverse {
+  if (rate.numerator === 0n) {
+    return {
+      outcome: 'unique',
+      netMagnitudes: indexes.map((index) => targetMagnitudes[index]!),
+    };
+  }
+  const taxDenominator = rate.denominator * 100n;
+  const targetTotal = indexes.reduce(
+    (sum, index) => sum + targetMagnitudes[index]!,
+    0n,
+  );
+  const requiredNet = exactMonotoneInverse(
+    targetTotal,
+    (net) => net + roundRatio(net * rate.numerator, taxDenominator),
+  );
+  if (requiredNet === null) return { outcome: 'none' };
+
+  const candidatesByIndex = indexes.map((index) => {
+    const target = targetMagnitudes[index]!;
+    const candidates: TaxExclusiveCandidate[] = [];
+    for (const bonus of [0, 1] as const) {
+      const netMagnitude = exactMonotoneInverse(
+        target,
+        (net) =>
+          net +
+          (net * rate.numerator) / taxDenominator +
+          BigInt(bonus),
+      );
+      if (netMagnitude === null) continue;
+      candidates.push({
+        netMagnitude,
+        bonus,
+        remainder: (netMagnitude * rate.numerator) % taxDenominator,
+        index,
+      });
+    }
+    return candidates;
+  });
+  if (candidatesByIndex.some((candidates) => candidates.length === 0)) {
+    return { outcome: 'none' };
+  }
+
+  const priorities = candidatesByIndex
+    .flat()
+    .sort(priorityCompare);
+  const priorityRank = new Map<TaxExclusiveCandidate, number>(
+    priorities.map((candidate, rank) => [candidate, rank]),
+  );
+  const uniqueSolutions = new Map<string, bigint[]>();
+
+  // A valid largest-remainder allocation has a cut between every line that
+  // received the extra cent and every line that did not. There are at most
+  // 2n candidate priorities, so sweeping every cut is exhaustive. For a
+  // positive rate, a line with both candidates has its no-bonus candidate
+  // strictly above its bonus candidate; therefore a cut admits at most one
+  // state for that line and no combinatorial enumeration is required.
+  for (let cut = 0; cut <= priorities.length; cut += 1) {
+    const selected: TaxExclusiveCandidate[] = [];
+    let compatible = true;
+    for (const candidates of candidatesByIndex) {
+      const admitted = candidates.filter((candidate) => {
+        const rank = priorityRank.get(candidate)!;
+        return candidate.bonus === 1 ? rank < cut : rank >= cut;
+      });
+      if (admitted.length !== 1) {
+        compatible = false;
+        break;
+      }
+      selected.push(admitted[0]!);
+    }
+    if (!compatible) continue;
+    const netTotal = selected.reduce(
+      (sum, candidate) => sum + candidate.netMagnitude,
+      0n,
+    );
+    if (netTotal !== requiredNet) continue;
+
+    const bonusCandidates = selected
+      .filter((candidate) => candidate.bonus === 1)
+      .sort(priorityCompare);
+    const nonBonusCandidates = selected
+      .filter((candidate) => candidate.bonus === 0)
+      .sort(priorityCompare);
+    if (
+      bonusCandidates.length > 0 &&
+      nonBonusCandidates.length > 0 &&
+      priorityCompare(
+        bonusCandidates.at(-1)!,
+        nonBonusCandidates[0]!,
+      ) >= 0
+    ) {
+      continue;
+    }
+
+    const solution = selected.map((candidate) => candidate.netMagnitude);
+    uniqueSolutions.set(solution.join(','), solution);
+    if (uniqueSolutions.size > 1) return { outcome: 'multiple' };
+  }
+
+  const netMagnitudes = uniqueSolutions.values().next().value;
+  return uniqueSolutions.size === 1 && netMagnitudes
+    ? { outcome: 'unique', netMagnitudes }
+    : { outcome: 'none' };
+}
+
+function reconstructTaxExcludedTransaction(
+  direction: TaxDirection,
+  input: { companyId: string; lines: PurchaseTaxLineInput[] },
+  reference: {
+    companyId: string;
+    codes: QboTaxCodeInfo[];
+    rates: QboTaxRateInfo[];
+  },
+): PurchaseTaxTransactionResult | null {
+  if (
+    input.lines.length === 0 ||
+    input.lines.length > MAX_TAX_EXCLUSIVE_INVERSE_LINES
+  ) {
+    return null;
+  }
+  const validation = calculateTaxTransaction(
+    direction,
+    { ...input, taxCalculation: 'TaxInclusive' },
+    reference,
+  );
+  if (!validation.eligible) return validation;
+
+  const resolved: ResolvedTaxLine[] = [];
+  for (const line of input.lines) {
+    const resolution = resolveTaxLine(
+      line,
+      'TaxExcluded',
+      reference,
+      direction,
+    );
+    if (typeof resolution === 'string') {
+      return { eligible: false, reason: resolution };
+    }
+    if (!resolution.rateQboId || !resolution.rate) return null;
+    resolved.push(resolution);
+  }
+
+  const nonZeroSigns = new Set(
+    input.lines
+      .filter((line) => line.grossCents !== 0)
+      .map((line) => Math.sign(line.grossCents)),
+  );
+  if (nonZeroSigns.size > 1) {
+    return { eligible: false, reason: 'TAX_AMOUNT_SIGN_MISMATCH' };
+  }
+  const sign = nonZeroSigns.values().next().value ?? 1;
+  const targetMagnitudes = input.lines.map(
+    (line) => BigInt(Math.abs(line.grossCents)),
+  );
+  const groups = new Map<
+    string,
+    { indexes: number[]; rate: { numerator: bigint; denominator: bigint } }
+  >();
+  for (const [index, resolution] of resolved.entries()) {
+    const group = groups.get(resolution.rateQboId!);
+    if (group) group.indexes.push(index);
+    else {
+      groups.set(resolution.rateQboId!, {
+        indexes: [index],
+        rate: resolution.rate!,
+      });
+    }
+  }
+
+  const reconstructed = Array<bigint>(input.lines.length).fill(0n);
+  for (const group of groups.values()) {
+    const inverse = inverseGroup(
+      targetMagnitudes,
+      group.indexes,
+      group.rate,
+    );
+    if (inverse.outcome !== 'unique') return null;
+    for (const [solutionIndex, lineIndex] of group.indexes.entries()) {
+      reconstructed[lineIndex] =
+        BigInt(sign) * inverse.netMagnitudes[solutionIndex]!;
+    }
+  }
+
+  let reconstructedCents: number[];
+  try {
+    reconstructedCents = reconstructed.map(toSafeCents);
+  } catch {
+    return null;
+  }
+  const finalCalculation = calculateTaxTransaction(
+    direction,
+    {
+      companyId: input.companyId,
+      taxCalculation: 'TaxExcluded',
+      lines: input.lines.map((line, index) => ({
+        ...line,
+        grossCents: reconstructedCents[index]!,
+      })),
+    },
+    reference,
+  );
+  if (
+    !finalCalculation.eligible ||
+    finalCalculation.lines.some(
+      (line, index) =>
+        line.netCents + line.taxCents !== input.lines[index]!.grossCents,
+    )
+  ) {
+    return null;
+  }
+  return finalCalculation;
+}
+
 /**
  * Authoritative structured purchase-tax calculator.
  *
@@ -276,7 +550,8 @@ function allocateExcludedTax(
  * rounded once. Tax-inclusive net amounts are back-calculated and rounded per
  * line, matching Intuit's documented non-US workflow.
  */
-export function calculatePurchaseTransaction(
+function calculateTaxTransaction(
+  direction: TaxDirection,
   input: { companyId: string; taxCalculation: TaxCalculation; lines: PurchaseTaxLineInput[] },
   reference: { companyId: string; codes: QboTaxCodeInfo[]; rates: QboTaxRateInfo[] },
 ): PurchaseTaxTransactionResult {
@@ -291,7 +566,7 @@ export function calculatePurchaseTransaction(
   if (input.lines.some((line) => !Number.isSafeInteger(line.grossCents))) {
     return { eligible: false, reason: 'TAX_AMOUNT_INVALID' };
   }
-  const referenceFailure = runtimeReferenceFailure(reference);
+  const referenceFailure = runtimeReferenceFailure(reference, direction);
   if (referenceFailure) {
     return { eligible: false, reason: referenceFailure, lineIndex: 0 };
   }
@@ -307,7 +582,7 @@ export function calculatePurchaseTransaction(
 
   const resolved: ResolvedTaxLine[] = [];
   for (const [lineIndex, line] of input.lines.entries()) {
-    const resolution = resolveTaxLine(line, input.taxCalculation, reference);
+    const resolution = resolveTaxLine(line, input.taxCalculation, reference, direction);
     if (typeof resolution === 'string') {
       return { eligible: false, reason: resolution, lineIndex };
     }
@@ -369,6 +644,34 @@ export function calculatePurchaseTransaction(
   result.taxCents = taxCents;
   return result;
 }
+
+export const calculatePurchaseTransaction = (
+  input: { companyId: string; taxCalculation: TaxCalculation; lines: PurchaseTaxLineInput[] },
+  reference: { companyId: string; codes: QboTaxCodeInfo[]; rates: QboTaxRateInfo[] },
+) => calculateTaxTransaction('purchase', input, reference);
+
+export const calculateSalesTransaction = (
+  input: { companyId: string; taxCalculation: TaxCalculation; lines: PurchaseTaxLineInput[] },
+  reference: { companyId: string; codes: QboTaxCodeInfo[]; rates: QboTaxRateInfo[] },
+) => calculateTaxTransaction('sales', input, reference);
+
+export const reconstructPurchaseTaxExcludedTransaction = (
+  input: { companyId: string; lines: PurchaseTaxLineInput[] },
+  reference: {
+    companyId: string;
+    codes: QboTaxCodeInfo[];
+    rates: QboTaxRateInfo[];
+  },
+) => reconstructTaxExcludedTransaction('purchase', input, reference);
+
+export const reconstructSalesTaxExcludedTransaction = (
+  input: { companyId: string; lines: PurchaseTaxLineInput[] },
+  reference: {
+    companyId: string;
+    codes: QboTaxCodeInfo[];
+    rates: QboTaxRateInfo[];
+  },
+) => reconstructTaxExcludedTransaction('sales', input, reference);
 
 export function calculatePurchaseLine(
   input: { grossCents: number; taxCalculation: TaxCalculation; taxCodeQboId: string },
@@ -726,7 +1029,7 @@ export function preparePurchaseRecategorization(args: {
   staged: StagedCategorization;
   before: QboPurchaseSnapshot;
   requestId: string;
-}): QboPreparedWrite {
+}): QboPurchasePreparedWrite {
   requiredIdentity(args.requestId, 'request id');
   if (args.holdingAccountQboIds.length === 0) {
     preparationError('QBO_REFERENCE_MISSING', 'Purchase holding-account references are missing.');
@@ -822,7 +1125,7 @@ export function preparePurchaseRecategorization(args: {
     Line: [...keptRawLines, ...newRawLines],
     GlobalTaxCalculation: args.staged.taxCalculation,
   });
-  const prepared: QboPreparedWrite = {
+  const prepared: QboPurchasePreparedWrite = {
     operation: 'recategorize',
     qboType: 'Purchase',
     qboId: current.qboId,
@@ -879,7 +1182,7 @@ function assertExpectedCurrent(
   return targetIndexes;
 }
 
-function beforeTargetLines(prepared: QboPreparedWrite): QboPurchaseSnapshot['lines'] {
+function beforeTargetLines(prepared: QboPurchasePreparedWrite): QboPurchaseSnapshot['lines'] {
   const remaining = [...prepared.before.lines];
   for (const untouchedHash of prepared.expected.untouchedLineHashes) {
     const index = remaining.findIndex((line) => canonicalSnapshotLine(line) === untouchedHash);
@@ -937,7 +1240,7 @@ export function preparePurchaseRestore(args: {
   current: RawPurchase;
   prepared: QboPreparedWrite;
   requestId: string;
-}): QboPreparedWrite {
+}): QboPurchasePreparedWrite {
   requiredIdentity(args.requestId, 'request id');
   if (args.prepared.operation !== 'recategorize' || args.prepared.qboType !== 'Purchase') {
     preparationError('QBO_PURCHASE_UNSUPPORTED', 'Only a prepared Purchase recategorization can be restored.');
@@ -959,14 +1262,14 @@ export function preparePurchaseRestore(args: {
     Line: restoredLines,
     GlobalTaxCalculation: args.prepared.before.globalTaxCalculation ?? undefined,
   });
-  const prepared: QboPreparedWrite = {
+  const prepared: QboPurchasePreparedWrite = {
     operation: 'restore',
     qboType: 'Purchase',
     qboId: current.qboId,
     requestId: args.requestId,
     requestHash: requestHash(body),
     body,
-    before: normalizedClone(args.prepared.before),
+    before: normalizedClone(current),
     expected: {
       ...expectedBase(
         args.prepared.before,

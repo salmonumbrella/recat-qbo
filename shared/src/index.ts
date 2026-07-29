@@ -37,6 +37,7 @@ export interface TaxCodeDto {
   active: boolean;
   taxable: boolean | null;
   combinedPurchaseRate: number | null;
+  combinedSalesRate: number | null;
 }
 
 export function isUsableTaxCodeDto(code: TaxCodeDto): boolean {
@@ -53,12 +54,29 @@ export function isUsableTaxCodeDto(code: TaxCodeDto): boolean {
   );
 }
 
+export function isUsableSalesTaxCodeDto(code: TaxCodeDto): boolean {
+  return (
+    code.active &&
+    (
+      (code.taxable === true &&
+        code.combinedSalesRate !== null &&
+        Number.isFinite(code.combinedSalesRate) &&
+        code.combinedSalesRate >= 0 &&
+        code.combinedSalesRate <= 999.999999) ||
+      (code.taxable === false && code.combinedSalesRate === null)
+    )
+  );
+}
+
 export interface TaxReadinessDto {
   status: TaxSupportStatus;
   reason: string | null;
   usingSalesTax: boolean | null;
   refreshedAt: string | null;
   taxCodes: TaxCodeDto[];
+  salesStatus: TaxSupportStatus;
+  salesReason: string | null;
+  salesTaxCodes: TaxCodeDto[];
 }
 
 export interface CategorizationProposalLine {

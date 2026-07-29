@@ -1,8 +1,8 @@
-// Read-only purchase-tax reference endpoints. The cached QBO reference remains
+// Read-only tax reference endpoints. The cached QBO reference remains
 // complete internally; HTTP responses deliberately expose only a bounded slice.
 
 import { Router } from 'express';
-import { isUsableTaxCodeDto, type TaxReadinessDto } from '@recat/shared';
+import { isUsableSalesTaxCodeDto, isUsableTaxCodeDto, type TaxReadinessDto } from '@recat/shared';
 import { asyncHandler } from '../lib/http.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
@@ -17,6 +17,7 @@ function boundedReadiness(readiness: TaxReadinessDto): TaxReadinessDto {
   return {
     ...readiness,
     taxCodes: readiness.taxCodes.filter(isUsableTaxCodeDto).slice(0, TAX_CODE_RESPONSE_LIMIT),
+    salesTaxCodes: readiness.salesTaxCodes.filter(isUsableSalesTaxCodeDto).slice(0, TAX_CODE_RESPONSE_LIMIT),
   };
 }
 

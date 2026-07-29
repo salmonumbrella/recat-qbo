@@ -17,13 +17,22 @@ import type { AuditAction, SplitDto, StagedCategorization, TxnStatus } from '@re
 import {
   QboSyncTokenConflict,
   type QboClient,
+  type QboDepositPreparedWrite,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboPurchaseSnapshot,
   type QboTxn,
   type QboWriteResult,
 } from '../lib/qbo/types.js';
-import { calculatePurchaseTransaction } from '../lib/qbo/purchaseTax.js';
-import { verifyPurchaseResult } from './tax/verify.js';
+import {
+  calculatePurchaseTransaction,
+  calculateSalesTransaction,
+  reconstructPurchaseTaxExcludedTransaction,
+  reconstructSalesTaxExcludedTransaction,
+} from '../lib/qbo/purchaseTax.js';
+import { verifyPreparedResult } from './tax/verify.js';
+import { cachedSalesTaxReadiness } from './tax/reference.js';
 import {
   acquireEntityLease,
   withEntityLease,
@@ -235,6 +244,54 @@ async function markSuperseded(
 // postTransaction
 // ---------------------------------------------------------------------------
 
+async function legacyNeedsStaging(
+  db: PrismaClient,
+  txn: {
+    id: string;
+    qboType: string;
+    companyId: string;
+    taxCalculation: string | null;
+    taxCodeQboId: string | null;
+    splitLines: { taxCodeQboId?: string | null }[];
+    company: {
+      taxSupportStatus: string;
+      taxUsingSalesTax: boolean | null;
+      taxSupportReason: string | null;
+    };
+  },
+): Promise<boolean> {
+  if (
+    txn.taxCalculation !== null ||
+    txn.taxCodeQboId !== null ||
+    txn.splitLines.some((line) => line.taxCodeQboId != null)
+  ) {
+    return true;
+  }
+  const durableAttempt = await db.qboMutationAttempt.findFirst({
+    where: { transactionId: txn.id },
+    select: { id: true },
+  });
+  if (durableAttempt) return true;
+  if (txn.qboType === 'Purchase') {
+    return txn.company.taxSupportStatus === 'ready';
+  }
+  if (txn.qboType !== 'Deposit') return false;
+  const cachedCodes = await db.qboTaxCode.findMany({
+    where: { companyId: txn.companyId },
+    select: {
+      active: true,
+      taxable: true,
+      salesTaxRateList: true,
+      combinedSalesRate: true,
+    },
+  });
+  return cachedSalesTaxReadiness(
+    txn.company.taxUsingSalesTax,
+    cachedCodes,
+    txn.company.taxSupportReason,
+  ).status === 'ready';
+}
+
 export async function postTransaction(
   txnId: string,
   actor: Actor,
@@ -253,14 +310,10 @@ export async function postTransaction(
   });
   if (!txn) throw new Error(`Transaction ${txnId} not found`);
   const company = txn.company;
-  if (
-    txn.qboType === 'Purchase' &&
-    company.taxSupportStatus === 'ready' &&
-    company.taxUsingSalesTax === true
-  ) {
+  if (await legacyNeedsStaging(d.db, txn)) {
     throw new WritebackLifecycleError(
       'TAX_AWARE_STAGING_REQUIRED',
-      'Tax-ready Purchases must use staged categorization.',
+      `Tax-ready ${txn.qboType}s must use staged categorization.`,
     );
   }
   if (txn.status !== 'PENDING' && txn.status !== 'ERROR') {
@@ -481,14 +534,10 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
   });
   if (!txn) throw new Error(`Transaction ${txnId} not found`);
   const company = txn.company;
-  if (
-    txn.qboType === 'Purchase' &&
-    company.taxSupportStatus === 'ready' &&
-    company.taxUsingSalesTax === true
-  ) {
+  if (await legacyNeedsStaging(d.db, txn)) {
     throw new WritebackLifecycleError(
       'TAX_AWARE_STAGING_REQUIRED',
-      'Tax-ready Purchases must use staged categorization.',
+      `Tax-ready ${txn.qboType}s must use staged categorization.`,
     );
   }
   if (txn.status !== 'POSTED' && txn.status !== 'DRY_RUN') {
@@ -706,6 +755,7 @@ interface DurableTransaction {
     holdingAccountIds: unknown;
     taxSupportStatus: string;
     taxUsingSalesTax: boolean | null;
+    taxSupportReason: string | null;
   };
   splitLines: {
     idx: number;
@@ -725,13 +775,15 @@ interface DurableTaxCode {
   active: boolean;
   taxable: boolean | null;
   purchaseTaxRateList: unknown;
+  salesTaxRateList: unknown;
+  combinedSalesRate: number | string | { toString(): string } | null;
 }
 
 interface DurableTaxRate {
   qboId: string;
   name: string;
   active: boolean;
-  rateValue: number | string | { toString(): string };
+  rateValue: number | string | { toString(): string } | null;
 }
 
 export interface DurableWritebackDb {
@@ -799,7 +851,7 @@ export interface DurableWritebackDb {
   };
   qboTaxRate: {
     findMany(args: {
-      where: { companyId: string };
+      where: { companyId: string; rateValue?: { not: null } };
     }): Promise<DurableTaxRate[]>;
   };
   $transaction<T>(callback: (tx: DurableWritebackDb) => Promise<T>): Promise<T>;
@@ -955,14 +1007,15 @@ function asPurchaseRates(value: unknown): {
   });
 }
 
-async function loadAuthorizedStage(
+async function loadAuthorizedTransactionState(
   transactionId: string,
   companyId: string,
   expectedRevision: number,
   actorId: string | null,
   d: DurableWritebackDeps,
   allowedStatuses: string[],
-): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
+  allowDisconnected = false,
+): Promise<DurableTransaction> {
   const [txn, authorized] = await Promise.all([
     d.db.transaction.findUnique({
       where: { id: transactionId },
@@ -978,7 +1031,7 @@ async function loadAuthorizedStage(
   if (!txn || txn.companyId !== companyId) {
     lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
   }
-  if (txn.company.disconnectedAt !== null) {
+  if (!allowDisconnected && txn.company.disconnectedAt !== null) {
     lifecycleError('COMPANY_DISCONNECTED', 'This company is disconnected from QuickBooks.');
   }
   if (txn.revision !== expectedRevision) {
@@ -987,11 +1040,33 @@ async function loadAuthorizedStage(
   if (!allowedStatuses.includes(txn.status)) {
     lifecycleError('INVALID_STATUS', `Transaction cannot be written from status ${txn.status}.`);
   }
-  if (txn.qboType !== 'Purchase') {
-    lifecycleError('QBO_PURCHASE_UNSUPPORTED', 'Tax-aware durable writes support Purchase transactions only.');
+  if (txn.qboType !== 'Purchase' && txn.qboType !== 'Deposit') {
+    lifecycleError(
+      'QBO_ENTITY_UNSUPPORTED',
+      'Tax-aware durable writes support Purchase and Deposit transactions only.',
+    );
   }
+  return txn;
+}
+
+async function loadAuthorizedStage(
+  transactionId: string,
+  companyId: string,
+  expectedRevision: number,
+  actorId: string | null,
+  d: DurableWritebackDeps,
+  allowedStatuses: string[],
+): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
+  const txn = await loadAuthorizedTransactionState(
+    transactionId,
+    companyId,
+    expectedRevision,
+    actorId,
+    d,
+    allowedStatuses,
+  );
   if (txn.splitLines.length === 0) {
-    lifecycleError('INVALID_STAGE', 'The staged Purchase has no prepared lines.');
+    lifecycleError('INVALID_STAGE', `The staged ${txn.qboType} has no prepared lines.`);
   }
 
   const accountIds = uniqueStrings(txn.splitLines.map((line) => line.categoryQboId));
@@ -1011,7 +1086,7 @@ async function loadAuthorizedStage(
     taxCalculation !== 'TaxExcluded' &&
     taxCalculation !== 'NotApplicable'
   ) {
-    lifecycleError('INVALID_STAGE', 'The staged Purchase tax calculation is invalid.');
+    lifecycleError('INVALID_STAGE', `The staged ${txn.qboType} tax calculation is invalid.`);
   }
 
   const grossCents = txn.splitLines.map((line) => exactMoneyCents(line.amount));
@@ -1030,12 +1105,6 @@ async function loadAuthorizedStage(
       totalCents,
     }));
   } else {
-    if (
-      txn.company.taxSupportStatus !== 'ready' ||
-      txn.company.taxUsingSalesTax !== true
-    ) {
-      lifecycleError('TAX_NOT_READY', 'Purchase tax references are not ready.');
-    }
     const taxCodeIds = uniqueStrings(txn.splitLines.map((line) => line.taxCodeQboId));
     if (taxCodeIds.length !== txn.splitLines.length) {
       lifecycleError('TAX_CODE_UNAVAILABLE', 'Every taxed line requires an available tax code.');
@@ -1044,7 +1113,9 @@ async function loadAuthorizedStage(
       d.db.qboTaxCode.findMany({
         where: { companyId, qboId: { in: taxCodeIds } },
       }),
-      d.db.qboTaxRate.findMany({ where: { companyId } }),
+      d.db.qboTaxRate.findMany({
+        where: { companyId, rateValue: { not: null } },
+      }),
     ]);
     if (
       taxCodes.length !== taxCodeIds.length ||
@@ -1052,43 +1123,100 @@ async function loadAuthorizedStage(
     ) {
       lifecycleError('TAX_CODE_UNAVAILABLE', 'A prepared tax code is no longer available.');
     }
-    const calculation = calculatePurchaseTransaction(
+    const taxReady =
+      txn.qboType === 'Deposit'
+        ? cachedSalesTaxReadiness(
+            txn.company.taxUsingSalesTax,
+            taxCodes,
+            txn.company.taxSupportReason,
+          ).status === 'ready'
+        : txn.company.taxSupportStatus === 'ready' &&
+          txn.company.taxUsingSalesTax === true;
+    if (!taxReady) {
+      lifecycleError('TAX_NOT_READY', `${txn.qboType} tax references are not ready.`);
+    }
+    const calculateTransaction =
+      txn.qboType === 'Deposit'
+        ? calculateSalesTransaction
+        : calculatePurchaseTransaction;
+    const taxReference = {
+      companyId,
+      codes: taxCodes.map((code) => ({
+        qboId: code.qboId,
+        name: code.name,
+        description: null,
+        active: code.active,
+        taxable: code.taxable,
+        purchaseRates: asPurchaseRates(code.purchaseTaxRateList),
+        salesRates: asPurchaseRates(code.salesTaxRateList),
+        sourceUpdatedAt: null,
+      })),
+      rates: taxRates.filter((rate) => rate.rateValue !== null).map((rate) => ({
+        qboId: rate.qboId,
+        name: rate.name,
+        description: null,
+        active: rate.active,
+        rateValue: Number(rate.rateValue),
+        sourceUpdatedAt: null,
+      })),
+    };
+    const calculate = (
+      mode: 'TaxInclusive' | 'TaxExcluded',
+      lineCents: readonly number[],
+    ) => calculateTransaction(
       {
         companyId,
-        taxCalculation,
+        taxCalculation: mode,
         lines: txn.splitLines.map((line, index) => ({
-          grossCents: grossCents[index]!,
+          grossCents: lineCents[index]!,
           taxCodeQboId: line.taxCodeQboId!,
         })),
       },
-      {
-        companyId,
-        codes: taxCodes.map((code) => ({
-          qboId: code.qboId,
-          name: code.name,
-          description: null,
-          active: code.active,
-          taxable: code.taxable,
-          purchaseRates: asPurchaseRates(code.purchaseTaxRateList),
-          sourceUpdatedAt: null,
-        })),
-        rates: taxRates.map((rate) => ({
-          qboId: rate.qboId,
-          name: rate.name,
-          description: null,
-          active: rate.active,
-          rateValue: Number(rate.rateValue),
-          sourceUpdatedAt: null,
-        })),
-      },
+      taxReference,
     );
+    const initialCalculation = calculate(
+      taxCalculation === 'TaxExcluded' ? 'TaxInclusive' : taxCalculation,
+      grossCents,
+    );
+    if (!initialCalculation.eligible) {
+      lifecycleError(
+        initialCalculation.reason,
+        `Prepared ${txn.qboType} tax references no longer calculate exactly.`,
+      );
+    }
+    const reconstructTaxExcluded =
+      txn.qboType === 'Deposit'
+        ? reconstructSalesTaxExcludedTransaction
+        : reconstructPurchaseTaxExcludedTransaction;
+    const calculation =
+      taxCalculation === 'TaxExcluded'
+        ? reconstructTaxExcluded(
+            {
+              companyId,
+              lines: txn.splitLines.map((line, index) => ({
+                grossCents: grossCents[index]!,
+                taxCodeQboId: line.taxCodeQboId!,
+              })),
+            },
+            taxReference,
+          )
+        : initialCalculation;
+    if (calculation === null) {
+      lifecycleError(
+        'TAX_AMOUNT_INVALID',
+        `Prepared ${txn.qboType} tax-exclusive totals cannot be reconstructed uniquely.`,
+      );
+    }
     if (!calculation.eligible) {
-      lifecycleError(calculation.reason, 'Prepared Purchase tax references no longer calculate exactly.');
+      lifecycleError(
+        calculation.reason,
+        `Prepared ${txn.qboType} tax references no longer calculate exactly.`,
+      );
     }
     calculatedLines = calculation.lines.map((line) => ({
       subtotalCents: line.netCents,
       taxCents: line.taxCents,
-      totalCents: line.grossCents,
+      totalCents: line.netCents + line.taxCents,
     }));
   }
 
@@ -1101,7 +1229,10 @@ async function loadAuthorizedStage(
     { subtotalCents: 0, taxCents: 0, totalCents: 0 },
   );
   if (totals.totalCents !== exactMoneyCents(txn.amount)) {
-    lifecycleError('STALE_REVISION', 'The staged Purchase total no longer matches the transaction.');
+    lifecycleError(
+      'STALE_REVISION',
+      `The staged ${txn.qboType} total no longer matches the transaction.`,
+    );
   }
   return {
     txn,
@@ -1134,7 +1265,7 @@ function isNullableSafeInteger(value: unknown): value is number | null {
   return value === null || (typeof value === 'number' && Number.isSafeInteger(value));
 }
 
-function isSnapshotLine(value: unknown): boolean {
+function isPurchaseSnapshotLine(value: unknown): boolean {
   if (!isRuntimeRecord(value)) return false;
   return (
     isNullableString(value.id) &&
@@ -1166,11 +1297,11 @@ function isPurchaseSnapshot(value: unknown): value is QboPurchaseSnapshot {
     isNullableString(value.globalTaxCalculation) &&
     isNullableSafeInteger(value.totalTaxCents) &&
     Array.isArray(value.lines) &&
-    value.lines.every(isSnapshotLine)
+    value.lines.every(isPurchaseSnapshotLine)
   );
 }
 
-function isExpectedPurchase(value: unknown): value is QboPreparedWrite['expected'] {
+function isExpectedPurchase(value: unknown): value is QboPurchasePreparedWrite['expected'] {
   if (!isRuntimeRecord(value)) return false;
   return (
     typeof value.qboId === 'string' &&
@@ -1184,7 +1315,7 @@ function isExpectedPurchase(value: unknown): value is QboPreparedWrite['expected
     isNullableString(value.globalTaxCalculation) &&
     isNullableSafeInteger(value.totalTaxCents) &&
     Array.isArray(value.targetLines) &&
-    value.targetLines.every(isSnapshotLine) &&
+    value.targetLines.every(isPurchaseSnapshotLine) &&
     Array.isArray(value.untouchedLineHashes) &&
     value.untouchedLineHashes.every((hash) => typeof hash === 'string')
   );
@@ -1207,7 +1338,7 @@ function isOptionalFiniteNumber(value: unknown): boolean {
   return value === undefined || (typeof value === 'number' && Number.isFinite(value));
 }
 
-function isPreparedBody(value: unknown): value is QboPreparedWrite['body'] {
+function isPreparedPurchaseBody(value: unknown): value is QboPurchasePreparedWrite['body'] {
   if (!isRuntimeRecord(value)) return false;
   if (
     typeof value.Id !== 'string' ||
@@ -1253,38 +1384,185 @@ function isPreparedBody(value: unknown): value is QboPreparedWrite['body'] {
   });
 }
 
+function isDepositSnapshotLine(value: unknown): boolean {
+  if (!isRuntimeRecord(value)) return false;
+  return (
+    isNullableString(value.id) &&
+    typeof value.amountCents === 'number' &&
+    Number.isSafeInteger(value.amountCents) &&
+    isNullableString(value.description) &&
+    isNullableString(value.accountQboId) &&
+    isNullableString(value.entityQboId) &&
+    isNullableString(value.paymentMethodQboId) &&
+    isNullableString(value.classQboId) &&
+    isNullableString(value.taxCodeQboId) &&
+    isNullableString(value.taxApplicableOn) &&
+    typeof value.rawHash === 'string' &&
+    value.rawHash.trim() !== '' &&
+    typeof value.targetHash === 'string' &&
+    value.targetHash.trim() !== ''
+  );
+}
+
+function isDepositSnapshot(value: unknown): value is QboDepositSnapshot {
+  if (!isRuntimeRecord(value)) return false;
+  return (
+    typeof value.qboId === 'string' &&
+    value.qboId.trim() !== '' &&
+    typeof value.syncToken === 'string' &&
+    value.syncToken.trim() !== '' &&
+    typeof value.totalCents === 'number' &&
+    Number.isSafeInteger(value.totalCents) &&
+    isNullableString(value.depositToAccountQboId) &&
+    typeof value.date === 'string' &&
+    value.date.trim() !== '' &&
+    isNullableString(value.globalTaxCalculation) &&
+    isNullableSafeInteger(value.totalTaxCents) &&
+    typeof value.preservedHash === 'string' &&
+    value.preservedHash.trim() !== '' &&
+    Array.isArray(value.lines) &&
+    value.lines.every(isDepositSnapshotLine)
+  );
+}
+
+function isExpectedDeposit(
+  value: unknown,
+): value is QboDepositPreparedWrite['expected'] {
+  if (!isRuntimeRecord(value)) return false;
+  return (
+    typeof value.qboId === 'string' &&
+    value.qboId.trim() !== '' &&
+    typeof value.totalCents === 'number' &&
+    Number.isSafeInteger(value.totalCents) &&
+    isNullableString(value.depositToAccountQboId) &&
+    typeof value.date === 'string' &&
+    value.date.trim() !== '' &&
+    isNullableString(value.globalTaxCalculation) &&
+    isNullableSafeInteger(value.totalTaxCents) &&
+    typeof value.preservedHash === 'string' &&
+    value.preservedHash.trim() !== '' &&
+    Array.isArray(value.targetLines) &&
+    value.targetLines.every(isDepositSnapshotLine) &&
+    Array.isArray(value.untouchedLineHashes) &&
+    value.untouchedLineHashes.every(
+      (hash) => typeof hash === 'string' && hash.trim() !== '',
+    )
+  );
+}
+
+function isPreparedDepositBody(
+  value: unknown,
+): value is QboDepositPreparedWrite['body'] {
+  if (!isRuntimeRecord(value)) return false;
+  if (
+    typeof value.Id !== 'string' ||
+    value.Id.trim() === '' ||
+    typeof value.SyncToken !== 'string' ||
+    value.SyncToken.trim() === '' ||
+    typeof value.TxnDate !== 'string' ||
+    value.TxnDate.trim() === '' ||
+    typeof value.TotalAmt !== 'number' ||
+    !Number.isFinite(value.TotalAmt) ||
+    !isQboReference(value.DepositToAccountRef) ||
+    !isOptionalQboReference(value.CurrencyRef) ||
+    !isOptionalFiniteNumber(value.ExchangeRate) ||
+    (value.GlobalTaxCalculation !== undefined &&
+      (typeof value.GlobalTaxCalculation !== 'string' ||
+        value.GlobalTaxCalculation.trim() === '')) ||
+    !Array.isArray(value.Line) ||
+    value.Line.length === 0
+  ) {
+    return false;
+  }
+  return value.Line.every((line) => {
+    if (!isRuntimeRecord(line)) return false;
+    if (line.Id !== undefined && (typeof line.Id !== 'string' || line.Id.trim() === '')) {
+      return false;
+    }
+    if (typeof line.Amount !== 'number' || !Number.isFinite(line.Amount)) {
+      return false;
+    }
+    if (line.Description !== undefined && typeof line.Description !== 'string') {
+      return false;
+    }
+    if (line.DetailType !== 'DepositLineDetail') return false;
+    const detail = line.DepositLineDetail;
+    if (!isRuntimeRecord(detail)) return false;
+    return (
+      isQboReference(detail.AccountRef) &&
+      isOptionalQboReference(detail.Entity) &&
+      isOptionalQboReference(detail.PaymentMethodRef) &&
+      isOptionalQboReference(detail.ClassRef) &&
+      isOptionalQboReference(detail.TaxCodeRef) &&
+      (detail.TaxApplicableOn === undefined ||
+        (typeof detail.TaxApplicableOn === 'string' &&
+          detail.TaxApplicableOn.trim() !== ''))
+    );
+  });
+}
+
 function persistedPrepared(value: unknown): QboPreparedWrite {
   if (
     !isRuntimeRecord(value) ||
     (value.operation !== 'recategorize' && value.operation !== 'restore') ||
-    value.qboType !== 'Purchase' ||
+    (value.qboType !== 'Purchase' && value.qboType !== 'Deposit') ||
     typeof value.qboId !== 'string' ||
     typeof value.requestId !== 'string' ||
     value.requestId.trim() === '' ||
     typeof value.requestHash !== 'string' ||
     value.requestHash.trim() === '' ||
-    !isPreparedBody(value.body) ||
-    !isPurchaseSnapshot(value.before) ||
-    !isExpectedPurchase(value.expected) ||
-    value.body.Id !== value.qboId ||
-    value.before.qboId !== value.qboId ||
-    value.expected.qboId !== value.qboId ||
-    (value.operation === 'recategorize' &&
-      (typeof value.body.GlobalTaxCalculation !== 'string' ||
-        value.body.GlobalTaxCalculation.trim() === '')) ||
-    (value.expected.globalTaxCalculation !== null &&
-      value.body.GlobalTaxCalculation !== value.expected.globalTaxCalculation)
+    !isRuntimeRecord(value.body) ||
+    !isRuntimeRecord(value.before) ||
+    !isRuntimeRecord(value.expected)
+  ) {
+    return lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation attempt is incomplete.');
+  }
+  const commonIdentity =
+    value.body.Id === value.qboId &&
+    value.before.qboId === value.qboId &&
+    value.expected.qboId === value.qboId;
+  const taxModeMatches =
+    value.expected.globalTaxCalculation === null ||
+    value.body.GlobalTaxCalculation === value.expected.globalTaxCalculation;
+  const recategorizationHasTaxMode =
+    value.operation !== 'recategorize' ||
+    (typeof value.body.GlobalTaxCalculation === 'string' &&
+      value.body.GlobalTaxCalculation.trim() !== '');
+  const entityPayloadValid =
+    value.qboType === 'Purchase'
+      ? isPreparedPurchaseBody(value.body) &&
+        isPurchaseSnapshot(value.before) &&
+        isExpectedPurchase(value.expected)
+      : isPreparedDepositBody(value.body) &&
+        isDepositSnapshot(value.before) &&
+        isExpectedDeposit(value.expected);
+  if (
+    !commonIdentity ||
+    !taxModeMatches ||
+    !recategorizationHasTaxMode ||
+    !entityPayloadValid
   ) {
     return lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation attempt is incomplete.');
   }
   return value as unknown as QboPreparedWrite;
 }
 
-function persistedSnapshot(value: unknown): QboPurchaseSnapshot {
-  if (!isPurchaseSnapshot(value)) {
-    return lifecycleError('ATTEMPT_CORRUPT', 'Stored Purchase snapshot is incomplete.');
+type QboPreparedSnapshot = QboPurchaseSnapshot | QboDepositSnapshot;
+
+function persistedSnapshot(
+  value: unknown,
+  qboType: QboPreparedWrite['qboType'],
+): QboPreparedSnapshot {
+  if (
+    (qboType === 'Purchase' && !isPurchaseSnapshot(value)) ||
+    (qboType === 'Deposit' && !isDepositSnapshot(value))
+  ) {
+    return lifecycleError(
+      'ATTEMPT_CORRUPT',
+      `Stored ${qboType} snapshot is incomplete.`,
+    );
   }
-  return value;
+  return value as QboPreparedSnapshot;
 }
 
 function preparedForAttempt(attempt: DurableAttempt): QboPreparedWrite {
@@ -1302,9 +1580,121 @@ function preparedForAttempt(attempt: DurableAttempt): QboPreparedWrite {
 
 function validateAttemptPersistence(attempt: DurableAttempt): QboPreparedWrite {
   const prepared = preparedForAttempt(attempt);
-  persistedSnapshot(attempt.beforeSnapshot);
-  if (attempt.responseSnapshot !== null) persistedSnapshot(attempt.responseSnapshot);
+  persistedSnapshot(attempt.beforeSnapshot, prepared.qboType);
+  if (attempt.responseSnapshot !== null) {
+    persistedSnapshot(attempt.responseSnapshot, prepared.qboType);
+  }
   return prepared;
+}
+
+function validatePreparedBinding(
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+): QboPreparedWrite {
+  const prepared = validateAttemptPersistence(attempt);
+  const before = persistedSnapshot(attempt.beforeSnapshot, prepared.qboType);
+  const response = attempt.responseSnapshot === null
+    ? null
+    : persistedSnapshot(attempt.responseSnapshot, prepared.qboType);
+  if (
+    attempt.transactionId !== txn.id ||
+    prepared.qboType !== txn.qboType ||
+    prepared.qboId !== txn.qboId ||
+    prepared.body.SyncToken !== before.syncToken ||
+    !snapshotEquals(prepared.before, before) ||
+    (response !== null && response.qboId !== txn.qboId)
+  ) {
+    lifecycleError(
+      'ATTEMPT_CORRUPT',
+      'Stored mutation attempt is not bound to its transaction and before snapshot.',
+    );
+  }
+  return prepared;
+}
+
+function validateFreshPrepared(
+  value: QboPreparedWrite,
+  expected: {
+    operation: 'recategorize' | 'restore';
+    requestId: string;
+    txn: DurableTransaction;
+    before: QboPreparedSnapshot;
+  },
+): QboPreparedWrite {
+  let prepared: QboPreparedWrite;
+  try {
+    prepared = persistedPrepared(value);
+  } catch {
+    lifecycleError('QBO_STATE_DRIFT', 'QuickBooks returned an invalid prepared write.');
+  }
+  if (
+    prepared.operation !== expected.operation ||
+    prepared.requestId !== expected.requestId ||
+    prepared.qboType !== expected.txn.qboType ||
+    prepared.qboId !== expected.txn.qboId ||
+    prepared.body.SyncToken !== expected.before.syncToken ||
+    !snapshotEquals(prepared.before, expected.before)
+  ) {
+    lifecycleError(
+      'QBO_STATE_DRIFT',
+      'QuickBooks prepared a write for a different request, entity, or before snapshot.',
+    );
+  }
+  return prepared;
+}
+
+function validateDryRunBinding(
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+): void {
+  const expectedPayload = {
+    operation: 'recategorize',
+    qboType: txn.qboType,
+    qboId: txn.qboId,
+    requestId: attempt.requestId,
+    references: {
+      accountQboIds: uniqueStrings(
+        txn.splitLines.map((line) => line.categoryQboId),
+      ),
+      taxCodeQboIds: uniqueStrings(
+        txn.splitLines.map((line) => line.taxCodeQboId),
+      ),
+    },
+    outcome: 'DRY_RUN',
+  };
+  if (
+    attempt.status !== 'DRY_RUN' ||
+    attempt.transactionId !== txn.id ||
+    attempt.operation !== 'recategorize' ||
+    attempt.expectedRevision !== txn.revision ||
+    attempt.expectedSyncToken !== txn.qboSyncToken ||
+    attempt.requestHash !== `dry-run:${attempt.requestId}` ||
+    txn.status !== 'DRY_RUN' ||
+    canonicalJson(attempt.requestPayload) !== canonicalJson(expectedPayload) ||
+    canonicalJson(attempt.beforeSnapshot) !==
+      canonicalJson({ outcome: 'DRY_RUN' }) ||
+    attempt.responseSnapshot !== null ||
+    canonicalJson(attempt.verification) !==
+      canonicalJson({ outcome: 'DRY_RUN', status: 'DRY_RUN' }) ||
+    attempt.errorCode !== null ||
+    attempt.errorMessage !== null
+  ) {
+    lifecycleError(
+      'ATTEMPT_CORRUPT',
+      'Stored dry-run attempt is not bound to its transaction and summary.',
+    );
+  }
+}
+
+function validateRecordedAttemptBinding(
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+): void {
+  if (attempt.status === 'DRY_RUN') {
+    validateDryRunBinding(attempt, txn);
+    return;
+  }
+  validatePreparedBinding(attempt, txn);
 }
 
 function mutationMetadata(
@@ -1333,7 +1723,7 @@ function auditLabels(txn: DurableTransaction): {
   after: string;
 } {
   return {
-    before: 'QuickBooks Purchase',
+    before: `QuickBooks ${txn.qboType}`,
     after: txn.splitLines.map((line) => line.category).join(' / '),
   };
 }
@@ -1601,6 +1991,7 @@ async function markUncertain(
       expectedRevision: attempt.expectedRevision,
       requestHash: attempt.requestHash,
     });
+    validatePreparedBinding(latest, txn);
     return recordedAttemptResult(latest, txn.status);
   } catch {
     return safeUncertainResult();
@@ -1613,7 +2004,7 @@ async function finalizeVerified(
   txn: DurableTransaction,
   actor: Actor,
   prepared: QboPreparedWrite,
-  response: QboPurchaseSnapshot,
+  response: QboPreparedSnapshot,
   newSyncToken: string,
   status: 'POSTED' | 'REVERTED',
 ): Promise<DurableMutationResult> {
@@ -1660,6 +2051,7 @@ async function finalizeVerified(
       where: { requestId: attempt.requestId },
     });
     if (!latest) lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared during finalization.');
+    validatePreparedBinding(latest, txn);
     return recordedAttemptResult(latest, txn.status);
   }
   return {
@@ -1676,7 +2068,7 @@ async function persistPrepared(
   transactionId: string,
   expectedRevision: number,
   prepared: QboPreparedWrite,
-  beforeSnapshot: QboPurchaseSnapshot,
+  beforeSnapshot: QboPreparedSnapshot,
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
     const attempt = await d.db.qboMutationAttempt.create({
@@ -1765,14 +2157,35 @@ async function loadAuthorizedAttempt(
   attempt: DurableAttempt,
   companyId: string,
   actorId: string | null,
-): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
-  return loadAuthorizedStage(
+): Promise<{ txn: DurableTransaction }> {
+  return {
+    txn: await loadAuthorizedAttemptState(
+      d,
+      attempt,
+      companyId,
+      actorId,
+      allowedStatusesForAttempt(attempt),
+      false,
+    ),
+  };
+}
+
+async function loadAuthorizedAttemptState(
+  d: DurableWritebackDeps,
+  attempt: DurableAttempt,
+  companyId: string,
+  actorId: string | null,
+  allowedStatuses: string[],
+  allowDisconnected: boolean,
+): Promise<DurableTransaction> {
+  return loadAuthorizedTransactionState(
     attempt.transactionId,
     companyId,
     attempt.expectedRevision,
     actorId,
     d,
-    allowedStatusesForAttempt(attempt),
+    allowedStatuses,
+    allowDisconnected,
   );
 }
 
@@ -1782,17 +2195,14 @@ async function loadAuthorizedRecordedAttempt(
   companyId: string,
   actorId: string | null,
 ): Promise<DurableTransaction> {
-  const [txn, authorized] = await Promise.all([
-    preliminaryTransaction(d, attempt.transactionId),
-    d.authorize(actorId, companyId),
-  ]);
-  if (!authorized) {
-    lifecycleError('FORBIDDEN', 'You do not have permission to write this transaction.');
-  }
-  if (txn.companyId !== companyId) {
-    lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
-  }
-  return txn;
+  return loadAuthorizedAttemptState(
+    d,
+    attempt,
+    companyId,
+    actorId,
+    allowedStatusesForAttempt(attempt),
+    true,
+  );
 }
 
 async function enterCommitting(
@@ -1802,7 +2212,7 @@ async function enterCommitting(
   actor: Actor,
   owner: string,
   allowedStatuses: string[],
-  finalQboProof?: () => Promise<void>,
+  finalQboProof?: (currentTxn: DurableTransaction) => Promise<void>,
 ): Promise<
   | { won: true; attempt: DurableAttempt }
   | { won: false; attempt: DurableAttempt }
@@ -1812,15 +2222,16 @@ async function enterCommitting(
     // every mutable authorization fact only after it returns so a stage that
     // committed while we waited cannot authorize this prepared revision.
     await d.renewLease(leaseKey(txn), owner);
-    await loadAuthorizedStage(
-      txn.id,
-      txn.companyId,
-      attempt.expectedRevision,
-      actor.id,
+    const currentTxn = await loadAuthorizedAttemptState(
       d,
+      attempt,
+      txn.companyId,
+      actor.id,
       allowedStatuses,
+      false,
     );
-    if (finalQboProof) await finalQboProof();
+    validatePreparedBinding(attempt, currentTxn);
+    if (finalQboProof) await finalQboProof(currentTxn);
   } catch (error) {
     const retryable = await markRetryable(d, attempt, error);
     if (!retryable.won && retryable.attempt.status !== 'PREPARED') {
@@ -1870,9 +2281,14 @@ async function sendAndVerifyPrepared(
   // Possible-write boundary: COMMITTING is durable before this function runs.
   try {
     await client.sendPreparedWrite(prepared);
-    const response = await client.fetchPurchaseSnapshot(txn.qboId);
-    if (!response) throw new Error('Prepared Purchase readback was missing.');
-    const verification = verifyPurchaseResult(prepared.expected, response);
+    const response = await client.fetchPreparedSnapshot(
+      prepared.qboType,
+      txn.qboId,
+    );
+    if (!response) {
+      throw new Error(`Prepared ${prepared.qboType} readback was missing.`);
+    }
+    const verification = verifyPreparedResult(prepared, response);
     if (!verification.ok) throw new Error(verification.message);
     return await finalizeVerified(
       d,
@@ -1899,7 +2315,7 @@ async function recordDryRun(
   const taxCodeQboIds = uniqueStrings(staged.lines.map((line) => line.taxCodeQboId));
   const requestPayload = {
     operation: 'recategorize',
-    qboType: 'Purchase',
+    qboType: txn.qboType,
     qboId: txn.qboId,
     requestId: input.requestId,
     references: { accountQboIds, taxCodeQboIds },
@@ -1910,7 +2326,7 @@ async function recordDryRun(
     outcome: 'DRY_RUN',
     references: {
       operation: 'recategorize',
-      qboType: 'Purchase',
+      qboType: txn.qboType,
       qboId: txn.qboId,
       accountQboIds,
       taxCodeQboIds,
@@ -1980,6 +2396,7 @@ export async function commitStagedCategorization(
           input.companyId,
           input.actor.id,
         );
+        validateRecordedAttemptBinding(existing, txn);
         return recordedAttemptResult(existing, txn.status);
       }
       const { txn } = await loadAuthorizedAttempt(
@@ -1989,8 +2406,8 @@ export async function commitStagedCategorization(
         input.actor.id,
       );
 
-      const prepared = preparedForAttempt(existing);
-      const before = persistedSnapshot(existing.beforeSnapshot);
+      const prepared = validatePreparedBinding(existing, txn);
+      const before = persistedSnapshot(existing.beforeSnapshot, prepared.qboType);
       const client = await d.getClient(input.companyId);
       const entered = await enterCommitting(
         d,
@@ -1999,20 +2416,23 @@ export async function commitStagedCategorization(
         input.actor,
         invocationOwner,
         ['PENDING'],
-        async () => {
+        async (currentTxn) => {
           const [freshTxn, current] = await Promise.all([
-            client.fetchTxn('Purchase', txn.qboId),
-            client.fetchPurchaseSnapshot(txn.qboId),
+            client.fetchTxn(prepared.qboType, currentTxn.qboId),
+            client.fetchPreparedSnapshot(prepared.qboType, currentTxn.qboId),
           ]);
           if (
             !freshTxn ||
             !current ||
             freshTxn.syncToken !== existing.expectedSyncToken ||
             current.syncToken !== existing.expectedSyncToken ||
-            txn.qboSyncToken !== existing.expectedSyncToken ||
+            currentTxn.qboSyncToken !== existing.expectedSyncToken ||
             !snapshotEquals(current, before)
           ) {
-            lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared write could resume.');
+            lifecycleError(
+              'QBO_STATE_DRIFT',
+              `${prepared.qboType} changed before the prepared write could resume.`,
+            );
           }
         },
       );
@@ -2023,6 +2443,7 @@ export async function commitStagedCategorization(
           input.companyId,
           input.actor.id,
         );
+        validatePreparedBinding(entered.attempt, latestTxn);
         return recordedAttemptResult(entered.attempt, latestTxn.status);
       }
       return sendAndVerifyPrepared(
@@ -2050,25 +2471,37 @@ export async function commitStagedCategorization(
 
     await d.renewLease(leaseKey(txn), invocationOwner);
     const client = await d.getClient(input.companyId);
+    const qboType = txn.qboType as 'Purchase' | 'Deposit';
     const [freshTxn, before] = await Promise.all([
-      client.fetchTxn('Purchase', txn.qboId),
-      client.fetchPurchaseSnapshot(txn.qboId),
+      client.fetchTxn(qboType, txn.qboId),
+      client.fetchPreparedSnapshot(qboType, txn.qboId),
     ]);
     if (!freshTxn || !before) {
-      lifecycleError('QBO_STATE_DRIFT', 'Purchase no longer exists in QuickBooks.');
+      lifecycleError('QBO_STATE_DRIFT', `${qboType} no longer exists in QuickBooks.`);
     }
     if (
       freshTxn.syncToken !== before.syncToken ||
       freshTxn.syncToken !== txn.qboSyncToken
     ) {
-      lifecycleError('QBO_STATE_DRIFT', 'Purchase SyncToken changed before preparation.');
+      lifecycleError(
+        'QBO_STATE_DRIFT',
+        `${qboType} SyncToken changed before preparation.`,
+      );
     }
 
-    const prepared = await client.preparePurchaseRecategorization(
-      freshTxn,
-      staged,
-      before,
-      input.requestId,
+    const prepared = validateFreshPrepared(
+      await client.prepareRecategorization(
+        freshTxn,
+        staged,
+        before,
+        input.requestId,
+      ),
+      {
+        operation: 'recategorize',
+        requestId: input.requestId,
+        txn,
+        before,
+      },
     );
     const persisted = await persistPrepared(
       d,
@@ -2084,6 +2517,7 @@ export async function commitStagedCategorization(
         input.companyId,
         input.actor.id,
       );
+      validatePreparedBinding(persisted.attempt, racedTxn);
       return recordedAttemptResult(persisted.attempt, racedTxn.status);
     }
     const entered = await enterCommitting(
@@ -2101,6 +2535,7 @@ export async function commitStagedCategorization(
         input.companyId,
         input.actor.id,
       );
+      validatePreparedBinding(entered.attempt, latestTxn);
       return recordedAttemptResult(entered.attempt, latestTxn.status);
     }
     return sendAndVerifyPrepared(
@@ -2125,7 +2560,10 @@ function canonicalJson(value: unknown): string {
     .join(',')}}`;
 }
 
-function snapshotEquals(left: QboPurchaseSnapshot, right: QboPurchaseSnapshot): boolean {
+function snapshotEquals(
+  left: QboPreparedSnapshot,
+  right: QboPreparedSnapshot,
+): boolean {
   return canonicalJson(left) === canonicalJson(right);
 }
 
@@ -2135,7 +2573,7 @@ async function finalizeUnchanged(
   txn: DurableTransaction,
   actor: Actor,
   prepared: QboPreparedWrite,
-  actual: QboPurchaseSnapshot,
+  actual: QboPreparedSnapshot,
 ): Promise<DurableMutationResult> {
   const unchangedStatus = prepared.operation === 'restore' ? 'POSTED' : 'PENDING';
   let transitioned = false;
@@ -2174,6 +2612,7 @@ async function finalizeUnchanged(
       where: { requestId: attempt.requestId },
     });
     if (!latest) lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared during reconciliation.');
+    validatePreparedBinding(latest, txn);
     return recordedAttemptResult(latest, txn.status);
   }
   return {
@@ -2210,6 +2649,7 @@ export async function reconcileMutationAttempt(
         preliminary.companyId,
         input.actor.id,
       );
+      validateDryRunBinding(attempt, txn);
       return recordedAttemptResult(attempt, txn.status);
     }
     if (
@@ -2221,25 +2661,37 @@ export async function reconcileMutationAttempt(
       await loadAuthorizedAttempt(d, attempt, preliminary.companyId, input.actor.id);
       lifecycleError('RECONCILE_NOT_ALLOWED', 'Only uncertain writes can be reconciled.');
     }
-    const prepared = validateAttemptPersistence(attempt);
-    const { txn } = await loadAuthorizedAttempt(
+    let { txn } = await loadAuthorizedAttempt(
       d,
       attempt,
       preliminary.companyId,
       input.actor.id,
     );
+    const prepared = validatePreparedBinding(attempt, txn);
     if (attempt.status === 'VERIFIED' || attempt.status === 'UNCHANGED') {
       return recordedAttemptResult(attempt, txn.status);
     }
-    const before = persistedSnapshot(attempt.beforeSnapshot);
+    const before = persistedSnapshot(attempt.beforeSnapshot, prepared.qboType);
     await d.renewLease(leaseKey(txn), invocationOwner);
+    txn = await loadAuthorizedAttemptState(
+      d,
+      attempt,
+      preliminary.companyId,
+      input.actor.id,
+      allowedStatusesForAttempt(attempt),
+      false,
+    );
+    validatePreparedBinding(attempt, txn);
     const client = await d.getClient(txn.companyId);
-    const actual = await client.fetchPurchaseSnapshot(txn.qboId);
+    const actual = await client.fetchPreparedSnapshot(
+      prepared.qboType,
+      txn.qboId,
+    );
     if (!actual) {
       return markUncertain(d, attempt, txn, input.actor, prepared);
     }
 
-    const expectedVerification = verifyPurchaseResult(prepared.expected, actual);
+    const expectedVerification = verifyPreparedResult(prepared, actual);
     if (expectedVerification.ok) {
       return finalizeVerified(
         d,
@@ -2296,6 +2748,8 @@ export async function undoCategorization(
           input.companyId,
           input.actor.id,
         );
+        validatePreparedBinding(original, txn);
+        validatePreparedBinding(sameRequest, txn);
         return recordedAttemptResult(sameRequest, txn.status);
       }
       const { txn } = await loadAuthorizedAttempt(
@@ -2304,7 +2758,8 @@ export async function undoCategorization(
         input.companyId,
         input.actor.id,
       );
-      const restore = preparedForAttempt(sameRequest);
+      validatePreparedBinding(original, txn);
+      const restore = validatePreparedBinding(sameRequest, txn);
       const client = await d.getClient(input.companyId);
       const entered = await enterCommitting(
         d,
@@ -2313,23 +2768,26 @@ export async function undoCategorization(
         input.actor,
         invocationOwner,
         ['POSTED'],
-        async () => {
+        async (currentTxn) => {
           const [freshTxn, current] = await Promise.all([
-            client.fetchTxn('Purchase', txn.qboId),
-            client.fetchPurchaseSnapshot(txn.qboId),
+            client.fetchTxn(restore.qboType, currentTxn.qboId),
+            client.fetchPreparedSnapshot(restore.qboType, currentTxn.qboId),
           ]);
           const verification = current
-            ? verifyPurchaseResult(originalPrepared.expected, current)
+            ? verifyPreparedResult(originalPrepared, current)
             : { ok: false as const };
           if (
             !freshTxn ||
             !current ||
             freshTxn.syncToken !== sameRequest.expectedSyncToken ||
             current.syncToken !== sameRequest.expectedSyncToken ||
-            txn.qboSyncToken !== sameRequest.expectedSyncToken ||
+            currentTxn.qboSyncToken !== sameRequest.expectedSyncToken ||
             !verification.ok
           ) {
-            lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared restore could resume.');
+            lifecycleError(
+              'QBO_STATE_DRIFT',
+              `${restore.qboType} changed before the prepared restore could resume.`,
+            );
           }
         },
       );
@@ -2340,6 +2798,7 @@ export async function undoCategorization(
           input.companyId,
           input.actor.id,
         );
+        validatePreparedBinding(entered.attempt, latestTxn);
         return recordedAttemptResult(entered.attempt, latestTxn.status);
       }
       return sendAndVerifyPrepared(
@@ -2353,41 +2812,65 @@ export async function undoCategorization(
       );
     }
 
-    const { txn } = await loadAuthorizedStage(
-      input.transactionId,
-      input.companyId,
-      original.expectedRevision,
-      input.actor.id,
+    let txn = await loadAuthorizedAttemptState(
       d,
+      original,
+      input.companyId,
+      input.actor.id,
       ['POSTED'],
+      false,
     );
+    if (originalPrepared.qboType !== txn.qboType) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation entity type is inconsistent.');
+    }
+    validatePreparedBinding(original, txn);
     await d.renewLease(leaseKey(txn), invocationOwner);
+    txn = await loadAuthorizedAttemptState(
+      d,
+      original,
+      input.companyId,
+      input.actor.id,
+      ['POSTED'],
+      false,
+    );
+    validatePreparedBinding(original, txn);
     const client = await d.getClient(input.companyId);
     const [freshTxn, current] = await Promise.all([
-      client.fetchTxn('Purchase', txn.qboId),
-      client.fetchPurchaseSnapshot(txn.qboId),
+      client.fetchTxn(originalPrepared.qboType, txn.qboId),
+      client.fetchPreparedSnapshot(originalPrepared.qboType, txn.qboId),
     ]);
     if (!freshTxn || !current) {
-      lifecycleError('QBO_STATE_DRIFT', 'Purchase no longer exists in QuickBooks.');
+      lifecycleError(
+        'QBO_STATE_DRIFT',
+        `${originalPrepared.qboType} no longer exists in QuickBooks.`,
+      );
     }
     if (
       freshTxn.syncToken !== current.syncToken ||
       current.syncToken !== txn.qboSyncToken
     ) {
-      lifecycleError('QBO_STATE_DRIFT', 'Purchase SyncToken changed after the verified post.');
+      lifecycleError(
+        'QBO_STATE_DRIFT',
+        `${originalPrepared.qboType} SyncToken changed after the verified post.`,
+      );
     }
-    const currentVerification = verifyPurchaseResult(
-      originalPrepared.expected,
-      current,
-    );
+    const currentVerification = verifyPreparedResult(originalPrepared, current);
     if (!currentVerification.ok) {
       lifecycleError('QBO_STATE_DRIFT', currentVerification.message);
     }
 
-    const restore = await client.preparePurchaseRestore(
-      freshTxn,
-      originalPrepared,
-      input.requestId,
+    const restore = validateFreshPrepared(
+      await client.prepareRestore(
+        freshTxn,
+        originalPrepared,
+        input.requestId,
+      ),
+      {
+        operation: 'restore',
+        requestId: input.requestId,
+        txn,
+        before: current,
+      },
     );
     const persisted = await persistPrepared(
       d,
@@ -2403,6 +2886,7 @@ export async function undoCategorization(
         input.companyId,
         input.actor.id,
       );
+      validatePreparedBinding(persisted.attempt, racedTxn);
       return recordedAttemptResult(persisted.attempt, racedTxn.status);
     }
     const entered = await enterCommitting(
@@ -2412,23 +2896,26 @@ export async function undoCategorization(
       input.actor,
       invocationOwner,
       ['POSTED'],
-      async () => {
+      async (currentTxn) => {
         const [lastTxn, lastSnapshot] = await Promise.all([
-          client.fetchTxn('Purchase', txn.qboId),
-          client.fetchPurchaseSnapshot(txn.qboId),
+          client.fetchTxn(originalPrepared.qboType, currentTxn.qboId),
+          client.fetchPreparedSnapshot(originalPrepared.qboType, currentTxn.qboId),
         ]);
         const verification = lastSnapshot
-          ? verifyPurchaseResult(originalPrepared.expected, lastSnapshot)
+          ? verifyPreparedResult(originalPrepared, lastSnapshot)
           : { ok: false as const };
         if (
           !lastTxn ||
           !lastSnapshot ||
           lastTxn.syncToken !== persisted.attempt.expectedSyncToken ||
           lastSnapshot.syncToken !== persisted.attempt.expectedSyncToken ||
-          txn.qboSyncToken !== persisted.attempt.expectedSyncToken ||
+          currentTxn.qboSyncToken !== persisted.attempt.expectedSyncToken ||
           !verification.ok
         ) {
-          lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared restore send.');
+          lifecycleError(
+            'QBO_STATE_DRIFT',
+            `${originalPrepared.qboType} changed before the prepared restore send.`,
+          );
         }
       },
     );
@@ -2439,6 +2926,7 @@ export async function undoCategorization(
         input.companyId,
         input.actor.id,
       );
+      validatePreparedBinding(entered.attempt, latestTxn);
       return recordedAttemptResult(entered.attempt, latestTxn.status);
     }
     return sendAndVerifyPrepared(
