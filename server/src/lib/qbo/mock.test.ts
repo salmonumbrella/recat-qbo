@@ -14,7 +14,7 @@ import {
   resetMockRealms,
 } from './mock.js';
 import type { StagedCategorization } from '@recat/shared';
-import type { RawPurchase } from './types.js';
+import { QboSyncTokenConflict, type RawPurchase } from './types.js';
 
 const HOLDING_IDS = ['4', '5']; // Harbor: Ask My Accountant + Uncategorized Expense
 
@@ -459,6 +459,345 @@ describe('MockQboClient tax fixtures', () => {
       totalTaxCents: 2572,
       lines: [{ amountCents: 21430, taxAmountCents: 2572 }],
     });
+  });
+});
+
+function addGenericLineWriteEntity(
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry',
+) {
+  const realm = getMockRealm(MOCK_REALM_HARBOR);
+  const qboId = `ENTITY_${qboType.toUpperCase()}_GENERIC`;
+  realm.txns.push({
+    qboId,
+    qboType,
+    syncToken: 7,
+    date: '2026-07-01',
+    payee: 'Generic Counterparty',
+    memo: 'generic private note',
+    amount: qboType === 'Deposit' ? 15 : -15,
+    bankAccountQboId: '1',
+    lines: [
+      {
+        id: 'LINE_HOLDING_GENERIC',
+        amount: 10,
+        accountQboId: '4',
+        memo: 'generic holding memo',
+      },
+      {
+        id: 'LINE_UNTOUCHED_GENERIC',
+        amount: 5,
+        accountQboId: '19',
+        memo: 'generic untouched memo',
+      },
+    ],
+    lastUpdated: '2026-07-01T00:00:00.000Z',
+  });
+  if (qboType === 'Purchase') {
+    realm.rawPurchases.push({
+      Id: qboId,
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 15,
+      PrivateNote: 'generic private note',
+      AccountRef: { value: '1', name: 'Generic payment account' },
+      UnknownDocumentField: { preserve: true },
+      Line: [
+        {
+          Id: 'LINE_HOLDING_GENERIC',
+          Amount: 10,
+          Description: 'generic holding memo',
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: '4', name: 'Generic holding account' },
+          },
+        },
+        {
+          Id: 'LINE_UNTOUCHED_GENERIC',
+          Amount: 5,
+          Description: 'generic untouched memo',
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: '19', name: 'Generic untouched account' },
+          },
+          UnknownLineField: { preserve: true },
+        },
+      ],
+    });
+  }
+  return {
+    realm,
+    qboId,
+    client: new MockQboClient(MOCK_REALM_HARBOR, ['4']),
+  };
+}
+
+describe('MockQboClient prepared transfer line writes', () => {
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
+    'prepares, verifies, and persists one exact %s write',
+    async (qboType) => {
+      const fixture = addGenericLineWriteEntity(qboType);
+      const txn = await fixture.client.fetchTxn(qboType, fixture.qboId);
+      if (!txn) throw new Error('generic mock line-write fixture missing');
+      const prepared = await fixture.client.prepareLineRecategorization(
+        txn,
+        [{
+          amount: txn.amount,
+          accountQboId: '17',
+          memo: 'generic target memo',
+        }],
+        'request-1',
+      );
+
+      expect(prepared.body).toEqual(
+        JSON.parse(JSON.stringify(prepared.body)) as Record<string, unknown>,
+      );
+      expect(prepared.body).toMatchObject({
+        Id: fixture.qboId,
+        SyncToken: '7',
+        PrivateNote: 'generic private note',
+      });
+      expect(prepared.before.contentHash).not.toBe(prepared.expected.contentHash);
+      expect(prepared.body.Line).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          Id: 'LINE_UNTOUCHED_GENERIC',
+          Amount: 5,
+          Description: 'generic untouched memo',
+        }),
+      ]));
+
+      const result = await fixture.client.sendPreparedLineWrite(prepared);
+      expect(result).toEqual({
+        ok: true,
+        newSyncToken: '8',
+        snapshot: {
+          ...prepared.expected,
+          syncToken: '8',
+        },
+      });
+      await expect(
+        fixture.client.fetchLineWriteSnapshot(qboType, fixture.qboId),
+      ).resolves.toEqual(result.snapshot);
+      const entity = fixture.realm.txns.find(
+        (candidate) =>
+          candidate.qboType === qboType && candidate.qboId === fixture.qboId,
+      );
+      expect(entity).toMatchObject({
+        syncToken: 8,
+        lines: expect.arrayContaining([
+          {
+            id: 'LINE_UNTOUCHED_GENERIC',
+            amount: 5,
+            accountQboId: '19',
+            memo: 'generic untouched memo',
+          },
+          expect.objectContaining({
+            amount: 10,
+            accountQboId: '17',
+            memo: 'generic target memo',
+          }),
+        ]),
+      });
+      expect(entity?.lines.some((line) => line.accountQboId === '4')).toBe(false);
+
+      await expect(
+        fixture.client.sendPreparedLineWrite(prepared),
+      ).rejects.toBeInstanceOf(QboSyncTokenConflict);
+      expect(entity?.syncToken).toBe(8);
+      expect(entity?.lines.filter((line) => line.accountQboId === '17')).toHaveLength(1);
+    },
+  );
+
+  it('applies the shared prepared validation contract before mutation', async () => {
+    const fixture = addGenericLineWriteEntity('Purchase');
+    const txn = await fixture.client.fetchTxn('Purchase', fixture.qboId);
+    if (!txn) throw new Error('generic mock line-write fixture missing');
+    const prepared = await fixture.client.prepareLineRecategorization(
+      txn,
+      [{ amount: txn.amount, accountQboId: '17' }],
+      'request-1',
+    );
+    const tampered = structuredClone(prepared);
+    (tampered.body.Line as Record<string, unknown>[]).at(-1)!.Amount = 9;
+
+    await expect(fixture.client.sendPreparedLineWrite(tampered)).rejects.toThrow(
+      /request hash/i,
+    );
+    expect(
+      fixture.realm.txns.find((candidate) => candidate.qboId === fixture.qboId),
+    ).toMatchObject({ syncToken: 7 });
+  });
+
+  it('runs the transfer authority guard immediately before mock provider mutation', async () => {
+    const fixture = addGenericLineWriteEntity('Purchase');
+    const txn = await fixture.client.fetchTxn('Purchase', fixture.qboId);
+    if (!txn) throw new Error('generic mock line-write fixture missing');
+    const prepared = await fixture.client.prepareLineRecategorization(
+      txn,
+      [{ amount: txn.amount, accountQboId: '17' }],
+      'request-1',
+    );
+    const guard = async () => {
+      throw new Error('AUTHORITY_LOST_SENTINEL');
+    };
+
+    await expect(
+      fixture.client.sendPreparedLineWrite(prepared, guard),
+    ).rejects.toThrow('AUTHORITY_LOST_SENTINEL');
+    expect(
+      fixture.realm.txns.find((candidate) => candidate.qboId === fixture.qboId),
+    ).toMatchObject({ syncToken: 7 });
+  });
+
+  it('captures the validated mock body before its first asynchronous boundary', async () => {
+    const fixture = addGenericLineWriteEntity('Deposit');
+    const txn = await fixture.client.fetchTxn('Deposit', fixture.qboId);
+    if (!txn) throw new Error('generic mock line-write fixture missing');
+    const prepared = await fixture.client.prepareLineRecategorization(
+      txn,
+      [{ amount: txn.amount, accountQboId: '17' }],
+      'request-1',
+    );
+
+    const result = fixture.client.sendPreparedLineWrite(prepared);
+    prepared.body.PrivateNote = 'mutation after send call';
+
+    await expect(result).resolves.toMatchObject({ newSyncToken: '8' });
+    await expect(
+      fixture.client.fetchTxn('Deposit', fixture.qboId),
+    ).resolves.toMatchObject({
+      raw: { PrivateNote: 'generic private note' },
+    });
+  });
+
+  it('accepts the same prepared identity after recursive JSONB-style key reordering', async () => {
+    const fixture = addGenericLineWriteEntity('Deposit');
+    const txn = await fixture.client.fetchTxn('Deposit', fixture.qboId);
+    if (!txn) throw new Error('generic mock line-write fixture missing');
+    const prepared = await fixture.client.prepareLineRecategorization(
+      txn,
+      [{ amount: txn.amount, accountQboId: '17' }],
+      'request-1',
+    );
+    const reorder = (value: unknown): unknown => {
+      if (value === null || typeof value !== 'object') return value;
+      if (Array.isArray(value)) return value.map(reorder);
+      const result = Object.create(null) as Record<string, unknown>;
+      for (const key of Object.keys(value).sort(
+        (left, right) =>
+          left.length - right.length || left.localeCompare(right),
+      )) {
+        Object.defineProperty(result, key, {
+          value: reorder((value as Record<string, unknown>)[key]),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+      return result;
+    };
+    const reloaded = reorder(prepared) as typeof prepared;
+
+    expect(JSON.stringify(reloaded.body)).not.toBe(JSON.stringify(prepared.body));
+    await expect(
+      fixture.client.sendPreparedLineWrite(reloaded),
+    ).resolves.toMatchObject({ newSyncToken: '8' });
+  });
+
+  it('routes direct recategorize through a verified prepared write', async () => {
+    const fixture = addGenericLineWriteEntity('Deposit');
+    const txn = await fixture.client.fetchTxn('Deposit', fixture.qboId);
+    if (!txn) throw new Error('generic mock line-write fixture missing');
+
+    await expect(
+      fixture.client.recategorize(
+        txn,
+        [{ amount: txn.amount, accountQboId: '17' }],
+      ),
+    ).resolves.toEqual({ ok: true, newSyncToken: '8' });
+    await expect(
+      fixture.client.fetchLineWriteSnapshot('Deposit', fixture.qboId),
+    ).resolves.toMatchObject({
+      qboType: 'Deposit',
+      qboId: fixture.qboId,
+      syncToken: '8',
+    });
+  });
+
+  it.each(['Deposit', 'JournalEntry'] as const)(
+    'keeps the exact %s raw body coherent through prepared write, undo, reprepare, and persisted hydrate',
+    async (qboType) => {
+      const fixture = addGenericLineWriteEntity(qboType);
+      const original = await fixture.client.fetchTxn(qboType, fixture.qboId);
+      if (!original) throw new Error('generic mock line-write fixture missing');
+      const prepared = await fixture.client.prepareLineRecategorization(
+        original,
+        [{ amount: original.amount, accountQboId: '17' }],
+        'request-1',
+      );
+      await fixture.client.sendPreparedLineWrite(prepared);
+      const posted = await fixture.client.fetchTxn(qboType, fixture.qboId);
+      if (!posted) throw new Error('generic posted line-write fixture missing');
+
+      await fixture.client.moveToAccount(posted, '4', ['17']);
+
+      const undone = await fixture.client.fetchTxn(qboType, fixture.qboId);
+      const snapshot = await fixture.client.fetchLineWriteSnapshot(
+        qboType,
+        fixture.qboId,
+      );
+      if (!undone || !snapshot) {
+        throw new Error('generic undone line-write fixture missing');
+      }
+      expect(undone.raw).toMatchObject({
+        Id: fixture.qboId,
+        SyncToken: '9',
+      });
+      const rawLines = (undone.raw as { Line: Record<string, unknown>[] }).Line;
+      const accountOf = (line: Record<string, unknown>): string | undefined => {
+        const detail = qboType === 'Deposit'
+          ? line.DepositLineDetail
+          : line.JournalEntryLineDetail;
+        return (
+          detail as { AccountRef?: { value?: string } } | undefined
+        )?.AccountRef?.value;
+      };
+      expect(rawLines.some((line) => accountOf(line) === '4')).toBe(true);
+      expect(rawLines.some((line) => accountOf(line) === '17')).toBe(false);
+      const reprepare = await fixture.client.prepareLineRecategorization(
+        undone,
+        [{ amount: undone.amount, accountQboId: '17' }],
+        'request-2',
+      );
+      expect(reprepare.before).toEqual(snapshot);
+      expect(reprepare.expected.contentHash).not.toBe(snapshot.contentHash);
+
+      const persisted = structuredClone(fixture.realm);
+      resetMockRealms();
+      const freshRealm = getMockRealm(MOCK_REALM_HARBOR);
+      Object.assign(
+        freshRealm,
+        mergePersistedMockRealm(freshRealm, persisted),
+      );
+      const hydratedClient = new MockQboClient(MOCK_REALM_HARBOR, ['4']);
+      await expect(
+        hydratedClient.fetchLineWriteSnapshot(qboType, fixture.qboId),
+      ).resolves.toEqual(snapshot);
+      const hydrated = await hydratedClient.fetchTxn(qboType, fixture.qboId);
+      if (!hydrated) throw new Error('generic hydrated line-write fixture missing');
+      await expect(
+        hydratedClient.prepareLineRecategorization(
+          hydrated,
+          [{ amount: hydrated.amount, accountQboId: '17' }],
+          'request-3',
+        ),
+      ).resolves.toMatchObject({ before: snapshot });
+    },
+  );
+
+  it('returns null for a missing line-write snapshot', async () => {
+    await expect(
+      client().fetchLineWriteSnapshot('JournalEntry', 'MISSING_GENERIC'),
+    ).resolves.toBeNull();
   });
 });
 

@@ -155,6 +155,40 @@ describe('createPreparedOperation', () => {
     expect(MCP_OPERATION_EXPIRY_MS).toBe(15 * 60 * 1000);
   });
 
+  it('accepts transfer envelopes and detects any private second-leg binding change', async () => {
+    const { store } = createStore();
+    const operation = await createPreparedOperation(input({
+      toolName: 'prepare_transfer',
+      kind: 'transfer' as never,
+      payload: {
+        transferOperationId: RETRY_OF_ID,
+        first: {
+          qboType: 'Purchase',
+          qboId: 'qbo-transaction-1',
+          qboSyncToken: 'sync-7',
+        },
+        second: {
+          transactionId: OTHER_USER_ID,
+          qboType: 'Deposit',
+          qboId: 'qbo-transaction-2',
+          qboSyncToken: 'sync-8',
+        },
+        preview: {
+          action: 'record_transfer',
+          direction: 'between_accounts',
+          totalCents: 1250,
+          legCount: 2,
+          preparationDigest: 'a'.repeat(64),
+        },
+      },
+    }), { store, now: () => NOW });
+
+    expect(hasValidMcpOperationIntegrity(operation)).toBe(true);
+    const tampered = structuredClone(operation);
+    (tampered.payload as Record<string, any>).second.qboId = 'changed';
+    expect(hasValidMcpOperationIntegrity(tampered)).toBe(false);
+  });
+
   it('uses the caller-supplied transaction/store instead of the default client', async () => {
     const { store } = createStore();
     const createMany = vi.spyOn(store.mcpOperation, 'createMany');
@@ -353,7 +387,7 @@ describe('createPreparedOperation', () => {
   });
 
   it.each([
-    'transfer',
+    'post_transfer',
     'categorization\nunsafe',
     '',
   ])('rejects an unsupported or unsafe operation kind: %j', async (kind) => {
@@ -545,5 +579,15 @@ describe('Prisma durability contract', () => {
     expect(migration).not.toContain('FOREIGN KEY ("userId")');
     expect(migration).not.toContain('FOREIGN KEY ("companyId")');
     expect(migration).not.toContain('FOREIGN KEY ("transactionId")');
+
+    const transferMigration = '20260729234000_allow_mcp_transfer_operations';
+    expect(migrations.indexOf(transferMigration))
+      .toBeGreaterThan(migrations.indexOf(operationMigration));
+    const transferKindMigration = await readFile(
+      new URL(`${transferMigration}/migration.sql`, migrationDirectory),
+      'utf8',
+    );
+    expect(transferKindMigration)
+      .toMatch(/CHECK \("kind" IN \('categorization', 'transfer', 'undo'\)\)/);
   });
 });

@@ -1895,6 +1895,19 @@ async function persistPrepared(
       where: { requestId: prepared.requestId },
     });
     if (!raced) {
+      const active = await d.db.qboMutationAttempt.findFirst({
+        where: {
+          transactionId,
+          status: { in: ACTIVE_ATTEMPT_STATUSES },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (active) {
+        lifecycleError(
+          'MUTATION_BLOCKED',
+          'A different write for this QuickBooks entity won the persistence race.',
+        );
+      }
       lifecycleError('REQUEST_ID_CONFLICT', 'Concurrent request identity could not be resolved.');
     }
     assertRequestIdentity(raced, {

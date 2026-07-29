@@ -424,12 +424,19 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     toolAnnotations: ToolAnnotations = annotations,
   ): void => {
     const callback = async (input: z.output<T>, sdkContext: ServerContext) => {
+      const tokenPrefixPolicy =
+        name === 'prepare_transfer' || name === 'commit_transfer'
+          ? 'redact'
+          : name === 'get_operation' || name === 'retry_operation'
+            ? 'redact-for-transfer-result'
+            : 'include';
       try {
         const value = await observeMcpToolCall(
           {
             requestId,
             traceId: traceContext.traceId,
             tokenPrefix: context.principal.tokenPrefix,
+            tokenPrefixPolicy,
             method: sdkContext.mcpReq.method,
             tool: name,
             era: context.era,

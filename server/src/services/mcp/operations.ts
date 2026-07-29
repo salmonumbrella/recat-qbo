@@ -17,9 +17,13 @@ const MAX_QBO_TYPE_LENGTH = 32;
 const MAX_PRISMA_INT = 2_147_483_647;
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/u;
 const TOOL_NAME = /^[a-z][a-z0-9_]*$/;
-const OPERATION_KINDS = new Set<McpOperationKind>(['categorization', 'undo']);
+const OPERATION_KINDS = new Set<McpOperationKind>([
+  'categorization',
+  'transfer',
+  'undo',
+]);
 
-export type McpOperationKind = 'categorization' | 'undo';
+export type McpOperationKind = 'categorization' | 'transfer' | 'undo';
 
 export type McpOperationJsonValue =
   | null

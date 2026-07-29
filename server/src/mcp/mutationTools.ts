@@ -18,6 +18,11 @@ import {
   prepareMcpUndo,
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
+import {
+  commitMcpTransfer,
+  prepareMcpTransfer,
+  type PrepareMcpTransferInput,
+} from '../services/mcp/transfers.js';
 import type { McpPrincipal } from './auth.js';
 import {
   MCP_AUTHORED_SCHEMA_BOUNDS,
@@ -31,6 +36,8 @@ export const MUTATION_TOOL_NAMES = [
   'retry_operation',
   'prepare_undo',
   'commit_undo',
+  'prepare_transfer',
+  'commit_transfer',
 ] as const;
 
 export interface McpMutationOperations {
@@ -58,6 +65,14 @@ export interface McpMutationOperations {
     principal: McpPrincipal,
     input: CommitMcpUndoInput,
   ): ReturnType<typeof commitMcpUndo>;
+  prepareTransfer(
+    principal: McpPrincipal,
+    input: PrepareMcpTransferInput,
+  ): ReturnType<typeof prepareMcpTransfer>;
+  commitTransfer(
+    principal: McpPrincipal,
+    input: { operationId: string; idempotencyKey?: string },
+  ): ReturnType<typeof commitMcpTransfer>;
 }
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
@@ -67,6 +82,8 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   retryOperation: retryMcpOperation,
   prepareUndo: prepareMcpUndo,
   commitUndo: commitMcpUndo,
+  prepareTransfer: prepareMcpTransfer,
+  commitTransfer: commitMcpTransfer,
 });
 
 interface McpMutationToolDefinition {
@@ -163,6 +180,14 @@ const prepareUndoInput = z.strictObject({
   operationId: uuid,
   idempotencyKey,
 });
+const prepareTransferInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  counterpartTransactionId: uuid,
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  counterpartExpectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey: idempotencyKey.optional(),
+});
 
 const warnings = z.array(
   z.string().max(MAX_WARNING_LENGTH),
@@ -219,11 +244,11 @@ const operationResult = z.strictObject({
 });
 const operationOutput = z.strictObject({
   operationId: uuid,
-  kind: z.enum(['categorization', 'undo']),
-  companyId: uuid,
-  transactionId: uuid,
-  sourceRevision: revision,
-  preparedRevision: revision,
+  kind: z.enum(['categorization', 'transfer', 'undo']),
+  companyId: uuid.optional(),
+  transactionId: uuid.optional(),
+  sourceRevision: revision.optional(),
+  preparedRevision: revision.optional(),
   expiresAt: z.iso.datetime(),
   state: z.enum([
     'prepared',
@@ -244,7 +269,32 @@ const operationOutput = z.strictObject({
     'dry_run',
     'corrupt',
   ]),
-  result: operationResult.nullable(),
+  result: z.union([
+    operationResult,
+    z.strictObject({
+      complete: z.boolean(),
+      firstLeg: z.strictObject({
+        outcome: z.enum([
+          'VERIFIED',
+          'UNCERTAIN',
+          'IN_PROGRESS',
+          'UNCHANGED',
+          'DRY_RUN',
+          'RETRYABLE',
+        ]),
+      }),
+      secondLeg: z.strictObject({
+        outcome: z.enum([
+          'VERIFIED',
+          'UNCERTAIN',
+          'IN_PROGRESS',
+          'UNCHANGED',
+          'DRY_RUN',
+          'RETRYABLE',
+        ]),
+      }),
+    }),
+  ]).nullable(),
   error: z.strictObject({
     code: z.string().min(1).max(64),
     message: z.string().max(200),
@@ -254,6 +304,54 @@ const operationOutput = z.strictObject({
     canRetry: z.boolean(),
     requiresReconciliation: z.boolean(),
   }),
+}).superRefine((value, context) => {
+  const privateScalarFields = [
+    'companyId',
+    'transactionId',
+    'sourceRevision',
+    'preparedRevision',
+  ] as const;
+  if (value.kind === 'transfer') {
+    for (const field of privateScalarFields) {
+      if (value[field] !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: [field],
+          message: 'Transfer status must not expose private scalar bindings.',
+        });
+      }
+    }
+    if (
+      value.result !== null
+      && !('complete' in value.result)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['result'],
+        message: 'Transfer status requires a paired-leg result.',
+      });
+    }
+  } else {
+    for (const field of privateScalarFields) {
+      if (value[field] === undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: [field],
+          message: 'Single-transaction status requires its scalar binding.',
+        });
+      }
+    }
+    if (
+      value.result !== null
+      && !('outcome' in value.result)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['result'],
+        message: 'Single-transaction status requires its write result.',
+      });
+    }
+  }
 });
 const preparedUndoOutput = z.strictObject({
   operationId: uuid,
@@ -269,6 +367,17 @@ const preparedUndoOutput = z.strictObject({
     restorationDigest: z.string().regex(SHA256),
   }),
   warnings,
+});
+const preparedTransferOutput = z.strictObject({
+  operationId: uuid,
+  expiresAt: z.iso.datetime(),
+  preview: z.strictObject({
+    action: z.literal('record_transfer'),
+    direction: z.literal('between_accounts'),
+    totalCents: safeInteger,
+    legCount: z.literal(2),
+    preparationDigest: z.string().regex(SHA256),
+  }),
 });
 
 const prepareCategorizationAnnotations: ToolAnnotations = Object.freeze({
@@ -290,6 +399,12 @@ const getOperationAnnotations: ToolAnnotations = Object.freeze({
   openWorldHint: false,
 });
 const prepareUndoAnnotations: ToolAnnotations = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+});
+const prepareTransferAnnotations: ToolAnnotations = Object.freeze({
   readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: false,
@@ -356,6 +471,30 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
     annotations: commitAnnotations,
     invoke: (operations, principal, input) =>
       operations.commitUndo(principal, input as CommitMcpUndoInput),
+  },
+  {
+    name: 'prepare_transfer',
+    description: 'Validate and prepare a durable two-leg transfer operation.',
+    inputSchema: prepareTransferInput,
+    outputSchema: preparedTransferOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareTransfer(
+        principal,
+        input as PrepareMcpTransferInput,
+      ),
+  },
+  {
+    name: 'commit_transfer',
+    description: 'Commit or reconcile a prepared transfer operation.',
+    inputSchema: operationWithOptionalIdempotencyInput,
+    outputSchema: operationOutput,
+    annotations: commitAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.commitTransfer(
+        principal,
+        input as { operationId: string; idempotencyKey?: string },
+      ),
   },
 ] as const;
 

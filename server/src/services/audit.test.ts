@@ -226,4 +226,67 @@ describe('writeAudit mutation metadata', () => {
       /sourcePreparedHash|currentPostHash|restoreHash|must-not-survive|secret|body/,
     );
   });
+
+  it('stores bounded transfer attribution without prepared bodies or provider details', async () => {
+    const create = vi.fn(async () => undefined);
+    await writeAudit(
+      { auditEntry: { create } } as never,
+      {
+        companyId: 'company-generic',
+        actorId: 'actor-generic',
+        actorLabel: 'Generic User (MCP rct_example1)',
+        txnId: 'transaction-generic',
+        payee: 'Generic Transfer',
+        amount: -250,
+        action: 'transfer',
+        before: 'QuickBooks transfer source',
+        after: 'Transfer to counterpart account',
+        payload: {
+          accessToken: 'must-not-survive',
+          requestPayload: { SyncToken: 'must-not-survive' },
+          providerError: 'must-not-survive',
+        },
+        mutation: {
+          requestId: `transfer-request-${'r'.repeat(200)}`,
+          outcome: 'VERIFIED',
+          references: {
+            operation: 'transfer',
+            qboType: 'Transfer',
+            qboId: `transfer-${'q'.repeat(200)}`,
+            accountQboIds: ['bank-b', 'bank-a', 'bank-b'],
+            taxCodeQboIds: [],
+          },
+          mcp: {
+            sourceOperationId: `source-${'s'.repeat(200)}`,
+            operationId: `operation-${'o'.repeat(200)}`,
+            tokenPrefix: `rct_${'p'.repeat(30)}`,
+          },
+        },
+      },
+    );
+
+    const data = create.mock.calls[0]?.[0].data;
+    expect(data).toEqual(expect.objectContaining({
+      action: 'transfer',
+      payload: {
+        requestId: `transfer-request-${'r'.repeat(111)}`,
+        outcome: 'VERIFIED',
+        references: {
+          operation: 'transfer',
+          qboType: 'Transfer',
+          qboId: `transfer-${'q'.repeat(119)}`,
+          accountQboIds: ['bank-a', 'bank-b'],
+          taxCodeQboIds: [],
+        },
+        mcp: {
+          sourceOperationId: `source-${'s'.repeat(121)}`,
+          operationId: `operation-${'o'.repeat(118)}`,
+          tokenPrefix: 'rct_pppppppp',
+        },
+      },
+    }));
+    expect(JSON.stringify(data)).not.toMatch(
+      /accessToken|requestPayload|SyncToken|providerError|must-not-survive/,
+    );
+  });
 });

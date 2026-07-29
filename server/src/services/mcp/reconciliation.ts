@@ -30,6 +30,12 @@ import {
   parseStoredMcpUndoPayload,
   type StoredMcpUndoPayload,
 } from './undo.js';
+import {
+  getMcpTransferOperation,
+  retryMcpTransferOperation,
+  type McpTransferExecutionDeps,
+  type McpTransferOperationDto,
+} from './transfers.js';
 
 export type McpOperationState =
   | 'prepared'
@@ -53,14 +59,16 @@ export type McpOperationPhase =
 export interface McpOperationDto {
   operationId: string;
   kind: McpOperationKind;
-  companyId: string;
-  transactionId: string;
-  sourceRevision: number;
-  preparedRevision: number;
+  companyId?: string;
+  transactionId?: string;
+  sourceRevision?: number;
+  preparedRevision?: number;
   expiresAt: string;
   state: McpOperationState;
   phase: McpOperationPhase;
-  result: null | { outcome: DurableMutationOutcome; status: TxnStatus };
+  result: null
+    | { outcome: DurableMutationOutcome; status: TxnStatus }
+    | McpTransferOperationDto['result'];
   error: null | { code: string; message: string };
   actions: {
     canCommit: boolean;
@@ -142,6 +150,9 @@ export interface McpOperationExecutionDeps {
   reconcile?: typeof reconcileMutationAttempt;
   createOperation?: typeof createPreparedOperation;
   validateAttempt?: (attempt: McpAttemptProjection) => DurableAttemptPersistenceProof;
+  transfer?: Omit<McpTransferExecutionDeps, 'store'>;
+  getTransferOperation?: typeof getMcpTransferOperation;
+  retryTransferOperation?: typeof retryMcpTransferOperation;
 }
 
 export type McpOperationExecutionErrorCode =
@@ -182,6 +193,17 @@ export async function getMcpOperation(
   input: GetMcpOperationInput,
   dependencies: McpOperationExecutionDeps = {},
 ): Promise<McpCategorizationOperationDto> {
+  const owned = await loadOwnedOperation(input.operationId, principal, {
+    store: storeFrom(dependencies),
+  });
+  if (owned.kind === 'transfer') {
+    const getTransfer = dependencies.getTransferOperation
+      ?? getMcpTransferOperation;
+    return getTransfer(principal, input.operationId, {
+      ...dependencies.transfer,
+      store: storeFrom(dependencies) as never,
+    });
+  }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   return project(loaded, nowFrom(dependencies));
 }
@@ -325,6 +347,17 @@ export async function retryMcpOperation(
   input: RetryMcpOperationInput,
   dependencies: McpOperationExecutionDeps = {},
 ): Promise<McpCategorizationOperationDto> {
+  const owned = await loadOwnedOperation(input.operationId, principal, {
+    store: storeFrom(dependencies),
+  });
+  if (owned.kind === 'transfer') {
+    const retryTransfer = dependencies.retryTransferOperation
+      ?? retryMcpTransferOperation;
+    return retryTransfer(principal, input.operationId, {
+      ...dependencies.transfer,
+      store: storeFrom(dependencies) as never,
+    });
+  }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   const current = project(loaded, nowFrom(dependencies));
   const commit = loaded.operation.kind === 'undo'

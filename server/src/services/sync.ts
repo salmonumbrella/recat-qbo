@@ -6,10 +6,19 @@
 // fixed inside QuickBooks as SUPERSEDED, recompute suggestion snapshots, apply
 // auto-post rules, and record a SyncLog row. QBO is always the source of truth.
 
+import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import type { SuggestionDto } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import type { QboTxn } from '../lib/qbo/types.js';
+import {
+  EntityLeaseError,
+  fenceEntityLeaseOwnerships,
+  withEntityLease,
+  type EntityLeaseDb,
+  type EntityLeaseFenceDb,
+  type EntityLeaseKey,
+} from './entityLease.js';
 import { refreshSuggestions } from './suggestions.js';
 import { postTransaction } from './writeback.js';
 
@@ -37,26 +46,146 @@ function buildMessage(created: number, dropped: number, autoPosted: number, acco
   return parts.join(', ');
 }
 
+export interface SyncMutationDeps {
+  lease<T>(
+    key: EntityLeaseKey,
+    owner: string,
+    callback: () => Promise<T>,
+  ): Promise<T>;
+  fence(
+    key: EntityLeaseKey,
+    owner: string,
+    tx: Prisma.TransactionClient,
+  ): Promise<void>;
+  owner(): string;
+}
+
+const defaultSyncMutationDeps: SyncMutationDeps = {
+  lease: (key, owner, callback) =>
+    withEntityLease(key, owner, callback, {
+      db: prisma as unknown as EntityLeaseDb,
+    }),
+  fence: (key, owner, tx) =>
+    fenceEntityLeaseOwnerships([key], owner, {
+      db: tx as unknown as EntityLeaseFenceDb,
+    }),
+  owner: randomUUID,
+};
+
+const ACTIVE_MUTATION_STATUSES = [
+  'PREPARED',
+  'COMMITTING',
+  'UNCERTAIN',
+] as const;
+
+function entityKey(
+  companyId: string,
+  value: { qboType: string; qboId: string },
+): EntityLeaseKey {
+  return { companyId, qboType: value.qboType, qboId: value.qboId };
+}
+
+function isEntityBusy(error: unknown): boolean {
+  return error instanceof EntityLeaseError
+    || (
+      typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && (error as { code?: unknown }).code === 'ENTITY_BUSY'
+    );
+}
+
+async function withSyncEntityLease<T>(
+  key: EntityLeaseKey,
+  dependencies: SyncMutationDeps,
+  callback: (owner: string) => Promise<T>,
+): Promise<T | null> {
+  const owner = dependencies.owner();
+  try {
+    return await dependencies.lease(
+      key,
+      owner,
+      () => callback(owner),
+    );
+  } catch (error) {
+    if (isEntityBusy(error)) return null;
+    throw error;
+  }
+}
+
+function syncTokenOrder(
+  left: string,
+  right: string,
+): number | null {
+  if (left === right) return 0;
+  if (!/^\d+$/u.test(left) || !/^\d+$/u.test(right)) return null;
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  return leftValue < rightValue ? -1 : 1;
+}
+
+function isStaleProviderToken(
+  incoming: string,
+  current: string,
+): boolean {
+  const order = syncTokenOrder(incoming, current);
+  return order === null || order < 0;
+}
+
 /** SUPERSEDED + audit, atomically. Lazy audit import (other agent's module). */
 async function supersedeTxn(
-  txn: { id: string; companyId: string; payee: string; amount: Prisma.Decimal },
+  txn: {
+    id: string;
+    companyId: string;
+    qboType: string;
+    qboId: string;
+    qboSyncToken: string;
+    revision: number;
+    payee: string;
+    amount: Prisma.Decimal | number;
+  },
   holdingName: string,
-): Promise<void> {
+  dependencies: SyncMutationDeps,
+): Promise<boolean> {
   const { writeAudit } = await import('./audit.js');
-  await prisma.$transaction(async (tx) => {
-    await tx.transaction.update({ where: { id: txn.id }, data: { status: 'SUPERSEDED' } });
-    await writeAudit(tx, {
-      companyId: txn.companyId,
-      actorId: null,
-      actorLabel: 'system',
-      txnId: txn.id,
-      payee: txn.payee,
-      amount: Number(txn.amount),
-      action: 'superseded',
-      before: holdingName,
-      after: 'fixed inside QuickBooks',
-    });
-  });
+  const key = {
+    companyId: txn.companyId,
+    qboType: txn.qboType,
+    qboId: txn.qboId,
+  };
+  const superseded = await withSyncEntityLease(
+    key,
+    dependencies,
+    async (owner) => prisma.$transaction(async (tx) => {
+      await dependencies.fence(key, owner, tx);
+      const updated = await tx.transaction.updateMany({
+        where: {
+          id: txn.id,
+          status: { in: ['PENDING', 'ERROR'] },
+          revision: txn.revision,
+          qboSyncToken: txn.qboSyncToken,
+          qboMutationAttempts: {
+            none: { status: { in: [...ACTIVE_MUTATION_STATUSES] } },
+          },
+        },
+        data: { status: 'SUPERSEDED' },
+      });
+      if (updated.count !== 1) return false;
+      await writeAudit(tx, {
+        companyId: txn.companyId,
+        actorId: null,
+        actorLabel: 'system',
+        txnId: txn.id,
+        payee: txn.payee,
+        amount: Number(txn.amount),
+        action: 'superseded',
+        before: holdingName,
+        after: 'fixed inside QuickBooks',
+      });
+      return true;
+    }),
+  );
+  return superseded ?? false;
 }
 
 /**
@@ -71,11 +200,15 @@ const CDC_MAX_AGE_MS = 25 * 24 * 60 * 60 * 1000;
  */
 const inFlightSyncs = new Map<string, Promise<unknown>>();
 
-export function syncCompany(companyId: string, kind: SyncKind): Promise<SyncResult> {
+export function syncCompany(
+  companyId: string,
+  kind: SyncKind,
+  mutationDependencies: SyncMutationDeps = defaultSyncMutationDeps,
+): Promise<SyncResult> {
   const prev = inFlightSyncs.get(companyId) ?? Promise.resolve();
   const run = prev.then(
-    () => runSyncCompany(companyId, kind),
-    () => runSyncCompany(companyId, kind),
+    () => runSyncCompany(companyId, kind, mutationDependencies),
+    () => runSyncCompany(companyId, kind, mutationDependencies),
   );
   inFlightSyncs.set(companyId, run);
   run
@@ -86,7 +219,11 @@ export function syncCompany(companyId: string, kind: SyncKind): Promise<SyncResu
   return run;
 }
 
-async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncResult> {
+async function runSyncCompany(
+  companyId: string,
+  kind: SyncKind,
+  mutationDependencies: SyncMutationDeps,
+): Promise<SyncResult> {
   const startedAt = new Date();
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   if (!company) throw new Error(`Company ${companyId} not found`);
@@ -194,12 +331,66 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
         bankAccount: t.bankAccount,
         rawData: t.raw as Prisma.InputJsonValue,
       };
-      await prisma.transaction.upsert({
-        where: { companyId_qboType_qboId: { companyId, qboType: t.qboType, qboId: t.qboId } },
-        create: { companyId, qboId: t.qboId, qboType: t.qboType, status: 'PENDING', ...mirror },
-        update: mirror,
-      });
-      if (!existingKeys.has(`${t.qboType}:${t.qboId}`)) created += 1;
+      const key = entityKey(companyId, t);
+      const mutation = await withSyncEntityLease(
+        key,
+        mutationDependencies,
+        async (owner) => prisma.$transaction(async (tx) => {
+          await mutationDependencies.fence(key, owner, tx);
+          const current = await tx.transaction.findUnique({
+            where: {
+              companyId_qboType_qboId: {
+                companyId,
+                qboType: t.qboType,
+                qboId: t.qboId,
+              },
+            },
+            select: {
+              id: true,
+              revision: true,
+              qboSyncToken: true,
+            },
+          });
+          if (current === null) {
+            await tx.transaction.upsert({
+              where: {
+                companyId_qboType_qboId: {
+                  companyId,
+                  qboType: t.qboType,
+                  qboId: t.qboId,
+                },
+              },
+              create: {
+                companyId,
+                qboId: t.qboId,
+                qboType: t.qboType,
+                status: 'PENDING',
+                ...mirror,
+              },
+              update: mirror,
+            });
+            return { created: true };
+          }
+          if (isStaleProviderToken(t.syncToken, current.qboSyncToken)) {
+            return { created: false };
+          }
+          await tx.transaction.updateMany({
+            where: {
+              id: current.id,
+              revision: current.revision,
+              qboSyncToken: current.qboSyncToken,
+              qboMutationAttempts: {
+                none: { status: { in: [...ACTIVE_MUTATION_STATUSES] } },
+              },
+            },
+            data: mirror,
+          });
+          return { created: false };
+        }),
+      );
+      if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
+        created += 1;
+      }
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -211,8 +402,9 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
       });
       for (const txn of open) {
         if (seen.has(`${txn.qboType}:${txn.qboId}`)) continue;
-        await supersedeTxn(txn, holdingName);
-        dropped += 1;
+        if (await supersedeTxn(txn, holdingName, mutationDependencies)) {
+          dropped += 1;
+        }
       }
     } else {
       const gone = [
@@ -224,8 +416,9 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
           where: { companyId_qboType_qboId: { companyId, qboType: g.qboType, qboId: g.qboId } },
         });
         if (txn && (txn.status === 'PENDING' || txn.status === 'ERROR')) {
-          await supersedeTxn(txn, holdingName);
-          dropped += 1;
+          if (await supersedeTxn(txn, holdingName, mutationDependencies)) {
+            dropped += 1;
+          }
         }
       }
     }
@@ -252,19 +445,57 @@ async function runSyncCompany(companyId: string, kind: SyncKind): Promise<SyncRe
       // One bad rule/txn must never kill the sync: post each in its own
       // try/catch, log, note it in the SyncLog, and continue.
       try {
-        // Stage the rule's category + tags, then post as 'system'.
-        await prisma.transaction.update({
-          where: { id: txn.id },
-          data: { category: rule.category, categoryQboId: rule.categoryQboId },
-        });
-        for (const rt of rule.ruleTags) {
-          await prisma.txnTag.upsert({
-            where: { txnId_tagId: { txnId: txn.id, tagId: rt.tagId } },
-            create: { txnId: txn.id, tagId: rt.tagId },
-            update: {},
-          });
-        }
-        const result = await postTransaction(txn.id, { id: null, label: 'system' }, { auto: true });
+        const key = entityKey(companyId, txn);
+        const result = await withSyncEntityLease(
+          key,
+          mutationDependencies,
+          async (owner) => {
+            const staged = await prisma.$transaction(async (tx) => {
+              await mutationDependencies.fence(key, owner, tx);
+              const updated = await tx.transaction.updateMany({
+                where: {
+                  id: txn.id,
+                  status: 'PENDING',
+                  revision: txn.revision,
+                  qboSyncToken: txn.qboSyncToken,
+                  category: null,
+                  splitLines: { none: {} },
+                  txnTags: { none: {} },
+                  qboMutationAttempts: {
+                    none: {
+                      status: { in: [...ACTIVE_MUTATION_STATUSES] },
+                    },
+                  },
+                },
+                data: {
+                  category: rule.category,
+                  categoryQboId: rule.categoryQboId,
+                },
+              });
+              if (updated.count !== 1) return false;
+              for (const rt of rule.ruleTags) {
+                await tx.txnTag.upsert({
+                  where: {
+                    txnId_tagId: {
+                      txnId: txn.id,
+                      tagId: rt.tagId,
+                    },
+                  },
+                  create: { txnId: txn.id, tagId: rt.tagId },
+                  update: {},
+                });
+              }
+              return true;
+            });
+            if (!staged) return null;
+            return postTransaction(
+              txn.id,
+              { id: null, label: 'system' },
+              { auto: true },
+            );
+          },
+        );
+        if (result === null) continue;
         if (result.ok) autoPosted += 1;
         else autoPostFailures.push(`${txn.payee}: ${result.error?.message ?? 'unknown error'}`);
       } catch (err) {

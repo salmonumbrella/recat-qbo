@@ -10,6 +10,7 @@
 // createTransfer records an entity, and every write bumps the SyncToken —
 // stale tokens throw QboSyncTokenConflict just like the real API.
 
+import { randomUUID } from 'node:crypto';
 import {
   QboSyncTokenConflict,
   type QboAccountInfo,
@@ -17,6 +18,9 @@ import {
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
+  type QboLineWriteResult,
+  type QboLineWriteSnapshot,
+  type QboPreparedLineWrite,
   type QboPreparedWrite,
   type QboStatement,
   type QboPurchaseSnapshot,
@@ -26,6 +30,8 @@ import {
   type QboTokenSet,
   type QboTxn,
   type QboWriteResult,
+  type RawDeposit,
+  type RawJournalEntry,
   type RawPurchase,
   type RawPurchaseLine,
 } from './types.js';
@@ -35,6 +41,15 @@ import {
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
+import {
+  buildPreparedLineWrite,
+  hashLineWriteContent,
+  rebuildDepositLines,
+  rebuildJournalEntryLines,
+  rebuildPurchaseLines,
+  validatePreparedLineWrite,
+  verifyLineWriteResult,
+} from './lineWrite.js';
 
 export const MOCK_REALM_HARBOR = MOCK_REALM_IDS[0];
 export const MOCK_REALM_BLUEBIRD = MOCK_REALM_IDS[1];
@@ -73,6 +88,8 @@ interface MockTxnEntity {
   bankAccountQboId: string;
   /** ALL category-side lines; writes replace only the holding-account ones */
   lines: MockLine[];
+  /** Exact last provider body for non-Purchase prepared line writes. */
+  rawLineWriteBody?: Record<string, unknown>;
   lastUpdated: string; // ISO
   deleted?: boolean;
 }
@@ -358,6 +375,26 @@ function isPersistedLine(value: unknown): value is MockLine {
   );
 }
 
+function isPersistedRawLineWriteBody(
+  value: unknown,
+  qboId: string,
+  syncToken: number,
+): value is Record<string, unknown> {
+  if (
+    !isRecord(value) ||
+    value.Id !== qboId ||
+    value.SyncToken !== String(syncToken)
+  ) {
+    return false;
+  }
+  try {
+    hashLineWriteContent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isPersistedTxn(value: unknown): value is MockTxnEntity {
   return (
     isRecord(value) &&
@@ -373,6 +410,12 @@ function isPersistedTxn(value: unknown): value is MockTxnEntity {
     typeof value.bankAccountQboId === 'string' &&
     Array.isArray(value.lines) &&
     value.lines.every(isPersistedLine) &&
+    (value.rawLineWriteBody === undefined ||
+      isPersistedRawLineWriteBody(
+        value.rawLineWriteBody,
+        value.qboId,
+        value.syncToken,
+      )) &&
     typeof value.lastUpdated === 'string' &&
     (value.deleted === undefined || typeof value.deleted === 'boolean')
   );
@@ -865,6 +908,112 @@ export class MockQboClient implements QboClient {
     return this.realm.rawPurchases.find((purchase) => purchase.Id === qboId);
   }
 
+  private lineWriteBody(entity: MockTxnEntity): Record<string, unknown> {
+    if (entity.qboType === 'Purchase') {
+      const raw = this.rawPurchaseById(entity.qboId) ??
+        rawPurchaseFromMock(
+          entity,
+          this.realm.purchaseSnapshots.find(
+            (snapshot) => snapshot.qboId === entity.qboId,
+          ),
+        );
+      const reconciledLines = entity.lines.map((line): RawPurchaseLine => {
+        const preserved = raw.Line?.find(
+          (candidate) =>
+            candidate.Id === line.id &&
+            candidate.Amount === line.amount &&
+            candidate.AccountBasedExpenseLineDetail?.AccountRef?.value ===
+              line.accountQboId,
+        );
+        if (preserved) {
+          return {
+            ...structuredClone(preserved),
+            ...(line.memo === undefined ? {} : { Description: line.memo }),
+          };
+        }
+        return {
+          Id: line.id,
+          Amount: line.amount,
+          ...(line.memo === undefined ? {} : { Description: line.memo }),
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: line.accountQboId },
+          },
+        };
+      });
+      return {
+        ...structuredClone(raw),
+        Id: entity.qboId,
+        SyncToken: String(entity.syncToken),
+        TxnDate: entity.date,
+        TotalAmt: Math.abs(entity.amount),
+        ...(entity.memo === undefined ? {} : { PrivateNote: entity.memo }),
+        Line: reconciledLines,
+      };
+    }
+    if (entity.rawLineWriteBody) {
+      return structuredClone(entity.rawLineWriteBody);
+    }
+
+    const accountRef = (qboId: string): { value: string; name?: string } => {
+      const name = this.accountById(qboId)?.name;
+      return {
+        value: qboId,
+        ...(name === undefined ? {} : { name }),
+      };
+    };
+    if (entity.qboType === 'Deposit') {
+      const body: RawDeposit = {
+        Id: entity.qboId,
+        SyncToken: String(entity.syncToken),
+        TxnDate: entity.date,
+        TotalAmt: Math.abs(entity.amount),
+        ...(entity.memo === undefined ? {} : { PrivateNote: entity.memo }),
+        DepositToAccountRef: accountRef(entity.bankAccountQboId),
+        Line: entity.lines.map((line) => ({
+          Id: line.id,
+          Amount: line.amount,
+          ...(line.memo === undefined ? {} : { Description: line.memo }),
+          DetailType: 'DepositLineDetail',
+          DepositLineDetail: { AccountRef: accountRef(line.accountQboId) },
+        })),
+      };
+      return body as unknown as Record<string, unknown>;
+    }
+
+    const debitTotal = round2(
+      entity.lines.reduce((total, line) => total + line.amount, 0),
+    );
+    const body: RawJournalEntry = {
+      Id: entity.qboId,
+      SyncToken: String(entity.syncToken),
+      TxnDate: entity.date,
+      ...(entity.memo === undefined ? {} : { PrivateNote: entity.memo }),
+      Line: [
+        ...entity.lines.map((line) => ({
+          Id: line.id,
+          Amount: line.amount,
+          ...(line.memo === undefined ? {} : { Description: line.memo }),
+          DetailType: 'JournalEntryLineDetail',
+          JournalEntryLineDetail: {
+            PostingType: 'Debit' as const,
+            AccountRef: accountRef(line.accountQboId),
+          },
+        })),
+        {
+          Id: `FUNDING_${entity.qboId}`,
+          Amount: debitTotal,
+          DetailType: 'JournalEntryLineDetail',
+          JournalEntryLineDetail: {
+            PostingType: 'Credit',
+            AccountRef: accountRef(entity.bankAccountQboId),
+          },
+        },
+      ],
+    };
+    return body as unknown as Record<string, unknown>;
+  }
+
   /**
    * Mirror the real client's mapping: QboTxn.lines is ONLY the lines posting
    * to `filterIds` (holding accounts), and amount is the signed sum of those
@@ -891,9 +1040,7 @@ export class MockQboClient implements QboClient {
         memo: l.memo,
       })),
       raw:
-        e.qboType === 'Purchase'
-          ? structuredClone(this.rawPurchaseById(e.qboId) ?? e)
-          : structuredClone(e),
+        this.lineWriteBody(e),
     };
   }
 
@@ -943,6 +1090,21 @@ export class MockQboClient implements QboClient {
     }
     const snapshot = this.realm.purchaseSnapshots.find((purchase) => purchase.qboId === qboId);
     return snapshot ? { ...snapshot, lines: snapshot.lines.map((line) => ({ ...line })) } : null;
+  }
+
+  async fetchLineWriteSnapshot(
+    qboType: QboTxn['qboType'],
+    qboId: string,
+  ): Promise<QboLineWriteSnapshot | null> {
+    await ensureMockRealmsHydrated();
+    const entity = this.findEntity(qboType, qboId);
+    if (!entity) return null;
+    return {
+      qboType,
+      qboId,
+      syncToken: String(entity.syncToken),
+      contentHash: hashLineWriteContent(this.lineWriteBody(entity)),
+    };
   }
 
   async preparePurchaseRecategorization(
@@ -1035,6 +1197,227 @@ export class MockQboClient implements QboClient {
     else this.realm.purchaseSnapshots[snapshotIndex] = responseSnapshot;
     await persistMockRealm(this.realmId);
     return { ok: true, newSyncToken: String(entity.syncToken) };
+  }
+
+  async prepareLineRecategorization(
+    txn: QboTxn,
+    splits: { amount: number; accountQboId: string; memo?: string }[],
+    requestId: string,
+  ): Promise<QboPreparedLineWrite> {
+    await ensureMockRealmsHydrated();
+    const entity = this.findEntity(txn.qboType, txn.qboId);
+    if (!entity) {
+      throw new Error(`Mock QBO: ${txn.qboType} ${txn.qboId} not found`);
+    }
+    if (String(entity.syncToken) !== txn.syncToken) {
+      throw new QboSyncTokenConflict();
+    }
+    const raw = this.lineWriteBody(entity);
+    return buildPreparedLineWrite({
+      txn: { ...txn, raw },
+      splits,
+      requestId,
+      holdingAccountQboIds: [...this.holdingIds],
+    });
+  }
+
+  async sendPreparedLineWrite(
+    preparedValue: QboPreparedLineWrite,
+    beforeSend?: () => Promise<void>,
+  ): Promise<QboLineWriteResult> {
+    const prepared = structuredClone(validatePreparedLineWrite(preparedValue));
+    const responseBody = structuredClone(prepared.body);
+    await ensureMockRealmsHydrated();
+    const entity = this.findEntity(prepared.qboType, prepared.qboId);
+    if (!entity) {
+      throw new Error(
+        `Mock QBO: ${prepared.qboType} ${prepared.qboId} not found`,
+      );
+    }
+    const currentBody = this.lineWriteBody(entity);
+    if (
+      String(entity.syncToken) !== prepared.before.syncToken ||
+      hashLineWriteContent(currentBody) !== prepared.before.contentHash
+    ) {
+      throw new QboSyncTokenConflict();
+    }
+
+    const rawLines = responseBody.Line;
+    if (
+      !Array.isArray(rawLines) ||
+      !rawLines.every(
+        (line) => typeof line === 'object' && line !== null && !Array.isArray(line),
+      )
+    ) {
+      throw new Error(
+        `Mock QBO: prepared ${prepared.qboType} Line array is missing`,
+      );
+    }
+    const lines = rawLines as Record<string, unknown>[];
+    const reservedLineIds = new Set(
+      lines.flatMap((line) =>
+        typeof line.Id === 'string' && line.Id !== '' ? [line.Id] : []),
+    );
+    let nextId = this.realm.nextId;
+    for (const line of lines) {
+      if (typeof line.Id === 'string' && line.Id !== '') continue;
+      let candidate: string;
+      do {
+        candidate = String(nextId);
+        nextId += 1;
+      } while (reservedLineIds.has(candidate));
+      line.Id = candidate;
+      reservedLineIds.add(candidate);
+    }
+
+    const mapLine = (
+      line: Record<string, unknown>,
+      detailName:
+        | 'AccountBasedExpenseLineDetail'
+        | 'DepositLineDetail'
+        | 'JournalEntryLineDetail',
+    ): MockLine => {
+      const detail = line[detailName];
+      const accountRef =
+        isRecord(detail) && isRecord(detail.AccountRef)
+          ? detail.AccountRef
+          : null;
+      const accountQboId =
+        accountRef && typeof accountRef.value === 'string'
+          ? accountRef.value
+          : '';
+      if (
+        typeof line.Id !== 'string' ||
+        typeof line.Amount !== 'number' ||
+        !this.accountById(accountQboId)
+      ) {
+        throw new Error(
+          `Mock QBO: invalid prepared ${prepared.qboType} line account`,
+        );
+      }
+      return {
+        id: line.Id,
+        amount: round2(line.Amount),
+        accountQboId,
+        ...(line.Description === undefined
+          ? {}
+          : { memo: String(line.Description) }),
+      };
+    };
+
+    let mappedLines: MockLine[];
+    let bankAccountQboId = entity.bankAccountQboId;
+    if (prepared.qboType === 'Purchase') {
+      mappedLines = lines.map((line) =>
+        mapLine(line, 'AccountBasedExpenseLineDetail'));
+      const accountRef = responseBody.AccountRef;
+      if (isRecord(accountRef) && typeof accountRef.value === 'string') {
+        bankAccountQboId = accountRef.value;
+      }
+    } else if (prepared.qboType === 'Deposit') {
+      mappedLines = lines.map((line) => mapLine(line, 'DepositLineDetail'));
+      const accountRef = responseBody.DepositToAccountRef;
+      if (isRecord(accountRef) && typeof accountRef.value === 'string') {
+        bankAccountQboId = accountRef.value;
+      }
+    } else {
+      const debitLines: Record<string, unknown>[] = [];
+      for (const line of lines) {
+        const detail = line.JournalEntryLineDetail;
+        if (!isRecord(detail)) {
+          throw new Error('Mock QBO: invalid prepared JournalEntry detail');
+        }
+        if (detail.PostingType === 'Debit') {
+          debitLines.push(line);
+        } else if (detail.PostingType === 'Credit') {
+          const accountRef = detail.AccountRef;
+          if (
+            !isRecord(accountRef) ||
+            typeof accountRef.value !== 'string' ||
+            !this.accountById(accountRef.value)
+          ) {
+            throw new Error(
+              'Mock QBO: invalid prepared JournalEntry credit account',
+            );
+          }
+          bankAccountQboId = accountRef.value;
+        } else {
+          throw new Error('Mock QBO: invalid prepared JournalEntry posting type');
+        }
+      }
+      mappedLines = debitLines.map((line) =>
+        mapLine(line, 'JournalEntryLineDetail'));
+    }
+
+    const nextSyncToken = String(entity.syncToken + 1);
+    responseBody.SyncToken = nextSyncToken;
+    const result = verifyLineWriteResult(prepared, {
+      qboType: prepared.qboType,
+      qboId: prepared.qboId,
+      syncToken: nextSyncToken,
+      contentHash: hashLineWriteContent(responseBody),
+    });
+
+    await beforeSend?.();
+    entity.lines = mappedLines;
+    entity.syncToken += 1;
+    entity.bankAccountQboId = bankAccountQboId;
+    if (typeof responseBody.TxnDate === 'string') {
+      entity.date = responseBody.TxnDate;
+    }
+    entity.memo =
+      typeof responseBody.PrivateNote === 'string'
+        ? responseBody.PrivateNote
+        : undefined;
+    if (prepared.qboType === 'Purchase') {
+      entity.amount =
+        responseBody.Credit === true
+          ? Math.abs(
+              typeof responseBody.TotalAmt === 'number'
+                ? responseBody.TotalAmt
+                : entity.amount,
+            )
+          : -Math.abs(
+              typeof responseBody.TotalAmt === 'number'
+                ? responseBody.TotalAmt
+                : entity.amount,
+            );
+      const rawIndex = this.realm.rawPurchases.findIndex(
+        (purchase) => purchase.Id === prepared.qboId,
+      );
+      const purchaseBody = responseBody as unknown as RawPurchase;
+      if (rawIndex === -1) this.realm.rawPurchases.push(purchaseBody);
+      else this.realm.rawPurchases[rawIndex] = purchaseBody;
+      const responseSnapshot = rawPurchaseSnapshot(
+        purchaseBody,
+        nextSyncToken,
+        this.realm,
+      );
+      const snapshotIndex = this.realm.purchaseSnapshots.findIndex(
+        (snapshot) => snapshot.qboId === prepared.qboId,
+      );
+      if (snapshotIndex === -1) {
+        this.realm.purchaseSnapshots.push(responseSnapshot);
+      } else {
+        this.realm.purchaseSnapshots[snapshotIndex] = responseSnapshot;
+      }
+    } else if (prepared.qboType === 'Deposit') {
+      entity.amount = Math.abs(
+        typeof responseBody.TotalAmt === 'number'
+          ? responseBody.TotalAmt
+          : entity.amount,
+      );
+      entity.rawLineWriteBody = responseBody;
+    } else {
+      entity.amount = -round2(
+        mappedLines.reduce((total, line) => total + line.amount, 0),
+      );
+      entity.rawLineWriteBody = responseBody;
+    }
+    entity.lastUpdated = new Date().toISOString();
+    this.realm.nextId = nextId;
+    await persistMockRealm(this.realmId);
+    return result;
   }
 
   async preparePurchaseRestore(
@@ -1168,8 +1551,12 @@ export class MockQboClient implements QboClient {
         throw new Error(`Mock QBO: unknown account id "${s.accountQboId}" in realm ${this.realmId}`);
       }
     }
+    const currentRaw =
+      txn.qboType === 'Deposit' || txn.qboType === 'JournalEntry'
+        ? this.lineWriteBody(entity)
+        : null;
     const keep = entity.lines.filter((l) => !replaceIds.has(l.accountQboId));
-    entity.lines = [
+    const nextLines = [
       ...keep,
       ...newLines.map((s, i) => ({
         id: String(keep.length + i + 1),
@@ -1178,6 +1565,35 @@ export class MockQboClient implements QboClient {
         memo: s.memo,
       })),
     ];
+    if (currentRaw) {
+      const rebuiltLines =
+        txn.qboType === 'Deposit'
+          ? rebuildDepositLines(
+              currentRaw as unknown as RawDeposit,
+              replaceIds,
+              newLines,
+            )
+          : rebuildJournalEntryLines(
+              currentRaw as unknown as RawJournalEntry,
+              replaceIds,
+              newLines,
+            );
+      const firstNewRawIndex = rebuiltLines.length - newLines.length;
+      const nextRawLines = rebuiltLines.map((line, index) => {
+        if (index < firstNewRawIndex) return line;
+        const newLineIndex = index - firstNewRawIndex;
+        return {
+          ...line,
+          Id: nextLines[keep.length + newLineIndex]!.id,
+        };
+      });
+      entity.rawLineWriteBody = {
+        ...currentRaw,
+        SyncToken: String(entity.syncToken + 1),
+        Line: nextRawLines,
+      };
+    }
+    entity.lines = nextLines;
     entity.syncToken += 1;
     entity.lastUpdated = new Date().toISOString();
     return { ok: true, newSyncToken: String(entity.syncToken) };
@@ -1187,10 +1603,13 @@ export class MockQboClient implements QboClient {
     txn: QboTxn,
     splits: { amount: number; accountQboId: string; memo?: string }[],
   ): Promise<QboWriteResult> {
-    await ensureMockRealmsHydrated();
-    const result = this.replaceLines(txn, this.holdingIds, splits);
-    await persistMockRealm(this.realmId);
-    return result;
+    const prepared = await this.prepareLineRecategorization(
+      txn,
+      splits,
+      randomUUID(),
+    );
+    const result = await this.sendPreparedLineWrite(prepared);
+    return { ok: true, newSyncToken: result.newSyncToken };
   }
 
   async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {

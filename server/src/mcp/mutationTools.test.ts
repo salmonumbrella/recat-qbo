@@ -20,6 +20,8 @@ const companyId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const transactionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const operationId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const undoOperationId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const counterpartTransactionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const transferOperationId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
 const preparedCategorization = {
   operationId,
@@ -82,6 +84,37 @@ const preparedUndo = {
   warnings: [],
 };
 
+const preparedTransfer = {
+  operationId: transferOperationId,
+  expiresAt: '2026-07-29T20:15:00.000Z',
+  preview: {
+    action: 'record_transfer' as const,
+    direction: 'between_accounts' as const,
+    totalCents: 1_050,
+    legCount: 2 as const,
+    preparationDigest: 'b'.repeat(64),
+  },
+};
+
+const transferOperation = {
+  operationId: transferOperationId,
+  kind: 'transfer' as const,
+  expiresAt: '2026-07-29T20:15:00.000Z',
+  state: 'prepared' as const,
+  phase: 'awaiting_commit' as const,
+  result: {
+    complete: false,
+    firstLeg: { outcome: 'IN_PROGRESS' as const },
+    secondLeg: { outcome: 'IN_PROGRESS' as const },
+  },
+  error: null,
+  actions: {
+    canCommit: true,
+    canRetry: false,
+    requiresReconciliation: false,
+  },
+};
+
 function mutations(
   overrides: Partial<McpMutationOperations> = {},
 ): McpMutationOperations {
@@ -96,6 +129,8 @@ function mutations(
       operationId: undoOperationId,
       kind: 'undo',
     }),
+    prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
+    commitTransfer: vi.fn().mockResolvedValue(transferOperation),
     ...overrides,
   };
 }
@@ -199,9 +234,29 @@ describe('Recat MCP mutation tools', () => {
     expect(
       undoSchema.properties.preview.properties.restorationDigest.pattern,
     ).toBe('^[0-9a-f]{64}$');
+
+    const prepareTransfer = mutationTools.find((tool) =>
+      tool.name === 'prepare_transfer')!;
+    expect(prepareTransfer.inputSchema.required).toEqual([
+      'companyId',
+      'transactionId',
+      'counterpartTransactionId',
+      'expectedRevision',
+      'counterpartExpectedRevision',
+    ]);
+    expect(prepareTransfer.inputSchema.additionalProperties).toBe(false);
+    expect(prepareTransfer.outputSchema.properties.preview.additionalProperties)
+      .toBe(false);
+    expect(prepareTransfer.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(mutationTools.some((tool) => tool.name === 'post_transfer')).toBe(false);
   });
 
-  it('routes all six operations with the fresh principal and sanitized DTOs', async () => {
+  it('routes all eight operations with the fresh principal and sanitized DTOs', async () => {
     const operations = mutations();
     const server = handler(operations);
     const proposal = {
@@ -237,6 +292,18 @@ describe('Recat MCP mutation tools', () => {
         operationId: undoOperationId,
         idempotencyKey: 'undo-one',
       }],
+      ['prepare_transfer', {
+        companyId,
+        transactionId,
+        counterpartTransactionId,
+        expectedRevision: 2,
+        counterpartExpectedRevision: 4,
+        idempotencyKey: 'transfer-one',
+      }],
+      ['commit_transfer', {
+        operationId: transferOperationId,
+        idempotencyKey: 'transfer-one',
+      }],
     ] as const;
 
     for (const [name, arguments_] of calls) {
@@ -259,6 +326,8 @@ describe('Recat MCP mutation tools', () => {
     expect(operations.retryOperation).toHaveBeenCalledWith(principal, calls[3][1]);
     expect(operations.prepareUndo).toHaveBeenCalledWith(principal, calls[4][1]);
     expect(operations.commitUndo).toHaveBeenCalledWith(principal, calls[5][1]);
+    expect(operations.prepareTransfer).toHaveBeenCalledWith(principal, calls[6][1]);
+    expect(operations.commitTransfer).toHaveBeenCalledWith(principal, calls[7][1]);
   });
 
   it('rejects extra keys and contradictory tax inputs before service dispatch', async () => {
@@ -351,5 +420,75 @@ describe('Recat MCP mutation tools', () => {
     });
     expect(JSON.stringify(response)).not.toContain(sentinel);
     expect(JSON.stringify(log.mock.calls)).not.toContain(sentinel);
+  });
+
+  it('redacts transfer token attribution from success and error observability logs', async () => {
+    const log = vi.fn();
+    const operations = mutations({
+      getOperation: vi.fn().mockResolvedValueOnce(transferOperation)
+        .mockResolvedValueOnce(operation),
+      retryOperation: vi.fn().mockResolvedValue(transferOperation),
+      commitTransfer: vi.fn().mockRejectedValue(new Error('provider failure')),
+    });
+    const server = handler(operations, log);
+
+    const calls = [
+      ['prepare_transfer', {
+        companyId,
+        transactionId,
+        counterpartTransactionId,
+        expectedRevision: 2,
+        counterpartExpectedRevision: 4,
+        idempotencyKey: 'transfer-observability',
+      }],
+      ['commit_transfer', {
+        operationId: transferOperationId,
+        idempotencyKey: 'transfer-observability',
+      }],
+      ['get_operation', { operationId: transferOperationId }],
+      ['retry_operation', { operationId: transferOperationId }],
+      ['get_operation', { operationId }],
+    ] as const;
+
+    for (const [name, arguments_] of calls) {
+      await legacy(server, 'tools/call', { name, arguments: arguments_ });
+    }
+
+    const events = log.mock.calls.map(([event]) => event as {
+      outcome: 'success' | 'error';
+      tokenPrefix: string;
+      tool: string;
+    });
+    expect(events.slice(0, 4).map((event) => ({
+      outcome: event.outcome,
+      tokenPrefix: event.tokenPrefix,
+      tool: event.tool,
+    }))).toEqual([
+      {
+        outcome: 'success',
+        tokenPrefix: 'redacted',
+        tool: 'prepare_transfer',
+      },
+      {
+        outcome: 'error',
+        tokenPrefix: 'redacted',
+        tool: 'commit_transfer',
+      },
+      {
+        outcome: 'success',
+        tokenPrefix: 'redacted',
+        tool: 'get_operation',
+      },
+      {
+        outcome: 'success',
+        tokenPrefix: 'redacted',
+        tool: 'retry_operation',
+      },
+    ]);
+    expect(events[4]).toMatchObject({
+      outcome: 'success',
+      tokenPrefix: principal.tokenPrefix,
+      tool: 'get_operation',
+    });
   });
 });

@@ -225,7 +225,9 @@ const categorizeBody = z.object({
   tagIds: z.array(z.string().min(1)).optional(),
 });
 
-const transferBody = z.object({ counterpartTxnId: z.string().min(1) });
+const transferBody = z.object({
+  counterpartTxnId: z.string().uuid(),
+}).strict();
 
 const bulkPostBody = z.object({ ids: z.array(z.string().min(1)).min(1).max(500) });
 
@@ -410,6 +412,15 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   TAX_RATE_UNSUPPORTED: { status: 400, message: 'A selected tax code is unsupported.' },
   TAX_REQUIRES_PURCHASE: { status: 400, message: 'Tax selection is supported only for Purchase transactions.' },
   TAX_TREATMENT_AMBIGUOUS: { status: 400, message: 'A selected tax code is unsupported.' },
+  TRANSFER_RECONCILIATION_REQUIRED: {
+    status: 409,
+    message:
+      'The transfer may be partially recorded. Verify both transactions in QuickBooks before retrying.',
+  },
+  TRANSFER_RETRYABLE: {
+    status: 409,
+    message: 'The transfer was not sent. Retry this transfer.',
+  },
   TRANSACTION_NOT_FOUND: { status: 404, message: 'Transaction not found.' },
   UNBALANCED_TOTAL: { status: 400, message: 'Categorization lines do not balance to the transaction total.' },
   VERIFIED_POST_REQUIRED: { status: 409, message: 'Undo requires a verified posted categorization.' },
@@ -801,7 +812,13 @@ transactionActionsRouter.post(
     try {
       await recordTransfer(id, counterpartTxnId, actorFor(user));
     } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err), 'TRANSFER_FAILED');
+      const mapped = mappedServiceHttpError(err);
+      if (mapped) throw mapped;
+      throw new HttpError(
+        400,
+        'Transfer could not be recorded.',
+        'TRANSFER_FAILED',
+      );
     }
     res.json([await dtoById(id), await dtoById(counterpartTxnId)]);
   }),

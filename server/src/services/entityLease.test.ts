@@ -2,8 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   EntityLeaseError,
   acquireEntityLease,
+  acquireEntityLeases,
+  canonicalEntityLeaseKeys,
+  fenceEntityLeaseOwnerships,
   releaseEntityLease,
+  renewEntityLeases,
   withEntityLease,
+  withEntityLeases,
   type EntityLeaseDb,
 } from './entityLease.js';
 import * as entityLeaseModule from './entityLease.js';
@@ -18,7 +23,9 @@ interface LeaseRow {
 
 class FakeLeaseDb implements EntityLeaseDb {
   rows: LeaseRow[] = [];
+  deleteOrder: string[] = [];
   failRelease = false;
+  transactionCount = 0;
   private transactionTail: Promise<void> = Promise.resolve();
 
   qboEntityLease: EntityLeaseDb['qboEntityLease'] = {
@@ -54,6 +61,7 @@ class FakeLeaseDb implements EntityLeaseDb {
     },
     deleteMany: async ({ where }) => {
       if (this.failRelease) throw new Error('lease cleanup storage failed');
+      this.deleteOrder.push(serialized(where));
       const before = this.rows.length;
       this.rows = this.rows.filter(
         (row) =>
@@ -69,6 +77,7 @@ class FakeLeaseDb implements EntityLeaseDb {
   };
 
   async $transaction<T>(callback: (tx: EntityLeaseDb) => Promise<T>): Promise<T> {
+    this.transactionCount += 1;
     const predecessor = this.transactionTail;
     let release!: () => void;
     this.transactionTail = new Promise<void>((resolve) => {
@@ -87,10 +96,97 @@ class FakeLeaseDb implements EntityLeaseDb {
   }
 }
 
-const key = { companyId: 'company-generic', qboType: 'Purchase', qboId: 'purchase-generic' };
+function serialized(entity: {
+  companyId: string;
+  qboType: string;
+  qboId: string;
+}): string {
+  return `${entity.companyId}:${entity.qboType}:${entity.qboId}`;
+}
+
+const keyA = {
+  companyId: 'company-generic',
+  qboType: 'Purchase',
+  qboId: 'purchase-a',
+};
+const keyB = {
+  companyId: 'company-generic',
+  qboType: 'Purchase',
+  qboId: 'purchase-b',
+};
+const key = keyA;
 const at = new Date('2026-07-28T12:00:00.000Z');
 
 describe('entity leases', () => {
+  it('sorts keys canonically and rejects duplicate entities before opening a transaction', async () => {
+    expect(canonicalEntityLeaseKeys([keyB, keyA])).toEqual([keyA, keyB]);
+    expect(() => canonicalEntityLeaseKeys([keyA, keyA])).toThrow(
+      expect.objectContaining({ code: 'DUPLICATE_ENTITY' }),
+    );
+
+    const db = new FakeLeaseDb();
+    await expect(
+      acquireEntityLeases([keyA, { ...keyA }], 'owner-a', { db }),
+    ).rejects.toMatchObject({ code: 'DUPLICATE_ENTITY' });
+    expect(db.transactionCount).toBe(0);
+  });
+
+  it('does not leave the first lease when the second entity is busy', async () => {
+    const db = new FakeLeaseDb();
+    await acquireEntityLease(keyB, 'owner-b', { db, now: async () => at });
+
+    await expect(
+      acquireEntityLeases([keyA, keyB], 'owner-a', { db, now: async () => at }),
+    ).rejects.toMatchObject({ code: 'ENTITY_BUSY' });
+    expect(db.rows.some((row) => serialized(row) === serialized(keyA))).toBe(false);
+    expect(db.rows).toEqual([
+      expect.objectContaining({ ...keyB, owner: 'owner-b' }),
+    ]);
+  });
+
+  it('rolls back every renewal when any entity is no longer owned', async () => {
+    const db = new FakeLeaseDb();
+    await acquireEntityLeases([keyA, keyB], 'owner-a', { db, now: async () => at });
+    const previousExpiry = db.rows.find(
+      (row) => serialized(row) === serialized(keyA),
+    )?.leaseExpiresAt;
+    const second = db.rows.find((row) => serialized(row) === serialized(keyB));
+    if (second) second.owner = 'owner-b';
+
+    await expect(
+      renewEntityLeases([keyB, keyA], 'owner-a', {
+        db,
+        now: async () => new Date(at.getTime() + 1_000),
+      }),
+    ).rejects.toMatchObject({ code: 'ENTITY_BUSY' });
+    expect(
+      db.rows.find((row) => serialized(row) === serialized(keyA))?.leaseExpiresAt,
+    ).toEqual(previousExpiry);
+  });
+
+  it('cleans up reversed callback keys canonically and only for the matching owner', async () => {
+    const db = new FakeLeaseDb();
+    const callbackError = new Error('multi callback failed');
+
+    await expect(
+      withEntityLeases(
+        [keyB, keyA],
+        'owner-a',
+        async () => {
+          const second = db.rows.find((row) => serialized(row) === serialized(keyB));
+          if (second) second.owner = 'owner-b';
+          throw callbackError;
+        },
+        { db, now: async () => at },
+      ),
+    ).rejects.toBe(callbackError);
+
+    expect(db.deleteOrder).toEqual([serialized(keyA), serialized(keyB)]);
+    expect(db.rows).toEqual([
+      expect.objectContaining({ ...keyB, owner: 'owner-b' }),
+    ]);
+  });
+
   it('locks and verifies the exact parameterized lease owner before fenced work', async () => {
     const query = vi.fn(async () => [{ owner: 'owner-a' }]);
     const fenceEntityLeaseOwnership = (
@@ -113,6 +209,20 @@ describe('entity leases', () => {
       key.qboType,
       key.qboId,
     );
+  });
+
+  it('uses PostgreSQL wall-clock time when fencing live lease expiry', async () => {
+    const query = vi.fn(async () => [{ owner: 'owner-a' }]);
+
+    await fenceEntityLeaseOwnerships([keyA, keyB], 'owner-a', {
+      db: { $queryRawUnsafe: query },
+    });
+
+    expect(query).toHaveBeenCalledTimes(2);
+    for (const [sql] of query.mock.calls) {
+      expect(sql).toContain('clock_timestamp()');
+      expect(sql).not.toContain('CURRENT_TIMESTAMP');
+    }
   });
 
   it.each([

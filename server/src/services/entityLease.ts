@@ -44,13 +44,47 @@ export interface EntityLeaseDeps {
   }) => void;
 }
 
-export class EntityLeaseError extends Error {
-  readonly code = 'ENTITY_BUSY';
+type EntityLeaseErrorCode = 'ENTITY_BUSY' | 'DUPLICATE_ENTITY';
 
-  constructor(message = 'Another write is already in progress for this QuickBooks entity.') {
+export class EntityLeaseError extends Error {
+  readonly code: EntityLeaseErrorCode;
+
+  constructor(codeOrMessage: EntityLeaseErrorCode | string = 'ENTITY_BUSY') {
+    const code = codeOrMessage === 'DUPLICATE_ENTITY'
+      ? 'DUPLICATE_ENTITY'
+      : 'ENTITY_BUSY';
+    const message = codeOrMessage === 'DUPLICATE_ENTITY'
+      ? 'Each QuickBooks entity may only appear once in a lease operation.'
+      : codeOrMessage === 'ENTITY_BUSY'
+        ? 'Another write is already in progress for this QuickBooks entity.'
+        : codeOrMessage;
     super(message);
     this.name = 'EntityLeaseError';
+    this.code = code;
   }
+}
+
+function compareEntityLeaseKeys(
+  left: EntityLeaseKey,
+  right: EntityLeaseKey,
+): number {
+  for (const field of ['companyId', 'qboType', 'qboId'] as const) {
+    if (left[field] < right[field]) return -1;
+    if (left[field] > right[field]) return 1;
+  }
+  return 0;
+}
+
+export function canonicalEntityLeaseKeys(
+  keys: readonly EntityLeaseKey[],
+): EntityLeaseKey[] {
+  const canonical = [...keys].sort(compareEntityLeaseKeys);
+  for (let index = 1; index < canonical.length; index += 1) {
+    if (compareEntityLeaseKeys(canonical[index - 1]!, canonical[index]!) === 0) {
+      throw new EntityLeaseError('DUPLICATE_ENTITY');
+    }
+  }
+  return canonical;
 }
 
 /**
@@ -77,6 +111,31 @@ export async function fenceEntityLeaseOwnership(
   );
   if (rows.length !== 1 || rows[0]?.owner !== owner) {
     throw new EntityLeaseError();
+  }
+}
+
+export async function fenceEntityLeaseOwnerships(
+  keys: readonly EntityLeaseKey[],
+  owner: string,
+  deps: { db: EntityLeaseFenceDb },
+): Promise<void> {
+  const canonical = canonicalEntityLeaseKeys(keys);
+  for (const key of canonical) {
+    const rows = await deps.db.$queryRawUnsafe<{ owner: string }[]>(
+      `SELECT "owner"
+         FROM "QboEntityLease"
+        WHERE "companyId" = $1
+          AND "qboType" = $2
+          AND "qboId" = $3
+          AND "leaseExpiresAt" > clock_timestamp()
+        FOR UPDATE`,
+      key.companyId,
+      key.qboType,
+      key.qboId,
+    );
+    if (rows.length !== 1 || rows[0]?.owner !== owner) {
+      throw new EntityLeaseError();
+    }
   }
 }
 
@@ -110,14 +169,15 @@ function boundedTtl(ttlMs: number | undefined): number {
   return Math.max(1, Math.min(Math.trunc(ttlMs), DEFAULT_LEASE_TTL_MS));
 }
 
-export async function acquireEntityLease(
-  key: EntityLeaseKey,
+async function acquireCanonicalEntityLeases(
+  keys: readonly EntityLeaseKey[],
   owner: string,
-  deps: EntityLeaseDeps,
+  tx: EntityLeaseDb,
+  deps: Pick<EntityLeaseDeps, 'now' | 'ttlMs'>,
 ): Promise<void> {
-  await deps.db.$transaction(async (tx) => {
-    const now = await (deps.now ?? databaseNow)(tx);
-    const leaseExpiresAt = new Date(now.getTime() + boundedTtl(deps.ttlMs));
+  const now = await (deps.now ?? databaseNow)(tx);
+  const leaseExpiresAt = new Date(now.getTime() + boundedTtl(deps.ttlMs));
+  for (const key of keys) {
     const updated = await tx.qboEntityLease.updateMany({
       where: {
         ...key,
@@ -128,7 +188,7 @@ export async function acquireEntityLease(
       },
       data: { owner, leaseExpiresAt },
     });
-    if (updated.count === 1) return;
+    if (updated.count === 1) continue;
 
     try {
       await tx.qboEntityLease.create({
@@ -137,6 +197,50 @@ export async function acquireEntityLease(
     } catch (error) {
       if (isUniqueConstraint(error)) throw new EntityLeaseError();
       throw error;
+    }
+  }
+}
+
+export async function acquireEntityLeases(
+  keys: readonly EntityLeaseKey[],
+  owner: string,
+  deps: EntityLeaseDeps,
+): Promise<void> {
+  const canonical = canonicalEntityLeaseKeys(keys);
+  await deps.db.$transaction(async (tx) => {
+    await acquireCanonicalEntityLeases(canonical, owner, tx, deps);
+  });
+}
+
+export async function acquireEntityLease(
+  key: EntityLeaseKey,
+  owner: string,
+  deps: EntityLeaseDeps,
+): Promise<void> {
+  await acquireEntityLeases([key], owner, deps);
+}
+
+export async function renewEntityLeases(
+  keys: readonly EntityLeaseKey[],
+  owner: string,
+  deps: EntityLeaseDeps,
+): Promise<void> {
+  const canonical = canonicalEntityLeaseKeys(keys);
+  await deps.db.$transaction(async (tx) => {
+    const now = await (deps.now ?? databaseNow)(tx);
+    const leaseExpiresAt = new Date(now.getTime() + boundedTtl(deps.ttlMs));
+    for (const key of canonical) {
+      const renewed = await tx.qboEntityLease.updateMany({
+        where: {
+          ...key,
+          OR: [
+            { leaseExpiresAt: { lte: now } },
+            { owner },
+          ],
+        },
+        data: { owner, leaseExpiresAt },
+      });
+      if (renewed.count !== 1) throw new EntityLeaseError();
     }
   });
 }
@@ -152,36 +256,53 @@ export async function releaseEntityLease(
   return released.count === 1;
 }
 
+async function releaseEntityLeases(
+  keys: readonly EntityLeaseKey[],
+  owner: string,
+  deps: Pick<EntityLeaseDeps, 'db'>,
+): Promise<void> {
+  await deps.db.$transaction(async (tx) => {
+    for (const key of keys) {
+      await tx.qboEntityLease.deleteMany({
+        where: { ...key, owner },
+      });
+    }
+  });
+}
+
+export async function withEntityLeases<T>(
+  keys: readonly EntityLeaseKey[],
+  owner: string,
+  callback: () => Promise<T>,
+  deps: EntityLeaseDeps,
+): Promise<T> {
+  const canonical = canonicalEntityLeaseKeys(keys);
+  await acquireEntityLeases(canonical, owner, deps);
+  try {
+    return await callback();
+  } finally {
+    try {
+      await releaseEntityLeases(canonical, owner, deps);
+    } catch {
+      const failure = {
+        code: 'LEASE_RELEASE_FAILED' as const,
+        message: 'Entity lease cleanup failed.',
+      };
+      try {
+        if (deps.reportCleanupFailure) deps.reportCleanupFailure(failure);
+        else console.warn(`[entityLease] ${failure.message}`);
+      } catch {
+        // Cleanup reporting must never replace the callback result/error either.
+      }
+    }
+  }
+}
+
 export async function withEntityLease<T>(
   key: EntityLeaseKey,
   owner: string,
   callback: () => Promise<T>,
   deps: EntityLeaseDeps,
 ): Promise<T> {
-  await acquireEntityLease(key, owner, deps);
-  let result: T | undefined;
-  let primaryError: unknown;
-  let callbackFailed = false;
-  try {
-    result = await callback();
-  } catch (error) {
-    callbackFailed = true;
-    primaryError = error;
-  }
-  try {
-    await releaseEntityLease(key, owner, deps);
-  } catch {
-    const failure = {
-      code: 'LEASE_RELEASE_FAILED' as const,
-      message: 'Entity lease cleanup failed.',
-    };
-    try {
-      if (deps.reportCleanupFailure) deps.reportCleanupFailure(failure);
-      else console.warn(`[entityLease] ${failure.message}`);
-    } catch {
-      // Cleanup reporting must never replace the callback result/error either.
-    }
-  }
-  if (callbackFailed) throw primaryError;
-  return result as T;
+  return withEntityLeases([key], owner, callback, deps);
 }

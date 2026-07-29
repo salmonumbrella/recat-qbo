@@ -5,6 +5,9 @@ import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
 import { McpUndoError } from '../services/mcp/undo.js';
+import { McpTransferExecutionError } from '../services/mcp/transfers.js';
+import { TransferExecutionError } from '../services/transferExecution.js';
+import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
@@ -65,6 +68,52 @@ const WRITEBACK_INVALID_CODES = new Set([
 ]);
 
 function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof McpTransferExecutionError) {
+    switch (error.code) {
+      case 'OPERATION_NOT_FOUND':
+        return 'NOT_FOUND';
+      case 'OPERATION_EXPIRED':
+      case 'OPERATION_CANCELLED':
+      case 'IDEMPOTENCY_CONFLICT':
+      case 'RETRY_NOT_ALLOWED':
+        return 'INVALID_INPUT';
+      default:
+        return 'COMPANY_UNAVAILABLE';
+    }
+  }
+  if (error instanceof TransferOperationError) {
+    if (error.code === 'FORBIDDEN') return 'FORBIDDEN';
+    if (error.code === 'TRANSACTION_NOT_FOUND') return 'NOT_FOUND';
+    if (error.code === 'COMPANY_DISCONNECTED') return 'QBO_DISCONNECTED';
+    if (
+      error.code === 'INVALID_INPUT'
+      || error.code === 'INVALID_TRANSFER_PAIR'
+      || error.code === 'STALE_REVISION'
+      || error.code === 'INVALID_STATUS'
+      || error.code === 'TARGET_ACCOUNT_INVALID'
+      || error.code === 'ACTIVE_ATTEMPT'
+      || error.code === 'STALE_QBO_BINDING'
+      || error.code === 'STALE_QBO_AMOUNT'
+      || error.code === 'IDEMPOTENCY_CONFLICT'
+    ) {
+      return 'INVALID_INPUT';
+    }
+    return 'COMPANY_UNAVAILABLE';
+  }
+  if (error instanceof TransferExecutionError) {
+    if (error.code === 'FORBIDDEN') return 'FORBIDDEN';
+    if (error.code === 'OPERATION_NOT_FOUND') return 'NOT_FOUND';
+    if (
+      error.code === 'INVALID_INPUT'
+      || error.code === 'OPERATION_EXPIRED'
+      || error.code === 'STALE_REVISION'
+      || error.code === 'STALE_QBO_BINDING'
+      || error.code === 'QBO_STATE_DRIFT'
+    ) {
+      return 'INVALID_INPUT';
+    }
+    return 'COMPANY_UNAVAILABLE';
+  }
   if (error instanceof McpCategorizationError) {
     switch (error.code) {
       case 'MCP_UNAUTHORIZED':

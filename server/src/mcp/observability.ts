@@ -15,6 +15,7 @@ export interface McpToolLogContext {
   requestId: string;
   traceId: string;
   tokenPrefix: string;
+  tokenPrefixPolicy?: 'include' | 'redact' | 'redact-for-transfer-result';
   method: string;
   tool: string;
   era?: 'legacy' | 'modern';
@@ -72,6 +73,27 @@ function resultCount(value: unknown): number {
     return Math.min((value as { items: unknown[] }).items.length, 100);
   }
   return 1;
+}
+
+function loggedTokenPrefix(
+  context: McpToolLogContext,
+  value: unknown,
+  outcome: 'success' | 'error',
+): string {
+  const redact = context.tokenPrefixPolicy === 'redact'
+    || (
+      context.tokenPrefixPolicy === 'redact-for-transfer-result'
+      && (
+        outcome === 'error'
+        || (
+          value !== null
+          && typeof value === 'object'
+          && 'kind' in value
+          && (value as { kind?: unknown }).kind === 'transfer'
+        )
+      )
+    );
+  return redact ? 'redacted' : bounded(context.tokenPrefix, 16);
 }
 
 export async function observeMcpToolCall<T>(
@@ -133,7 +155,7 @@ export async function observeMcpToolCall<T>(
     log({
       requestId: bounded(context.requestId, 128),
       traceId: bounded(context.traceId, 64),
-      tokenPrefix: bounded(context.tokenPrefix, 16),
+      tokenPrefix: loggedTokenPrefix(context, value, 'success'),
       method: bounded(context.method, 64),
       tool: bounded(context.tool, 64),
       durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -146,7 +168,7 @@ export async function observeMcpToolCall<T>(
     log({
       requestId: bounded(context.requestId, 128),
       traceId: bounded(context.traceId, 64),
-      tokenPrefix: bounded(context.tokenPrefix, 16),
+      tokenPrefix: loggedTokenPrefix(context, undefined, 'error'),
       method: bounded(context.method, 64),
       tool: bounded(context.tool, 64),
       durationMs: Math.max(0, Math.round(performance.now() - startedAt)),

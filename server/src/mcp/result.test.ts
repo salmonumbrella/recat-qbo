@@ -5,6 +5,9 @@ import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
 import { McpUndoError } from '../services/mcp/undo.js';
+import { McpTransferExecutionError } from '../services/mcp/transfers.js';
+import { TransferExecutionError } from '../services/transferExecution.js';
+import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
 import { safeToolFailure, toolSuccess } from './result.js';
 
@@ -71,6 +74,16 @@ describe('MCP tool results', () => {
     [new McpOperationExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('RETRY_NOT_ALLOWED'), 'INVALID_INPUT'],
     [new McpOperationExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpTransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
+    [new McpTransferExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
+    [new McpTransferExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new TransferOperationError('FORBIDDEN'), 'FORBIDDEN'],
+    [new TransferOperationError('TRANSACTION_NOT_FOUND'), 'NOT_FOUND'],
+    [new TransferOperationError('COMPANY_DISCONNECTED'), 'QBO_DISCONNECTED'],
+    [new TransferOperationError('INVALID_TRANSFER_PAIR'), 'INVALID_INPUT'],
+    [new TransferExecutionError('FORBIDDEN'), 'FORBIDDEN'],
+    [new TransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
+    [new TransferExecutionError('OPERATION_EXPIRED'), 'INVALID_INPUT'],
     [new McpUndoError('UNDO_NOT_ALLOWED'), 'INVALID_INPUT'],
     [new McpUndoError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
     [
