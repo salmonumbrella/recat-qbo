@@ -29,6 +29,9 @@ const settingsPatchBody = z.object({
   suggestionSource: z.enum(['builtin', 'ai', 'off']).optional(),
   suggestionProvider: z.enum(['custom', 'openrouter']).optional(),
   suggestionModel: z.string().trim().min(1).optional(),
+  // Empty clears the override so it follows the effective suggestion model.
+  agentDecisionModel: z.string().trim().max(200).optional(),
+  agentVerifierModel: z.string().trim().max(200).optional(),
   aiEndpoint: z.string().nullable().optional(),
   // The client contract (api.ts) sends `aiKey`; `aiApiKey` accepted too.
   aiKey: z.string().optional(),
@@ -72,6 +75,8 @@ instanceRouter.patch(
       ...(body.suggestionSource !== undefined ? { suggestionSource: body.suggestionSource } : {}),
       ...(body.suggestionProvider !== undefined ? { suggestionProvider: body.suggestionProvider } : {}),
       ...(body.suggestionModel !== undefined ? { suggestionModel: body.suggestionModel } : {}),
+      ...(body.agentDecisionModel !== undefined ? { agentDecisionModel: body.agentDecisionModel } : {}),
+      ...(body.agentVerifierModel !== undefined ? { agentVerifierModel: body.agentVerifierModel } : {}),
       ...(body.aiEndpoint !== undefined ? { aiEndpoint: body.aiEndpoint ?? '' } : {}),
       ...(aiApiKey !== undefined ? { aiApiKey } : {}),
       ...(body.openrouterApiKey !== undefined ? { openrouterApiKey: body.openrouterApiKey } : {}),
