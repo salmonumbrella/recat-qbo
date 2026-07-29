@@ -181,6 +181,31 @@ export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
 export type SuggestionProvider = 'custom' | 'openrouter';
+
+export type AgentMode = 'off' | 'shadow';
+export type AgentJobStatus = 'queued' | 'running' | 'retry' | 'completed' | 'cancelled' | 'terminal';
+export type AgentRunStatus = 'running' | 'verified' | 'abstain' | 'failed';
+
+export interface AgentLimitsDto {
+  maxToolCalls: number;
+  maxTurns: number;
+  maxContextBytes: number;
+  maxResponseBytes: number;
+  timeoutMs: number;
+}
+
+/** Company-scoped shadow configuration. Provider credentials are never included. */
+export interface AgentCompanySettingsDto {
+  mode: AgentMode;
+  provider: SuggestionProvider;
+  decisionModel: string;
+  verifierModel: string;
+  scheduleMinutes: number;
+  companyConcurrency: number;
+  evidenceThreshold: number;
+  limits: AgentLimitsDto;
+  configVersion: string;
+}
 export type AuditAction =
   | 'posted'
   | 'dry-run'

@@ -31,6 +31,10 @@ import {
   type EntityLeaseKey,
 } from './entityLease.js';
 import type { MutationAuditInput } from './audit.js';
+import type {
+  VerifiedCategorizationOutcome,
+  VerifiedCategorizationProposal,
+} from './agent/evaluation.js';
 
 export interface Actor {
   /** userId, or null for 'system' */
@@ -715,6 +719,7 @@ interface DurableTransaction {
     taxCode: string | null;
     taxCodeQboId: string | null;
     memo: string | null;
+    tags: { tagId: string }[];
   }[];
   txnTags: { tagId: string }[];
 }
@@ -740,7 +745,10 @@ export interface DurableWritebackDb {
       where: { id: string };
       include: {
         company: true;
-        splitLines: { orderBy: { idx: 'asc' } };
+        splitLines: {
+          orderBy: { idx: 'asc' };
+          include: { tags: true };
+        };
         txnTags: true;
       };
     }): Promise<DurableTransaction | null>;
@@ -819,6 +827,9 @@ export interface DurableWritebackDeps {
   renewLease: (key: EntityLeaseKey, owner: string) => Promise<void>;
   invocationId: () => string;
   now: () => Date;
+  onVerifiedCategorizationOutcome?: (
+    outcome: VerifiedCategorizationOutcome,
+  ) => Promise<void>;
 }
 
 export interface CommitStagedCategorizationInput {
@@ -907,6 +918,10 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
       }),
     invocationId: randomUUID,
     now: () => new Date(),
+    onVerifiedCategorizationOutcome: async (outcome) => {
+      const { evaluateShadowRunAgainstOutcome } = await import('./agent/evaluation.js');
+      await evaluateShadowRunAgainstOutcome(outcome);
+    },
   };
 }
 
@@ -968,7 +983,10 @@ async function loadAuthorizedStage(
       where: { id: transactionId },
       include: {
         company: true,
-        splitLines: { orderBy: { idx: 'asc' } },
+        splitLines: {
+          orderBy: { idx: 'asc' },
+          include: { tags: true },
+        },
         txnTags: true,
       },
     }),
@@ -1116,6 +1134,7 @@ async function loadAuthorizedStage(
         categoryQboId: line.categoryQboId!,
         taxCodeQboId: line.taxCodeQboId,
         memo: line.memo,
+        tagIds: line.tags.map((tag) => tag.tagId),
       })),
       tagIds: txn.txnTags.map((tag) => tag.tagId),
     },
@@ -1124,6 +1143,115 @@ async function loadAuthorizedStage(
 
 function isRuntimeRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function evidenceProposal(staged: StagedCategorization): VerifiedCategorizationProposal {
+  return {
+    taxCalculation: staged.taxCalculation,
+    lines: staged.lines.map((line) => ({
+      idx: line.idx,
+      subtotalCents: line.subtotalCents,
+      taxCents: line.taxCents,
+      totalCents: line.totalCents,
+      categoryQboId: line.categoryQboId,
+      taxCodeQboId: line.taxCodeQboId,
+      memo: line.memo,
+      tagIds: [...(line.tagIds ?? [])],
+    })),
+    tagIds: [...staged.tagIds],
+  };
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
+const EVIDENCE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const EVIDENCE_QBO_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+function isEvidenceTagIds(value: unknown): value is string[] {
+  return (
+    isStringArray(value)
+    && value.length <= 50
+    && new Set(value).size === value.length
+    && value.every((tagId) => EVIDENCE_UUID_PATTERN.test(tagId))
+  );
+}
+
+function isEvidenceQboReference(value: unknown): value is string {
+  return (
+    typeof value === 'string'
+    && value.length <= 120
+    && EVIDENCE_QBO_REFERENCE_PATTERN.test(value)
+  );
+}
+
+function isVerifiedCategorizationProposal(
+  value: unknown,
+): value is VerifiedCategorizationProposal {
+  if (!isRuntimeRecord(value)) return false;
+  if (
+    value.taxCalculation !== 'TaxInclusive'
+    && value.taxCalculation !== 'TaxExcluded'
+    && value.taxCalculation !== 'NotApplicable'
+  ) {
+    return false;
+  }
+  if (
+    !isEvidenceTagIds(value.tagIds)
+    || !Array.isArray(value.lines)
+    || value.lines.length === 0
+    || value.lines.length > 20
+  ) {
+    return false;
+  }
+  const indexes = new Set<number>();
+  return value.lines.every((line) => {
+    if (!isRuntimeRecord(line)) return false;
+    if (
+      !Number.isSafeInteger(line.idx)
+      || (line.idx as number) < 0
+      || indexes.has(line.idx as number)
+    ) {
+      return false;
+    }
+    indexes.add(line.idx as number);
+    const subtotalCents = line.subtotalCents;
+    const taxCents = line.taxCents;
+    const totalCents = line.totalCents;
+    return (
+      Number.isSafeInteger(subtotalCents)
+      && Number.isSafeInteger(taxCents)
+      && Number.isSafeInteger(totalCents)
+      && Number.isSafeInteger((subtotalCents as number) + (taxCents as number))
+      && (subtotalCents as number) + (taxCents as number) === totalCents
+      && isEvidenceQboReference(line.categoryQboId)
+      && (
+        value.taxCalculation === 'NotApplicable'
+          ? line.taxCodeQboId === null
+          : isEvidenceQboReference(line.taxCodeQboId)
+      )
+      && (
+        line.memo === null
+        || (typeof line.memo === 'string' && line.memo.length <= 500)
+      )
+      && isEvidenceTagIds(line.tagIds)
+    );
+  });
+}
+
+function persistedEvidenceProposal(value: unknown): VerifiedCategorizationProposal | null {
+  if (!isRuntimeRecord(value)) return null;
+  const evidence = value.categorizationEvidence;
+  if (
+    !isRuntimeRecord(evidence)
+    || evidence.version !== 1
+    || !isVerifiedCategorizationProposal(evidence.proposal)
+  ) {
+    return null;
+  }
+  return evidence.proposal;
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -1427,6 +1555,52 @@ function recordedAttemptResult(
   };
 }
 
+async function emitVerifiedCategorizationOutcome(
+  d: DurableWritebackDeps,
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+  verifiedStatus?: 'POSTED' | 'REVERTED',
+): Promise<void> {
+  if (attempt.status !== 'VERIFIED' || d.onVerifiedCategorizationOutcome === undefined) return;
+  const operation = attempt.operation === 'restore' ? 'reverted' : 'posted';
+  const effectiveStatus = verifiedStatus ?? txn.status;
+  if (
+    txn.revision !== attempt.expectedRevision
+    || (operation === 'posted' && effectiveStatus !== 'POSTED')
+    || (operation === 'reverted' && effectiveStatus !== 'REVERTED')
+  ) {
+    return;
+  }
+  const proposal = operation === 'posted'
+    ? persistedEvidenceProposal(attempt.requestPayload)
+    : null;
+  // Legacy or corrupt recategorization attempts cannot prove the exact staged
+  // proposal, so they are deliberately excluded instead of guessed from QBO.
+  if (operation === 'posted' && proposal === null) return;
+  try {
+    await d.onVerifiedCategorizationOutcome({
+      companyId: txn.companyId,
+      transactionId: txn.id,
+      inputRevision: attempt.expectedRevision,
+      requestId: attempt.requestId,
+      operation,
+      proposal,
+    });
+  } catch {
+    // The QuickBooks readback and local VERIFIED state are already durable.
+    // Evidence is advisory and can be retried by an idempotent VERIFIED replay.
+  }
+}
+
+async function recordedAttemptResultWithOutcome(
+  d: DurableWritebackDeps,
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+): Promise<DurableMutationResult> {
+  await emitVerifiedCategorizationOutcome(d, attempt, txn);
+  return recordedAttemptResult(attempt, txn.status);
+}
+
 interface RequestIntent {
   transactionId: string;
   operation: 'recategorize' | 'restore';
@@ -1601,7 +1775,7 @@ async function markUncertain(
       expectedRevision: attempt.expectedRevision,
       requestHash: attempt.requestHash,
     });
-    return recordedAttemptResult(latest, txn.status);
+    return recordedAttemptResultWithOutcome(d, latest, txn);
   } catch {
     return safeUncertainResult();
   }
@@ -1660,8 +1834,15 @@ async function finalizeVerified(
       where: { requestId: attempt.requestId },
     });
     if (!latest) lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared during finalization.');
+    await emitVerifiedCategorizationOutcome(d, latest, txn, status);
     return recordedAttemptResult(latest, txn.status);
   }
+  await emitVerifiedCategorizationOutcome(
+    d,
+    { ...attempt, status: 'VERIFIED' },
+    txn,
+    status,
+  );
   return {
     transactionId: txn.id,
     requestId: attempt.requestId,
@@ -1677,6 +1858,7 @@ async function persistPrepared(
   expectedRevision: number,
   prepared: QboPreparedWrite,
   beforeSnapshot: QboPurchaseSnapshot,
+  staged?: StagedCategorization,
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
     const attempt = await d.db.qboMutationAttempt.create({
@@ -1688,7 +1870,15 @@ async function persistPrepared(
         expectedRevision,
         expectedSyncToken: prepared.body.SyncToken,
         requestHash: prepared.requestHash,
-        requestPayload: prepared,
+        requestPayload: staged === undefined
+          ? prepared
+          : {
+              ...prepared,
+              categorizationEvidence: {
+                version: 1,
+                proposal: evidenceProposal(staged),
+              },
+            },
         beforeSnapshot,
         responseSnapshot: null,
         verification: null,
@@ -1728,7 +1918,10 @@ async function preliminaryTransaction(
     where: { id: transactionId },
     include: {
       company: true,
-      splitLines: { orderBy: { idx: 'asc' } },
+      splitLines: {
+        orderBy: { idx: 'asc' },
+        include: { tags: true },
+      },
       txnTags: true,
     },
   });
@@ -1980,7 +2173,7 @@ export async function commitStagedCategorization(
           input.companyId,
           input.actor.id,
         );
-        return recordedAttemptResult(existing, txn.status);
+        return recordedAttemptResultWithOutcome(d, existing, txn);
       }
       const { txn } = await loadAuthorizedAttempt(
         d,
@@ -2023,7 +2216,7 @@ export async function commitStagedCategorization(
           input.companyId,
           input.actor.id,
         );
-        return recordedAttemptResult(entered.attempt, latestTxn.status);
+        return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
       }
       return sendAndVerifyPrepared(
         d,
@@ -2076,6 +2269,7 @@ export async function commitStagedCategorization(
       input.expectedRevision,
       prepared,
       before,
+      staged,
     );
     if (!persisted.created) {
       const { txn: racedTxn } = await loadAuthorizedAttempt(
@@ -2084,7 +2278,7 @@ export async function commitStagedCategorization(
         input.companyId,
         input.actor.id,
       );
-      return recordedAttemptResult(persisted.attempt, racedTxn.status);
+      return recordedAttemptResultWithOutcome(d, persisted.attempt, racedTxn);
     }
     const entered = await enterCommitting(
       d,
@@ -2101,7 +2295,7 @@ export async function commitStagedCategorization(
         input.companyId,
         input.actor.id,
       );
-      return recordedAttemptResult(entered.attempt, latestTxn.status);
+      return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
     }
     return sendAndVerifyPrepared(
       d,
@@ -2174,7 +2368,7 @@ async function finalizeUnchanged(
       where: { requestId: attempt.requestId },
     });
     if (!latest) lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared during reconciliation.');
-    return recordedAttemptResult(latest, txn.status);
+    return recordedAttemptResultWithOutcome(d, latest, txn);
   }
   return {
     transactionId: txn.id,
@@ -2210,7 +2404,7 @@ export async function reconcileMutationAttempt(
         preliminary.companyId,
         input.actor.id,
       );
-      return recordedAttemptResult(attempt, txn.status);
+      return recordedAttemptResultWithOutcome(d, attempt, txn);
     }
     if (
       attempt.status !== 'VERIFIED' &&
@@ -2229,7 +2423,7 @@ export async function reconcileMutationAttempt(
       input.actor.id,
     );
     if (attempt.status === 'VERIFIED' || attempt.status === 'UNCHANGED') {
-      return recordedAttemptResult(attempt, txn.status);
+      return recordedAttemptResultWithOutcome(d, attempt, txn);
     }
     const before = persistedSnapshot(attempt.beforeSnapshot);
     await d.renewLease(leaseKey(txn), invocationOwner);
@@ -2296,7 +2490,7 @@ export async function undoCategorization(
           input.companyId,
           input.actor.id,
         );
-        return recordedAttemptResult(sameRequest, txn.status);
+        return recordedAttemptResultWithOutcome(d, sameRequest, txn);
       }
       const { txn } = await loadAuthorizedAttempt(
         d,
@@ -2340,7 +2534,7 @@ export async function undoCategorization(
           input.companyId,
           input.actor.id,
         );
-        return recordedAttemptResult(entered.attempt, latestTxn.status);
+        return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
       }
       return sendAndVerifyPrepared(
         d,
@@ -2403,7 +2597,7 @@ export async function undoCategorization(
         input.companyId,
         input.actor.id,
       );
-      return recordedAttemptResult(persisted.attempt, racedTxn.status);
+      return recordedAttemptResultWithOutcome(d, persisted.attempt, racedTxn);
     }
     const entered = await enterCommitting(
       d,
@@ -2439,7 +2633,7 @@ export async function undoCategorization(
         input.companyId,
         input.actor.id,
       );
-      return recordedAttemptResult(entered.attempt, latestTxn.status);
+      return recordedAttemptResultWithOutcome(d, entered.attempt, latestTxn);
     }
     return sendAndVerifyPrepared(
       d,

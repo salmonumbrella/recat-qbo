@@ -110,6 +110,9 @@ model Company {
   syncLogs          SyncLog[]
   memberships       Membership[]
   logTags           LogTag[]
+  agentConfig       AgentCompanyConfig?
+  agentJobs         AgentJob[]
+  agentRuns         AgentRun[]
 }
 
 model Transaction {
@@ -369,6 +372,73 @@ model AppConfig {
   value     String // encrypted where sensitive
   encrypted Boolean  @default(false)
   updatedAt DateTime @updatedAt
+}
+
+model AgentCompanyConfig {
+  companyId          String   @id
+  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  mode               String   @default("off")
+  /// A provider name only. Credentials remain in encrypted instance settings.
+  provider           String
+  decisionModel      String
+  verifierModel      String
+  scheduleMinutes    Int      @default(10)
+  companyConcurrency Int      @default(1)
+  evidenceThreshold  Int      @default(50)
+  limits             Json
+  configVersion      String
+  updatedAt          DateTime @updatedAt
+}
+
+model AgentJob {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  revision       Int
+  configVersion  String
+  status         String
+  dueAt          DateTime
+  lockOwner      String?
+  leaseExpiresAt DateTime?
+  attemptCount   Int      @default(0)
+  lastErrorCode  String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  runs           AgentRun[]
+
+  @@unique([companyId, transactionId, revision, configVersion])
+  @@index([status, dueAt])
+}
+
+model AgentRun {
+  id             String   @id @default(uuid())
+  jobId          String
+  job            AgentJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  revision       Int
+  configVersion  String
+  attemptCount   Int
+  status         String
+  snapshot       Json
+  decision       Json?
+  verification   Json?
+  decisionModel  String
+  verifierModel  String
+  verifierKind   String
+  promptVersion  String
+  schemaVersion  String
+  durationMs     Int?
+  usage          Json?
+  errorCode      String?
+  createdAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  @@index([companyId, createdAt])
+  @@index([transactionId, revision])
+  @@unique([jobId, attemptCount])
 }
 
 model WebhookEvent {

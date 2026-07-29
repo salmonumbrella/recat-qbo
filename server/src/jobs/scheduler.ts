@@ -8,6 +8,11 @@ import { env } from '../env.js';
 import { isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
 import { writeAudit } from '../services/audit.js';
+import {
+  runAgentTick,
+  startAgentScheduler,
+  stopAgentScheduler,
+} from '../services/agent/scheduler.js';
 import { syncCompany, type SyncKind } from '../services/sync.js';
 
 const TICK_MS = 60_000;
@@ -157,12 +162,19 @@ async function tick(): Promise<void> {
   } catch (err) {
     console.error('[jobs] scheduler tick failed:', err);
   }
+  try {
+    await runAgentTick();
+  } catch {
+    console.error('[jobs] agent scheduler tick failed');
+  }
 }
 
 export function startJobs(): void {
   if (ticker !== null) return;
+  startAgentScheduler();
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));
+  runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();
@@ -172,6 +184,7 @@ export function startJobs(): void {
 }
 
 export function stopJobs(): void {
+  stopAgentScheduler();
   if (ticker !== null) {
     clearInterval(ticker);
     ticker = null;

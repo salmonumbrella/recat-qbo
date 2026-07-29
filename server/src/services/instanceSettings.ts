@@ -38,6 +38,14 @@ const ENCRYPTED_KEYS: ReadonlySet<SettingKey> = new Set([
   'smtpPass',
 ]);
 
+export interface InstanceSettingsDb {
+  appConfig: {
+    findMany(args: {
+      where: { key: { in: readonly SettingKey[] } };
+    }): Promise<{ key: string; value: string; encrypted: boolean }[]>;
+  };
+}
+
 /** Plaintext settings — server-internal only, never serialized to a client. */
 export interface InstanceSettings {
   intuitClientId: string;
@@ -83,8 +91,10 @@ export interface InstanceSettingsPatch {
   smtpFrom?: string;
 }
 
-async function readStored(): Promise<Partial<Record<SettingKey, string>>> {
-  const rows = await prisma.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
+async function readStored(
+  db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+): Promise<Partial<Record<SettingKey, string>>> {
+  const rows = await db.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
   const out: Partial<Record<SettingKey, string>> = {};
   for (const row of rows) {
     const key = row.key as SettingKey;
@@ -112,8 +122,10 @@ function normalizeSmtpPort(v: string | undefined): number {
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : 587;
 }
 
-export async function getInstanceSettings(): Promise<InstanceSettings> {
-  const stored = await readStored();
+export async function getInstanceSettings(
+  db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+): Promise<InstanceSettings> {
+  const stored = await readStored(db);
   // SMTP is env-managed as a block: SMTP_HOST set → all five values come from
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).

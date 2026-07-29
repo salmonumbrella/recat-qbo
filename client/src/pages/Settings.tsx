@@ -12,6 +12,7 @@ import { useApp } from '../state/AppContext';
 import ConfirmDialog from '../components/ConfirmDialog';
 import AccessCard from './settings/AccessCard';
 import ApiAccessCard from './settings/ApiAccessCard';
+import AutopilotCard from './settings/AutopilotCard';
 import ConnectionCard from './settings/ConnectionCard';
 import type { HoldingAccountOption } from './settings/ConnectionCard';
 import DensityCard from './settings/DensityCard';
@@ -198,6 +199,10 @@ export default function Settings() {
           />
 
           <TaxCard />
+
+          {(role === 'categorizer' || role === 'admin') && (
+            <AutopilotCard key={activeCompany.id} companyId={activeCompany.id} role={role} />
+          )}
 
           {/* dry run */}
           <div
