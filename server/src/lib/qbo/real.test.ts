@@ -548,6 +548,60 @@ describe('tax read normalization', () => {
     });
   });
 
+  it('derives omitted inclusive tax fields exactly from normalized QBO amounts', () => {
+    expect(
+      mapPurchaseSnapshot({
+        Id: 'P-DERIVED',
+        SyncToken: '1',
+        TxnDate: '2026-07-27',
+        TotalAmt: 10.5,
+        Credit: false,
+        GlobalTaxCalculation: 'TaxInclusive',
+        Line: [{
+          Amount: 10,
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: 'CATEGORY_GENERIC' },
+            TaxCodeRef: { value: 'TAX_GENERIC' },
+            TaxInclusiveAmt: 10.5,
+          },
+        }],
+      }),
+    ).toMatchObject({
+      totalTaxCents: -50,
+      lines: [{
+        amountCents: -1_000,
+        taxAmountCents: -50,
+        taxInclusiveCents: -1_050,
+      }],
+    });
+  });
+
+  it.each([
+    ['TaxExcluded', { TaxCodeRef: { value: 'TAX_GENERIC' }, TaxAmount: 0.5 }, -50],
+    ['NotApplicable', {}, 0],
+  ] as const)(
+    'derives an omitted %s aggregate from fully provable normalized lines',
+    (taxCalculation, detail, totalTaxCents) => {
+      expect(
+        mapPurchaseSnapshot({
+          Id: 'P-AGGREGATE',
+          SyncToken: '1',
+          TxnDate: '2026-07-27',
+          TotalAmt: 10,
+          Credit: false,
+          GlobalTaxCalculation: taxCalculation,
+          Line: [{
+            Amount: 10,
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: 'CATEGORY_GENERIC' },
+              ...detail,
+            },
+          }],
+        }).totalTaxCents,
+      ).toBe(totalTaxCents);
+    },
+  );
+
   it('preserves malformed tax preferences and rates as unavailable metadata', () => {
     expect(mapTaxProfile({ TaxPrefs: {} })).toEqual({
       usingSalesTax: null,

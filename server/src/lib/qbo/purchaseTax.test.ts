@@ -714,6 +714,33 @@ describe('preparePurchaseRecategorization', () => {
     expect(Object.isFrozen(prepared.body)).toBe(true);
   });
 
+  it('canonicalizes negative raw Purchase money without reversing its direction', () => {
+    const source = completePurchase();
+    const raw = completePurchase({
+      TotalAmt: -15,
+      TxnTaxDetail: { TotalTax: -0.75 },
+      Line: source.Line!.map((line) => ({
+        ...line,
+        Amount: -(line.Amount ?? 0),
+        AccountBasedExpenseLineDetail: line.AccountBasedExpenseLineDetail === undefined
+          ? undefined
+          : {
+              ...line.AccountBasedExpenseLineDetail,
+              TaxAmount:
+                line.AccountBasedExpenseLineDetail.TaxAmount === undefined
+                  ? undefined
+                  : -line.AccountBasedExpenseLineDetail.TaxAmount,
+              TaxInclusiveAmt:
+                line.AccountBasedExpenseLineDetail.TaxInclusiveAmt === undefined
+                  ? undefined
+                  : -line.AccountBasedExpenseLineDetail.TaxInclusiveAmt,
+            },
+      })),
+    });
+
+    expect(() => prepare(raw, staged(), snapshotFor(raw))).not.toThrow();
+  });
+
   it.each([
     ['TaxExcluded', undefined],
     ['TaxInclusive', 10],
@@ -764,6 +791,7 @@ describe('preparePurchaseRecategorization', () => {
           AccountBasedExpenseLineDetail: {
             ...aggregateBacked.Line![0]!.AccountBasedExpenseLineDetail,
             TaxAmount: undefined,
+            TaxInclusiveAmt: undefined,
           },
         },
         aggregateBacked.Line![1]!,
@@ -772,7 +800,11 @@ describe('preparePurchaseRecategorization', () => {
     const unprovableBefore: QboPurchaseSnapshot = {
       ...aggregateBefore,
       lines: [
-        { ...aggregateBefore.lines[0]!, taxAmountCents: null },
+        {
+          ...aggregateBefore.lines[0]!,
+          taxAmountCents: null,
+          taxInclusiveCents: null,
+        },
         aggregateBefore.lines[1]!,
       ],
     };
@@ -1034,6 +1066,33 @@ describe('preparePurchaseRestore', () => {
       },
       current.Line![0],
     ]);
+  });
+
+  it('restores when QBO omits redundant inclusive tax fields that remain exactly derivable', () => {
+    const original = prepare();
+    const target = structuredClone(original.body.Line![1]!);
+    delete target.AccountBasedExpenseLineDetail!.TaxAmount;
+    const current: RawPurchase = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: undefined,
+      Line: [
+        original.body.Line![0]!,
+        { Id: 'LINE_QBO_ASSIGNED', ...target },
+      ],
+    };
+
+    const restore = preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_GENERIC',
+    });
+
+    expect(restore).toMatchObject({
+      operation: 'restore',
+      qboType: 'Purchase',
+      qboId: 'PURCHASE_GENERIC',
+    });
   });
 
   it('rejects current Purchase drift and unsupported restore shapes', () => {

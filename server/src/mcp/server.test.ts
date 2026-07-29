@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { SUPPORTED_PROTOCOL_VERSIONS } from '@modelcontextprotocol/server';
 import type { CompanyReadOperations } from './readTools.js';
 import {
+  MUTATION_TOOL_NAMES,
+  type McpMutationOperations,
+} from './mutationTools.js';
+import {
   contextFrom,
   createRecatMcpHandler,
   prepareBoundedToolCalls,
@@ -97,6 +101,41 @@ function mockReads(overrides: Partial<CompanyReadOperations> = {}): CompanyReadO
     listTags: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     listRules: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    ...overrides,
+  };
+}
+
+function mockMutations(
+  overrides: Partial<McpMutationOperations> = {},
+): McpMutationOperations {
+  const operation = {
+    operationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    kind: 'categorization' as const,
+    companyId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    transactionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    sourceRevision: 2,
+    preparedRevision: 3,
+    expiresAt: '2026-07-29T20:15:00.000Z',
+    state: 'prepared' as const,
+    phase: 'awaiting_commit' as const,
+    result: null,
+    error: null,
+    actions: {
+      canCommit: true,
+      canRetry: false,
+      requiresReconciliation: false,
+    },
+  };
+  return {
+    prepareCategorization: vi.fn(),
+    commitCategorization: vi.fn().mockResolvedValue(operation),
+    getOperation: vi.fn().mockResolvedValue(operation),
+    retryOperation: vi.fn().mockResolvedValue(operation),
+    prepareUndo: vi.fn(),
+    commitUndo: vi.fn().mockResolvedValue({
+      ...operation,
+      kind: 'undo',
+    }),
     ...overrides,
   };
 }
@@ -843,5 +882,78 @@ describe('stateless MCP handler', () => {
     const [first, second] = await Promise.all([call('first'), call('second')]);
     expect(first.result.structuredContent.identity.userId).toBe('first');
     expect(second.result.structuredContent.identity.userId).toBe('second');
+  });
+
+  it('publishes and routes the same six mutation tools for modern and legacy clients', async () => {
+    const mutations = mockMutations();
+    const handler = createRecatMcpHandler(mockReads(), mutations);
+    const modernList = await modern(handler, 'tools/list', {}, {
+      authInfo: auth('modern-user'),
+    });
+    const legacyListResponse = await handler.fetch(new Request('http://localhost/mcp', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'legacy-list',
+        method: 'tools/list',
+        params: {},
+      }),
+    }), { authInfo: auth('legacy-user') });
+    const [legacyList] = await legacyPayload(legacyListResponse);
+    const modernTools = modernList.body.result.tools as Array<Record<string, any>>;
+    const legacyTools = legacyList!.result.tools as Array<Record<string, any>>;
+
+    expect(
+      modernTools.filter((tool) => MUTATION_TOOL_NAMES.includes(tool.name)),
+    ).toEqual(
+      legacyTools.filter((tool) => MUTATION_TOOL_NAMES.includes(tool.name)),
+    );
+    expect(
+      modernTools.filter((tool) => MUTATION_TOOL_NAMES.includes(tool.name))
+        .map((tool) => tool.name),
+    ).toEqual(MUTATION_TOOL_NAMES);
+
+    const operationId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const modernCall = await modern(handler, 'tools/call', {
+      name: 'get_operation',
+      arguments: { operationId },
+    }, { authInfo: auth('modern-user') });
+    const legacyCallResponse = await handler.fetch(new Request('http://localhost/mcp', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'legacy-call',
+        method: 'tools/call',
+        params: {
+          name: 'get_operation',
+          arguments: { operationId },
+        },
+      }),
+    }), { authInfo: auth('legacy-user') });
+    const [legacyCall] = await legacyPayload(legacyCallResponse);
+
+    expect(modernCall.body.result.structuredContent).toEqual(
+      legacyCall!.result.structuredContent,
+    );
+    expect(mutations.getOperation).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ userId: 'modern-user' }),
+      { operationId },
+    );
+    expect(mutations.getOperation).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ userId: 'legacy-user' }),
+      { operationId },
+    );
+    expect(modernCall.response.headers.get('mcp-session-id')).toBeNull();
+    expect(legacyCallResponse.headers.get('mcp-session-id')).toBeNull();
   });
 });

@@ -129,7 +129,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine closed-world, read-only tools with strict bounded inputs', async () => {
+  it('registers exactly nine reads and six conservatively annotated mutation tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -137,9 +137,17 @@ describe('Recat MCP read tools', () => {
     const body = await legacy(handler, 'tools/list', {});
     const tools = body.result.tools as Array<Record<string, any>>;
 
-    expect(tools.map((tool) => tool.name)).toEqual(READ_TOOL_NAMES);
-    expect(tools).toHaveLength(9);
-    for (const tool of tools) {
+    expect(tools.map((tool) => tool.name)).toEqual([
+      ...READ_TOOL_NAMES,
+      'prepare_categorization',
+      'commit_categorization',
+      'get_operation',
+      'retry_operation',
+      'prepare_undo',
+      'commit_undo',
+    ]);
+    expect(tools).toHaveLength(15);
+    for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
         destructiveHint: false,
@@ -148,6 +156,65 @@ describe('Recat MCP read tools', () => {
       });
       expect(tool.inputSchema.additionalProperties).toBe(false);
     }
+    expect(tools.slice(READ_TOOL_NAMES.length).map((tool) => ({
+      name: tool.name,
+      annotations: tool.annotations,
+    }))).toEqual([
+      {
+        name: 'prepare_categorization',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'commit_categorization',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'get_operation',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'retry_operation',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'prepare_undo',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'commit_undo',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+    ]);
     const listTransactions = tools.find((tool) => tool.name === 'list_transactions')!;
     expect(listTransactions.inputSchema.properties.limit.maximum).toBe(100);
     expect(listTransactions.inputSchema.properties.cursor.maxLength).toBe(2048);

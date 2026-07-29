@@ -27,6 +27,11 @@ export interface MutationAuditInput {
     accountQboIds: string[];
     taxCodeQboIds: string[];
   };
+  mcp?: {
+    sourceOperationId: string;
+    operationId: string;
+    tokenPrefix: string;
+  };
 }
 
 export interface AuditInput {
@@ -55,13 +60,24 @@ export interface AuditInput {
 
 const MAX_AUDIT_REFERENCE_LENGTH = 128;
 const MAX_AUDIT_REFERENCES = 50;
+const MAX_TOKEN_PREFIX_LENGTH = 12;
 
-function boundedReference(value: string): string {
-  return value.trim().slice(0, MAX_AUDIT_REFERENCE_LENGTH);
+function boundedReference(
+  value: string,
+  maximum = MAX_AUDIT_REFERENCE_LENGTH,
+): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/gu, '')
+    .trim()
+    .slice(0, maximum);
 }
 
 function normalizedReferences(values: string[]): string[] {
-  return [...new Set(values.map(boundedReference).filter((value) => value !== ''))]
+  return [...new Set(
+    values
+      .map((value) => boundedReference(value))
+      .filter((value) => value !== ''),
+  )]
     .sort()
     .slice(0, MAX_AUDIT_REFERENCES);
 }
@@ -70,6 +86,7 @@ export function normalizeMutationAuditMetadata(entry: MutationAuditInput): {
   requestId: string;
   outcome: MutationAuditOutcome;
   references: MutationAuditInput['references'];
+  mcp?: NonNullable<MutationAuditInput['mcp']>;
 } {
   return {
     requestId: boundedReference(entry.requestId),
@@ -81,6 +98,18 @@ export function normalizeMutationAuditMetadata(entry: MutationAuditInput): {
       accountQboIds: normalizedReferences(entry.references.accountQboIds),
       taxCodeQboIds: normalizedReferences(entry.references.taxCodeQboIds),
     },
+    ...(entry.mcp === undefined
+      ? {}
+      : {
+          mcp: {
+            sourceOperationId: boundedReference(entry.mcp.sourceOperationId),
+            operationId: boundedReference(entry.mcp.operationId),
+            tokenPrefix: boundedReference(
+              entry.mcp.tokenPrefix,
+              MAX_TOKEN_PREFIX_LENGTH,
+            ),
+          },
+        }),
   };
 }
 
