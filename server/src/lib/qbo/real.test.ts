@@ -7,12 +7,15 @@ import {
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
+  type QboDepositPreparedWrite,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
 } from './types.js';
 import {
   RealQboClient,
   exchangeAuthCode,
   mapDeposit,
+  mapDepositSnapshot,
   mapJournalEntry,
   mapPurchase,
   mapPurchaseSnapshot,
@@ -182,6 +185,125 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase/P%2F1?minorversion=75');
   });
 
+  it('reads a prepared Deposit snapshot from the Deposit endpoint', async () => {
+    const rawDeposit: RawDeposit = {
+      Id: 'D/1',
+      SyncToken: '2',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      GlobalTaxCalculation: 'TaxExcluded',
+      TxnTaxDetail: { TotalTax: 0.5 },
+      Line: [{
+        Id: 'LINE_GENERIC',
+        Amount: 10,
+        Description: 'Generic sale',
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'INCOME_GENERIC' },
+          TaxCodeRef: { value: 'TAX_GENERIC' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Deposit: rawDeposit,
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      realClient().client.fetchPreparedSnapshot('Deposit', 'D/1'),
+    ).resolves.toEqual(mapDepositSnapshot(rawDeposit));
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/deposit/D%2F1?minorversion=75',
+    );
+  });
+
+  it('dispatches prepared recategorization and restore to the Deposit pure functions', async () => {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      Line: [{
+        Id: 'LINE_HOLDING',
+        Amount: 10.5,
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: { AccountRef: { value: 'HOLDING_GENERIC' } },
+      }],
+    };
+    const before: QboDepositSnapshot = mapDepositSnapshot(raw);
+    const staged = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxCalculation: 'TaxExcluded',
+      totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: 1000,
+        taxCents: 50,
+        totalCents: 1050,
+        categoryQboId: 'INCOME_GENERIC',
+        taxCodeQboId: 'TAX_GENERIC',
+        memo: 'Generic sale',
+      }],
+      tagIds: [],
+    } as const;
+    const client = realClient(undefined, ['HOLDING_GENERIC']).client;
+    const txn = mapDeposit(raw, new Set(['HOLDING_GENERIC']));
+
+    const prepared = await client.prepareRecategorization(
+      txn,
+      staged,
+      before,
+      'REQUEST_DEPOSIT',
+    );
+    expect(prepared).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'recategorize',
+      body: {
+        Id: raw.Id,
+        Line: [{
+          Id: 'LINE_HOLDING',
+          Amount: 10,
+          DepositLineDetail: {
+            AccountRef: { value: 'INCOME_GENERIC' },
+            TaxCodeRef: { value: 'TAX_GENERIC' },
+            TaxApplicableOn: 'Sales',
+          },
+        }],
+      },
+    });
+
+    const postedRaw: RawDeposit = {
+      ...prepared.body,
+      SyncToken: '8',
+      TxnTaxDetail: { TotalTax: 0.5 },
+      Line: structuredClone(prepared.body.Line),
+    };
+    await expect(client.preparePurchaseRestore(
+      mapDeposit(postedRaw, new Set(['HOLDING_GENERIC'])),
+      prepared,
+      'REQUEST_WRONG_COMPATIBILITY_RESTORE',
+    )).rejects.toThrow(/Purchase compatibility restore/i);
+    const restore = await client.prepareRestore(
+      mapDeposit(postedRaw, new Set(['HOLDING_GENERIC'])),
+      prepared,
+      'REQUEST_DEPOSIT_RESTORE',
+    );
+    expect(restore).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'restore',
+      requestId: 'REQUEST_DEPOSIT_RESTORE',
+      body: {
+        Id: raw.Id,
+        SyncToken: '8',
+        Line: [{ Id: 'LINE_HOLDING', Amount: 10.5 }],
+      },
+    });
+  });
+
   it('refreshes once after a 401 and retries a tax-profile request', async () => {
     const onTokensRefreshed = vi.fn(async () => undefined);
     const fetchMock = vi.fn()
@@ -241,7 +363,7 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       TotalAmt: 10,
       PrivateNote: 'generic private note',
       AccountRef: { value: 'ACCOUNT_PAYMENT' },
-      CurrencyRef: { value: 'CAD' },
+      CurrencyRef: { value: 'CUR' },
       ExchangeRate: 1.25,
       GlobalTaxCalculation: 'TaxInclusive',
       TxnTaxDetail: { TotalTax: 0.48 },
@@ -285,6 +407,51 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       body: JSON.stringify(body),
     });
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends exact prepared Deposit JSON to the Deposit endpoint and requires its response token', async () => {
+    const body: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 10,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      Line: [],
+    };
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Deposit',
+      qboId: body.Id,
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body,
+      before: {} as QboDepositPreparedWrite['before'],
+      expected: {} as QboDepositPreparedWrite['expected'],
+    } satisfies QboDepositPreparedWrite;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Deposit: { ...body, SyncToken: '8' },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Purchase: { SyncToken: '9' },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '8',
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/deposit?requestid=REQUEST_GENERIC&minorversion=75',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toThrow(
+      /Deposit SyncToken/,
+    );
   });
 
   it.each([
@@ -413,7 +580,7 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
 const HOLDING = new Set(['4']);
 
 describe('tax read normalization', () => {
-  it('normalizes purchase rate components without retaining the raw response', () => {
+  it('normalizes distinct purchase and sales rate components without retaining the raw response', () => {
     expect(
       mapTaxCode({
         Id: 'GST5',
@@ -423,15 +590,13 @@ describe('tax read normalization', () => {
         PurchaseTaxRateList: {
           TaxRateDetail: [{ TaxRateRef: { value: 'RATE5' }, TaxTypeApplicable: 'TaxOnAmount' }],
         },
+        SalesTaxRateList: {
+          TaxRateDetail: [{ TaxRateRef: { value: 'RATE7' }, TaxTypeApplicable: 'TaxOnAmount' }],
+        },
       }),
-    ).toEqual({
-      qboId: 'GST5',
-      name: 'GST 5%',
-      description: null,
-      active: true,
-      taxable: true,
+    ).toMatchObject({
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
-      sourceUpdatedAt: null,
+      salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
     });
   });
 
@@ -445,6 +610,18 @@ describe('tax read normalization', () => {
             { TaxRateRef: { value: 'GST5' }, TaxTypeApplicable: 'TaxOnAmount' },
             { TaxTypeApplicable: 'TaxOnTax' },
           ],
+        },
+      }),
+    ).toThrow(/rate reference/i);
+  });
+
+  it('rejects a malformed sales component before it reaches the cache', () => {
+    expect(() =>
+      mapTaxCode({
+        Id: 'CODE',
+        Name: 'Code',
+        SalesTaxRateList: {
+          TaxRateDetail: [{ TaxTypeApplicable: 'TaxOnAmount' }],
         },
       }),
     ).toThrow(/rate reference/i);

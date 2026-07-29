@@ -13,8 +13,13 @@ import {
   MOCK_REALM_HARBOR,
   resetMockRealms,
 } from './mock.js';
+import { mapDepositSnapshot } from './depositTax.js';
 import type { StagedCategorization } from '@recat/shared';
-import type { RawPurchase } from './types.js';
+import type {
+  QboDepositSnapshot,
+  RawDeposit,
+  RawPurchase,
+} from './types.js';
 
 const HOLDING_IDS = ['4', '5']; // Harbor: Ask My Accountant + Uncategorized Expense
 
@@ -389,38 +394,44 @@ describe('MockQboClient tax fixtures', () => {
     const bluebird = new MockQboClient(MOCK_REALM_BLUEBIRD, ['3', '4']);
 
     await expect(bluebird.listTaxRates()).resolves.toEqual([
-      { qboId: 'GST5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
-      { qboId: 'PST7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
+      { qboId: 'STANDARD_RATE', name: 'Standard tax 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
+      { qboId: 'SECONDARY_RATE', name: 'Secondary tax 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
     ]);
     await expect(bluebird.listTaxCodes()).resolves.toEqual([
       {
-        qboId: 'GST',
-        name: 'GST',
-        description: 'Goods and services tax',
+        qboId: 'STANDARD',
+        name: 'Standard tax',
+        description: 'Standard tax code',
         active: true,
         taxable: true,
-        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        purchaseRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
         sourceUpdatedAt: null,
       },
       {
-        qboId: 'GST-PST',
-        name: 'GST + PST',
+        qboId: 'COMBINED',
+        name: 'Combined tax',
         description: null,
         active: true,
         taxable: true,
         purchaseRates: [
-          { taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' },
-          { taxRateQboId: 'PST7', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'SECONDARY_RATE', taxTypeApplicable: 'TaxOnAmount' },
+        ],
+        salesRates: [
+          { taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'SECONDARY_RATE', taxTypeApplicable: 'TaxOnAmount' },
         ],
         sourceUpdatedAt: null,
       },
       {
-        qboId: 'OLD-GST',
-        name: 'Old GST',
+        qboId: 'INACTIVE_STANDARD',
+        name: 'Inactive standard tax',
         description: null,
         active: false,
         taxable: true,
-        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        purchaseRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
         sourceUpdatedAt: null,
       },
     ]);
@@ -559,7 +570,7 @@ describe('MockQboClient prepared Purchase writes', () => {
         referenceKind: 'GenericVendor',
       },
       AccountRef: { value: 'ACCOUNT_PAYMENT_GENERIC', name: 'Generic Payment' },
-      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      CurrencyRef: { value: 'CUR', name: 'Generic Currency' },
       ExchangeRate: 1.25,
       DepartmentRef: { value: 'DEPARTMENT_GENERIC', name: 'Generic Department' },
       CustomDocumentProperty: { preserve: true },
@@ -746,5 +757,220 @@ describe('MockQboClient prepared Purchase writes', () => {
       expected: {} as never,
     })).rejects.toThrow(/SyncToken conflict/);
     expect(existing.syncToken).toBe(0);
+  });
+});
+
+describe('MockQboClient prepared Deposit writes', () => {
+  it('round-trips, replays idempotently, reads back, and restores a Deposit', async () => {
+    const realm = getMockRealm(MOCK_REALM_HARBOR);
+    realm.accounts.push(
+      {
+        qboId: 'DEPOSIT_HOLDING_GENERIC',
+        name: 'Deposit Holding',
+        classification: 'Other',
+        accountType: 'Other Current Asset',
+        fullName: 'Deposit Holding',
+      },
+      {
+        qboId: 'DEPOSIT_INCOME_GENERIC',
+        name: 'Deposit Income',
+        classification: 'Income',
+        accountType: 'Income',
+        fullName: 'Income:Deposit Income',
+      },
+      {
+        qboId: 'DEPOSIT_BANK_GENERIC',
+        name: 'Deposit Bank',
+        classification: 'Bank',
+        accountType: 'Bank',
+        fullName: 'Deposit Bank',
+      },
+    );
+    realm.taxProfile = { usingSalesTax: true, partnerTaxEnabled: false };
+    realm.taxRates.push({
+      qboId: 'DEPOSIT_RATE_GENERIC',
+      name: 'Generic sales rate',
+      description: null,
+      active: true,
+      rateValue: 5,
+      sourceUpdatedAt: null,
+    });
+    realm.taxCodes.push({
+      qboId: 'DEPOSIT_TAX_GENERIC',
+      name: 'Generic sales code',
+      description: null,
+      active: true,
+      taxable: true,
+      purchaseRates: [],
+      salesRates: [{
+        taxRateQboId: 'DEPOSIT_RATE_GENERIC',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+      sourceUpdatedAt: null,
+    });
+    realm.txns.push({
+      qboId: 'DEPOSIT_GENERIC',
+      qboType: 'Deposit',
+      syncToken: 7,
+      date: '2026-07-28',
+      payee: 'Generic Customer',
+      amount: 10.5,
+      bankAccountQboId: 'DEPOSIT_BANK_GENERIC',
+      lines: [{
+        id: 'DEPOSIT_LINE_HOLDING',
+        amount: 10.5,
+        accountQboId: 'DEPOSIT_HOLDING_GENERIC',
+      }],
+      lastUpdated: '2026-07-28T00:00:00.000Z',
+    });
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      PrivateNote: 'Generic deposit',
+      DepositToAccountRef: { value: 'DEPOSIT_BANK_GENERIC' },
+      CurrencyRef: { value: 'CUR' },
+      ExchangeRate: 1.25,
+      UnknownDepositField: { preserve: true },
+      Line: [{
+        Id: 'DEPOSIT_LINE_HOLDING',
+        Amount: 10.5,
+        Description: 'Generic holding line',
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'DEPOSIT_HOLDING_GENERIC' },
+          Entity: { value: 'DEPOSIT_ENTITY_GENERIC' },
+          PaymentMethodRef: { value: 'DEPOSIT_PAYMENT_GENERIC' },
+          ClassRef: { value: 'DEPOSIT_CLASS_GENERIC' },
+        },
+      }],
+    };
+    realm.rawDeposits.push(structuredClone(raw));
+    const before: QboDepositSnapshot = mapDepositSnapshot(raw);
+    const staged = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxCalculation: 'TaxExcluded',
+      totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: 1000,
+        taxCents: 50,
+        totalCents: 1050,
+        categoryQboId: 'DEPOSIT_INCOME_GENERIC',
+        taxCodeQboId: 'DEPOSIT_TAX_GENERIC',
+        memo: 'Generic sale',
+      }],
+      tagIds: [],
+    } satisfies StagedCategorization;
+    const c = new MockQboClient(MOCK_REALM_HARBOR, ['DEPOSIT_HOLDING_GENERIC']);
+    const txn = await c.fetchTxn('Deposit', raw.Id);
+    if (!txn) throw new Error('generic Deposit fixture missing');
+
+    await expect(c.fetchPreparedSnapshot('Deposit', raw.Id)).resolves.toEqual(before);
+    const prepared = await c.prepareRecategorization(
+      txn,
+      staged,
+      before,
+      'REQUEST_DEPOSIT_GENERIC',
+    );
+    expect(prepared).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'recategorize',
+      body: {
+        PrivateNote: raw.PrivateNote,
+        CurrencyRef: raw.CurrencyRef,
+        ExchangeRate: raw.ExchangeRate,
+        UnknownDepositField: raw.UnknownDepositField,
+      },
+    });
+
+    await expect(c.sendPreparedWrite(prepared)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '8',
+    });
+    await expect(c.sendPreparedWrite(prepared)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '8',
+    });
+    expect(
+      realm.txns.find((candidate) => candidate.qboId === raw.Id)?.syncToken,
+    ).toBe(8);
+    await expect(c.fetchPreparedSnapshot('Deposit', raw.Id)).resolves.toEqual({
+      qboId: prepared.expected.qboId,
+      syncToken: '8',
+      totalCents: prepared.expected.totalCents,
+      depositToAccountQboId: prepared.expected.depositToAccountQboId,
+      date: prepared.expected.date,
+      globalTaxCalculation: prepared.expected.globalTaxCalculation,
+      totalTaxCents: prepared.expected.totalTaxCents,
+      preservedHash: prepared.expected.preservedHash,
+      lines: [{
+        ...prepared.expected.targetLines[0]!,
+        id: expect.any(String),
+        rawHash: expect.any(String),
+      }],
+    });
+
+    const posted = await c.fetchTxn('Deposit', raw.Id);
+    if (!posted) throw new Error('posted Deposit fixture missing');
+    await expect(c.preparePurchaseRestore(
+      posted,
+      prepared,
+      'REQUEST_WRONG_COMPATIBILITY_RESTORE',
+    )).rejects.toThrow(/Purchase compatibility restore/i);
+    const restore = await c.prepareRestore(
+      posted,
+      prepared,
+      'REQUEST_DEPOSIT_RESTORE',
+    );
+    await expect(c.sendPreparedWrite(restore)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '9',
+    });
+    await expect(c.fetchPreparedSnapshot('Deposit', raw.Id)).resolves.toEqual({
+      ...before,
+      syncToken: '9',
+    });
+
+    const hydrated = mergePersistedMockRealm(
+      { ...structuredClone(realm), rawDeposits: [], preparedWriteResults: [] },
+      structuredClone(realm),
+    );
+    expect(hydrated.rawDeposits.find((candidate) => candidate.Id === raw.Id)).toEqual(
+      realm.rawDeposits.find((candidate) => candidate.Id === raw.Id),
+    );
+    expect(hydrated.preparedWriteResults).toEqual(realm.preparedWriteResults);
+
+    const appendBody: RawDeposit = {
+      ...raw,
+      SyncToken: '9',
+      TotalAmt: 2,
+      Line: [{
+        Amount: 2,
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'DEPOSIT_INCOME_GENERIC' },
+        },
+      }],
+    };
+    await expect(c.sendPreparedWrite({
+      ...prepared,
+      requestId: 'REQUEST_DEPOSIT_APPEND_GENERIC',
+      requestHash: 'hash-deposit-append-generic',
+      body: appendBody,
+    })).resolves.toEqual({
+      ok: true,
+      newSyncToken: '10',
+    });
+    await expect(c.fetchPreparedSnapshot('Deposit', raw.Id)).resolves.toMatchObject({
+      syncToken: '10',
+      totalCents: 1_250,
+      lines: [
+        { id: 'DEPOSIT_LINE_HOLDING', amountCents: 1_050 },
+        { id: expect.any(String), amountCents: 200 },
+      ],
+    });
   });
 });

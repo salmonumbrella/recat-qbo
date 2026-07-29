@@ -22,7 +22,11 @@ import {
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
+  type RawDeposit,
+  type RawDepositLine,
   type QboStatement,
   type QboStatementRow,
   type QboPurchaseSnapshot,
@@ -44,8 +48,13 @@ import {
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
+import {
+  mapDepositSnapshot as mapDepositSnapshotBody,
+  prepareDepositRecategorization as prepareDepositRecategorizationBody,
+  prepareDepositRestore as prepareDepositRestoreBody,
+} from './depositTax.js';
 
-export type { RawPurchase, RawPurchaseLine } from './types.js';
+export type { RawDeposit, RawDepositLine, RawPurchase, RawPurchaseLine } from './types.js';
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -115,27 +124,10 @@ export interface RawTaxCode {
   PurchaseTaxRateList?: {
     TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
   };
+  SalesTaxRateList?: {
+    TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
+  };
   MetaData?: RawMetaData;
-}
-
-export interface RawDepositLine {
-  Id?: string;
-  Amount?: number;
-  Description?: string;
-  DetailType?: string;
-  DepositLineDetail?: { AccountRef?: QboRef; Entity?: QboRef; PaymentMethodRef?: QboRef };
-}
-
-export interface RawDeposit {
-  Id: string;
-  SyncToken: string;
-  TxnDate?: string;
-  TotalAmt?: number;
-  DocNumber?: string;
-  PrivateNote?: string;
-  DepositToAccountRef?: QboRef;
-  Line?: RawDepositLine[];
-  status?: string;
 }
 
 export interface RawJournalEntryLine {
@@ -487,16 +479,21 @@ export function mapTaxRate(raw: RawTaxRate): QboTaxRateInfo {
 }
 
 export function mapTaxCode(raw: RawTaxCode): QboTaxCodeInfo {
+  const mapRates = (
+    details: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[] | undefined,
+    direction: 'purchase' | 'sales',
+  ) => (details ?? []).map((detail) => ({
+    taxRateQboId: requiredTaxIdentity(detail.TaxRateRef?.value, `${direction} rate reference`),
+    taxTypeApplicable: requiredTaxIdentity(detail.TaxTypeApplicable, 'component type'),
+  }));
   return {
     qboId: requiredTaxIdentity(raw.Id, 'code Id'),
     name: raw.Name,
     description: raw.Description ?? null,
     active: activeOrDefault(raw.Active, 'tax-code'),
     taxable: typeof raw.Taxable === 'boolean' ? raw.Taxable : null,
-    purchaseRates: (raw.PurchaseTaxRateList?.TaxRateDetail ?? []).map((detail) => ({
-      taxRateQboId: requiredTaxIdentity(detail.TaxRateRef?.value, 'purchase rate reference'),
-      taxTypeApplicable: requiredTaxIdentity(detail.TaxTypeApplicable, 'component type'),
-    })),
+    purchaseRates: mapRates(raw.PurchaseTaxRateList?.TaxRateDetail, 'purchase'),
+    salesRates: mapRates(raw.SalesTaxRateList?.TaxRateDetail, 'sales'),
     sourceUpdatedAt: sourceUpdatedAt(raw.MetaData),
   };
 }
@@ -535,6 +532,10 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
           : signedCents(line.AccountBasedExpenseLineDetail.TaxInclusiveAmt),
     })),
   };
+}
+
+export function mapDepositSnapshot(raw: RawDeposit): QboDepositSnapshot {
+  return mapDepositSnapshotBody(raw);
 }
 
 function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
@@ -942,7 +943,18 @@ export class RealQboClient implements QboClient {
    * Prepared mutations are already the durable retry unit. Send their exact
    * body once and surface an ambiguous timeout to the lifecycle caller.
    */
-  private async requestPreparedWrite(prepared: QboPreparedWrite): Promise<{ Purchase?: RawPurchase }> {
+  private async requestPreparedWrite(
+    prepared: QboPreparedWrite,
+  ): Promise<{ Purchase?: RawPurchase; Deposit?: RawDeposit }> {
+    const entityPath =
+      prepared.qboType === 'Purchase'
+        ? 'purchase'
+        : prepared.qboType === 'Deposit'
+          ? 'deposit'
+          : null;
+    if (entityPath === null) {
+      throw new Error('Prepared writes support Purchase and Deposit transactions only.');
+    }
     const accessToken = await this.ensureFreshToken();
     const controller = new AbortController();
     const timeout = setTimeout(
@@ -951,7 +963,7 @@ export class RealQboClient implements QboClient {
     );
     try {
       const res = await fetch(
-        `${this.base}/purchase?requestid=${encodeURIComponent(prepared.requestId)}&minorversion=${MINOR_VERSION}`,
+        `${this.base}/${entityPath}?requestid=${encodeURIComponent(prepared.requestId)}&minorversion=${MINOR_VERSION}`,
         {
           method: 'POST',
           headers: {
@@ -965,7 +977,10 @@ export class RealQboClient implements QboClient {
       );
       const text = await res.text();
       if (!res.ok) throw this.toError(res.status, text);
-      return (text ? JSON.parse(text) : {}) as { Purchase?: RawPurchase };
+      return (text ? JSON.parse(text) : {}) as {
+        Purchase?: RawPurchase;
+        Deposit?: RawDeposit;
+      };
     } catch (error) {
       const cause = error instanceof Error
         ? (error as Error & { cause?: unknown }).cause
@@ -1069,14 +1084,61 @@ export class RealQboClient implements QboClient {
     return rows.map(mapTaxRate);
   }
 
-  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+  async fetchPreparedSnapshot(
+    qboType: 'Purchase' | 'Deposit',
+    qboId: string,
+  ): Promise<QboPurchaseSnapshot | QboDepositSnapshot | null> {
     try {
-      const body = await this.request<{ Purchase?: RawPurchase }>('GET', `/purchase/${encodeURIComponent(qboId)}`);
-      return body.Purchase ? mapPurchaseSnapshot(body.Purchase) : null;
+      if (qboType === 'Purchase') {
+        const body = await this.request<{ Purchase?: RawPurchase }>(
+          'GET',
+          `/purchase/${encodeURIComponent(qboId)}`,
+        );
+        return body.Purchase ? mapPurchaseSnapshot(body.Purchase) : null;
+      }
+      if (qboType === 'Deposit') {
+        const body = await this.request<{ Deposit?: RawDeposit }>(
+          'GET',
+          `/deposit/${encodeURIComponent(qboId)}`,
+        );
+        return body.Deposit ? mapDepositSnapshot(body.Deposit) : null;
+      }
+      throw new Error('Prepared snapshots support Purchase and Deposit transactions only.');
     } catch (err) {
       if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
       throw err;
     }
+  }
+
+  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+    return this.fetchPreparedSnapshot('Purchase', qboId) as Promise<QboPurchaseSnapshot | null>;
+  }
+
+  async prepareRecategorization(
+    txn: QboTxn,
+    staged: StagedCategorization,
+    before: QboPurchaseSnapshot | QboDepositSnapshot,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    if (txn.qboType === 'Purchase' && 'accountQboId' in before) {
+      return preparePurchaseRecategorizationBody({
+        current: txn.raw as RawPurchase,
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    if (txn.qboType === 'Deposit' && 'depositToAccountQboId' in before) {
+      return prepareDepositRecategorizationBody({
+        current: txn.raw as RawDeposit,
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    throw new Error('Prepared writes require a matching Purchase or Deposit snapshot.');
   }
 
   async preparePurchaseRecategorization(
@@ -1084,46 +1146,78 @@ export class RealQboClient implements QboClient {
     staged: StagedCategorization,
     before: QboPurchaseSnapshot,
     requestId: string,
-  ): Promise<QboPreparedWrite> {
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared tax-aware writes support Purchase transactions only.');
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || !('accountQboId' in before)) {
+      throw new Error('Purchase compatibility recategorization requires a Purchase transaction.');
     }
-    return preparePurchaseRecategorizationBody({
-      current: txn.raw as RawPurchase,
-      holdingAccountQboIds: [...this.holdingIds],
+    const prepared = await this.prepareRecategorization(
+      txn,
       staged,
       before,
       requestId,
-    });
+    );
+    if (prepared.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility recategorization returned a non-Purchase write.');
+    }
+    return prepared;
   }
 
   async sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
     const response = await this.requestPreparedWrite(prepared);
-    if (
-      typeof response.Purchase?.SyncToken !== 'string' ||
-      response.Purchase.SyncToken.trim() === ''
-    ) {
-      throw new Error('QuickBooks prepared write response omitted the updated Purchase SyncToken.');
+    const responseEntity =
+      prepared.qboType === 'Purchase' ? response.Purchase : response.Deposit;
+    if (typeof responseEntity?.SyncToken !== 'string' || responseEntity.SyncToken.trim() === '') {
+      throw new Error(
+        `QuickBooks prepared write response omitted the updated ${prepared.qboType} SyncToken.`,
+      );
     }
     return {
       ok: true,
-      newSyncToken: response.Purchase.SyncToken,
+      newSyncToken: responseEntity.SyncToken,
     };
+  }
+
+  async prepareRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    if (txn.qboType === 'Purchase' && prepared.qboType === 'Purchase') {
+      return preparePurchaseRestoreBody({
+        current: txn.raw as RawPurchase,
+        prepared,
+        requestId,
+      });
+    }
+    if (txn.qboType === 'Deposit' && prepared.qboType === 'Deposit') {
+      return prepareDepositRestoreBody({
+        current: txn.raw as RawDeposit,
+        prepared,
+        requestId,
+      });
+    }
+    throw new Error('Prepared restore requires matching Purchase or Deposit transactions.');
   }
 
   async preparePurchaseRestore(
     txn: QboTxn,
     prepared: QboPreparedWrite,
     requestId: string,
-  ): Promise<QboPreparedWrite> {
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared restore supports Purchase transactions only.');
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || prepared.qboType !== 'Purchase') {
+      throw new Error(
+        'Purchase compatibility restore requires a Purchase transaction and prepared write.',
+      );
     }
-    return preparePurchaseRestoreBody({
-      current: txn.raw as RawPurchase,
+    const restore = await this.prepareRestore(
+      txn,
       prepared,
       requestId,
-    });
+    );
+    if (restore.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility restore returned a non-Purchase write.');
+    }
+    return restore;
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {

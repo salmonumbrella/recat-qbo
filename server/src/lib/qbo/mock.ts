@@ -17,7 +17,9 @@ import {
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboStatement,
   type QboPurchaseSnapshot,
   type QboTaxCodeInfo,
@@ -26,6 +28,8 @@ import {
   type QboTokenSet,
   type QboTxn,
   type QboWriteResult,
+  type RawDeposit,
+  type RawDepositLine,
   type RawPurchase,
   type RawPurchaseLine,
 } from './types.js';
@@ -35,6 +39,11 @@ import {
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
+import {
+  mapDepositSnapshot as mapDepositSnapshotBody,
+  prepareDepositRecategorization as prepareDepositRecategorizationBody,
+  prepareDepositRestore as prepareDepositRestoreBody,
+} from './depositTax.js';
 
 export const MOCK_REALM_HARBOR = MOCK_REALM_IDS[0];
 export const MOCK_REALM_BLUEBIRD = MOCK_REALM_IDS[1];
@@ -87,6 +96,14 @@ interface MockTransfer {
   lastUpdated: string;
 }
 
+interface MockPreparedWriteResult {
+  requestId: string;
+  requestHash: string;
+  qboType: 'Purchase' | 'Deposit';
+  qboId: string;
+  newSyncToken: string;
+}
+
 export interface MockRealm {
   realmId: string;
   legalName: string;
@@ -98,6 +115,9 @@ export interface MockRealm {
   purchaseSnapshots: QboPurchaseSnapshot[];
   /** Authoritative full QBO-shaped Purchase bodies, including unknown fields. */
   rawPurchases: RawPurchase[];
+  /** Authoritative full QBO-shaped Deposit bodies, including unknown fields. */
+  rawDeposits: RawDeposit[];
+  preparedWriteResults: MockPreparedWriteResult[];
   transfers: MockTransfer[];
   nextId: number;
 }
@@ -200,6 +220,8 @@ function buildHarborRealm(): MockRealm {
     taxRates: [],
     purchaseSnapshots: [],
     rawPurchases: [],
+    rawDeposits: [],
+    preparedWriteResults: [],
     transfers: [],
     nextId: 1000,
   };
@@ -240,38 +262,44 @@ function buildBluebirdRealm(): MockRealm {
     txns: seeds.map((s) => seedTxn(s, HOLDING)),
     taxProfile: { usingSalesTax: true, partnerTaxEnabled: false },
     taxRates: [
-      { qboId: 'GST5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
-      { qboId: 'PST7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
+      { qboId: 'STANDARD_RATE', name: 'Standard tax 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
+      { qboId: 'SECONDARY_RATE', name: 'Secondary tax 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
     ],
     taxCodes: [
       {
-        qboId: 'GST',
-        name: 'GST',
-        description: 'Goods and services tax',
+        qboId: 'STANDARD',
+        name: 'Standard tax',
+        description: 'Standard tax code',
         active: true,
         taxable: true,
-        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        purchaseRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
         sourceUpdatedAt: null,
       },
       {
-        qboId: 'GST-PST',
-        name: 'GST + PST',
+        qboId: 'COMBINED',
+        name: 'Combined tax',
         description: null,
         active: true,
         taxable: true,
         purchaseRates: [
-          { taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' },
-          { taxRateQboId: 'PST7', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'SECONDARY_RATE', taxTypeApplicable: 'TaxOnAmount' },
+        ],
+        salesRates: [
+          { taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'SECONDARY_RATE', taxTypeApplicable: 'TaxOnAmount' },
         ],
         sourceUpdatedAt: null,
       },
       {
-        qboId: 'OLD-GST',
-        name: 'Old GST',
+        qboId: 'INACTIVE_STANDARD',
+        name: 'Inactive standard tax',
         description: null,
         active: false,
         taxable: true,
-        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        purchaseRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [{ taxRateQboId: 'STANDARD_RATE', taxTypeApplicable: 'TaxOnAmount' }],
         sourceUpdatedAt: null,
       },
     ],
@@ -316,7 +344,7 @@ function buildBluebirdRealm(): MockRealm {
             accountQboId: '3',
             customerQboId: 'customer-1',
             classQboId: 'class-1',
-            taxCodeQboId: 'GST',
+            taxCodeQboId: 'STANDARD',
             taxAmountCents: 2572,
             taxInclusiveCents: null,
           },
@@ -324,6 +352,8 @@ function buildBluebirdRealm(): MockRealm {
       },
     ],
     rawPurchases: [],
+    rawDeposits: [],
+    preparedWriteResults: [],
     transfers: [],
     nextId: 1000,
   };
@@ -339,6 +369,9 @@ function buildRealms(): Map<string, MockRealm> {
           txn,
           realm.purchaseSnapshots.find((snapshot) => snapshot.qboId === txn.qboId),
         ));
+    realm.rawDeposits = realm.txns
+      .filter((txn) => txn.qboType === 'Deposit')
+      .map(rawDepositFromMock);
   }
   return new Map(built.map((realm) => [realm.realmId, realm]));
 }
@@ -487,6 +520,55 @@ function isPersistedRawPurchase(value: unknown): value is RawPurchase {
   );
 }
 
+function isPersistedRawDepositLine(value: unknown): value is RawDepositLine {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.Id) ||
+    !isFiniteNumber(value.Amount) ||
+    value.DetailType !== 'DepositLineDetail' ||
+    !isRecord(value.DepositLineDetail)
+  ) {
+    return false;
+  }
+  const detail = value.DepositLineDetail;
+  return (
+    isPersistedReference(detail.AccountRef) &&
+    isOptionalPersistedReference(detail.Entity) &&
+    isOptionalPersistedReference(detail.PaymentMethodRef) &&
+    isOptionalPersistedReference(detail.ClassRef) &&
+    isOptionalPersistedReference(detail.TaxCodeRef) &&
+    (detail.TaxApplicableOn === undefined ||
+      typeof detail.TaxApplicableOn === 'string')
+  );
+}
+
+function isPersistedRawDeposit(value: unknown): value is RawDeposit {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.Id) &&
+    isNonEmptyString(value.SyncToken) &&
+    isNonEmptyString(value.TxnDate) &&
+    isFiniteNumber(value.TotalAmt) &&
+    isPersistedReference(value.DepositToAccountRef) &&
+    Array.isArray(value.Line) &&
+    value.Line.length > 0 &&
+    value.Line.every(isPersistedRawDepositLine)
+  );
+}
+
+function isPersistedPreparedWriteResult(
+  value: unknown,
+): value is MockPreparedWriteResult {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.requestId) &&
+    isNonEmptyString(value.requestHash) &&
+    (value.qboType === 'Purchase' || value.qboType === 'Deposit') &&
+    isNonEmptyString(value.qboId) &&
+    isNonEmptyString(value.newSyncToken)
+  );
+}
+
 function isPersistedTxnArray(value: unknown): value is MockTxnEntity[] {
   return Array.isArray(value) && value.every(isPersistedTxn);
 }
@@ -501,8 +583,16 @@ function isPersistedRawPurchaseArray(value: unknown): value is RawPurchase[] {
   return Array.isArray(value) && value.every(isPersistedRawPurchase);
 }
 
+function isPersistedRawDepositArray(value: unknown): value is RawDeposit[] {
+  return Array.isArray(value) && value.every(isPersistedRawDeposit);
+}
+
 function activePurchaseEntities(txns: readonly MockTxnEntity[]): MockTxnEntity[] {
   return txns.filter((txn) => txn.qboType === 'Purchase' && !txn.deleted);
+}
+
+function activeDepositEntities(txns: readonly MockTxnEntity[]): MockTxnEntity[] {
+  return txns.filter((txn) => txn.qboType === 'Deposit' && !txn.deleted);
 }
 
 function rawPurchasesMatchEntities(
@@ -540,6 +630,36 @@ function reconcileRawPurchases(
           entity,
           snapshots.find((snapshot) => snapshot.qboId === entity.qboId),
         );
+  });
+}
+
+function rawDepositsMatchEntities(
+  rawDeposits: readonly RawDeposit[],
+  txns: readonly MockTxnEntity[],
+): boolean {
+  const deposits = activeDepositEntities(txns);
+  const byId = new Map(rawDeposits.map((raw) => [raw.Id, raw]));
+  return (
+    rawDeposits.length === deposits.length &&
+    byId.size === rawDeposits.length &&
+    deposits.every(
+      (entity) =>
+        byId.get(entity.qboId)?.SyncToken === String(entity.syncToken),
+    )
+  );
+}
+
+function reconcileRawDeposits(
+  txns: readonly MockTxnEntity[],
+  persistedCandidates: readonly RawDeposit[],
+): RawDeposit[] {
+  return activeDepositEntities(txns).map((entity) => {
+    const matches = persistedCandidates.filter(
+      (raw) =>
+        raw.Id === entity.qboId &&
+        raw.SyncToken === String(entity.syncToken),
+    );
+    return matches.length === 1 ? matches[0]! : rawDepositFromMock(entity);
   });
 }
 
@@ -587,6 +707,26 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
             usablePersistedRawPurchases,
           )
         : current.rawPurchases;
+  const persistedRawDeposits = isPersistedRawDepositArray(
+    persisted.rawDeposits,
+  )
+    ? persisted.rawDeposits
+    : null;
+  const usablePersistedRawDeposits = Array.isArray(persisted.rawDeposits)
+    ? persisted.rawDeposits.filter(isPersistedRawDeposit)
+    : [];
+  const rawDeposits =
+    persistedRawDeposits !== null &&
+    rawDepositsMatchEntities(persistedRawDeposits, txns)
+      ? persistedRawDeposits
+      : Array.isArray(persisted.rawDeposits) || persistedTxns !== null
+        ? reconcileRawDeposits(txns, usablePersistedRawDeposits)
+        : current.rawDeposits;
+  const preparedWriteResults =
+    Array.isArray(persisted.preparedWriteResults) &&
+    persisted.preparedWriteResults.every(isPersistedPreparedWriteResult)
+      ? persisted.preparedWriteResults
+      : current.preparedWriteResults;
   const nextId =
     typeof persisted.nextId === 'number' &&
     Number.isSafeInteger(persisted.nextId) &&
@@ -599,6 +739,8 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
     transfers === current.transfers &&
     purchaseSnapshots === current.purchaseSnapshots &&
     rawPurchases === current.rawPurchases &&
+    rawDeposits === current.rawDeposits &&
+    preparedWriteResults === current.preparedWriteResults &&
     nextId === current.nextId
   ) {
     return current;
@@ -608,6 +750,8 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
     txns,
     purchaseSnapshots,
     rawPurchases,
+    rawDeposits,
+    preparedWriteResults,
     transfers,
     nextId,
   };
@@ -842,6 +986,63 @@ function rawPurchaseSnapshot(
   };
 }
 
+function rawDepositFromMock(entity: MockTxnEntity): RawDeposit {
+  return {
+    Id: entity.qboId,
+    SyncToken: String(entity.syncToken),
+    TxnDate: entity.date,
+    TotalAmt: Math.abs(entity.amount),
+    ...(entity.memo === undefined ? {} : { PrivateNote: entity.memo }),
+    DepositToAccountRef: { value: entity.bankAccountQboId },
+    Line: entity.lines.map((line) => ({
+      Id: line.id,
+      Amount: Math.abs(line.amount),
+      ...(line.memo === undefined ? {} : { Description: line.memo }),
+      DetailType: 'DepositLineDetail',
+      DepositLineDetail: {
+        AccountRef: { value: line.accountQboId },
+      },
+    })),
+  };
+}
+
+function rawDepositSnapshot(
+  raw: RawDeposit,
+  realm: Pick<MockRealm, 'taxCodes' | 'taxRates'>,
+): QboDepositSnapshot {
+  const snapshot = mapDepositSnapshotBody(raw);
+  const calculatedTaxCents = (raw.Line ?? []).reduce((sum, line) => {
+    const taxCodeQboId = line.DepositLineDetail?.TaxCodeRef?.value;
+    if (!taxCodeQboId) return sum;
+    const code = realm.taxCodes.find(
+      (candidate) => candidate.qboId === taxCodeQboId && candidate.active,
+    );
+    if (!code?.taxable) return sum;
+    const ratePercent = code.salesRates.reduce((rateSum, reference) => {
+      if (reference.taxTypeApplicable !== 'TaxOnAmount') return rateSum;
+      const rate = realm.taxRates.find(
+        (candidate) =>
+          candidate.qboId === reference.taxRateQboId && candidate.active,
+      );
+      return rateSum + (rate?.rateValue ?? 0);
+    }, 0);
+    const amountCents = Math.round((line.Amount ?? 0) * 100);
+    // QBO Deposit line Amount is net for both taxable calculation modes; QBO
+    // adds the selected sales tax to the Deposit total.
+    const taxCents = Math.round(amountCents * ratePercent / 100);
+    return sum + taxCents;
+  }, 0);
+  return {
+    ...snapshot,
+    totalTaxCents:
+      raw.TxnTaxDetail?.TotalTax === undefined
+        ? raw.GlobalTaxCalculation === undefined
+          ? null
+          : calculatedTaxCents
+        : Math.round(raw.TxnTaxDetail.TotalTax * 100),
+  };
+}
+
 export class MockQboClient implements QboClient {
   readonly realmId: string;
   private readonly holdingIds: ReadonlySet<string>;
@@ -863,6 +1064,10 @@ export class MockQboClient implements QboClient {
 
   private rawPurchaseById(qboId: string): RawPurchase | undefined {
     return this.realm.rawPurchases.find((purchase) => purchase.Id === qboId);
+  }
+
+  private rawDepositById(qboId: string): RawDeposit | undefined {
+    return this.realm.rawDeposits.find((deposit) => deposit.Id === qboId);
   }
 
   /**
@@ -893,6 +1098,8 @@ export class MockQboClient implements QboClient {
       raw:
         e.qboType === 'Purchase'
           ? structuredClone(this.rawPurchaseById(e.qboId) ?? e)
+          : e.qboType === 'Deposit'
+            ? structuredClone(this.rawDepositById(e.qboId) ?? e)
           : structuredClone(e),
     };
   }
@@ -935,14 +1142,72 @@ export class MockQboClient implements QboClient {
     return this.realm.taxRates.map((rate) => ({ ...rate }));
   }
 
-  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+  async fetchPreparedSnapshot(
+    qboType: 'Purchase' | 'Deposit',
+    qboId: string,
+  ): Promise<QboPurchaseSnapshot | QboDepositSnapshot | null> {
     await ensureMockRealmsHydrated();
-    const raw = this.rawPurchaseById(qboId);
-    if (raw) {
-      return rawPurchaseSnapshot(raw, raw.SyncToken, this.realm);
+    if (qboType === 'Purchase') {
+      const raw = this.rawPurchaseById(qboId);
+      if (raw) {
+        return rawPurchaseSnapshot(raw, raw.SyncToken, this.realm);
+      }
+      const snapshot = this.realm.purchaseSnapshots.find(
+        (purchase) => purchase.qboId === qboId,
+      );
+      return snapshot
+        ? { ...snapshot, lines: snapshot.lines.map((line) => ({ ...line })) }
+        : null;
     }
-    const snapshot = this.realm.purchaseSnapshots.find((purchase) => purchase.qboId === qboId);
-    return snapshot ? { ...snapshot, lines: snapshot.lines.map((line) => ({ ...line })) } : null;
+    if (qboType === 'Deposit') {
+      const raw = this.rawDepositById(qboId);
+      return raw ? rawDepositSnapshot(raw, this.realm) : null;
+    }
+    throw new Error('Prepared snapshots support Purchase and Deposit transactions only.');
+  }
+
+  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+    return this.fetchPreparedSnapshot('Purchase', qboId) as Promise<QboPurchaseSnapshot | null>;
+  }
+
+  async prepareRecategorization(
+    txn: QboTxn,
+    staged: StagedCategorization,
+    before: QboPurchaseSnapshot | QboDepositSnapshot,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    await ensureMockRealmsHydrated();
+    if (txn.qboType === 'Purchase' && 'accountQboId' in before) {
+      const entity = this.findEntity('Purchase', txn.qboId);
+      if (!entity) throw new Error(`Mock QBO: Purchase ${txn.qboId} not found`);
+      if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
+      const raw = this.rawPurchaseById(txn.qboId);
+      if (!raw) throw new Error(`Mock QBO: raw Purchase ${txn.qboId} not found`);
+      if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
+      return preparePurchaseRecategorizationBody({
+        current: structuredClone(raw),
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    if (txn.qboType === 'Deposit' && 'depositToAccountQboId' in before) {
+      const entity = this.findEntity('Deposit', txn.qboId);
+      if (!entity) throw new Error(`Mock QBO: Deposit ${txn.qboId} not found`);
+      if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
+      const raw = this.rawDepositById(txn.qboId);
+      if (!raw) throw new Error(`Mock QBO: raw Deposit ${txn.qboId} not found`);
+      if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
+      return prepareDepositRecategorizationBody({
+        current: structuredClone(raw),
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    throw new Error('Prepared writes require a matching Purchase or Deposit snapshot.');
   }
 
   async preparePurchaseRecategorization(
@@ -950,32 +1215,50 @@ export class MockQboClient implements QboClient {
     staged: StagedCategorization,
     before: QboPurchaseSnapshot,
     requestId: string,
-  ): Promise<QboPreparedWrite> {
-    await ensureMockRealmsHydrated();
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared tax-aware writes support Purchase transactions only.');
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || !('accountQboId' in before)) {
+      throw new Error('Purchase compatibility recategorization requires a Purchase transaction.');
     }
-    const entity = this.findEntity('Purchase', txn.qboId);
-    if (!entity) throw new Error(`Mock QBO: Purchase ${txn.qboId} not found`);
-    if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
-    const raw = this.rawPurchaseById(txn.qboId);
-    if (!raw) throw new Error(`Mock QBO: raw Purchase ${txn.qboId} not found`);
-    if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
-    return preparePurchaseRecategorizationBody({
-      current: structuredClone(raw),
-      holdingAccountQboIds: [...this.holdingIds],
+    const prepared = await this.prepareRecategorization(
+      txn,
       staged,
       before,
       requestId,
-    });
+    );
+    if (prepared.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility recategorization returned a non-Purchase write.');
+    }
+    return prepared;
   }
 
   async sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
     await ensureMockRealmsHydrated();
-    const entity = this.findEntity('Purchase', prepared.qboId);
-    if (!entity) throw new Error(`Mock QBO: Purchase ${prepared.qboId} not found`);
-    const currentRaw = this.rawPurchaseById(prepared.qboId);
-    if (!currentRaw) throw new Error(`Mock QBO: raw Purchase ${prepared.qboId} not found`);
+    const replay = this.realm.preparedWriteResults.find(
+      (result) => result.requestId === prepared.requestId,
+    );
+    if (replay) {
+      if (
+        replay.requestHash !== prepared.requestHash ||
+        replay.qboType !== prepared.qboType ||
+        replay.qboId !== prepared.qboId
+      ) {
+        throw new Error('Mock QBO: request ID represents a different prepared write');
+      }
+      return { ok: true, newSyncToken: replay.newSyncToken };
+    }
+    const entity = this.findEntity(prepared.qboType, prepared.qboId);
+    if (!entity) {
+      throw new Error(`Mock QBO: ${prepared.qboType} ${prepared.qboId} not found`);
+    }
+    const currentRaw =
+      prepared.qboType === 'Purchase'
+        ? this.rawPurchaseById(prepared.qboId)
+        : this.rawDepositById(prepared.qboId);
+    if (!currentRaw) {
+      throw new Error(
+        `Mock QBO: raw ${prepared.qboType} ${prepared.qboId} not found`,
+      );
+    }
     if (
       prepared.body.Id !== prepared.qboId ||
       String(entity.syncToken) !== prepared.body.SyncToken ||
@@ -985,7 +1268,11 @@ export class MockQboClient implements QboClient {
     }
     const responseBody = structuredClone(prepared.body);
     const lines = responseBody.Line;
-    if (!Array.isArray(lines)) throw new Error('Mock QBO: prepared Purchase Line array is missing');
+    if (!Array.isArray(lines)) {
+      throw new Error(
+        `Mock QBO: prepared ${prepared.qboType} Line array is missing`,
+      );
+    }
     const reservedLineIds = new Set(
       lines.flatMap((line) =>
         typeof line.Id === 'string' && line.Id !== '' ? [line.Id] : []),
@@ -999,64 +1286,169 @@ export class MockQboClient implements QboClient {
       line.Id = candidate;
       reservedLineIds.add(candidate);
     }
-    const mappedLines = lines.map((line): MockLine => {
-      const accountQboId = line.AccountBasedExpenseLineDetail?.AccountRef?.value;
-      if (!accountQboId || !this.accountById(accountQboId)) {
-        throw new Error(`Mock QBO: unknown prepared Purchase account id "${accountQboId ?? ''}"`);
-      }
-      return {
-        id: line.Id!,
-        amount: round2(line.Amount ?? 0),
-        accountQboId,
-        ...(line.Description === undefined ? {} : { memo: line.Description }),
-      };
-    });
-
-    entity.lines = mappedLines;
-    entity.amount = responseBody.Credit === true
-      ? Math.abs(responseBody.TotalAmt ?? entity.amount)
-      : -Math.abs(responseBody.TotalAmt ?? entity.amount);
+    if (prepared.qboType === 'Purchase') {
+      const purchaseResponse = responseBody as RawPurchase;
+      entity.lines = purchaseResponse.Line!.map((line): MockLine => {
+        const accountQboId =
+          line.AccountBasedExpenseLineDetail?.AccountRef?.value;
+        if (!accountQboId || !this.accountById(accountQboId)) {
+          throw new Error(
+            `Mock QBO: unknown prepared Purchase account id "${accountQboId ?? ''}"`,
+          );
+        }
+        return {
+          id: line.Id!,
+          amount: round2(line.Amount ?? 0),
+          accountQboId,
+          ...(line.Description === undefined ? {} : { memo: line.Description }),
+        };
+      });
+      entity.amount = responseBody.Credit === true
+        ? Math.abs(responseBody.TotalAmt ?? entity.amount)
+        : -Math.abs(responseBody.TotalAmt ?? entity.amount);
+    } else {
+      const depositResponse = responseBody as RawDeposit;
+      const currentDeposit = currentRaw as RawDeposit;
+      const requestedById = new Map(
+        depositResponse.Line!.map((line) => [line.Id!, line]),
+      );
+      const currentIds = new Set(
+        (currentDeposit.Line ?? []).flatMap((line) =>
+          typeof line.Id === 'string' && line.Id !== '' ? [line.Id] : []),
+      );
+      depositResponse.Line = [
+        ...(currentDeposit.Line ?? []).map((line) =>
+          line.Id === undefined ? line : requestedById.get(line.Id) ?? line),
+        ...depositResponse.Line!.filter((line) => !currentIds.has(line.Id!)),
+      ];
+      entity.lines = depositResponse.Line!.map((line): MockLine => {
+        const accountQboId = line.DepositLineDetail?.AccountRef?.value;
+        if (!accountQboId || !this.accountById(accountQboId)) {
+          throw new Error(
+            `Mock QBO: unknown prepared Deposit account id "${accountQboId ?? ''}"`,
+          );
+        }
+        return {
+          id: line.Id!,
+          amount: round2(line.Amount ?? 0),
+          accountQboId,
+          ...(line.Description === undefined ? {} : { memo: line.Description }),
+        };
+      });
+      entity.amount = Math.abs(responseBody.TotalAmt ?? entity.amount);
+    }
     entity.syncToken += 1;
     entity.lastUpdated = new Date().toISOString();
     responseBody.SyncToken = String(entity.syncToken);
-    const rawIndex = this.realm.rawPurchases.findIndex(
-      (purchase) => purchase.Id === prepared.qboId,
-    );
-    this.realm.rawPurchases[rawIndex] = responseBody;
-    const responseSnapshot = rawPurchaseSnapshot(
-      responseBody,
-      String(entity.syncToken),
-      this.realm,
-    );
-    const snapshotIndex = this.realm.purchaseSnapshots.findIndex(
-      (snapshot) => snapshot.qboId === prepared.qboId,
-    );
-    if (snapshotIndex === -1) this.realm.purchaseSnapshots.push(responseSnapshot);
-    else this.realm.purchaseSnapshots[snapshotIndex] = responseSnapshot;
+    if (prepared.qboType === 'Purchase') {
+      const rawIndex = this.realm.rawPurchases.findIndex(
+        (purchase) => purchase.Id === prepared.qboId,
+      );
+      this.realm.rawPurchases[rawIndex] = responseBody;
+      const responseSnapshot = rawPurchaseSnapshot(
+        responseBody,
+        String(entity.syncToken),
+        this.realm,
+      );
+      const snapshotIndex = this.realm.purchaseSnapshots.findIndex(
+        (snapshot) => snapshot.qboId === prepared.qboId,
+      );
+      if (snapshotIndex === -1) {
+        this.realm.purchaseSnapshots.push(responseSnapshot);
+      } else {
+        this.realm.purchaseSnapshots[snapshotIndex] = responseSnapshot;
+      }
+    } else {
+      const depositResponse = responseBody as RawDeposit;
+      if (depositResponse.GlobalTaxCalculation !== undefined) {
+        const computed = rawDepositSnapshot({
+          ...depositResponse,
+          TxnTaxDetail: undefined,
+        }, this.realm);
+        depositResponse.TxnTaxDetail = {
+          TotalTax: (computed.totalTaxCents ?? 0) / 100,
+        };
+      }
+      const lineSubtotalCents = depositResponse.Line!.reduce(
+        (sum, line) => sum + Math.round((line.Amount ?? 0) * 100),
+        0,
+      );
+      const taxCents = Math.round(
+        (depositResponse.TxnTaxDetail?.TotalTax ?? 0) * 100,
+      );
+      depositResponse.TotalAmt = (lineSubtotalCents + taxCents) / 100;
+      entity.amount = Math.abs(depositResponse.TotalAmt);
+      const rawIndex = this.realm.rawDeposits.findIndex(
+        (deposit) => deposit.Id === prepared.qboId,
+      );
+      this.realm.rawDeposits[rawIndex] = depositResponse;
+    }
+    const newSyncToken = String(entity.syncToken);
+    this.realm.preparedWriteResults.push({
+      requestId: prepared.requestId,
+      requestHash: prepared.requestHash,
+      qboType: prepared.qboType,
+      qboId: prepared.qboId,
+      newSyncToken,
+    });
     await persistMockRealm(this.realmId);
-    return { ok: true, newSyncToken: String(entity.syncToken) };
+    return { ok: true, newSyncToken };
+  }
+
+  async prepareRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    await ensureMockRealmsHydrated();
+    if (txn.qboType === 'Purchase' && prepared.qboType === 'Purchase') {
+      const entity = this.findEntity('Purchase', txn.qboId);
+      if (!entity) throw new Error(`Mock QBO: Purchase ${txn.qboId} not found`);
+      if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
+      const raw = this.rawPurchaseById(txn.qboId);
+      if (!raw) throw new Error(`Mock QBO: raw Purchase ${txn.qboId} not found`);
+      if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
+      return preparePurchaseRestoreBody({
+        current: structuredClone(raw),
+        prepared,
+        requestId,
+      });
+    }
+    if (txn.qboType === 'Deposit' && prepared.qboType === 'Deposit') {
+      const entity = this.findEntity('Deposit', txn.qboId);
+      if (!entity) throw new Error(`Mock QBO: Deposit ${txn.qboId} not found`);
+      if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
+      const raw = this.rawDepositById(txn.qboId);
+      if (!raw) throw new Error(`Mock QBO: raw Deposit ${txn.qboId} not found`);
+      if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
+      return prepareDepositRestoreBody({
+        current: structuredClone(raw),
+        prepared,
+        requestId,
+      });
+    }
+    throw new Error('Prepared restore requires matching Purchase or Deposit transactions.');
   }
 
   async preparePurchaseRestore(
     txn: QboTxn,
     prepared: QboPreparedWrite,
     requestId: string,
-  ): Promise<QboPreparedWrite> {
-    await ensureMockRealmsHydrated();
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared restore supports Purchase transactions only.');
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || prepared.qboType !== 'Purchase') {
+      throw new Error(
+        'Purchase compatibility restore requires a Purchase transaction and prepared write.',
+      );
     }
-    const entity = this.findEntity('Purchase', txn.qboId);
-    if (!entity) throw new Error(`Mock QBO: Purchase ${txn.qboId} not found`);
-    if (String(entity.syncToken) !== txn.syncToken) throw new QboSyncTokenConflict();
-    const raw = this.rawPurchaseById(txn.qboId);
-    if (!raw) throw new Error(`Mock QBO: raw Purchase ${txn.qboId} not found`);
-    if (raw.SyncToken !== txn.syncToken) throw new QboSyncTokenConflict();
-    return preparePurchaseRestoreBody({
-      current: structuredClone(raw),
+    const restore = await this.prepareRestore(
+      txn,
       prepared,
       requestId,
-    });
+    );
+    if (restore.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility restore returned a non-Purchase write.');
+    }
+    return restore;
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {

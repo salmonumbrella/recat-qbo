@@ -24,6 +24,7 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { getTaxReadiness } from '../services/tax/reference.js';
 import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import { stageCategorization } from '../services/categorization.js';
@@ -498,9 +499,47 @@ async function assertCompanyConnected(companyId: string): Promise<void> {
 }
 
 async function assertLegacyCategorizationAllowed(
-  txn: Pick<TxnRow, 'companyId' | 'qboType'>,
+  txn: Pick<
+    TxnRow,
+    | 'id'
+    | 'companyId'
+    | 'qboType'
+    | 'taxCalculation'
+    | 'taxCodeQboId'
+    | 'splitLines'
+    | 'qboMutationAttempts'
+  >,
 ): Promise<void> {
-  if (txn.qboType !== 'Purchase') return;
+  if (txn.qboType !== 'Purchase' && txn.qboType !== 'Deposit') return;
+  const hasStagedMarker =
+    txn.taxCalculation !== null ||
+    txn.taxCodeQboId !== null ||
+    txn.splitLines.some((line) => line.taxCodeQboId !== null);
+  const durableAttempt =
+    txn.qboMutationAttempts.length > 0
+      ? txn.qboMutationAttempts[0]
+      : await prisma.qboMutationAttempt.findFirst({
+          where: { transactionId: txn.id },
+          select: { id: true },
+        });
+  if (hasStagedMarker || durableAttempt) {
+    throw new HttpError(
+      409,
+      txn.qboType === 'Purchase'
+        ? 'Tax-ready Purchases must use staged categorization.'
+        : 'Tax-ready transactions must use staged categorization.',
+      'TAX_AWARE_STAGING_REQUIRED',
+    );
+  }
+  if (txn.qboType === 'Deposit') {
+    const readiness = await getTaxReadiness(txn.companyId);
+    if (readiness.salesStatus !== 'ready') return;
+    throw new HttpError(
+      409,
+      'Tax-ready transactions must use staged categorization.',
+      'TAX_AWARE_STAGING_REQUIRED',
+    );
+  }
   const company = await prisma.company.findUnique({
     where: { id: txn.companyId },
     select: { taxSupportStatus: true, taxUsingSalesTax: true },
@@ -509,7 +548,9 @@ async function assertLegacyCategorizationAllowed(
   if (company.taxSupportStatus === 'ready' && company.taxUsingSalesTax === true) {
     throw new HttpError(
       409,
-      'Tax-ready Purchases must use staged categorization.',
+      txn.qboType === 'Purchase'
+        ? 'Tax-ready Purchases must use staged categorization.'
+        : 'Tax-ready transactions must use staged categorization.',
       'TAX_AWARE_STAGING_REQUIRED',
     );
   }
@@ -542,25 +583,33 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
     message: 'This transaction has a prepared write that must be resumed or verified.',
   },
   PREWRITE_PERSISTENCE_FAILED: { status: 503, message: 'The prepared write was not sent. Retry with a new request.' },
+  QBO_AMOUNT_UNSAFE: { status: 400, message: 'The transaction amount cannot be categorized safely.' },
+  QBO_DEPOSIT_UNSUPPORTED: { status: 400, message: 'This transaction cannot use tax-aware Deposit writeback.' },
+  QBO_ENTITY_UNSUPPORTED: { status: 400, message: 'This transaction type cannot use tax-aware writeback.' },
   QBO_PURCHASE_UNSUPPORTED: { status: 400, message: 'This transaction cannot use tax-aware Purchase writeback.' },
+  QBO_REFERENCE_MISSING: { status: 400, message: 'Required QuickBooks references are unavailable.' },
   QBO_STATE_DRIFT: { status: 409, message: 'The QuickBooks transaction changed. Reload before continuing.' },
   RECONCILE_NOT_ALLOWED: { status: 409, message: 'This mutation attempt does not require reconciliation.' },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
   TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
-  TAX_AWARE_STAGING_REQUIRED: { status: 409, message: 'Tax-ready Purchases must use staged categorization.' },
+  TAX_AWARE_STAGING_REQUIRED: {
+    status: 409,
+    message: 'Tax-ready transactions must use staged categorization.',
+  },
   TAX_CODE_INACTIVE: { status: 400, message: 'A selected tax code is unavailable.' },
   TAX_CODE_MALFORMED: { status: 400, message: 'A selected tax code is unsupported.' },
+  TAX_CODE_PURCHASE_ONLY: { status: 400, message: 'A selected tax code is unsupported.' },
   TAX_CODE_SALES_ONLY: { status: 400, message: 'A selected tax code is unsupported.' },
   TAX_CODE_UNAVAILABLE: { status: 400, message: 'A selected tax code is unavailable.' },
   TAX_COMPANY_MISMATCH: { status: 400, message: 'A selected tax reference is unavailable for this company.' },
-  TAX_NOT_READY: { status: 409, message: 'Purchase tax references are not ready.' },
+  TAX_NOT_READY: { status: 409, message: 'Tax references are not ready.' },
   TAX_RATE_INACTIVE: { status: 400, message: 'A selected tax code is unavailable.' },
   TAX_RATE_MALFORMED: { status: 400, message: 'A selected tax code is unsupported.' },
   TAX_RATE_UNAVAILABLE: { status: 400, message: 'A selected tax code is unavailable.' },
   TAX_RATE_UNSUPPORTED: { status: 400, message: 'A selected tax code is unsupported.' },
-  TAX_REQUIRES_PURCHASE: { status: 400, message: 'Tax selection is supported only for Purchase transactions.' },
+  TAX_REQUIRES_PURCHASE: { status: 400, message: 'Tax selection is unsupported for this transaction type.' },
   TAX_TREATMENT_AMBIGUOUS: { status: 400, message: 'A selected tax code is unsupported.' },
   TRANSACTION_NOT_FOUND: { status: 404, message: 'Transaction not found.' },
   UNBALANCED_TOTAL: { status: 400, message: 'Categorization lines do not balance to the transaction total.' },
