@@ -474,6 +474,10 @@ describe('runShadowDecision', () => {
     expect(provider).toMatchObject({
       status: 'abstain',
       diagnosticCode: 'AGENT_MODEL_NETWORK_ERROR',
+      providerFailure: {
+        code: 'AGENT_MODEL_NETWORK_ERROR',
+        classification: 'retryable',
+      },
     });
     expect(unexpected).toMatchObject({
       status: 'abstain',
@@ -504,6 +508,10 @@ describe('runShadowDecision', () => {
       diagnosticCode: code,
       turns: 1,
       toolCalls: 0,
+      providerFailure: {
+        code,
+        classification: code === 'AGENT_MODEL_NETWORK_ERROR' ? 'retryable' : 'terminal',
+      },
     });
     expect(model.calls).toBe(1);
   });

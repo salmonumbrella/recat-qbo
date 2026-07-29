@@ -558,6 +558,7 @@ describe('postTransaction guards', () => {
 const DURABLE_COMPANY_ID = '00000000-0000-4000-8000-000000000110';
 const DURABLE_TRANSACTION_ID = '00000000-0000-4000-8000-000000000120';
 const DURABLE_ACTOR_ID = '00000000-0000-4000-8000-000000000130';
+const DURABLE_TAG_ID = '00000000-0000-4000-8000-000000000140';
 
 const beforePurchase: QboPurchaseSnapshot = {
   qboId: 'purchase-generic',
@@ -710,8 +711,9 @@ function durableTransaction() {
       taxCode: 'Generic tax',
       taxCodeQboId: 'tax-generic',
       memo: 'Prepared purchase',
+      tags: [{ tagId: DURABLE_TAG_ID }],
     }],
-    txnTags: [] as { tagId: string }[],
+    txnTags: [{ tagId: DURABLE_TAG_ID }],
   };
 }
 
@@ -962,6 +964,7 @@ function durableDeps(
   const leaseOwners: string[] = [];
   let invocationSequence = 0;
   const invocationId = vi.fn(() => `invocation-${++invocationSequence}`);
+  const onVerifiedCategorizationOutcome = vi.fn(async () => undefined);
   const deps: DurableWritebackDeps = {
     db: db as unknown as DurableWritebackDb,
     getClient,
@@ -975,6 +978,7 @@ function durableDeps(
     renewLease,
     invocationId,
     now: () => new Date('2026-07-28T12:00:00.000Z'),
+    onVerifiedCategorizationOutcome,
     ...overrides,
   };
   return {
@@ -984,6 +988,7 @@ function durableDeps(
     authorize,
     renewLease,
     invocationId,
+    onVerifiedCategorizationOutcome,
     leaseOwners,
     client,
     getClient,
@@ -1083,6 +1088,110 @@ function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number)
 }
 
 describe('commitStagedCategorization durable lifecycle', () => {
+  it('emits the canonical staged categorization only after the verified state is durable', async () => {
+    const fixture = durableDeps();
+    fixture.onVerifiedCategorizationOutcome.mockImplementationOnce(async (outcome) => {
+      expect(fixture.db.attempts[0]?.status).toBe('VERIFIED');
+      expect(fixture.db.transactionRow.status).toBe('POSTED');
+      expect(outcome).toEqual({
+        companyId: DURABLE_COMPANY_ID,
+        transactionId: DURABLE_TRANSACTION_ID,
+        inputRevision: 1,
+        requestId: 'request-generic',
+        operation: 'posted',
+        proposal: {
+          taxCalculation: 'TaxInclusive',
+          lines: [{
+            idx: 0,
+            subtotalCents: -1000,
+            taxCents: -50,
+            totalCents: -1050,
+            categoryQboId: 'expense-generic',
+            taxCodeQboId: 'tax-generic',
+            memo: 'Prepared purchase',
+            tagIds: [DURABLE_TAG_ID],
+          }],
+          tagIds: [DURABLE_TAG_ID],
+        },
+      });
+    });
+
+    const result = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(result).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a verified write verified when evidence evaluation fails and retries the hook on replay', async () => {
+    const fixture = durableDeps();
+    fixture.onVerifiedCategorizationOutcome.mockRejectedValue(new Error('evaluation unavailable'));
+
+    const first = await commitStagedCategorization(commitInput(), fixture.deps);
+    const replay = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(first).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(replay).toEqual(first);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not emit evidence outcomes for dry runs or uncertain writes', async () => {
+    const dryRun = durableDeps();
+    dryRun.db.transactionRow.company.dryRun = true;
+    await commitStagedCategorization(commitInput(), dryRun.deps);
+    expect(dryRun.onVerifiedCategorizationOutcome).not.toHaveBeenCalled();
+
+    const uncertain = durableDeps();
+    uncertain.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockResolvedValueOnce({ ...structuredClone(verifiedPurchase), totalCents: -999 });
+    await commitStagedCategorization(commitInput(), uncertain.deps);
+    expect(uncertain.onVerifiedCategorizationOutcome).not.toHaveBeenCalled();
+  });
+
+  it('does not replay an old posted outcome over a newer revision post', async () => {
+    const fixture = durableDeps();
+    await commitStagedCategorization(commitInput(), fixture.deps);
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce({ ...structuredClone(beforePurchase), syncToken: '9' });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue(currentQboTxn('8'));
+
+    await undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps);
+
+    fixture.db.transactionRow.status = 'PENDING';
+    fixture.db.transactionRow.revision = 2;
+    fixture.db.transactionRow.qboSyncToken = '9';
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce({ ...structuredClone(beforePurchase), syncToken: '9' })
+      .mockResolvedValueOnce({ ...structuredClone(verifiedPurchase), syncToken: '10' });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue(currentQboTxn('9'));
+    await commitStagedCategorization({
+      ...commitInput('request-new-revision'),
+      expectedRevision: 2,
+    }, fixture.deps);
+
+    await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(fixture.onVerifiedCategorizationOutcome.mock.calls.map(([outcome]) => [
+      outcome.operation,
+      outcome.requestId,
+    ])).toEqual([
+      ['posted', 'request-generic'],
+      ['reverted', 'request-undo'],
+      ['posted', 'request-new-revision'],
+    ]);
+  });
+
   it('renews the entity lease before preparation and again immediately before send', async () => {
     const fixture = durableDeps();
 
