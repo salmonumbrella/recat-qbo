@@ -411,6 +411,9 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         await acquireEntityLease(key, owner, {
           db: attemptClient as unknown as EntityLeaseDb,
           ttlMs: 20,
+          now: renewCount === 2
+            ? async () => new Date(Date.now() + 60_000)
+            : undefined,
         });
       },
       invocationId: randomUUID,
