@@ -266,6 +266,8 @@ export interface InstanceSettingsPatchBody {
   suggestionSource?: SuggestionSetting;
   suggestionProvider?: 'custom' | 'openrouter';
   suggestionModel?: string;
+  agentDecisionModel?: string;
+  agentVerifierModel?: string;
   aiEndpoint?: string | null;
   aiKey?: string;
   aiApiKey?: string;

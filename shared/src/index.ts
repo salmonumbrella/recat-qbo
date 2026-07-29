@@ -441,6 +441,8 @@ export interface InstanceSettingsDto {
   suggestionSource: SuggestionSetting;
   suggestionProvider: SuggestionProvider;
   suggestionModel: string;
+  agentDecisionModel: string;
+  agentVerifierModel: string;
   aiEndpoint: string | null;
   aiKeySet: boolean;
   openrouterKeySet: boolean;
