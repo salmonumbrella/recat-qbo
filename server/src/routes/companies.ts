@@ -48,6 +48,7 @@ export function toCompanyDto(c: Company): CompanyDto {
     holdingAccountIds: jsonStringArray(c.holdingAccountIds),
     dryRun: c.dryRun,
     tagsRequired: c.tagsRequired,
+    retainAttachmentFiles: c.retainAttachmentFiles,
     connectedAt: c.connectedAt.toISOString(),
     disconnectedAt: c.disconnectedAt?.toISOString() ?? null,
     lastSyncedAt: c.lastSyncedAt?.toISOString() ?? null,
@@ -66,6 +67,7 @@ const patchBody = z.object({
   holdingAccountIds: z.array(z.string().min(1)).min(1).optional(),
   dryRun: z.boolean().optional(),
   tagsRequired: z.boolean().optional(),
+  retainAttachmentFiles: z.boolean().optional(),
 });
 
 const holdingAccountsBody = z.object({ holdingAccountIds: z.array(z.string().min(1)).min(1) });

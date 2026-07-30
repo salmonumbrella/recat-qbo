@@ -7,6 +7,10 @@
 import type {
   AgentCompanySettingsDto,
   AgentRunStatus,
+  AttachmentDto,
+  AttachmentOperationDto,
+  AttachmentSourceInput,
+  AttachmentUploadGrantDto,
   AutopilotRunOutcome,
   AuditEntryDto,
   AuthMethodsDto,
@@ -520,6 +524,104 @@ export const transactions = {
   /** ERROR → re-fetch SyncToken from QBO and re-queue as PENDING. TODO(server): not in handoff §4. */
   retry: (id: string) => api.post<TransactionDto>(`/api/transactions/${id}/retry`),
   bulkPost: (ids: string[]) => api.post<void>('/api/transactions/bulk-post', { ids }),
+};
+
+interface StagedAttachmentResponse {
+  uploads: Array<{ id: string }>;
+}
+
+async function attachmentUploadRequest(
+  grant: AttachmentUploadGrantDto,
+  files: readonly File[],
+): Promise<StagedAttachmentResponse> {
+  const body = new FormData();
+  for (const file of files) body.append('files', file, file.name);
+  const res = await fetch(grant.uploadUrl, {
+    method: 'POST',
+    credentials: 'omit',
+    headers: { Authorization: `Bearer ${grant.grant}` },
+    body,
+  });
+  if (!res.ok) {
+    let message = res.statusText || `Request failed (${res.status})`;
+    let code: string | undefined;
+    try {
+      const errorBody = await res.json() as Partial<ApiErrorBody>;
+      if (typeof errorBody.error === 'string') message = errorBody.error;
+      if (typeof errorBody.code === 'string') code = errorBody.code;
+    } catch {
+      // Preserve the bounded HTTP status message for non-JSON failures.
+    }
+    throw new ApiError(res.status, message, code);
+  }
+  return await res.json() as StagedAttachmentResponse;
+}
+
+const attachmentPath = (companyId: string, transactionId: string) =>
+  `/api/companies/${companyId}/transactions/${transactionId}/attachments`;
+
+export const attachments = {
+  createGrant: (companyId: string, fileCount: number, _contentBytes: number) =>
+    api.post<AttachmentUploadGrantDto>(
+      `/api/companies/${companyId}/attachment-upload-grants`,
+      {
+        fileCount,
+        // The server enforces the exact encoded request size while parsing.
+        // Asking for the provider ceiling avoids guessing the browser boundary overhead.
+        maxEncodedRequestBytes: 100_000_000,
+      },
+    ),
+  stage: async (grant: AttachmentUploadGrantDto, files: readonly File[]) => {
+    const response = await attachmentUploadRequest(grant, files);
+    return response.uploads.map((upload) => upload.id);
+  },
+  attach: (
+    companyId: string,
+    transactionId: string,
+    sources: readonly AttachmentSourceInput[],
+  ) =>
+    api.post<AttachmentOperationDto>(attachmentPath(companyId, transactionId), {
+      idempotencyKey: createCategorizationRequestId(),
+      sources,
+    }),
+  list: (
+    companyId: string,
+    transactionId: string,
+    refresh = false,
+  ) => refresh
+    ? api.post<AttachmentDto[]>(`${attachmentPath(companyId, transactionId)}/refresh`, {})
+    : api.get<AttachmentDto[]>(attachmentPath(companyId, transactionId)),
+  retry: (companyId: string, transactionId: string, operationId: string) =>
+    api.post<AttachmentOperationDto>(
+      `${attachmentPath(companyId, transactionId)}/operations/${operationId}/retry`,
+      {},
+    ),
+  reconcile: (companyId: string, transactionId: string, operationId: string) =>
+    api.post<AttachmentOperationDto>(
+      `${attachmentPath(companyId, transactionId)}/operations/${operationId}/reconcile`,
+      {},
+    ),
+  downloadUrl: (companyId: string, transactionId: string, attachmentId: string) =>
+    `${attachmentPath(companyId, transactionId)}/${attachmentId}/download`,
+  previewUrl: (companyId: string, transactionId: string, attachmentId: string) =>
+    `${attachmentPath(companyId, transactionId)}/${attachmentId}/preview`,
+  saveLocal: (companyId: string, transactionId: string, attachmentId: string) =>
+    api.post<AttachmentDto>(
+      `${attachmentPath(companyId, transactionId)}/${attachmentId}/save-local`,
+      {},
+    ),
+  delete: (
+    companyId: string,
+    transactionId: string,
+    attachmentId: string,
+    scope: 'local' | 'everywhere',
+  ) =>
+    api.del<AttachmentOperationDto>(
+      `${attachmentPath(companyId, transactionId)}/${attachmentId}${qs({
+        scope,
+        idempotencyKey: createCategorizationRequestId(),
+      })}`,
+    ),
 };
 
 export const tags = {

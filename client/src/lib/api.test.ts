@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
+  attachments,
   autopilot,
   createCategorizationRequestId,
   transactions,
@@ -152,6 +153,86 @@ describe('strict live control requests', () => {
         method: 'POST',
         body: '{}',
       }),
+    );
+  });
+});
+
+describe('attachment requests', () => {
+  it('stages browser files with a one-use bearer grant and lets the browser set the boundary', async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => new Response(JSON.stringify({
+      uploads: [{ id: 'upload-1' }, { id: 'upload-2' }],
+      }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const first = new File(['first'], 'first.txt', { type: 'text/plain' });
+    const second = new File(['second'], 'second.txt', { type: 'text/plain' });
+
+    await expect(attachments.stage({
+      uploadUrl: '/api/attachment-uploads/grant-1',
+      grant: 'one-use-secret',
+      expiresAt: '2026-07-30T00:00:00.000Z',
+      maxFileCount: 2,
+      maxEncodedRequestBytes: 100_000_000,
+    }, [first, second])).resolves.toEqual(['upload-1', 'upload-2']);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init).toMatchObject({
+      method: 'POST',
+      credentials: 'omit',
+      headers: { Authorization: 'Bearer one-use-secret' },
+    });
+    expect((init?.headers as Record<string, string>)['Content-Type']).toBeUndefined();
+    expect(init?.body).toBeInstanceOf(FormData);
+  });
+
+  it('uses fresh idempotency keys for attach and destructive requests', async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => new Response(JSON.stringify({
+      operationId: 'operation-1',
+      status: 'PREPARED',
+      files: [],
+      actions: { canRetry: false, requiresReconciliation: false },
+      }), {
+        status: 202,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('crypto', {
+      randomUUID: vi.fn()
+        .mockReturnValueOnce('00000000-0000-4000-8000-000000000041')
+        .mockReturnValueOnce('00000000-0000-4000-8000-000000000042'),
+    });
+
+    await attachments.attach('company-1', 'transaction-1', [
+      { kind: 'upload', uploadId: 'upload-1' },
+      { kind: 'https', url: 'https://example.test/receipt.pdf' },
+    ]);
+    await attachments.delete('company-1', 'transaction-1', 'attachment-1', 'everywhere');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/companies/company-1/transactions/transaction-1/attachments',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          idempotencyKey: '00000000-0000-4000-8000-000000000041',
+          sources: [
+            { kind: 'upload', uploadId: 'upload-1' },
+            { kind: 'https', url: 'https://example.test/receipt.pdf' },
+          ],
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/companies/company-1/transactions/transaction-1/attachments/attachment-1?scope=everywhere&idempotencyKey=00000000-0000-4000-8000-000000000042',
+      expect.objectContaining({ method: 'DELETE' }),
     );
   });
 });

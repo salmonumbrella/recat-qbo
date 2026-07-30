@@ -10,6 +10,7 @@ import {
   type QboPreparedLineWrite,
   type QboPreparedWrite,
 } from './types.js';
+import { QboAttachmentAdapterError } from './attachments.js';
 import {
   RealQboClient,
   exchangeAuthCode,
@@ -79,6 +80,32 @@ describe('OAuth token errors', () => {
     expect(error).toBeInstanceOf(QboAuthError);
     expect(error).toMatchObject({ reason: 'INTUIT_UNAVAILABLE' });
   });
+
+  it('aborts a stalled token request at its explicit deadline', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'));
+      }, { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const exchanging = exchangeAuthCode({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      redirectUri: 'https://recat.example/qbo/callback',
+      code: 'auth-code',
+    });
+    const assertion = expect(exchanging).rejects.toMatchObject({
+      reason: 'INTUIT_UNAVAILABLE',
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    await assertion;
+  });
 });
 
 describe('OAuth token revocation', () => {
@@ -140,6 +167,408 @@ function realClient(
     onTokensRefreshed,
   };
 }
+
+function rawAttachable(overrides: Record<string, unknown> = {}) {
+  return {
+    Id: 'A1',
+    SyncToken: '2',
+    FileName: 'receipt.pdf',
+    ContentType: 'application/pdf',
+    Size: 4,
+    Note: 'Recat reference: marker-1',
+    AttachableRef: [{
+      EntityRef: { type: 'Purchase', value: 'P1' },
+    }],
+    ...overrides,
+  };
+}
+
+function attachmentUploadFile(content = '%PDF') {
+  const bytes = Buffer.from(content);
+  return {
+    ordinal: 7,
+    filename: 'receipt.pdf',
+    contentType: 'application/pdf',
+    sizeBytes: bytes.byteLength,
+    marker: 'marker-1',
+    async openContent() {
+      return {
+        contentType: 'application/pdf',
+        sizeBytes: bytes.byteLength,
+        async *chunks() {
+          yield bytes;
+        },
+      };
+    },
+  };
+}
+
+async function consumeRequestBody(init: RequestInit | undefined): Promise<Buffer> {
+  const body = init?.body as unknown as AsyncIterable<Uint8Array> | undefined;
+  if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
+    return Buffer.alloc(0);
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of body) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+describe('RealQboClient attachment HTTP seam', () => {
+  it('streams an exact multipart request and parses per-file upload outcomes', async () => {
+    let encodedBody = Buffer.alloc(0);
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      encodedBody = await consumeRequestBody(init);
+      return new Response(JSON.stringify([
+        { Attachable: rawAttachable() },
+      ]));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    await expect(client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request/attachment',
+    )).resolves.toMatchObject([
+      {
+        ordinal: 7,
+        outcome: 'ATTACHED',
+        attachable: { id: 'A1', filename: 'receipt.pdf' },
+      },
+    ]);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toContain(
+      '/upload?requestid=request%2Fattachment&minorversion=75',
+    );
+    expect(init?.headers).toMatchObject({
+      'Content-Length': String(encodedBody.byteLength),
+    });
+    expect(encodedBody.toString()).toContain('name="file_metadata_01"');
+    expect(encodedBody.toString()).toContain('name="file_content_01"');
+    expect(encodedBody.subarray(-4).toString()).toBe('--\r\n');
+  });
+
+  it('treats a network loss after body consumption as an ambiguous timeout', async () => {
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      await consumeRequestBody(init);
+      throw new TypeError('connection closed');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request-timeout',
+    )).rejects.toBeInstanceOf(QboRequestTimeout);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a whole-request server error after upload as ambiguous', async () => {
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      await consumeRequestBody(init);
+      return new Response('upstream unavailable', { status: 503 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request-server-error',
+    )).rejects.toBeInstanceOf(QboRequestTimeout);
+  });
+
+  it('keeps an authoritative client rejection definite', async () => {
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      await consumeRequestBody(init);
+      return new Response(JSON.stringify({
+        Fault: {
+          Error: [{ Message: 'Invalid attachment request', code: '2010' }],
+        },
+      }), { status: 400 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const error = await realClient().client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request-client-error',
+    ).catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(QboRequestTimeout);
+  });
+
+  it.each([
+    'not-json',
+    JSON.stringify([]),
+  ])('treats an unverified successful upload response as ambiguous', async (body) => {
+    const fetchMock = vi.fn(async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      await consumeRequestBody(init);
+      return new Response(body);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request-unverified',
+    )).rejects.toBeInstanceOf(QboRequestTimeout);
+  });
+
+  it('refreshes and reopens the body only when a 401 arrives before consumption', async () => {
+    const onTokensRefreshed = vi.fn(async () => undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'fresh-access',
+        refresh_token: 'fresh-refresh',
+        expires_in: 3600,
+      })))
+      .mockImplementationOnce(async (
+        _input: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        await consumeRequestBody(init);
+        return new Response(JSON.stringify([
+          { Attachable: rawAttachable() },
+        ]));
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient(onTokensRefreshed);
+
+    await expect(client.uploadAttachments(
+      { qboType: 'Purchase', qboId: 'P1' },
+      [attachmentUploadFile()],
+      'request-refresh',
+    )).resolves.toHaveLength(1);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(onTokensRefreshed).toHaveBeenCalledWith(
+      expect.objectContaining({ refreshToken: 'fresh-refresh' }),
+    );
+    expect(fetchMock.mock.calls[2]?.[1]?.headers).toMatchObject({
+      Authorization: 'Bearer fresh-access',
+    });
+  });
+
+  it('lists exact transaction references without exposing temporary URLs', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      QueryResponse: {
+        Attachable: [
+          rawAttachable({ TempDownloadUri: 'https://download.example/secret' }),
+          rawAttachable({
+            Id: 'A2',
+            AttachableRef: [{
+              EntityRef: { type: 'Deposit', value: 'D1' },
+            }],
+          }),
+        ],
+      },
+    }))));
+
+    const attachments = await realClient().client.listAttachments({
+      qboType: 'Purchase',
+      qboId: 'P1',
+    });
+
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({ id: 'A1' });
+    expect(attachments[0]).not.toHaveProperty('TempDownloadUri');
+    expect(JSON.stringify(attachments)).not.toContain('download.example');
+  });
+
+  it('ignores valid attachments for unsupported entity types and unattached documents', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      QueryResponse: {
+        Attachable: [
+          rawAttachable({
+            Id: 'BILL-ATTACHMENT',
+            AttachableRef: [{
+              EntityRef: { type: 'Bill', value: 'B1' },
+            }],
+          }),
+          rawAttachable({
+            Id: 'UNATTACHED',
+            AttachableRef: [],
+          }),
+          rawAttachable({
+            Id: 'UNATTACHED-OMITTED-REFS',
+            AttachableRef: undefined,
+          }),
+          rawAttachable({
+            Id: 'MIXED',
+            AttachableRef: [
+              { EntityRef: { type: 'Bill', value: 'B2' } },
+              { EntityRef: { type: 'Purchase', value: 'P1' } },
+            ],
+          }),
+        ],
+      },
+    }))));
+
+    await expect(realClient().client.listAttachments({
+      qboType: 'Purchase',
+      qboId: 'P1',
+    })).resolves.toMatchObject([{ id: 'MIXED' }]);
+  });
+
+  it('still rejects structurally malformed attachment references while listing', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      QueryResponse: {
+        Attachable: [
+          rawAttachable({
+            AttachableRef: [{ EntityRef: { type: 'Bill' } }],
+          }),
+        ],
+      },
+    }))));
+
+    await expect(realClient().client.listAttachments({
+      qboType: 'Purchase',
+      qboId: 'P1',
+    })).rejects.toBeInstanceOf(QboAttachmentAdapterError);
+  });
+
+  it('fetches a temporary download internally and returns only the byte stream', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable({
+          TempDownloadUri: 'https://download.example/capability',
+        }),
+      })))
+      .mockResolvedValueOnce(new Response('%PDF', {
+        headers: {
+          'content-type': 'application/pdf',
+          'content-length': '4',
+        },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const download = await realClient().client.openAttachmentDownload('A1');
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of download.body) chunks.push(chunk);
+
+    expect(download).toMatchObject({
+      contentType: 'application/pdf',
+      sizeBytes: 4,
+    });
+    expect(download).not.toHaveProperty('TempDownloadUri');
+    expect(Buffer.concat(chunks).toString()).toBe('%PDF');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+      'https://download.example/capability',
+    );
+  });
+
+  it('bounds a stalled temporary attachment download', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable({
+          TempDownloadUri: 'https://download.example/capability',
+        }),
+      })))
+      .mockImplementationOnce((
+        _input: string | URL | Request,
+        init?: RequestInit,
+      ) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const downloading = realClient().client.openAttachmentDownload('A1');
+    const assertion = expect(downloading).rejects.toBeInstanceOf(QboRequestTimeout);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await assertion;
+  });
+
+  it('preflights deletion and refuses a stale SyncToken before mutating', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Attachable: rawAttachable(),
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    await expect(client.deleteAttachment({
+      id: 'A1',
+      syncToken: '1',
+      requestId: 'delete-stale',
+    })).rejects.toBeInstanceOf(QboSyncTokenConflict);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes with the verified SyncToken and caller request ID', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable(),
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable({ status: 'Deleted' }),
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    await client.deleteAttachment({
+      id: 'A1',
+      syncToken: '2',
+      requestId: 'delete/1',
+    });
+
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
+      '/attachable?operation=delete&requestid=delete%2F1&minorversion=75',
+    );
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(
+      JSON.stringify({ Id: 'A1', SyncToken: '2' }),
+    );
+  });
+
+  it('treats an unconfirmed deletion write as ambiguous', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable(),
+      })))
+      .mockRejectedValueOnce(new TypeError('connection closed'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.deleteAttachment({
+      id: 'A1',
+      syncToken: '2',
+      requestId: 'delete-ambiguous',
+    })).rejects.toBeInstanceOf(QboRequestTimeout);
+  });
+
+  it('treats a deletion server error after send as ambiguous', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable(),
+      })))
+      .mockResolvedValueOnce(new Response('upstream unavailable', {
+        status: 503,
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.deleteAttachment({
+      id: 'A1',
+      syncToken: '2',
+      requestId: 'delete-server-error',
+    })).rejects.toBeInstanceOf(QboRequestTimeout);
+  });
+});
 
 describe('RealQboClient purchase-tax HTTP seam', () => {
   it('requests and normalizes valid and malformed tax profiles', async () => {
@@ -241,10 +670,13 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       controller.signal,
     );
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const fetchSignal = fetchMock.mock.calls[0]?.[1]?.signal;
+    const assertion = expect(reading).rejects.toMatchObject({ name: 'AbortError' });
     controller.abort();
 
-    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
-    await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchSignal).toBeInstanceOf(AbortSignal);
+    expect(fetchSignal?.aborted).toBe(true);
+    await assertion;
     rejectFetch?.(new Error('settled'));
   });
 
@@ -276,8 +708,9 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       controller.signal,
     );
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const assertion = expect(reading).rejects.toMatchObject({ name: 'AbortError' });
     controller.abort();
-    await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+    await assertion;
 
     resolveRefresh?.(new Response(JSON.stringify({
       access_token: 'fresh-access',

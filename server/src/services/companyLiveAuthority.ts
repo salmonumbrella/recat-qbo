@@ -14,6 +14,7 @@ export interface CompanySettingsPatch {
   holdingAccountIds?: string[];
   dryRun?: boolean;
   tagsRequired?: boolean;
+  retainAttachmentFiles?: boolean;
 }
 
 export interface CompanyLiveAuthorityDeps {

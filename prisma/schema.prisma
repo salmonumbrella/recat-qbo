@@ -33,6 +33,46 @@ enum QboEnv {
   production
 }
 
+enum AttachmentSourceKind {
+  LOCAL_UPLOAD
+  HTTPS_IMPORT
+  QBO_EXTERNAL
+}
+
+enum AttachmentStatus {
+  STAGED
+  UPLOADING
+  ATTACHED
+  FAILED
+  UNCERTAIN
+  RECONCILING
+  DELETING
+  DELETED
+  QBO_MISSING
+}
+
+enum AttachmentOperationStatus {
+  PREPARED
+  COMMITTING
+  PARTIAL
+  VERIFIED
+  FAILED
+  UNCERTAIN
+  DELETING
+  DELETED
+}
+
+enum AttachmentOperationKind {
+  ATTACH
+  DELETE_LOCAL
+  DELETE_EVERYWHERE
+}
+
+enum AttachmentBlobState {
+  STAGING
+  READY
+}
+
 model User {
   id              String           @id @default(uuid())
   email           String           @unique
@@ -119,6 +159,7 @@ model Company {
   holdingAccountIds Json          @default("[]")
   dryRun            Boolean       @default(true)
   tagsRequired      Boolean       @default(false)
+  retainAttachmentFiles Boolean   @default(true)
   accessToken       String? // encrypted (AES-256-GCM)
   refreshToken      String? // encrypted (AES-256-GCM)
   tokenExpiresAt    DateTime?
@@ -146,6 +187,12 @@ model Company {
   autopilotRuleCandidates AutopilotRuleCandidate[]
   autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
   liveWritePermits LiveWritePermit[]
+  attachmentBlobs AttachmentBlob[]
+  stagedAttachments StagedAttachment[]
+  transactionAttachments TransactionAttachment[]
+  attachmentOperations AttachmentOperation[]
+  attachmentUploadGrants AttachmentUploadGrant[]
+  attachmentDownloadGrants AttachmentDownloadGrant[]
 }
 
 model Transaction {
@@ -180,9 +227,155 @@ model Transaction {
   qboMutationAttempts QboMutationAttempt[]
   autopilotRuleCandidateEvidence AutopilotRuleCandidateEvidence[]
   autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
+  attachments TransactionAttachment[]
+  attachmentOperations AttachmentOperation[]
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
+}
+
+model AttachmentBlob {
+  id          String                  @id @default(uuid())
+  companyId   String
+  company     Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  state       AttachmentBlobState     @default(STAGING)
+  sha256      String?                 @db.Char(64)
+  sizeBytes   BigInt                  @default(0)
+  contentType String?                 @db.VarChar(120)
+  chunkCount  Int                     @default(0)
+  expiresAt   DateTime?
+  createdAt   DateTime                @default(now())
+  chunks      AttachmentBlobChunk[]
+  stagedFiles StagedAttachment[]
+  attachments TransactionAttachment[]
+
+  @@unique([companyId, sha256])
+  @@index([state, expiresAt])
+}
+
+model AttachmentBlobChunk {
+  blobId  String
+  blob    AttachmentBlob @relation(fields: [blobId], references: [id], onDelete: Cascade)
+  ordinal Int
+  content Bytes
+
+  @@id([blobId, ordinal])
+}
+
+model StagedAttachment {
+  id               String               @id @default(uuid())
+  companyId        String
+  company          Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  actorKey         String               @db.VarChar(160)
+  blobId           String
+  blob             AttachmentBlob       @relation(fields: [blobId], references: [id], onDelete: Restrict)
+  originalFilename String               @db.VarChar(255)
+  contentType      String               @db.VarChar(120)
+  sizeBytes        BigInt
+  sourceKind       AttachmentSourceKind
+  retainLocally    Boolean
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  createdAt        DateTime             @default(now())
+
+  @@index([companyId, actorKey, expiresAt])
+}
+
+model TransactionAttachment {
+  id               String                    @id @default(uuid())
+  companyId        String
+  company          Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId    String
+  transaction      Transaction               @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  blobId           String?
+  blob             AttachmentBlob?           @relation(fields: [blobId], references: [id], onDelete: SetNull)
+  originalFilename String                    @db.VarChar(255)
+  contentType      String                    @db.VarChar(120)
+  sizeBytes        BigInt
+  sha256           String                    @db.Char(64)
+  sourceKind       AttachmentSourceKind
+  retainLocally    Boolean
+  status           AttachmentStatus          @default(STAGED)
+  qboAttachableId  String?                   @db.VarChar(128)
+  qboSyncToken     String?                   @db.VarChar(64)
+  recatMarker      String                    @unique @db.Uuid
+  errorCode        String?                   @db.VarChar(64)
+  createdAt        DateTime                  @default(now())
+  updatedAt        DateTime                  @updatedAt
+  operationFiles   AttachmentOperationFile[]
+  downloadGrants   AttachmentDownloadGrant[]
+
+  @@unique([companyId, qboAttachableId])
+  @@index([companyId, transactionId, status])
+}
+
+model AttachmentOperation {
+  id             String                    @id @default(uuid())
+  kind           AttachmentOperationKind   @default(ATTACH)
+  actorKey       String                    @db.VarChar(160)
+  companyId      String
+  company        Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  transaction    Transaction               @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  idempotencyKey String                    @db.VarChar(128)
+  requestHash    String                    @db.Char(64)
+  inputHash      String                    @db.Char(64)
+  status         AttachmentOperationStatus @default(PREPARED)
+  fileCount      Int
+  totalBytes     BigInt
+  errorCode      String?                   @db.VarChar(64)
+  createdAt      DateTime                  @default(now())
+  updatedAt      DateTime                  @updatedAt
+  files          AttachmentOperationFile[]
+
+  @@unique([actorKey, companyId, transactionId, idempotencyKey])
+  @@index([companyId, transactionId, status])
+}
+
+model AttachmentOperationFile {
+  operationId  String
+  operation    AttachmentOperation   @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  attachmentId String
+  attachment   TransactionAttachment @relation(fields: [attachmentId], references: [id], onDelete: Cascade)
+  ordinal      Int
+  status       AttachmentStatus
+  errorCode    String?               @db.VarChar(64)
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+
+  @@id([operationId, attachmentId])
+  @@unique([operationId, ordinal])
+  @@index([attachmentId, status])
+}
+
+model AttachmentUploadGrant {
+  id           String    @id @default(uuid())
+  tokenHash    String    @unique @db.Char(64)
+  actorKey     String    @db.VarChar(160)
+  companyId    String
+  company      Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  maxFileCount Int
+  maxBytes     BigInt
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([companyId, actorKey, expiresAt])
+}
+
+model AttachmentDownloadGrant {
+  id           String                @id @default(uuid())
+  tokenHash    String                @unique @db.Char(64)
+  actorKey     String                @db.VarChar(160)
+  companyId    String
+  company      Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  attachmentId String
+  attachment   TransactionAttachment @relation(fields: [attachmentId], references: [id], onDelete: Cascade)
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime              @default(now())
+
+  @@index([companyId, actorKey, expiresAt])
 }
 
 model Tag {
@@ -209,7 +402,7 @@ model LogTag {
   /// JournalEntry) where known, else the report's type string verbatim.
   qboKey    String
   tagId     String
-  tag       Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
 
   @@id([companyId, qboKey, tagId])
   @@index([companyId, qboKey])
@@ -253,25 +446,25 @@ model TxnTag {
 }
 
 model Rule {
-  id            String    @id @default(uuid())
-  companyId     String
-  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  id               String                  @id @default(uuid())
+  companyId        String
+  company          Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
   /// Match order: lowest priority number wins when several rules match a payee.
-  priority      Int       @default(0)
-  matchField    String    @default("payee") // v1: payee contains, case-insensitive
-  matchText     String
-  category      String // category display name
-  categoryQboId String?
-  taxCalculation String?
-  taxCode        String?
-  taxCodeQboId   String?
-  autoPost      Boolean   @default(false)
-  createdById   String?
-  createdAt     DateTime  @default(now())
+  priority         Int                     @default(0)
+  matchField       String                  @default("payee") // v1: payee contains, case-insensitive
+  matchText        String
+  category         String // category display name
+  categoryQboId    String?
+  taxCalculation   String?
+  taxCode          String?
+  taxCodeQboId     String?
+  autoPost         Boolean                 @default(false)
+  createdById      String?
+  createdAt        DateTime                @default(now())
   reviewRequiredAt DateTime?
   reviewReason     String?
-  ruleTags      RuleTag[]
-  candidateOrigin AutopilotRuleCandidate? @relation("ActivatedCandidateRule")
+  ruleTags         RuleTag[]
+  candidateOrigin  AutopilotRuleCandidate? @relation("ActivatedCandidateRule")
 }
 
 model RuleTag {
@@ -327,33 +520,33 @@ model QboAccount {
 }
 
 model QboTaxRate {
-  id          String   @id @default(uuid())
-  companyId   String
-  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  qboId       String
-  name        String
-  description String?
-  active      Boolean  @default(true)
-  rateValue   Decimal  @db.Decimal(9, 6)
+  id              String    @id @default(uuid())
+  companyId       String
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId           String
+  name            String
+  description     String?
+  active          Boolean   @default(true)
+  rateValue       Decimal   @db.Decimal(9, 6)
   sourceUpdatedAt DateTime?
-  updatedAt   DateTime @updatedAt
+  updatedAt       DateTime  @updatedAt
 
   @@unique([companyId, qboId])
 }
 
 model QboTaxCode {
-  id                      String   @id @default(uuid())
-  companyId               String
-  company                 Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  qboId                   String
-  name                    String
-  description             String?
-  active                  Boolean  @default(true)
-  taxable                 Boolean?
-  purchaseTaxRateList     Json
-  combinedPurchaseRate    Decimal? @db.Decimal(9, 6)
-  sourceUpdatedAt         DateTime?
-  updatedAt               DateTime @updatedAt
+  id                   String    @id @default(uuid())
+  companyId            String
+  company              Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId                String
+  name                 String
+  description          String?
+  active               Boolean   @default(true)
+  taxable              Boolean?
+  purchaseTaxRateList  Json
+  combinedPurchaseRate Decimal?  @db.Decimal(9, 6)
+  sourceUpdatedAt      DateTime?
+  updatedAt            DateTime  @updatedAt
 
   @@unique([companyId, qboId])
 }
@@ -384,24 +577,24 @@ model QboEntityLease {
 }
 
 model QboMutationAttempt {
-  id                String      @id @default(uuid())
-  transactionId     String
-  transaction       Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
-  requestId         String      @unique
-  operation         String
-  status            String
-  expectedRevision  Int
-  expectedSyncToken String
-  requestHash       String
-  requestPayload    Json
-  beforeSnapshot    Json
-  responseSnapshot  Json?
-  verification      Json?
-  errorCode         String?
-  errorMessage      String?
+  id                    String      @id @default(uuid())
+  transactionId         String
+  transaction           Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  requestId             String      @unique
+  operation             String
+  status                String
+  expectedRevision      Int
+  expectedSyncToken     String
+  requestHash           String
+  requestPayload        Json
+  beforeSnapshot        Json
+  responseSnapshot      Json?
+  verification          Json?
+  errorCode             String?
+  errorMessage          String?
   ruleCandidateFoldedAt DateTime?
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
 
   @@index([transactionId, status])
 }
@@ -441,33 +634,33 @@ model QboTransferOperation {
 /// deliberate scalars so account or token deletion cannot erase audit history.
 /// QBO write authority remains exclusively in QboMutationAttempt.
 model McpOperation {
-  id                String   @id @default(uuid())
-  tokenId           String
-  tokenPrefix       String   @db.VarChar(12)
-  userId            String
-  companyId         String
-  transactionId     String
-  toolName          String   @db.VarChar(64)
-  kind              String   @db.VarChar(32)
-  idempotencyKey    String?  @db.VarChar(128)
-  inputHash         String   @db.Char(64)
-  payload           Json
-  payloadHash       String   @db.Char(64)
-  sourceRevision    Int
-  preparedRevision  Int
-  qboType           String   @db.VarChar(32)
-  qboId             String   @db.VarChar(128)
-  qboSyncToken      String   @db.VarChar(128)
-  expiresAt         DateTime
-  retryOfId         String?  @unique
-  cancelledAt       DateTime?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id               String    @id @default(uuid())
+  tokenId          String
+  tokenPrefix      String    @db.VarChar(12)
+  userId           String
+  companyId        String
+  transactionId    String
+  toolName         String    @db.VarChar(64)
+  kind             String    @db.VarChar(32)
+  idempotencyKey   String?   @db.VarChar(128)
+  inputHash        String    @db.Char(64)
+  payload          Json
+  payloadHash      String    @db.Char(64)
+  sourceRevision   Int
+  preparedRevision Int
+  qboType          String    @db.VarChar(32)
+  qboId            String    @db.VarChar(128)
+  qboSyncToken     String    @db.VarChar(128)
+  expiresAt        DateTime
+  retryOfId        String?   @unique
+  cancelledAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
+  @@unique([tokenId, toolName, transactionId, idempotencyKey])
   @@index([tokenId, createdAt])
   @@index([userId, createdAt])
   @@index([companyId, transactionId])
-  @@unique([tokenId, toolName, transactionId, idempotencyKey])
 }
 
 model AppConfig {
@@ -478,29 +671,29 @@ model AppConfig {
 }
 
 model AgentCompanyConfig {
-  companyId          String   @id
-  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  mode               String   @default("off")
+  companyId                   String    @id
+  company                     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  mode                        String    @default("off")
   /// A provider name only. Credentials remain in encrypted instance settings.
-  provider           String
-  decisionModel      String
-  verifierModel      String
-  scheduleMinutes    Int      @default(10)
-  companyConcurrency Int      @default(1)
-  evidenceThreshold  Int      @default(50)
-  dailyLiveWriteLimit Int     @default(25)
-  limits             Json
-  configVersion      String
-  liveRequested              Boolean   @default(false)
-  liveAcceptedPolicyVersion  String?
-  liveAcceptedConfigVersion  String?
+  provider                    String
+  decisionModel               String
+  verifierModel               String
+  scheduleMinutes             Int       @default(10)
+  companyConcurrency          Int       @default(1)
+  evidenceThreshold           Int       @default(50)
+  dailyLiveWriteLimit         Int       @default(25)
+  limits                      Json
+  configVersion               String
+  liveRequested               Boolean   @default(false)
+  liveAcceptedPolicyVersion   String?
+  liveAcceptedConfigVersion   String?
   liveAcceptedProviderBinding String?
-  liveEnabledAt              DateTime?
-  liveEnabledByUserId        String?
-  livePausedAt               DateTime?
-  livePauseCode              String?
-  livePauseMessage           String?
-  updatedAt          DateTime @updatedAt
+  liveEnabledAt               DateTime?
+  liveEnabledByUserId         String?
+  livePausedAt                DateTime?
+  livePauseCode               String?
+  livePauseMessage            String?
+  updatedAt                   DateTime  @updatedAt
 }
 
 model LiveWritePermit {
@@ -515,9 +708,9 @@ model LiveWritePermit {
 }
 
 model AgentJob {
-  id             String   @id @default(uuid())
+  id             String     @id @default(uuid())
   companyId      String
-  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  company        Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
   transactionId  String
   revision       Int
   configVersion  String
@@ -525,10 +718,10 @@ model AgentJob {
   dueAt          DateTime
   lockOwner      String?
   leaseExpiresAt DateTime?
-  attemptCount   Int      @default(0)
+  attemptCount   Int        @default(0)
   lastErrorCode  String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
   runs           AgentRun[]
 
   @@unique([companyId, transactionId, revision, configVersion])
@@ -536,65 +729,65 @@ model AgentJob {
 }
 
 model AgentRun {
-  id             String   @id @default(uuid())
-  jobId          String
-  job            AgentJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  companyId      String
-  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  transactionId  String
-  revision       Int
-  configVersion  String
-  attemptCount   Int
-  status         String
-  snapshot       Json
-  decision       Json?
-  verification   Json?
-  decisionModel  String
-  verifierModel  String
-  verifierKind   String
-  promptVersion  String
-  schemaVersion  String
-  durationMs     Int?
-  usage          Json?
-  errorCode      String?
-  createdAt      DateTime @default(now())
-  completedAt    DateTime?
+  id            String    @id @default(uuid())
+  jobId         String
+  job           AgentJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  companyId     String
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId String
+  revision      Int
+  configVersion String
+  attemptCount  Int
+  status        String
+  snapshot      Json
+  decision      Json?
+  verification  Json?
+  decisionModel String
+  verifierModel String
+  verifierKind  String
+  promptVersion String
+  schemaVersion String
+  durationMs    Int?
+  usage         Json?
+  errorCode     String?
+  createdAt     DateTime  @default(now())
+  completedAt   DateTime?
 
+  @@unique([jobId, attemptCount])
   @@index([companyId, createdAt])
   @@index([transactionId, revision])
-  @@unique([jobId, attemptCount])
 }
 
 /// Inert, explainable rule proposal derived only from durable VERIFIED writes.
 /// State values are gathering | ready | conflict | dismissed | activated | stale.
 model AutopilotRuleCandidate {
-  id                       String                  @id @default(uuid())
-  companyId                String
-  company                  Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  conditionFingerprint     String
-  schemaVersion            String
-  configVersion            String
-  matchField               String                  @default("payee")
-  matchText                String
-  state                    String                  @default("gathering")
-  winningActionFingerprint String?
-  categoryQboId            String?
-  taxCalculation           String?
-  taxCodeQboId             String?
-  tagIds                   Json                    @default("[]")
-  evidenceCount            Int                     @default(0)
-  conflictingEvidenceCount Int                     @default(0)
-  dismissedAt              DateTime?
-  dismissedByUserId        String?
-  activatedAt              DateTime?
-  activatedByUserId        String?
-  activationEvidenceCount  Int?
+  id                          String                           @id @default(uuid())
+  companyId                   String
+  company                     Company                          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  conditionFingerprint        String
+  schemaVersion               String
+  configVersion               String
+  matchField                  String                           @default("payee")
+  matchText                   String
+  state                       String                           @default("gathering")
+  winningActionFingerprint    String?
+  categoryQboId               String?
+  taxCalculation              String?
+  taxCodeQboId                String?
+  tagIds                      Json                             @default("[]")
+  evidenceCount               Int                              @default(0)
+  conflictingEvidenceCount    Int                              @default(0)
+  dismissedAt                 DateTime?
+  dismissedByUserId           String?
+  activatedAt                 DateTime?
+  activatedByUserId           String?
+  activationEvidenceCount     Int?
   activationActionFingerprint String?
-  activatedRuleId          String?                 @unique
-  activatedRule            Rule?                   @relation("ActivatedCandidateRule", fields: [activatedRuleId], references: [id], onDelete: SetNull)
-  evidence                 AutopilotRuleCandidateEvidence[]
-  createdAt                DateTime                @default(now())
-  updatedAt                DateTime                @updatedAt
+  activatedRuleId             String?                          @unique
+  activatedRule               Rule?                            @relation("ActivatedCandidateRule", fields: [activatedRuleId], references: [id], onDelete: SetNull)
+  evidence                    AutopilotRuleCandidateEvidence[]
+  createdAt                   DateTime                         @default(now())
+  updatedAt                   DateTime                         @updatedAt
 
   @@unique([companyId, conditionFingerprint, schemaVersion, configVersion])
   @@index([companyId, state, updatedAt])
@@ -603,18 +796,18 @@ model AutopilotRuleCandidate {
 /// Append-preserving outcome evidence. A correction/revert marks earlier rows
 /// inactive; requestId makes VERIFIED replay idempotent.
 model AutopilotRuleCandidateEvidence {
-  id                 String        @id @default(uuid())
+  id                 String                 @id @default(uuid())
   candidateId        String
   candidate          AutopilotRuleCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
   transactionId      String
-  transaction        Transaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transaction        Transaction            @relation(fields: [transactionId], references: [id], onDelete: Cascade)
   inputRevision      Int
-  requestId          String        @unique
+  requestId          String                 @unique
   source             String
   actionFingerprint  String
   pattern            Json
-  active             Boolean       @default(true)
-  observedAt         DateTime      @default(now())
+  active             Boolean                @default(true)
+  observedAt         DateTime               @default(now())
   invalidatedAt      DateTime?
   invalidationReason String?
 

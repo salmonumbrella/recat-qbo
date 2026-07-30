@@ -14,7 +14,11 @@ import {
   resetMockRealms,
 } from './mock.js';
 import type { StagedCategorization } from '@recat/shared';
-import { QboSyncTokenConflict, type RawPurchase } from './types.js';
+import {
+  QboRequestTimeout,
+  QboSyncTokenConflict,
+  type RawPurchase,
+} from './types.js';
 
 const HOLDING_IDS = ['4', '5']; // Harbor: Ask My Accountant + Uncategorized Expense
 
@@ -101,6 +105,121 @@ describe('MockQboClient multi-line entity safety', () => {
     expect(sysco?.lines).toHaveLength(1);
     expect(sysco?.lines[0]?.accountQboId).toBe('10');
     expect(sysco?.amount).toBe(-50);
+  });
+});
+
+describe('MockQboClient attachments', () => {
+  function uploadFile(
+    ordinal: number,
+    content: string,
+    marker = `marker-${ordinal}`,
+  ) {
+    const bytes = Buffer.from(content);
+    return {
+      ordinal,
+      filename: `receipt-${ordinal}.txt`,
+      contentType: 'text/plain',
+      sizeBytes: bytes.byteLength,
+      marker,
+      async openContent() {
+        return {
+          contentType: 'text/plain',
+          sizeBytes: bytes.byteLength,
+          async *chunks() {
+            yield bytes;
+          },
+        };
+      },
+    };
+  }
+
+  it('returns mixed per-file outcomes and exposes successful content', async () => {
+    const realm = getMockRealm(MOCK_REALM_HARBOR);
+    realm.attachmentUploadFaults['1'] = {
+      code: 'FILE_REJECTED',
+      message: 'Configured mock rejection',
+    };
+    const c = client();
+    const ref = { qboType: 'Purchase' as const, qboId: '2' };
+
+    const outcomes = await c.uploadAttachments(
+      ref,
+      [uploadFile(0, 'accepted'), uploadFile(1, 'rejected')],
+      'request-1',
+    );
+
+    expect(outcomes).toMatchObject([
+      {
+        ordinal: 0,
+        outcome: 'ATTACHED',
+        attachable: {
+          filename: 'receipt-0.txt',
+          note: 'Recat reference: marker-0',
+          refs: [ref],
+        },
+      },
+      {
+        ordinal: 1,
+        outcome: 'FAILED',
+        code: 'FILE_REJECTED',
+        message: 'Configured mock rejection',
+      },
+    ]);
+    const attached = await c.listAttachments(ref);
+    expect(attached).toHaveLength(1);
+    expect(attached[0]).not.toHaveProperty('contentBase64');
+    const download = await c.openAttachmentDownload(attached[0]!.id);
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of download.body) chunks.push(chunk);
+    expect(Buffer.concat(chunks).toString()).toBe('accepted');
+  });
+
+  it('models timeout-after-accept so marker reconciliation can discover the upload', async () => {
+    const realm = getMockRealm(MOCK_REALM_HARBOR);
+    realm.attachmentTimeoutAfterAccept = true;
+    const c = client();
+    const ref = { qboType: 'Deposit' as const, qboId: '1' };
+
+    await expect(
+      c.uploadAttachments(ref, [uploadFile(4, 'ambiguous', 'reconcile-me')], 'request-2'),
+    ).rejects.toBeInstanceOf(QboRequestTimeout);
+
+    await expect(c.listAttachments(ref)).resolves.toMatchObject([
+      { note: 'Recat reference: reconcile-me' },
+    ]);
+  });
+
+  it('returns externally seeded attachments and rejects stale deletion tokens', async () => {
+    const realm = getMockRealm(MOCK_REALM_HARBOR);
+    realm.attachments.push({
+      id: 'external-1',
+      syncToken: '3',
+      filename: 'external.pdf',
+      contentType: 'application/pdf',
+      sizeBytes: 4,
+      note: null,
+      refs: [{ qboType: 'Purchase', qboId: '2' }],
+      contentBase64: Buffer.from('%PDF').toString('base64'),
+    });
+    const c = client();
+
+    await expect(c.getAttachment('external-1')).resolves.toMatchObject({
+      id: 'external-1',
+      filename: 'external.pdf',
+    });
+    await expect(c.deleteAttachment({
+      id: 'external-1',
+      syncToken: '2',
+      requestId: 'request-3',
+    })).rejects.toBeInstanceOf(QboSyncTokenConflict);
+    await expect(c.getAttachment('external-1')).resolves.not.toBeNull();
+
+    await c.deleteAttachment({
+      id: 'external-1',
+      syncToken: '3',
+      requestId: 'request-4',
+    });
+    await expect(c.getAttachment('external-1')).resolves.toBeNull();
   });
 });
 

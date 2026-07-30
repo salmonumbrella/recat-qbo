@@ -129,7 +129,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine reads and eight conservatively annotated mutation tools', async () => {
+  it('registers exactly nine reads and thirteen conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -147,8 +147,13 @@ describe('Recat MCP read tools', () => {
       'commit_undo',
       'prepare_transfer',
       'commit_transfer',
+      'create_attachment_upload',
+      'attach_transaction_files',
+      'list_transaction_attachments',
+      'get_attachment_download',
+      'delete_transaction_attachment',
     ]);
-    expect(tools).toHaveLength(17);
+    expect(tools).toHaveLength(22);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -227,6 +232,51 @@ describe('Recat MCP read tools', () => {
       },
       {
         name: 'commit_transfer',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'create_attachment_upload',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'attach_transaction_files',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'list_transaction_attachments',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'get_attachment_download',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'delete_transaction_attachment',
         annotations: {
           readOnlyHint: false,
           destructiveHint: true,

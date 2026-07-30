@@ -694,6 +694,15 @@ describe('shadow agent scheduler', () => {
     const startAgentScheduler = vi.fn();
     const stopAgentScheduler = vi.fn();
     const runAgentTick = vi.fn(async () => undefined);
+    const runAttachmentCleanup = vi.fn(async () => ({
+      grants: 0,
+      staging: 0,
+      blobs: 0,
+    }));
+    const recoverStuckAttachmentOperations = vi.fn(async () => ({
+      inspected: 0,
+      recovered: 0,
+    }));
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.doMock('../../lib/prisma.js', () => ({
       prisma: {
@@ -712,6 +721,10 @@ describe('shadow agent scheduler', () => {
       stopAgentScheduler,
       runAgentTick,
     }));
+    vi.doMock('../attachments/cleanup.js', () => ({ runAttachmentCleanup }));
+    vi.doMock('../attachments/operations.js', () => ({
+      recoverStuckAttachmentOperations,
+    }));
 
     const jobsScheduler = await import('../../jobs/scheduler.js');
     jobsScheduler.startJobs();
@@ -720,6 +733,8 @@ describe('shadow agent scheduler', () => {
     expect(runAgentTick).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(runAgentTick).toHaveBeenCalledTimes(2);
+    expect(runAttachmentCleanup).toHaveBeenCalledTimes(2);
+    expect(recoverStuckAttachmentOperations).toHaveBeenCalledTimes(2);
 
     jobsScheduler.stopJobs();
     expect(stopAgentScheduler).toHaveBeenCalledOnce();
@@ -731,5 +746,6 @@ describe('shadow agent scheduler', () => {
     vi.doUnmock('../sync.js');
     vi.doUnmock('../../lib/mailer.js');
     vi.doUnmock('./scheduler.js');
+    vi.doUnmock('../attachments/cleanup.js');
   });
 });

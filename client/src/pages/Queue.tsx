@@ -4,7 +4,7 @@
 // All filtering, sorting and row-state transitions happen client-side on the
 // locally-held transaction list, exactly like the prototype.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type {
@@ -37,6 +37,7 @@ import BulkBar from '../components/BulkBar';
 import RulePrompt from '../components/RulePrompt';
 import TaxCodePicker from '../components/TaxCodePicker';
 import { AutopilotQueueStatus } from './settings/AutopilotCard';
+import AttachmentPanel from '../components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
 // Prototype-state mapping & small helpers
@@ -227,6 +228,8 @@ export default function Queue() {
   const [rulePrompt, setRulePrompt] = useState<RulePromptState | null>(null);
   const [splitEditId, setSplitEditId] = useState<string | null>(null);
   const [bulkCat, setBulkCat] = useState<string | null>(null);
+  const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
+  const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({});
   const [taxRows, setTaxRows] = useState<Record<string, TaxRowState>>({});
   const taxVersionsRef = useRef<Record<string, number>>({});
   const stageRequestSequenceRef = useRef(0);
@@ -235,6 +238,11 @@ export default function Queue() {
     () => window.matchMedia('(max-width: 640px)').matches,
   );
   const [, setClock] = useState(0); // re-render for 'last synced …'
+
+  useEffect(() => {
+    setAttachmentOpenId(null);
+    setAttachmentCounts({});
+  }, [activeCompanyId]);
 
   const taxState = useCallback(
     (t: TransactionDto): TaxRowState => taxRows[t.id] ?? initialTaxState(t),
@@ -2191,8 +2199,8 @@ export default function Queue() {
             {vis.map((t) => {
               const v = rowView(t);
               return (
+                <Fragment key={t.id}>
                 <div
-                  key={t.id}
                   onClick={() => onRowClick(t)}
                   style={{
                     position: 'relative',
@@ -2273,6 +2281,30 @@ export default function Queue() {
                         }}
                       >
                         + tag
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setAttachmentOpenId((current) => current === t.id ? null : t.id);
+                        }}
+                        onMouseDown={stopMouse}
+                        aria-expanded={attachmentOpenId === t.id}
+                        aria-label={`Attachments for ${t.payee}`}
+                        className="hov-dash"
+                        style={{
+                          fontSize: 11.5,
+                          fontWeight: 600,
+                          color: 'var(--fnt)',
+                          border: '1px dashed var(--bd)',
+                          background: 'none',
+                          borderRadius: 99,
+                          padding: '2px 9px',
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >
+                        📎{attachmentCounts[t.id] === undefined ? '' : ` ${attachmentCounts[t.id]}`}
                       </button>
                       {tagPicker === t.id && (
                         <TagPicker
@@ -2399,6 +2431,19 @@ export default function Queue() {
                   </span>
                   <span style={{ textAlign: 'center' }}>{statusCell(v, false)}</span>
                 </div>
+                {activeCompanyId && attachmentOpenId === t.id && (
+                  <AttachmentPanel
+                    companyId={activeCompanyId}
+                    transactionId={t.id}
+                    canMutate={role === 'categorizer' || role === 'admin'}
+                    onCountChange={(count) => setAttachmentCounts((current) => ({
+                      ...current,
+                      [t.id]: count,
+                    }))}
+                    toast={toast}
+                  />
+                )}
+                </Fragment>
               );
             })}
             {loaded && vis.length === 0 && (
@@ -2510,6 +2555,29 @@ export default function Queue() {
                   >
                     + tag
                   </button>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setAttachmentOpenId((current) => current === t.id ? null : t.id);
+                    }}
+                    onMouseDown={stopMouse}
+                    aria-expanded={attachmentOpenId === t.id}
+                    aria-label={`Attachments for ${t.payee}`}
+                    style={{
+                      fontSize: 11.5,
+                      fontWeight: 600,
+                      color: 'var(--fnt)',
+                      border: '1px dashed var(--bd)',
+                      background: 'none',
+                      borderRadius: 99,
+                      padding: '2px 9px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    📎{attachmentCounts[t.id] === undefined ? '' : ` ${attachmentCounts[t.id]}`}
+                  </button>
                   {tagPicker === t.id && (
                     <TagPicker
                       tags={tags}
@@ -2597,6 +2665,18 @@ export default function Queue() {
                   </span>
                 </div>
                 {errLine(v, 6)}
+                {activeCompanyId && attachmentOpenId === t.id && (
+                  <AttachmentPanel
+                    companyId={activeCompanyId}
+                    transactionId={t.id}
+                    canMutate={role === 'categorizer' || role === 'admin'}
+                    onCountChange={(count) => setAttachmentCounts((current) => ({
+                      ...current,
+                      [t.id]: count,
+                    }))}
+                    toast={toast}
+                  />
+                )}
               </div>
             );
           })}

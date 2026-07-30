@@ -14,12 +14,18 @@
 // 401 we refresh once and retry the request.
 
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import {
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
   type QboAccountTxn,
+  type QboAttachable,
+  type QboAttachmentDownload,
+  type QboAttachmentRef,
+  type QboAttachmentUploadFile,
+  type QboAttachmentUploadOutcome,
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
@@ -63,6 +69,12 @@ import {
   validatePreparedLineWrite,
   verifyLineWriteResult,
 } from './lineWrite.js';
+import {
+  createQboAttachmentMultipart,
+  parseQboAttachable,
+  parseQboAttachmentUploadResponse,
+  parseSupportedQboAttachable,
+} from './attachments.js';
 
 export {
   rebuildDepositLines,
@@ -87,6 +99,9 @@ const OAUTH_SCOPE = 'com.intuit.quickbooks.accounting';
 const MINOR_VERSION = '75';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const PREPARED_WRITE_TIMEOUT_MS = 30_000;
+const QBO_READ_TIMEOUT_MS = 30_000;
+const QBO_DOWNLOAD_TIMEOUT_MS = 60_000;
+const OAUTH_TOKEN_TIMEOUT_MS = 30_000;
 const REVOKE_TIMEOUT_MS = 5_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
@@ -164,6 +179,7 @@ interface OAuthTokenResponse {
 interface QueryBody {
   QueryResponse?: {
     Account?: RawAccount[];
+    Attachable?: unknown[];
     Preferences?: RawPreferences[];
     TaxCode?: RawTaxCode[];
     TaxRate?: RawTaxRate[];
@@ -185,6 +201,10 @@ interface CdcBody {
 
 interface CompanyInfoBody {
   CompanyInfo?: { CompanyName?: string; LegalName?: string };
+}
+
+interface AttachableBody {
+  Attachable?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +573,45 @@ function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
   return undefined;
 }
 
+function runtimeRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function attachableDownloadUri(value: unknown): string | null {
+  const raw = runtimeRecord(value);
+  if (typeof raw?.TempDownloadUri !== 'string') return null;
+  try {
+    const url = new URL(raw.TempDownloadUri);
+    if (
+      url.protocol !== 'https:'
+      || url.username !== ''
+      || url.password !== ''
+    ) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function* responseBodyChunks(
+  body: ReadableStream<Uint8Array>,
+): AsyncIterable<Uint8Array> {
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) return;
+      yield result.value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /**
  * QboTxn.lines is defined as ONLY the lines posting to holding accounts (the
  * lines recategorize will replace) — never the bank/funding side and never
@@ -708,6 +767,11 @@ export function intuitAuthorizeUrl(args: { clientId: string; redirectUri: string
 }
 
 async function tokenRequest(clientId: string, clientSecret: string, body: URLSearchParams): Promise<QboTokenSet> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    OAUTH_TOKEN_TIMEOUT_MS,
+  );
   const request: RequestInit = {
     method: 'POST',
     headers: {
@@ -716,24 +780,39 @@ async function tokenRequest(clientId: string, clientSecret: string, body: URLSea
       Accept: 'application/json',
     },
     body: body.toString(),
+    signal: controller.signal,
   };
-  let res: Response;
   try {
-    res = await fetch(OAUTH_TOKEN_URL, request);
-  } catch {
-    throw new QboAuthError('Intuit token request was unavailable', 'INTUIT_UNAVAILABLE');
+    let res: Response;
+    try {
+      res = await fetch(OAUTH_TOKEN_URL, request);
+    } catch {
+      throw new QboAuthError(
+        'Intuit token request was unavailable',
+        'INTUIT_UNAVAILABLE',
+      );
+    }
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => '')).slice(0, 4096);
+      const reason = classifyIntuitOAuthBody(res.status, detail);
+      throw new QboAuthError(`Intuit token request failed (${res.status})`, reason);
+    }
+    try {
+      const json = (await res.json()) as OAuthTokenResponse;
+      return {
+        accessToken: json.access_token,
+        refreshToken: json.refresh_token,
+        expiresAt: Date.now() + json.expires_in * 1000,
+      };
+    } catch {
+      throw new QboAuthError(
+        'Intuit token response was invalid',
+        'INTUIT_UNAVAILABLE',
+      );
+    }
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!res.ok) {
-    const detail = (await res.text().catch(() => '')).slice(0, 4096);
-    const reason = classifyIntuitOAuthBody(res.status, detail);
-    throw new QboAuthError(`Intuit token request failed (${res.status})`, reason);
-  }
-  const json = (await res.json()) as OAuthTokenResponse;
-  return {
-    accessToken: json.access_token,
-    refreshToken: json.refresh_token,
-    expiresAt: Date.now() + json.expires_in * 1000,
-  };
 }
 
 export async function exchangeAuthCode(args: {
@@ -858,25 +937,69 @@ export class RealQboClient implements QboClient {
   ): Promise<T> {
     const accessToken = await this.ensureFreshToken();
     if (signal?.aborted) throw abortedRequest();
+    const controller = new AbortController();
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort(signal?.reason);
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, QBO_READ_TIMEOUT_MS);
+    const requestSignal = controller.signal;
     const sep = path.includes('?') ? '&' : '?';
-    const res = await fetch(`${this.base}${path}${sep}minorversion=${MINOR_VERSION}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: 'application/json',
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal,
-    });
-    if (res.status === 401 && !retried) {
-      // Access token invalidated server-side: refresh once and retry.
-      await this.refresh();
-      return this.request<T>(method, path, body, true, signal);
+    try {
+      let res: Response;
+      try {
+        res = await fetch(`${this.base}${path}${sep}minorversion=${MINOR_VERSION}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          },
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          signal: requestSignal,
+        });
+      } catch (error) {
+        if (method === 'POST' || timedOut) {
+          throw new QboRequestTimeout('QuickBooks did not confirm the request.');
+        }
+        if (signal?.aborted) throw abortedRequest();
+        throw error;
+      }
+      if (res.status === 401 && !retried) {
+        // Access token invalidated server-side: refresh once and retry.
+        await this.refresh();
+        return this.request<T>(method, path, body, true, signal);
+      }
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (error) {
+        if (method === 'POST' || timedOut) {
+          throw new QboRequestTimeout('QuickBooks did not confirm the request.');
+        }
+        if (signal?.aborted) throw abortedRequest();
+        throw error;
+      }
+      if (!res.ok) {
+        if (method === 'POST' && res.status >= 500) {
+          throw new QboRequestTimeout('QuickBooks did not confirm the request.');
+        }
+        throw this.toError(res.status, text);
+      }
+      try {
+        return (text ? JSON.parse(text) : {}) as T;
+      } catch (error) {
+        if (method === 'POST') {
+          throw new QboRequestTimeout('QuickBooks did not confirm the request.');
+        }
+        throw error;
+      }
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abortFromCaller);
     }
-    const text = await res.text();
-    if (!res.ok) throw this.toError(res.status, text);
-    return (text ? JSON.parse(text) : {}) as T;
   }
 
   /**
@@ -939,6 +1062,89 @@ export class RealQboClient implements QboClient {
         throw new QboRequestTimeout();
       }
       throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async requestAttachmentUpload(
+    ref: QboAttachmentRef,
+    files: QboAttachmentUploadFile[],
+    requestId: string,
+    retried = false,
+  ): Promise<QboAttachmentUploadOutcome[]> {
+    const multipart = createQboAttachmentMultipart(ref, files, requestId);
+    const accessToken = await this.ensureFreshToken();
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      PREPARED_WRITE_TIMEOUT_MS,
+    );
+    let sendBegan = false;
+    const trackedBody = async function* () {
+      for await (const chunk of multipart.openStream()) {
+        sendBegan = true;
+        yield chunk;
+      }
+    };
+    let response: Response;
+    try {
+      try {
+        response = await fetch(
+          `${this.base}/upload?requestid=${encodeURIComponent(requestId)}&minorversion=${MINOR_VERSION}`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+              'Content-Type': multipart.contentType,
+              'Content-Length': String(multipart.contentLength),
+            },
+            body: Readable.from(trackedBody()) as unknown as BodyInit,
+            signal: controller.signal,
+            duplex: 'half',
+          } as RequestInit & { duplex: 'half' },
+        );
+      } catch (error) {
+        if (sendBegan || controller.signal.aborted) {
+          throw new QboRequestTimeout(
+            'QuickBooks did not confirm the attachment upload.',
+          );
+        }
+        throw error;
+      }
+      if (response.status === 401 && !retried && !sendBegan) {
+        await response.body?.cancel().catch(() => undefined);
+        await this.refresh();
+        return this.requestAttachmentUpload(ref, files, requestId, true);
+      }
+      let text: string;
+      try {
+        text = await response.text();
+      } catch {
+        throw new QboRequestTimeout(
+          'QuickBooks did not confirm the attachment upload.',
+        );
+      }
+      if (!response.ok) {
+        if (response.status >= 400 && response.status < 500) {
+          throw this.toError(response.status, text);
+        }
+        throw new QboRequestTimeout(
+          'QuickBooks did not confirm the attachment upload.',
+        );
+      }
+      try {
+        const parsed: unknown = text ? JSON.parse(text) : null;
+        return parseQboAttachmentUploadResponse(
+          parsed,
+          files.map((file) => file.ordinal),
+        );
+      } catch {
+        throw new QboRequestTimeout(
+          'QuickBooks did not confirm the attachment upload.',
+        );
+      }
     } finally {
       clearTimeout(timeout);
     }
@@ -1028,6 +1234,139 @@ export class RealQboClient implements QboClient {
   async listTaxRates(): Promise<QboTaxRateInfo[]> {
     const rows = await this.queryAll('select * from TaxRate', 'TaxRate');
     return rows.map(mapTaxRate);
+  }
+
+  async uploadAttachments(
+    ref: QboAttachmentRef,
+    files: QboAttachmentUploadFile[],
+    requestId: string,
+  ): Promise<QboAttachmentUploadOutcome[]> {
+    return this.requestAttachmentUpload(ref, files, requestId);
+  }
+
+  async listAttachments(ref: QboAttachmentRef): Promise<QboAttachable[]> {
+    const rows = await this.queryAll('select * from Attachable', 'Attachable');
+    return rows
+      .map((row) => parseSupportedQboAttachable(row))
+      .filter((attachment): attachment is QboAttachable =>
+        attachment !== null)
+      .filter((attachment) =>
+        attachment.refs.some(
+          (candidate) =>
+            candidate.qboType === ref.qboType
+            && candidate.qboId === ref.qboId,
+        ));
+  }
+
+  private async getRawAttachment(id: string): Promise<{
+    attachment: QboAttachable;
+    raw: unknown;
+  } | null> {
+    try {
+      const body = await this.request<AttachableBody>(
+        'GET',
+        `/attachable/${encodeURIComponent(id)}`,
+      );
+      if (body.Attachable === undefined) return null;
+      return {
+        attachment: parseQboAttachable(body.Attachable),
+        raw: body.Attachable,
+      };
+    } catch (error) {
+      if (error instanceof Error && /not\s*found/iu.test(error.message)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async getAttachment(id: string): Promise<QboAttachable | null> {
+    return (await this.getRawAttachment(id))?.attachment ?? null;
+  }
+
+  async openAttachmentDownload(id: string): Promise<QboAttachmentDownload> {
+    const current = await this.getRawAttachment(id);
+    if (!current) throw new Error('QuickBooks attachment was not found.');
+    const downloadUri = attachableDownloadUri(current.raw);
+    if (!downloadUri) {
+      throw new Error(
+        'QuickBooks attachment download information was unavailable.',
+      );
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      QBO_DOWNLOAD_TIMEOUT_MS,
+    );
+    let response: Response;
+    try {
+      response = await fetch(downloadUri, {
+        method: 'GET',
+        headers: { Accept: '*/*' },
+        signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      if (controller.signal.aborted) {
+        throw new QboRequestTimeout('QuickBooks attachment download timed out.');
+      }
+      throw error;
+    }
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      clearTimeout(timeout);
+      throw this.toError(response.status, text);
+    }
+    if (!response.body) {
+      clearTimeout(timeout);
+      throw new Error('QuickBooks attachment download was empty.');
+    }
+    const lengthText = response.headers.get('content-length');
+    const parsedLength =
+      lengthText !== null && /^(0|[1-9]\d*)$/u.test(lengthText)
+        ? Number(lengthText)
+        : null;
+    return {
+      contentType:
+        response.headers.get('content-type') ?? current.attachment.contentType,
+      sizeBytes:
+        parsedLength !== null
+        && Number.isSafeInteger(parsedLength)
+        && parsedLength >= 0
+          ? parsedLength
+          : null,
+      body: (async function* () {
+        try {
+          yield* responseBodyChunks(response.body!);
+        } catch (error) {
+          if (controller.signal.aborted) {
+            throw new QboRequestTimeout(
+              'QuickBooks attachment download timed out.',
+            );
+          }
+          throw error;
+        } finally {
+          clearTimeout(timeout);
+        }
+      })(),
+    };
+  }
+
+  async deleteAttachment(input: {
+    id: string;
+    syncToken: string;
+    requestId: string;
+  }): Promise<void> {
+    const current = await this.getRawAttachment(input.id);
+    if (!current) throw new Error('QuickBooks attachment was not found.');
+    if (current.attachment.syncToken !== input.syncToken) {
+      throw new QboSyncTokenConflict();
+    }
+    await this.request<AttachableBody>(
+      'POST',
+      `/attachable?operation=delete&requestid=${encodeURIComponent(input.requestId)}`,
+      { Id: input.id, SyncToken: input.syncToken },
+    );
   }
 
   async fetchPurchaseSnapshot(
