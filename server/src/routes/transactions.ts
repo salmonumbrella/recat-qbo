@@ -28,6 +28,11 @@ import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/sugge
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import { stageCategorization } from '../services/categorization.js';
 import {
+  isLiveReconciliationOwnedRequest,
+  loadLiveReconciliationRequest,
+  reconcileLiveMutation,
+} from '../services/agent/liveReconciliation.js';
+import {
   bulkPost,
   commitStagedCategorization,
   postTransaction,
@@ -92,6 +97,13 @@ function requestUser(req: { user?: User }): User {
 async function assertCategorizerFor(user: User, companyId: string): Promise<void> {
   const role = await effectiveRole(user, companyId);
   if (role === null || roleRank(role) < roleRank('categorizer')) {
+    throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
+  }
+}
+
+async function assertAdminFor(user: User, companyId: string): Promise<void> {
+  const role = await effectiveRole(user, companyId);
+  if (role === null || roleRank(role) < roleRank('admin')) {
     throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
   }
 }
@@ -545,6 +557,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   QBO_PURCHASE_UNSUPPORTED: { status: 400, message: 'This transaction cannot use tax-aware Purchase writeback.' },
   QBO_STATE_DRIFT: { status: 409, message: 'The QuickBooks transaction changed. Reload before continuing.' },
   RECONCILE_NOT_ALLOWED: { status: 409, message: 'This mutation attempt does not require reconciliation.' },
+  LIVE_RECONCILIATION_BINDING_MISMATCH: {
+    status: 409,
+    message: 'This live mutation is no longer bound to the current transaction state.',
+  },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
@@ -723,10 +739,34 @@ async function reconcileCategorizationRequest(
   await assertCompanyConnected(scope.companyId);
   await assertAttemptScope(body.requestId, scope.transactionId);
   try {
-    const result = await reconcileMutationAttempt({
-      requestId: body.requestId,
-      actor: actorFor(user),
-    });
+    const actor = actorFor(user);
+    const liveOwned = await isLiveReconciliationOwnedRequest(
+      body.requestId,
+      scope.companyId,
+      scope.transactionId,
+    );
+    let result: DurableMutationResult;
+    if (!liveOwned) {
+      result = await reconcileMutationAttempt({
+          requestId: body.requestId,
+          actor,
+        });
+    } else {
+      await assertAdminFor(user, scope.companyId);
+      const live = await loadLiveReconciliationRequest(
+        body.requestId,
+        scope.companyId,
+        scope.transactionId,
+      );
+      if (live === null) {
+        throw new HttpError(
+          409,
+          'This live mutation is no longer bound to the current transaction state.',
+          'LIVE_RECONCILIATION_BINDING_MISMATCH',
+        );
+      }
+      result = await reconcileLiveMutation(live, { actor });
+    }
     sendMutationResult(res, result, {
       transactionId: scope.transactionId,
       requestId: body.requestId,

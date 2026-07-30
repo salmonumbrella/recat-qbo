@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import type { Role } from '@recat/shared';
 import {
   autopilot,
+  type LiveReadinessDto,
   type AutopilotOverviewDto,
   type AutopilotRunDto,
   type AutopilotSettingsPatch,
@@ -24,9 +25,29 @@ const cardStyle = {
   boxShadow: '0 1px 6px rgba(60,55,45,.05)',
 } as const;
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Could not load shadow operations';
+const RECONCILIATION_POLL_INTERVAL_MS = 250;
+const RECONCILIATION_MAX_POLLS = 8;
+
+function errorMessage(_error: unknown): string {
+  return 'Could not load autopilot operations';
 }
+
+const OUTCOME_LABEL: Record<AutopilotRunDto['outcome'], string> = {
+  shadow_proposed: 'Shadow proposal',
+  shadow_verified: 'Shadow proposal verified',
+  abstained: 'Abstained',
+  failed_before_write: 'Failed before write',
+  posted_verified: 'Posted and independently verified in QuickBooks',
+  possible_write_uncertain: 'Outcome uncertain — verify in QuickBooks',
+  readback_mismatch: 'QuickBooks readback mismatch — explicit review required',
+  reconciled_unchanged: 'Reconciled — QuickBooks unchanged',
+  reconciled_posted: 'Reconciled — posted and independently verified',
+  reverted: 'Reverted and independently verified',
+  retrying: 'Retrying',
+  in_progress: 'In progress',
+  dry_run: 'Dry run — nothing posted',
+  unavailable: 'Outcome unavailable',
+};
 
 function numberField(form: FormData, name: string): number {
   return Number(form.get(name));
@@ -147,7 +168,19 @@ function EvidenceProgress({ state }: { state: AutopilotOverviewDto }) {
   );
 }
 
-function RunSummary({ run }: { run: AutopilotRunDto }) {
+function RunSummary({
+  run,
+  canReconcile = false,
+  reconciling = false,
+  reconciliationInProgress = false,
+  onReconcile,
+}: {
+  run: AutopilotRunDto;
+  canReconcile?: boolean;
+  reconciling?: boolean;
+  reconciliationInProgress?: boolean;
+  onReconcile?: (operationId: string) => void;
+}) {
   const proposal = run.proposal;
   const evidence = run.verification.evidence;
   const outcome = proposal?.kind === 'proposal'
@@ -175,7 +208,10 @@ function RunSummary({ run }: { run: AutopilotRunDto }) {
     >
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: 600 }}>
-          {run.status} · {outcome}
+          {OUTCOME_LABEL[run.outcome]}
+        </div>
+        <div style={{ fontSize: 11.5, color: 'var(--fnt)', marginTop: 3 }}>
+          Durable state: {run.status} · {outcome}
         </div>
         <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
           Verifier: {VERIFIER_LABEL[run.verification.verifierKind]} · {evidenceLabel}
@@ -215,43 +251,202 @@ function RunSummary({ run }: { run: AutopilotRunDto }) {
           {run.usage?.totalTokens ?? '—'} tokens
         </div>
         {run.errorCode && <div style={{ color: 'var(--erT)' }}>{run.errorCode}</div>}
+        {reconciliationInProgress && (
+          <div role="status" style={{ color: 'var(--amT)', marginTop: 5 }}>
+            Reconciliation in progress
+          </div>
+        )}
+        {canReconcile && run.operationId !== null && (
+          <button
+            className="btn-ghost"
+            type="button"
+            disabled={reconciling || reconciliationInProgress}
+            onClick={() => onReconcile?.(run.operationId!)}
+            style={{ marginTop: 7 }}
+          >
+            {reconciling ? 'Reconciling…' : 'Reconcile live operation'}
+          </button>
+        )}
       </div>
     </li>
   );
 }
 
+export function LiveRunHistory({
+  runs,
+  canReconcile = false,
+  reconcilingOperationId = null,
+  inProgressOperationId = null,
+  onReconcile,
+  label = 'Recent autopilot runs',
+}: {
+  runs: AutopilotRunDto[];
+  canReconcile?: boolean;
+  reconcilingOperationId?: string | null;
+  inProgressOperationId?: string | null;
+  onReconcile?: (operationId: string) => void;
+  label?: string;
+}) {
+  return (
+    <ul aria-label={label} style={{ margin: '7px 0 0', padding: 0 }}>
+      {runs.map((run) => (
+        <RunSummary
+          key={run.id}
+          run={run}
+          canReconcile={canReconcile}
+          reconciling={run.operationId === reconcilingOperationId}
+          reconciliationInProgress={
+            inProgressOperationId !== null
+            && run.operationId === inProgressOperationId
+          }
+          onReconcile={onReconcile}
+        />
+      ))}
+    </ul>
+  );
+}
+
+function LiveReadiness({
+  readiness,
+  compact = false,
+}: {
+  readiness: LiveReadinessDto;
+  compact?: boolean;
+}) {
+  const evidenceStart = new Date(readiness.evidence.completedSince)
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const evidenceEnd = new Date(readiness.evidence.completedThrough)
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  return (
+    <section
+      aria-label="Live readiness"
+      style={{
+        border: '1px solid var(--bd2)',
+        borderRadius: 8,
+        padding: compact ? 10 : 14,
+        marginTop: compact ? 0 : 16,
+      }}
+    >
+      <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+        {readiness.state.enabled
+          ? 'Live mode enabled'
+          : readiness.state.paused
+            ? 'Live mode paused'
+            : 'Live mode not enabled'}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 5 }}>
+        Policy {readiness.policyVersion}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        {readiness.policy.supportedEntities.join(', ')} only · Minimum confidence{' '}
+        {Math.round(readiness.policy.minimumConfidence * 100)}%
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        {readiness.models.decisionAlias} → {readiness.models.verifierAlias} ·{' '}
+        provider {readiness.models.provider}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        {readiness.models.decisionIdentity ?? 'canonical identity unavailable'} →{' '}
+        {readiness.models.verifierIdentity ?? 'canonical identity unavailable'}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        Evidence {evidenceStart} – {evidenceEnd} · {readiness.evidence.eligibleRuns} qualified /{' '}
+        {readiness.evidence.threshold} required
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        Agreement ≥ {Math.round(readiness.evidence.minimumAgreement * 100)}% · abstention ≤{' '}
+        {Math.round(readiness.evidence.maximumAbstentionRate * 100)}% · errors ≤{' '}
+        {Math.round(readiness.evidence.maximumErrorRate * 100)}%
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        Policy {readiness.policy.policyAccepted ? 'accepted' : 'not accepted'} · configuration{' '}
+        {readiness.policy.configurationAccepted ? 'accepted' : 'not accepted'} · model binding{' '}
+        {readiness.policy.modelBindingAccepted ? 'accepted' : 'not accepted'}
+      </div>
+      {readiness.state.pauseMessage && (
+        <div role="status" style={{ fontSize: 12, color: 'var(--amT)', marginTop: 5 }}>
+          Pause reason: {readiness.state.pauseMessage}
+        </div>
+      )}
+      <div style={{ fontSize: 12, color: 'var(--mut)', marginTop: 3 }}>
+        Last live action:{' '}
+        {readiness.lastAction === null
+          ? 'none'
+          : `${OUTCOME_LABEL[readiness.lastAction.outcome]} · ${readiness.lastAction.at}`}
+      </div>
+      <ul aria-label="Live readiness gates" style={{ padding: 0, margin: '10px 0 0' }}>
+        {readiness.gates.map((gate) => (
+          <li
+            key={gate.code}
+            style={{ listStyle: 'none', fontSize: compact ? 11.5 : 12, marginTop: 4 }}
+          >
+            <span style={{ color: gate.ok ? 'var(--okT)' : 'var(--erT)' }}>
+              {gate.ok ? 'Ready' : 'Blocked'}
+            </span>
+            {' · '}
+            {gate.code.replaceAll('_', ' ')}
+            {' · '}
+            {gate.message}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export default function AutopilotCard({
   companyId,
+  companyName,
   role,
 }: {
   companyId: string;
+  companyName: string;
   role: Exclude<Role, 'viewer'>;
 }) {
   const { toast } = useApp();
   const [state, setState] = useState<AutopilotOverviewDto | null>(null);
   const [runs, setRuns] = useState<AutopilotRunDto[]>([]);
+  const [readiness, setReadiness] = useState<LiveReadinessDto | null>(null);
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [confirmation, setConfirmation] = useState('');
+  const [enabling, setEnabling] = useState(false);
+  const [pausing, setPausing] = useState(false);
+  const [reconcilingOperationId, setReconcilingOperationId] = useState<string | null>(null);
+  const [inProgressOperationId, setInProgressOperationId] = useState<string | null>(null);
   const generationRef = useRef(0);
+  const reconciliationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isAdmin = role === 'admin';
 
   useEffect(() => {
+    if (reconciliationTimerRef.current !== null) {
+      clearTimeout(reconciliationTimerRef.current);
+      reconciliationTimerRef.current = null;
+    }
     const generation = ++generationRef.current;
     let cancelled = false;
     setState(null);
     setRuns([]);
+    setReadiness(null);
     setLoadingError(null);
     setSaving(false);
     setCancelling(false);
+    setConfirmation('');
+    setEnabling(false);
+    setPausing(false);
+    setReconcilingOperationId(null);
+    setInProgressOperationId(null);
     Promise.all([
       autopilot.get(companyId),
       autopilot.listRuns(companyId, { limit: 10 }),
+      autopilot.getReadiness(companyId),
     ])
-      .then(([nextState, page]) => {
+      .then(([nextState, page, nextReadiness]) => {
         if (cancelled || generationRef.current !== generation) return;
         setState(nextState);
         setRuns(page.runs);
+        setReadiness(nextReadiness);
       })
       .catch((error) => {
         if (!cancelled && generationRef.current === generation) {
@@ -260,6 +455,10 @@ export default function AutopilotCard({
       });
     return () => {
       cancelled = true;
+      if (reconciliationTimerRef.current !== null) {
+        clearTimeout(reconciliationTimerRef.current);
+        reconciliationTimerRef.current = null;
+      }
       if (generationRef.current === generation) generationRef.current += 1;
     };
   }, [companyId]);
@@ -308,6 +507,146 @@ export default function AutopilotCard({
     }
   };
 
+  const enableLive = async () => {
+    if (
+      readiness === null
+      || confirmation !== companyName
+      || enabling
+    ) return;
+    const generation = generationRef.current;
+    setEnabling(true);
+    try {
+      const next = await autopilot.enableLive(companyId, {
+        confirmation,
+        acceptedPolicyVersion: readiness.policyVersion,
+      });
+      if (generationRef.current !== generation) return;
+      setReadiness(next);
+      setConfirmation('');
+      if (next.state.enabled && next.gates.every((gate) => gate.ok)) {
+        toast('Live mode enabled');
+      } else if (next.state.paused) {
+        toast('Live mode remains paused');
+      } else {
+        toast('Live mode was not enabled');
+      }
+    } catch {
+      if (generationRef.current === generation) toast('Could not enable live mode');
+    } finally {
+      if (generationRef.current === generation) setEnabling(false);
+    }
+  };
+
+  const pauseLive = async () => {
+    if (pausing) return;
+    const generation = generationRef.current;
+    setPausing(true);
+    try {
+      const ack = await autopilot.pauseLive(companyId);
+      if (generationRef.current !== generation) return;
+      setReadiness((current) => current === null
+        ? current
+        : {
+            ...current,
+            state: ack,
+          });
+      try {
+        const next = await autopilot.getReadiness(companyId);
+        if (generationRef.current !== generation) return;
+        setReadiness(next);
+        toast(ack.paused ? 'Live mode paused' : 'Live mode was not active');
+      } catch {
+        if (generationRef.current === generation) {
+          toast('Could not refresh live mode status');
+        }
+      }
+    } catch {
+      if (generationRef.current === generation) toast('Could not pause live mode');
+    } finally {
+      if (generationRef.current === generation) setPausing(false);
+    }
+  };
+
+  const reconcileLive = async (operationId: string) => {
+    if (reconcilingOperationId !== null || inProgressOperationId === operationId) return;
+    const generation = generationRef.current;
+    setReconcilingOperationId(operationId);
+    let result: Awaited<ReturnType<typeof autopilot.reconcileLive>>;
+    try {
+      result = await autopilot.reconcileLive(companyId, operationId);
+    } catch {
+      if (generationRef.current === generation) {
+        toast('Could not reconcile live operation');
+      }
+      if (generationRef.current === generation) setReconcilingOperationId(null);
+      return;
+    }
+    try {
+      if (generationRef.current !== generation) return;
+      if (result.outcome === 'IN_PROGRESS') {
+        setInProgressOperationId(operationId);
+        void pollReconciliation(operationId, generation, 0);
+      } else {
+        try {
+          await refreshReconciliationTruth(generation);
+        } catch {
+          if (generationRef.current === generation) {
+            toast('Could not refresh reconciliation status');
+          }
+        }
+      }
+    } finally {
+      if (generationRef.current === generation) setReconcilingOperationId(null);
+    }
+  };
+
+  const refreshReconciliationTruth = async (
+    generation: number,
+  ): Promise<AutopilotRunDto[] | null> => {
+    const [nextState, page, nextReadiness] = await Promise.all([
+      autopilot.get(companyId),
+      autopilot.listRuns(companyId, { limit: 10 }),
+      autopilot.getReadiness(companyId),
+    ]);
+    if (generationRef.current !== generation) return null;
+    setState(nextState);
+    setRuns(page.runs);
+    setReadiness(nextReadiness);
+    return page.runs;
+  };
+
+  const pollReconciliation = async (
+    operationId: string,
+    generation: number,
+    pollCount: number,
+  ): Promise<void> => {
+    if (generationRef.current !== generation) return;
+    try {
+      const refreshedRuns = await refreshReconciliationTruth(generation);
+      if (refreshedRuns === null || generationRef.current !== generation) return;
+      const operation = refreshedRuns.find((run) => run.id === operationId);
+      if (
+        operation !== undefined
+        && operation.operationId === null
+        && operation.outcome !== 'in_progress'
+        && operation.outcome !== 'retrying'
+        && operation.outcome !== 'possible_write_uncertain'
+        && operation.outcome !== 'readback_mismatch'
+      ) {
+        setInProgressOperationId((current) =>
+          current === operationId ? null : current);
+        return;
+      }
+    } catch {
+      if (generationRef.current !== generation) return;
+    }
+    if (pollCount + 1 >= RECONCILIATION_MAX_POLLS) return;
+    reconciliationTimerRef.current = setTimeout(() => {
+      reconciliationTimerRef.current = null;
+      void pollReconciliation(operationId, generation, pollCount + 1);
+    }, RECONCILIATION_POLL_INTERVAL_MS);
+  };
+
   if (loadingError) {
     return (
       <div style={cardStyle}>
@@ -318,7 +657,7 @@ export default function AutopilotCard({
       </div>
     );
   }
-  if (state === null) {
+  if (state === null || readiness === null) {
     return (
       <div style={cardStyle} aria-busy="true">
         <div style={{ fontSize: 15, fontWeight: 600 }}>Shadow autopilot</div>
@@ -382,6 +721,56 @@ export default function AutopilotCard({
           </span>
         )}
       </div>
+
+      <LiveReadiness readiness={readiness} />
+
+      {isAdmin && (
+        <div
+          aria-label="Live mode controls"
+          style={{
+            border: '1px solid var(--bd2)',
+            borderRadius: 8,
+            padding: 12,
+            marginTop: 12,
+            display: 'grid',
+            gap: 10,
+          }}
+        >
+          <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>
+            Enabling reruns every durable and credential-backed gate. Type the exact legal company
+            name and accept the displayed policy.
+          </div>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12.5, color: 'var(--mut)' }}>
+            Type company name
+            <input
+              className="input"
+              aria-label="Type company name"
+              value={confirmation}
+              maxLength={200}
+              autoComplete="off"
+              onChange={(event) => setConfirmation(event.target.value)}
+            />
+          </label>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              className="btn-ghost"
+              type="button"
+              disabled={confirmation !== companyName || enabling}
+              onClick={() => void enableLive()}
+            >
+              {enabling ? 'Enabling live mode…' : 'Enable live mode'}
+            </button>
+            <button
+              className="btn-ghost"
+              type="button"
+              disabled={pausing}
+              onClick={() => void pauseLive()}
+            >
+              {pausing ? 'Pausing live mode…' : 'Pause live mode'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {isAdmin ? (
         <form key={settings.configVersion} onSubmit={(event) => void save(event)} style={{ marginTop: 18 }}>
@@ -524,17 +913,29 @@ export default function AutopilotCard({
             No shadow runs yet.
           </div>
         ) : (
-          <ul aria-label="Recent shadow runs" style={{ margin: '7px 0 0', padding: 0 }}>
-            {runs.map((run) => <RunSummary key={run.id} run={run} />)}
-          </ul>
+          <LiveRunHistory
+            runs={runs}
+            canReconcile={isAdmin}
+            reconcilingOperationId={reconcilingOperationId}
+            inProgressOperationId={inProgressOperationId}
+            onReconcile={(operationId) => void reconcileLive(operationId)}
+            label="Recent autopilot runs"
+          />
         )}
       </div>
     </section>
   );
 }
 
-export function AutopilotQueueStatus({ companyId }: { companyId: string }) {
+export function AutopilotQueueStatus({
+  companyId,
+  surface = 'queue',
+}: {
+  companyId: string;
+  surface?: 'queue' | 'audit';
+}) {
   const [state, setState] = useState<AutopilotOverviewDto | null>(null);
+  const [readiness, setReadiness] = useState<LiveReadinessDto | null>(null);
   const [runs, setRuns] = useState<AutopilotRunDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -544,6 +945,7 @@ export function AutopilotQueueStatus({ companyId }: { companyId: string }) {
     const generation = ++generationRef.current;
     let cancelled = false;
     setState(null);
+    setReadiness(null);
     setRuns([]);
     setNextCursor(null);
     setLoadingOlder(false);
@@ -551,10 +953,12 @@ export function AutopilotQueueStatus({ companyId }: { companyId: string }) {
       autopilot.get(companyId),
       autopilot.listRuns(companyId, { limit: 5 })
         .catch(() => ({ runs: [], nextCursor: null })),
+      autopilot.getReadiness(companyId),
     ])
-      .then(([nextState, page]) => {
+      .then(([nextState, page, nextReadiness]) => {
         if (cancelled || generationRef.current !== generation) return;
         setState(nextState);
+        setReadiness(nextReadiness);
         setRuns(page.runs);
         setNextCursor(page.nextCursor);
       })
@@ -586,10 +990,10 @@ export function AutopilotQueueStatus({ companyId }: { companyId: string }) {
     }
   };
 
-  if (state === null) return null;
+  if (state === null || readiness === null) return null;
   return (
     <aside
-      aria-label="Shadow autopilot status"
+      aria-label={`${surface === 'audit' ? 'Audit' : 'Queue'} live autopilot status`}
       style={{
         ...cardStyle,
         padding: '12px 16px',
@@ -608,12 +1012,11 @@ export function AutopilotQueueStatus({ companyId }: { companyId: string }) {
         </div>
         <EvidenceProgress state={state} />
       </div>
+      <LiveReadiness readiness={readiness} compact />
       {runs.length === 0 ? (
         <div style={{ fontSize: 12.5, color: 'var(--mut)' }}>No shadow runs yet.</div>
       ) : (
-        <ul aria-label="Recent shadow runs" style={{ margin: 0, padding: 0 }}>
-          {runs.map((run) => <RunSummary key={run.id} run={run} />)}
-        </ul>
+        <LiveRunHistory runs={runs} label="Recent autopilot runs" />
       )}
       {nextCursor !== null && (
         <button

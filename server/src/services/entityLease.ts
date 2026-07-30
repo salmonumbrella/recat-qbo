@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 const DEFAULT_LEASE_TTL_MS = 30_000;
 
 export interface EntityLeaseKey {
@@ -13,10 +15,15 @@ interface LeaseWhere extends EntityLeaseKey {
   ];
 }
 
+interface RenewalWhere extends EntityLeaseKey {
+  owner: string;
+  leaseExpiresAt: { gt: Date };
+}
+
 export interface EntityLeaseDb {
   qboEntityLease: {
     updateMany(args: {
-      where: LeaseWhere;
+      where: LeaseWhere | RenewalWhere;
       data: { owner: string; leaseExpiresAt: Date };
     }): Promise<{ count: number }>;
     create(args: {
@@ -53,6 +60,14 @@ export class EntityLeaseError extends Error {
   }
 }
 
+interface ActiveLease {
+  readonly db: EntityLeaseDb;
+  readonly key: EntityLeaseKey;
+  readonly owner: string;
+}
+
+const activeLeases = new AsyncLocalStorage<readonly ActiveLease[]>();
+
 /**
  * Lock the exact entity-lease row in the caller's transaction and verify that
  * it still belongs to `owner`. The row lock is held until that transaction
@@ -70,6 +85,7 @@ export async function fenceEntityLeaseOwnership(
       WHERE "companyId" = $1
         AND "qboType" = $2
         AND "qboId" = $3
+        AND "leaseExpiresAt" > CURRENT_TIMESTAMP
       FOR UPDATE`,
     key.companyId,
     key.qboType,
@@ -141,6 +157,30 @@ export async function acquireEntityLease(
   });
 }
 
+/**
+ * Extends only a currently live lease held by the same owner. Unlike initial
+ * acquisition, renewal never resurrects an expired row or takes ownership.
+ */
+export async function renewEntityLease(
+  key: EntityLeaseKey,
+  owner: string,
+  deps: EntityLeaseDeps,
+): Promise<void> {
+  await deps.db.$transaction(async (tx) => {
+    const now = await (deps.now ?? databaseNow)(tx);
+    const leaseExpiresAt = new Date(now.getTime() + boundedTtl(deps.ttlMs));
+    const renewed = await tx.qboEntityLease.updateMany({
+      where: {
+        ...key,
+        owner,
+        leaseExpiresAt: { gt: now },
+      },
+      data: { owner, leaseExpiresAt },
+    });
+    if (renewed.count !== 1) throw new EntityLeaseError();
+  });
+}
+
 export async function releaseEntityLease(
   key: EntityLeaseKey,
   owner: string,
@@ -158,12 +198,30 @@ export async function withEntityLease<T>(
   callback: () => Promise<T>,
   deps: EntityLeaseDeps,
 ): Promise<T> {
+  const inherited = activeLeases.getStore() ?? [];
+  const reentrant = inherited.some(
+    (active) => (
+      active.db === deps.db
+      && active.owner === owner
+      && sameKey(active.key, key)
+    ),
+  );
+  if (reentrant) {
+    // Async context proves only call-chain nesting. Database renewal proves
+    // the original owner still holds unexpired authority before nested work.
+    await renewEntityLease(key, owner, deps);
+    return callback();
+  }
+
   await acquireEntityLease(key, owner, deps);
   let result: T | undefined;
   let primaryError: unknown;
   let callbackFailed = false;
   try {
-    result = await callback();
+    result = await activeLeases.run(
+      [...inherited, { db: deps.db, key: { ...key }, owner }],
+      callback,
+    );
   } catch (error) {
     callbackFailed = true;
     primaryError = error;
@@ -184,4 +242,10 @@ export async function withEntityLease<T>(
   }
   if (callbackFailed) throw primaryError;
   return result as T;
+}
+
+function sameKey(left: EntityLeaseKey, right: EntityLeaseKey): boolean {
+  return left.companyId === right.companyId
+    && left.qboType === right.qboType
+    && left.qboId === right.qboId;
 }

@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, createCategorizationRequestId, transactions } from './api';
+import {
+  ApiError,
+  autopilot,
+  createCategorizationRequestId,
+  transactions,
+} from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -115,5 +120,38 @@ describe('structured mutation failures', () => {
       expect(error).toBeInstanceOf(ApiError);
       expect((error as ApiError).mutationResult).toBeUndefined();
     });
+  });
+});
+
+describe('strict live control requests', () => {
+  it('sends an explicit empty object for pause and opaque reconciliation', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await autopilot.pauseLive('company-1');
+    await autopilot.reconcileLive(
+      'company-1',
+      '00000000-0000-4000-8000-000000000040',
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/companies/company-1/autopilot/pause-live',
+      expect.objectContaining({
+        method: 'POST',
+        body: '{}',
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/companies/company-1/autopilot/reconcile/00000000-0000-4000-8000-000000000040',
+      expect.objectContaining({
+        method: 'POST',
+        body: '{}',
+      }),
+    );
   });
 });

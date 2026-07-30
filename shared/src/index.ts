@@ -184,7 +184,33 @@ export type SuggestionProvider = 'custom' | 'openrouter';
 
 export type AgentMode = 'off' | 'shadow';
 export type AgentJobStatus = 'queued' | 'running' | 'retry' | 'completed' | 'cancelled' | 'terminal';
-export type AgentRunStatus = 'running' | 'verified' | 'abstain' | 'failed';
+/** Exact durable AgentRun.status values. UI meaning is projected separately. */
+export type AgentRunStatus =
+  | 'running'
+  | 'verified'
+  | 'abstain'
+  | 'failed'
+  | 'posted_verified'
+  | 'dry_run'
+  | 'unchanged'
+  | 'uncertain'
+  | 'retryable';
+
+export type AutopilotRunOutcome =
+  | 'shadow_proposed'
+  | 'shadow_verified'
+  | 'abstained'
+  | 'failed_before_write'
+  | 'posted_verified'
+  | 'possible_write_uncertain'
+  | 'readback_mismatch'
+  | 'reconciled_unchanged'
+  | 'reconciled_posted'
+  | 'reverted'
+  | 'retrying'
+  | 'in_progress'
+  | 'dry_run'
+  | 'unavailable';
 
 export interface AgentLimitsDto {
   maxToolCalls: number;
@@ -205,6 +231,69 @@ export interface AgentCompanySettingsDto {
   evidenceThreshold: number;
   limits: AgentLimitsDto;
   configVersion: string;
+}
+
+export type LiveGateCode =
+  | 'SHADOW_MODE_UNHEALTHY'
+  | 'EVIDENCE_INSUFFICIENT'
+  | 'SHADOW_AGREEMENT_INSUFFICIENT'
+  | 'SHADOW_ABSTENTION_EXCESSIVE'
+  | 'SHADOW_ERROR_RATE_EXCESSIVE'
+  | 'VERIFIER_NOT_DISTINCT'
+  | 'PROVIDER_UNHEALTHY'
+  | 'TAX_REFERENCE_STALE'
+  | 'QBO_DISCONNECTED'
+  | 'WRITEBACK_DISABLED'
+  | 'UNRESOLVED_MUTATION'
+  | 'WORKER_UNHEALTHY'
+  | 'LIVE_POLICY_NOT_ACCEPTED';
+
+/** Safe, bounded activation readiness status; provider and accounting details stay server-side. */
+export interface LiveGateResult {
+  code: LiveGateCode;
+  ok: boolean;
+  message: string;
+}
+
+export interface LivePauseStateDto {
+  liveRequested: boolean;
+  enabled: boolean;
+  paused: boolean;
+  pauseCode: string | null;
+  pauseMessage: string | null;
+}
+
+export interface LiveReadinessDto {
+  policyVersion: string;
+  gates: LiveGateResult[];
+  evidence: {
+    completedSince: string;
+    completedThrough: string;
+    eligibleRuns: number;
+    threshold: number;
+    minimumAgreement: number;
+    maximumAbstentionRate: number;
+    maximumErrorRate: number;
+  };
+  models: {
+    provider: string;
+    decisionAlias: string;
+    verifierAlias: string;
+    decisionIdentity: string | null;
+    verifierIdentity: string | null;
+  };
+  policy: {
+    supportedEntities: ['Purchase'];
+    minimumConfidence: number;
+    policyAccepted: boolean;
+    configurationAccepted: boolean;
+    modelBindingAccepted: boolean;
+  };
+  state: LivePauseStateDto;
+  lastAction: {
+    outcome: AutopilotRunOutcome;
+    at: string;
+  } | null;
 }
 export type AuditAction =
   | 'posted'

@@ -1,0 +1,138 @@
+import type { Company, Prisma } from '@prisma/client';
+import { HttpError } from '../lib/http.js';
+import { prisma } from '../lib/prisma.js';
+import type {
+  QboRevocationCapability,
+  QboRevocationSource,
+} from '../lib/qbo/types.js';
+import { runSerializableTransaction } from '../lib/serializableTransaction.js';
+
+export interface CompanySettingsPatch {
+  nickname?: string;
+  syncMode?: 'polling' | 'webhook';
+  pollIntervalMin?: 5 | 10 | 30 | 60;
+  holdingAccountIds?: string[];
+  dryRun?: boolean;
+  tagsRequired?: boolean;
+}
+
+export interface CompanyLiveAuthorityDeps {
+  now(): Date;
+  withSerializableTransaction<T>(
+    callback: (db: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T>;
+}
+
+export interface DisconnectedCompany {
+  company: Company;
+  revoke: QboRevocationCapability;
+}
+
+const defaultDeps: CompanyLiveAuthorityDeps = {
+  now: () => new Date(),
+  withSerializableTransaction: (callback) =>
+    runSerializableTransaction(prisma, callback),
+};
+
+const policyPause = {
+  liveAcceptedPolicyVersion: null,
+  liveAcceptedConfigVersion: null,
+  liveAcceptedProviderBinding: null,
+  livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+  livePauseMessage: 'Live mode is paused: The current live policy must be accepted.',
+} as const;
+
+const disconnectPause = {
+  liveAcceptedPolicyVersion: null,
+  liveAcceptedConfigVersion: null,
+  liveAcceptedProviderBinding: null,
+  livePauseCode: 'QBO_DISCONNECTED',
+  livePauseMessage: 'Live mode is paused: QuickBooks is disconnected.',
+} as const;
+
+function captureRevocationCapability(
+  source: QboRevocationSource,
+): QboRevocationCapability {
+  const snapshot = {
+    realmId: source.realmId,
+    refreshToken: source.refreshToken,
+  };
+  return async () => {
+    try {
+      const { revokeCapturedQboToken } = await import('../lib/qbo/factory.js');
+      await revokeCapturedQboToken(snapshot);
+    } catch {
+      // Best effort only; local token and live authority are already gone.
+    }
+  };
+}
+
+/**
+ * Applies authority-relevant company settings and their live pause in one
+ * retryable serializable transaction. Requested intent is deliberately not
+ * changed; an administrator must renew acceptance after a dry-run transition.
+ */
+export async function updateCompanySettingsWithLiveAuthority(
+  companyId: string,
+  patch: CompanySettingsPatch,
+  deps: CompanyLiveAuthorityDeps = defaultDeps,
+): Promise<Company> {
+  const pausedAt = deps.now();
+  return deps.withSerializableTransaction(async (db) => {
+    const current = await db.company.findUnique({ where: { id: companyId } });
+    if (current === null) {
+      throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    }
+    const dryRunChanged = patch.dryRun !== undefined && patch.dryRun !== current.dryRun;
+    const updated = await db.company.update({
+      where: { id: companyId },
+      data: patch,
+    });
+    if (dryRunChanged) {
+      await db.agentCompanyConfig.updateMany({
+        where: { companyId, liveRequested: true },
+        data: {
+          ...policyPause,
+          livePausedAt: pausedAt,
+        },
+      });
+    }
+    return updated;
+  });
+}
+
+/**
+ * Captures an opaque revocation capability from the current token snapshot,
+ * then disconnects QBO and invalidates requested live authority atomically.
+ * The caller invokes the bounded best-effort capability only after commit.
+ */
+export async function disconnectCompanyWithLiveAuthority(
+  companyId: string,
+  deps: CompanyLiveAuthorityDeps = defaultDeps,
+): Promise<DisconnectedCompany> {
+  const disconnectedAt = deps.now();
+  return deps.withSerializableTransaction(async (db) => {
+    const current = await db.company.findUnique({ where: { id: companyId } });
+    if (current === null) {
+      throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    }
+    const revoke = captureRevocationCapability(current);
+    const updated = await db.company.update({
+      where: { id: companyId },
+      data: {
+        disconnectedAt: current.disconnectedAt ?? disconnectedAt,
+        accessToken: null,
+        refreshToken: null,
+        tokenExpiresAt: null,
+      },
+    });
+    await db.agentCompanyConfig.updateMany({
+      where: { companyId, liveRequested: true },
+      data: {
+        ...disconnectPause,
+        livePausedAt: disconnectedAt,
+      },
+    });
+    return { company: updated, revoke };
+  });
+}

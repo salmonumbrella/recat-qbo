@@ -17,8 +17,27 @@ import {
 } from './openAiCompatibleModel.js';
 import { AgentSettingError, getAgentSettings } from './settings.js';
 import { runClaimedShadowJob } from './worker.js';
+import {
+  markLiveWorkerClaimCycle,
+  markLiveWorkerStarted,
+  markLiveWorkerStopped,
+} from './liveWorkerHealth.js';
+import {
+  isClaimedLiveJobAuthorized,
+  runProductionClaimedLiveJob,
+  runProductionClaimedLiveRecovery,
+  type ProductionLiveWorkerModels,
+} from './liveWorker.js';
+import { evaluateCircuitBreakers } from './circuitBreaker.js';
+import {
+  deferLiveReconciliation,
+  listAllLiveReconciliationCandidates,
+  reconcileScheduledLiveMutation,
+} from './liveReconciliation.js';
 
 const GLOBAL_CONCURRENCY = 4;
+const LIVE_RECOVERY_CONCURRENCY = 4;
+const LIVE_RECOVERY_TIMEOUT_MS = 10_000;
 
 export type AgentSchedulerModelConfig = OpenAiCompatibleAgentModelConfig;
 
@@ -39,13 +58,14 @@ export interface AgentWorkerModels {
 export interface ScheduledShadowCompany {
   readonly companyId: string;
   readonly scheduleMinutes: number;
+  readonly liveRequested: boolean;
 }
 
 interface ScheduledCompanyDb {
   agentCompanyConfig: {
     findMany(args: {
       where: { mode: 'shadow'; company: { disconnectedAt: null } };
-      select: { companyId: true; scheduleMinutes: true };
+      select: { companyId: true; scheduleMinutes: true; liveRequested: true };
       orderBy: { companyId: 'asc' };
     }): Promise<ScheduledShadowCompany[]>;
   };
@@ -56,6 +76,8 @@ export interface AgentSchedulerDeps {
   readonly globalConcurrency: number;
   readonly now: () => Date;
   readonly listShadowCompanies: () => Promise<readonly ScheduledShadowCompany[]>;
+  readonly guardCompany?: (company: ScheduledShadowCompany) => Promise<void>;
+  readonly recoverLiveMutations?: () => Promise<void>;
   readonly discoverJobs: (companyId: string) => Promise<unknown>;
   readonly claimJobs: (
     workerId: string,
@@ -75,6 +97,19 @@ export interface ScheduledShadowJobDeps {
     workerId: string,
     models: AgentWorkerModels,
   ) => Promise<void>;
+  readonly isLiveAuthorized?: (
+    job: ClaimedAgentJob,
+    models: AgentWorkerModels,
+  ) => Promise<boolean>;
+  readonly runClaimedLiveJob?: (
+    job: ClaimedAgentJob,
+    workerId: string,
+    models: AgentWorkerModels,
+  ) => Promise<void>;
+  readonly runClaimedLiveRecovery?: (
+    job: ClaimedAgentJob,
+    workerId: string,
+  ) => Promise<boolean>;
   readonly terminalize: (
     job: ClaimedAgentJob,
     workerId: string,
@@ -146,6 +181,8 @@ export async function runScheduledShadowJob(
   workerId: string,
   deps: ScheduledShadowJobDeps,
 ): Promise<void> {
+  if (await deps.runClaimedLiveRecovery?.(job, workerId)) return;
+
   let settings: AgentCompanySettingsDto;
   try {
     settings = await deps.getCompanySettings(job.companyId);
@@ -170,6 +207,18 @@ export async function runScheduledShadowJob(
     await deps.terminalize(job, workerId, 'AGENT_MODEL_CONFIG_INVALID');
     return;
   }
+  let liveAuthorized = false;
+  if (deps.isLiveAuthorized !== undefined && deps.runClaimedLiveJob !== undefined) {
+    try {
+      liveAuthorized = await deps.isLiveAuthorized(job, models);
+    } catch {
+      liveAuthorized = false;
+    }
+  }
+  if (liveAuthorized) {
+    await deps.runClaimedLiveJob!(job, workerId, models);
+    return;
+  }
   await deps.runClaimedJob(job, workerId, models);
 }
 
@@ -181,10 +230,12 @@ export function createAgentScheduler(deps: AgentSchedulerDeps): AgentScheduler {
   return {
     start(): void {
       acceptingClaims = true;
+      markLiveWorkerStarted(deps.workerId);
     },
     stop(): void {
       acceptingClaims = false;
       lifecycleGeneration += 1;
+      markLiveWorkerStopped(deps.workerId);
     },
     async tick(): Promise<void> {
       if (!acceptingClaims || running) return;
@@ -195,17 +246,28 @@ export function createAgentScheduler(deps: AgentSchedulerDeps): AgentScheduler {
       running = true;
       try {
         const now = checkedDate(deps.now());
+        if (deps.recoverLiveMutations !== undefined) {
+          await Promise.allSettled([deps.recoverLiveMutations()]);
+          if (!isCurrentLifecycle()) return;
+        }
         const companies = await deps.listShadowCompanies();
         if (!isCurrentLifecycle()) return;
-        for (const company of companies) {
-          if (isDue(now, company.scheduleMinutes)) {
-            await deps.discoverJobs(company.companyId);
-            if (!isCurrentLifecycle()) return;
-          }
+        if (deps.guardCompany !== undefined) {
+          await Promise.allSettled(
+            companies.map((company) => deps.guardCompany!(company)),
+          );
+          if (!isCurrentLifecycle()) return;
         }
+        await runBoundedSettled(
+          companies.filter((company) => isDue(now, company.scheduleMinutes)),
+          deps.globalConcurrency,
+          (company) => deps.discoverJobs(company.companyId),
+        );
+        if (!isCurrentLifecycle()) return;
 
         const jobs = await deps.claimJobs(deps.workerId, deps.globalConcurrency);
         if (!isCurrentLifecycle()) return;
+        markLiveWorkerClaimCycle(deps.workerId, checkedDate(deps.now()));
         await Promise.allSettled(jobs.map((job) => deps.runJob(job)));
         if (!isCurrentLifecycle()) return;
       } finally {
@@ -234,6 +296,7 @@ const productionJobDeps: ScheduledShadowJobDeps = {
   getCompanySettings: getAgentSettings,
   getProviderSettings: getInstanceSettings,
   createModel: (config) => new OpenAiCompatibleAgentModel(config),
+  runClaimedLiveRecovery: runProductionClaimedLiveRecovery,
   runClaimedJob: async (job, workerId, models) => {
     await runClaimedShadowJob(job, {
       db: prisma,
@@ -242,6 +305,15 @@ const productionJobDeps: ScheduledShadowJobDeps = {
       reviewModel: models.reviewModel,
       limits: models.limits,
     });
+  },
+  isLiveAuthorized: async (job, models) => (
+    asProductionLiveModels(models) !== null
+    && isClaimedLiveJobAuthorized(job)
+  ),
+  runClaimedLiveJob: async (job, workerId, models) => {
+    const liveModels = asProductionLiveModels(models);
+    if (liveModels === null) throw new Error('Agent live model capability is unavailable.');
+    await runProductionClaimedLiveJob(job, workerId, liveModels);
   },
   terminalize: async (job, workerId, errorCode) => {
     await finishAgentJob(job.id, workerId, job.attemptCount, {
@@ -253,6 +325,26 @@ const productionJobDeps: ScheduledShadowJobDeps = {
   supersede: async (job, workerId) => cancelSupersededAgentJob(job, workerId),
 };
 
+function asProductionLiveModels(
+  models: AgentWorkerModels,
+): ProductionLiveWorkerModels | null {
+  const decision = models.decisionModel as Partial<ProductionLiveWorkerModels['decisionModel']>;
+  const review = models.reviewModel as Partial<ProductionLiveWorkerModels['reviewModel']>;
+  if (
+    typeof decision.probe !== 'function'
+    || typeof decision.reviewLiveDecision !== 'function'
+    || typeof decision.healthAuthority !== 'string'
+    || typeof review.probe !== 'function'
+    || typeof review.reviewLiveDecision !== 'function'
+    || typeof review.healthAuthority !== 'string'
+  ) return null;
+  return {
+    decisionModel: decision as ProductionLiveWorkerModels['decisionModel'],
+    reviewModel: review as ProductionLiveWorkerModels['reviewModel'],
+    limits: models.limits,
+  };
+}
+
 export async function listScheduledShadowCompanies(
   db: ScheduledCompanyDb = prisma as unknown as ScheduledCompanyDb,
 ): Promise<ScheduledShadowCompany[]> {
@@ -261,9 +353,108 @@ export async function listScheduledShadowCompanies(
       mode: 'shadow',
       company: { disconnectedAt: null },
     },
-    select: { companyId: true, scheduleMinutes: true },
+    select: { companyId: true, scheduleMinutes: true, liveRequested: true },
     orderBy: { companyId: 'asc' },
   });
+}
+
+export interface ScheduledLiveSafetyDeps {
+  readonly evaluate: (companyId: string) => Promise<unknown>;
+}
+
+const productionLiveSafetyDeps: ScheduledLiveSafetyDeps = {
+  evaluate: evaluateCircuitBreakers,
+};
+
+export async function guardScheduledLiveCompany(
+  company: ScheduledShadowCompany,
+  deps: ScheduledLiveSafetyDeps = productionLiveSafetyDeps,
+): Promise<void> {
+  if (company.liveRequested) await deps.evaluate(company.companyId);
+}
+
+export interface ScheduledLiveRecoveryDeps {
+  readonly listCandidates: typeof listAllLiveReconciliationCandidates;
+  readonly reconcile: (
+    candidate: Awaited<ReturnType<typeof listAllLiveReconciliationCandidates>>[number],
+    signal?: AbortSignal,
+  ) => ReturnType<typeof reconcileScheduledLiveMutation>;
+  readonly defer?: typeof deferLiveReconciliation;
+  readonly timeoutMs?: number;
+  readonly concurrency?: number;
+}
+
+const productionLiveRecoveryDeps: ScheduledLiveRecoveryDeps = {
+  listCandidates: listAllLiveReconciliationCandidates,
+  reconcile: (candidate, signal) =>
+    reconcileScheduledLiveMutation(candidate, undefined, { signal }),
+  defer: deferLiveReconciliation,
+};
+
+export async function reconcileScheduledLiveMutations(
+  deps: ScheduledLiveRecoveryDeps = productionLiveRecoveryDeps,
+): Promise<void> {
+  const candidates = await deps.listCandidates();
+  const timeoutMs = deps.timeoutMs ?? LIVE_RECOVERY_TIMEOUT_MS;
+  const concurrency = deps.concurrency ?? LIVE_RECOVERY_CONCURRENCY;
+  if (
+    !Number.isSafeInteger(timeoutMs)
+    || timeoutMs < 1
+    || !Number.isSafeInteger(concurrency)
+    || concurrency < 1
+  ) throw new Error('Invalid live recovery scheduler configuration.');
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < candidates.length) {
+      const candidate = candidates[next++]!;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        await deps.reconcile(candidate, controller.signal);
+      } catch {
+        try {
+          await deps.defer?.(candidate);
+        } catch {
+          // A stale exact binding needs no backoff; continue the bounded page.
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+  };
+  await Promise.allSettled(
+    Array.from(
+      { length: Math.min(concurrency, candidates.length) },
+      () => worker(),
+    ),
+  );
+}
+
+async function runBoundedSettled<T>(
+  items: readonly T[],
+  concurrency: number,
+  operation: (item: T) => Promise<unknown>,
+): Promise<void> {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+    throw new Error('Invalid scheduler concurrency.');
+  }
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const item = items[next++]!;
+      try {
+        await operation(item);
+      } catch {
+        // Isolation is deliberate; other companies/items must keep progressing.
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, items.length) },
+      () => worker(),
+    ),
+  );
 }
 
 const productionScheduler = createAgentScheduler({
@@ -271,6 +462,8 @@ const productionScheduler = createAgentScheduler({
   globalConcurrency: GLOBAL_CONCURRENCY,
   now: () => new Date(),
   listShadowCompanies: listScheduledShadowCompanies,
+  guardCompany: guardScheduledLiveCompany,
+  recoverLiveMutations: reconcileScheduledLiveMutations,
   discoverJobs: discoverShadowJobs,
   claimJobs: claimShadowJobs,
   runJob: async (job) => runScheduledShadowJob(job, processWorkerId, productionJobDeps),

@@ -17,19 +17,21 @@ const configuredProvider = {
 
 function createDeps(): AgentSettingsDeps & { rows: Map<string, AgentCompanyConfigRow> } {
   const rows = new Map<string, AgentCompanyConfigRow>();
-  return {
-    rows,
-    db: {
-      agentCompanyConfig: {
-        findUnique: async ({ where }) => rows.get(where.companyId) ?? null,
-        upsert: async ({ where, create, update }) => {
-          const row = rows.get(where.companyId);
-          const next = row ? { ...row, ...update } : create;
-          rows.set(where.companyId, next);
-          return next;
-        },
+  const db: AgentSettingsDeps['db'] = {
+    agentCompanyConfig: {
+      findUnique: async ({ where }) => rows.get(where.companyId) ?? null,
+      upsert: async ({ where, create, update }) => {
+        const row = rows.get(where.companyId);
+        const next = row ? { ...row, ...update } : create;
+        rows.set(where.companyId, next);
+        return next;
       },
     },
+  };
+  return {
+    rows,
+    db,
+    withSerializableTransaction: async (callback) => callback(db),
     getInstanceSettings: async () => configuredProvider,
   };
 }
@@ -66,6 +68,72 @@ describe('shadow agent company settings', () => {
     expect(unchanged.configVersion).toBe(initial.configVersion);
     expect(changed.configVersion).not.toBe(initial.configVersion);
     expect(deps.rows.get('company-1')).toMatchObject({ mode: 'shadow', evidenceThreshold: 51 });
+  });
+
+  it('pauses requested live mode and invalidates acceptance when configuration changes', async () => {
+    await updateShadowSettings('company-1', { mode: 'shadow' }, deps);
+    const previous = deps.rows.get('company-1')!;
+    deps.rows.set('company-1', {
+      ...previous,
+      liveRequested: true,
+      liveAcceptedPolicyVersion: 'recat-live-purchase-v1',
+      liveAcceptedConfigVersion: previous.configVersion,
+      liveAcceptedProviderBinding: 'accepted-provider-binding',
+      livePausedAt: null,
+      livePauseCode: null,
+      livePauseMessage: null,
+    });
+
+    await updateShadowSettings('company-1', { evidenceThreshold: 51 }, deps);
+
+    expect(deps.rows.get('company-1')).toMatchObject({
+      liveRequested: true,
+      liveAcceptedPolicyVersion: null,
+      liveAcceptedConfigVersion: null,
+      liveAcceptedProviderBinding: null,
+      livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+    });
+  });
+
+  it('performs the settings read and invalidating write in one authority transaction', async () => {
+    await updateShadowSettings('company-1', { mode: 'shadow' }, deps);
+    const previous = deps.rows.get('company-1')!;
+    deps.rows.set('company-1', {
+      ...previous,
+      liveRequested: true,
+      liveAcceptedPolicyVersion: 'recat-live-purchase-v1',
+      liveAcceptedConfigVersion: previous.configVersion,
+      liveAcceptedProviderBinding: 'accepted-provider-binding',
+    });
+    let transactionCalls = 0;
+    const transactionOnly: AgentSettingsDeps = {
+      ...deps,
+      db: {
+        agentCompanyConfig: {
+          findUnique: async () => {
+            throw new Error('settings read escaped authority transaction');
+          },
+          upsert: async () => {
+            throw new Error('settings write escaped authority transaction');
+          },
+        },
+      },
+      withSerializableTransaction: async (callback) => {
+        transactionCalls += 1;
+        return callback(deps.db);
+      },
+    };
+
+    await updateShadowSettings('company-1', { evidenceThreshold: 51 }, transactionOnly);
+
+    expect(transactionCalls).toBe(1);
+    expect(deps.rows.get('company-1')).toMatchObject({
+      liveRequested: true,
+      liveAcceptedPolicyVersion: null,
+      liveAcceptedConfigVersion: null,
+      liveAcceptedProviderBinding: null,
+      livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+    });
   });
 
   it('uses one instance settings snapshot for first-time defaults and provider availability', async () => {

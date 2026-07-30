@@ -11,7 +11,7 @@
 // Dependencies on other agents' modules (audit, qbo factory) are imported
 // lazily and injectable, so unit tests can exercise this file with fakes.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { PrismaClient, Prisma } from '@prisma/client';
 import type { AuditAction, SplitDto, StagedCategorization, TxnStatus } from '@recat/shared';
 import {
@@ -24,8 +24,10 @@ import {
 } from '../lib/qbo/types.js';
 import { calculatePurchaseTransaction } from '../lib/qbo/purchaseTax.js';
 import { verifyPurchaseResult } from './tax/verify.js';
+import { lockCompanyMutationScope } from './companyMutationScope.js';
 import {
   acquireEntityLease,
+  renewEntityLease,
   withEntityLease,
   type EntityLeaseDb,
   type EntityLeaseKey,
@@ -35,6 +37,15 @@ import type {
   VerifiedCategorizationOutcome,
   VerifiedCategorizationProposal,
 } from './agent/evaluation.js';
+import {
+  assertLiveCommitAuthority,
+  assertLiveRetryAuthority,
+  type AutopilotWritebackAuthorityInput,
+  type LiveMutationContext,
+  type LiveMutationProof,
+} from './agent/liveMutationAuthority.js';
+import { pauseLiveCompanyInTransaction } from './agent/circuitBreaker.js';
+import { isCanonicalLiveCheckpoint } from './agent/liveCheckpoint.js';
 
 export interface Actor {
   /** userId, or null for 'system' */
@@ -669,7 +680,8 @@ type AttemptStatus =
   | 'UNCERTAIN'
   | 'RETRYABLE'
   | 'UNCHANGED'
-  | 'DRY_RUN';
+  | 'DRY_RUN'
+  | 'FAILED';
 
 interface DurableAttempt {
   id: string;
@@ -740,6 +752,7 @@ interface DurableTaxRate {
 }
 
 export interface DurableWritebackDb {
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   transaction: {
     findUnique(args: {
       where: { id: string };
@@ -756,6 +769,18 @@ export interface DurableWritebackDb {
       where: { id: string };
       data: Record<string, unknown>;
     }): Promise<unknown>;
+    updateMany(args: {
+      where: {
+        id: string;
+        companyId: string;
+        qboType: string;
+        qboId: string;
+        qboSyncToken: string;
+        revision: number;
+        status: string;
+      };
+      data: Record<string, unknown>;
+    }): Promise<{ count: number }>;
   };
   qboMutationAttempt: {
     findUnique(args: {
@@ -827,8 +852,30 @@ export interface DurableWritebackDeps {
   renewLease: (key: EntityLeaseKey, owner: string) => Promise<void>;
   invocationId: () => string;
   now: () => Date;
+  reconciliationSignal?: AbortSignal;
+  authorizeReconciliationInTransaction?: (
+    tx: DurableWritebackDb,
+    actorId: string,
+    companyId: string,
+  ) => Promise<boolean>;
   onVerifiedCategorizationOutcome?: (
     outcome: VerifiedCategorizationOutcome,
+  ) => Promise<void>;
+  onReconciledMutation?: (
+    tx: DurableWritebackDb,
+    outcome: {
+      attempt: DurableAttempt;
+      transaction: DurableTransaction;
+      status: 'VERIFIED' | 'UNCHANGED';
+    },
+  ) => Promise<void>;
+  onUncertainMutation?: (
+    tx: DurableWritebackDb,
+    outcome: {
+      attempt: DurableAttempt;
+      transaction: DurableTransaction;
+      errorCode: 'QBO_WRITE_UNCERTAIN' | 'QBO_READBACK_MISMATCH';
+    },
   ) => Promise<void>;
 }
 
@@ -843,6 +890,19 @@ export interface CommitStagedCategorizationInput {
 export interface ReconcileMutationAttemptInput {
   requestId: string;
   actor: Actor;
+}
+
+export interface GuardedLiveReconciliationInput {
+  readonly companyId: string;
+  readonly transactionId: string;
+  readonly qboType: 'Purchase';
+  readonly qboId: string;
+  readonly requestId: string;
+  readonly operation: 'recategorize';
+  readonly expectedRevision: number;
+  readonly configVersion: string;
+  readonly requestHash: string;
+  readonly checkpointHash: string;
 }
 
 export interface UndoCategorizationInput {
@@ -882,6 +942,12 @@ export class WritebackLifecycleError extends Error {
 const ACTIVE_ATTEMPT_STATUSES = ['PREPARED', 'COMMITTING', 'UNCERTAIN'];
 const POSSIBLE_WRITE_GUIDANCE =
   'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.';
+const LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE =
+  'The guarded live mutation exhausted its retry budget.';
+const AUTOPILOT_ACTOR: Actor = Object.freeze({
+  id: null,
+  label: 'Recat autopilot',
+});
 
 async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
   const [{ prisma }, { qboFactory }, { writeAudit }, { env }] = await Promise.all([
@@ -913,7 +979,7 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
         db: prisma as unknown as EntityLeaseDb,
       }),
     renewLease: (key, owner) =>
-      acquireEntityLease(key, owner, {
+      renewEntityLease(key, owner, {
         db: prisma as unknown as EntityLeaseDb,
       }),
     invocationId: randomUUID,
@@ -1532,14 +1598,26 @@ function recordedAttemptResult(
       error: { code: 'RETRYABLE', message: 'The prepared write was not sent. Create a new request to retry.' },
     };
   }
+  if (attempt.status === 'FAILED') {
+    lifecycleError(
+      'LIVE_MUTATION_RETRY_EXHAUSTED',
+      LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+    );
+  }
   if (attempt.status === 'UNCERTAIN') {
+    const mismatch = attempt.errorCode === 'QBO_READBACK_MISMATCH';
     return {
       transactionId: attempt.transactionId,
       requestId: attempt.requestId,
       ok: false,
       status: 'ERROR',
       outcome: 'UNCERTAIN',
-      error: { code: 'QBO_WRITE_UNCERTAIN', message: POSSIBLE_WRITE_GUIDANCE },
+      error: {
+        code: mismatch ? 'QBO_READBACK_MISMATCH' : 'QBO_WRITE_UNCERTAIN',
+        message: mismatch
+          ? 'QuickBooks readback did not match the prepared intent or original snapshot.'
+          : POSSIBLE_WRITE_GUIDANCE,
+      },
     };
   }
   return {
@@ -1651,23 +1729,40 @@ async function findRequestOrConflict(
 async function markRetryable(
   d: DurableWritebackDeps,
   attempt: DurableAttempt,
+  companyId: string,
   error: unknown,
+  exhausted = false,
 ): Promise<
   | { won: true; attempt: DurableAttempt }
   | { won: false; attempt: DurableAttempt }
 > {
   const info = errorInfo(error);
   try {
-    const updated = await d.db.qboMutationAttempt.updateMany({
-      where: { id: attempt.id, status: 'PREPARED' },
-      data: {
-        status: 'RETRYABLE',
-        errorCode: info.code,
-        errorMessage: info.message.slice(0, 500),
-      },
+    const updated = await d.db.$transaction(async (tx) => {
+      await lockCompanyMutationScope(tx, companyId);
+      return tx.qboMutationAttempt.updateMany({
+        where: { id: attempt.id, status: 'PREPARED' },
+        data: {
+          status: exhausted ? 'FAILED' : 'RETRYABLE',
+          errorCode: exhausted ? 'LIVE_MUTATION_RETRY_EXHAUSTED' : info.code,
+          errorMessage: exhausted
+            ? LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE
+            : info.message.slice(0, 500),
+        },
+      });
     });
     if (updated.count === 1) {
-      return { won: true, attempt: { ...attempt, status: 'RETRYABLE' } };
+      return {
+        won: true,
+        attempt: {
+          ...attempt,
+          status: exhausted ? 'FAILED' : 'RETRYABLE',
+          errorCode: exhausted ? 'LIVE_MUTATION_RETRY_EXHAUSTED' : info.code,
+          errorMessage: exhausted
+            ? LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE
+            : info.message.slice(0, 500),
+        },
+      };
     }
   } catch {
     // PREPARED remains safely resumable if the best-effort transition fails.
@@ -1688,31 +1783,52 @@ async function markUncertain(
   txn: DurableTransaction,
   actor: Actor,
   prepared: QboPreparedWrite,
+  mismatch = false,
 ): Promise<DurableMutationResult> {
-  const safeUncertainResult = (): DurableMutationResult =>
-    recordedAttemptResult({ ...attempt, status: 'UNCERTAIN' }, 'ERROR');
   const attemptData = {
     status: 'UNCERTAIN',
-    errorCode: 'QBO_WRITE_UNCERTAIN',
-    errorMessage: POSSIBLE_WRITE_GUIDANCE,
+    errorCode: mismatch ? 'QBO_READBACK_MISMATCH' : 'QBO_WRITE_UNCERTAIN',
+    errorMessage: mismatch
+      ? 'QuickBooks readback did not match the prepared intent or original snapshot.'
+      : POSSIBLE_WRITE_GUIDANCE,
   };
   const transactionData = {
     status: 'ERROR',
-    errorCode: 'QBO_WRITE_UNCERTAIN',
-    errorMessage: POSSIBLE_WRITE_GUIDANCE,
+    errorCode: attemptData.errorCode,
+    errorMessage: attemptData.errorMessage,
   };
+  const safeUncertainResult = (): DurableMutationResult =>
+    recordedAttemptResult({ ...attempt, ...attemptData }, 'ERROR');
   let transitioned = false;
   try {
     await d.db.$transaction(async (tx) => {
+      await lockCompanyMutationScope(tx, txn.companyId);
+      await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+      await assertCurrentReconciliationState(tx, attempt, txn);
+      throwIfReconciliationAborted(d.reconciliationSignal);
       const guarded = await tx.qboMutationAttempt.updateMany({
-        where: { id: attempt.id, status: 'COMMITTING' },
+        where: {
+          id: attempt.id,
+          status: mismatch
+            ? { in: ['COMMITTING', 'UNCERTAIN'] }
+            : 'COMMITTING',
+        },
         data: attemptData,
       });
       if (guarded.count !== 1) return;
       transitioned = true;
-      await tx.transaction.update({
-        where: { id: txn.id },
-        data: transactionData,
+      await updateCurrentReconciliationTransaction(
+        tx,
+        attempt,
+        txn,
+        transactionData,
+      );
+      await d.onUncertainMutation?.(tx, {
+        attempt,
+        transaction: txn,
+        errorCode: attemptData.errorCode as
+          | 'QBO_WRITE_UNCERTAIN'
+          | 'QBO_READBACK_MISMATCH',
       });
       await writeMutationAudit(
         d,
@@ -1723,34 +1839,56 @@ async function markUncertain(
         mutationMetadata(prepared, 'UNCERTAIN'),
       );
     });
-  } catch {
+  } catch (error) {
+    rethrowReconciliationFence(error);
     // The exact prepared request is already durable as COMMITTING, so it is
-    // still a non-resend barrier. Make independent best-effort updates and
-    // always return the safe uncertain result even if the database is degraded.
+    // still a non-resend barrier. Retry the complete transition atomically and
+    // always return safe uncertainty even if the database remains degraded.
     transitioned = false;
     try {
-      const guarded = await d.db.qboMutationAttempt.updateMany({
-        where: { id: attempt.id, status: 'COMMITTING' },
-        data: attemptData,
+      const guarded = await d.db.$transaction(async (tx) => {
+        await lockCompanyMutationScope(tx, txn.companyId);
+        await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+        await assertCurrentReconciliationState(tx, attempt, txn);
+        throwIfReconciliationAborted(d.reconciliationSignal);
+        const updated = await tx.qboMutationAttempt.updateMany({
+          where: {
+            id: attempt.id,
+            status: mismatch
+              ? { in: ['COMMITTING', 'UNCERTAIN'] }
+              : 'COMMITTING',
+          },
+          data: attemptData,
+        });
+        if (updated.count !== 1) return updated;
+        await updateCurrentReconciliationTransaction(
+          tx,
+          attempt,
+          txn,
+          transactionData,
+        );
+        await d.onUncertainMutation?.(tx, {
+          attempt,
+          transaction: txn,
+          errorCode: attemptData.errorCode as
+            | 'QBO_WRITE_UNCERTAIN'
+            | 'QBO_READBACK_MISMATCH',
+        });
+        await writeMutationAudit(
+          d,
+          tx,
+          txn,
+          actor,
+          'error',
+          mutationMetadata(prepared, 'UNCERTAIN'),
+        );
+        return updated;
       });
       if (guarded.count === 1) {
         transitioned = true;
-        await Promise.allSettled([
-          d.db.transaction.update({
-            where: { id: txn.id },
-            data: transactionData,
-          }),
-          writeMutationAudit(
-            d,
-            d.db,
-            txn,
-            actor,
-            'error',
-            mutationMetadata(prepared, 'UNCERTAIN'),
-          ),
-        ]);
       }
-    } catch {
+    } catch (error) {
+      rethrowReconciliationFence(error);
       // The durable COMMITTING record remains a reconciliation-only barrier.
     }
   }
@@ -1793,6 +1931,10 @@ async function finalizeVerified(
 ): Promise<DurableMutationResult> {
   let transitioned = false;
   await d.db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, txn.companyId);
+    await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+    await assertCurrentReconciliationState(tx, attempt, txn);
+    throwIfReconciliationAborted(d.reconciliationSignal);
     const guarded = await tx.qboMutationAttempt.updateMany({
       where: { id: attempt.id, status: { in: ['COMMITTING', 'UNCERTAIN'] } },
       data: {
@@ -1809,9 +1951,11 @@ async function finalizeVerified(
     });
     if (guarded.count !== 1) return;
     transitioned = true;
-    await tx.transaction.update({
-      where: { id: txn.id },
-      data: {
+    await updateCurrentReconciliationTransaction(
+      tx,
+      attempt,
+      txn,
+      {
         status,
         qboSyncToken: newSyncToken,
         postedAt: status === 'POSTED' ? d.now() : txn.postedAt,
@@ -1819,6 +1963,11 @@ async function finalizeVerified(
         errorCode: null,
         errorMessage: null,
       },
+    );
+    await d.onReconciledMutation?.(tx, {
+      attempt,
+      transaction: txn,
+      status: 'VERIFIED',
     });
     await writeMutationAudit(
       d,
@@ -1852,8 +2001,119 @@ async function finalizeVerified(
   };
 }
 
+async function assertCurrentReconciliationState(
+  tx: DurableWritebackDb,
+  attempt: DurableAttempt,
+  expected: DurableTransaction,
+): Promise<void> {
+  const locked = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `SELECT "id"
+       FROM "Transaction"
+      WHERE "id" = $1
+      FOR UPDATE`,
+    expected.id,
+  );
+  if (locked.length !== 1) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+  const current = await tx.transaction.findUnique({
+    where: { id: expected.id },
+    include: {
+      company: true,
+      splitLines: {
+        orderBy: { idx: 'asc' },
+        include: { tags: true },
+      },
+      txnTags: true,
+    },
+  });
+  if (
+    current === null
+    || current.companyId !== expected.companyId
+    || current.qboType !== expected.qboType
+    || current.qboId !== expected.qboId
+    || current.qboSyncToken !== expected.qboSyncToken
+    || current.revision !== attempt.expectedRevision
+    || current.status !== expected.status
+  ) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+}
+
+async function updateCurrentReconciliationTransaction(
+  tx: DurableWritebackDb,
+  attempt: DurableAttempt,
+  expected: DurableTransaction,
+  data: Record<string, unknown>,
+): Promise<void> {
+  const updated = await tx.transaction.updateMany({
+    where: {
+      id: expected.id,
+      companyId: expected.companyId,
+      qboType: expected.qboType,
+      qboId: expected.qboId,
+      qboSyncToken: expected.qboSyncToken,
+      revision: attempt.expectedRevision,
+      status: expected.status,
+    },
+    data,
+  });
+  if (updated.count !== 1) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+}
+
+function throwIfReconciliationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error('QuickBooks reconciliation was cancelled.');
+  error.name = 'AbortError';
+  throw error;
+}
+
+function rethrowReconciliationFence(error: unknown): void {
+  if (
+    (error instanceof Error && error.name === 'AbortError')
+    || (
+      error instanceof WritebackLifecycleError
+      && (
+        error.code === 'LIVE_RECONCILIATION_BINDING_MISMATCH'
+        || error.code === 'FORBIDDEN'
+      )
+    )
+  ) throw error;
+}
+
+async function assertReconciliationAdminInTransaction(
+  d: DurableWritebackDeps,
+  tx: DurableWritebackDb,
+  actor: Actor,
+  companyId: string,
+): Promise<void> {
+  if (d.authorizeReconciliationInTransaction === undefined) return;
+  if (
+    actor.id === null
+    || !await d.authorizeReconciliationInTransaction(
+      tx,
+      actor.id,
+      companyId,
+    )
+  ) {
+    lifecycleError('FORBIDDEN', 'You do not have permission to reconcile this transaction.');
+  }
+}
+
 async function persistPrepared(
   d: DurableWritebackDeps,
+  companyId: string,
   transactionId: string,
   expectedRevision: number,
   prepared: QboPreparedWrite,
@@ -1861,30 +2121,33 @@ async function persistPrepared(
   staged?: StagedCategorization,
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
-    const attempt = await d.db.qboMutationAttempt.create({
-      data: {
-        transactionId,
-        requestId: prepared.requestId,
-        operation: prepared.operation,
-        status: 'PREPARED',
-        expectedRevision,
-        expectedSyncToken: prepared.body.SyncToken,
-        requestHash: prepared.requestHash,
-        requestPayload: staged === undefined
-          ? prepared
-          : {
-              ...prepared,
-              categorizationEvidence: {
-                version: 1,
-                proposal: evidenceProposal(staged),
+    const attempt = await d.db.$transaction(async (tx) => {
+      await lockCompanyMutationScope(tx, companyId);
+      return tx.qboMutationAttempt.create({
+        data: {
+          transactionId,
+          requestId: prepared.requestId,
+          operation: prepared.operation,
+          status: 'PREPARED',
+          expectedRevision,
+          expectedSyncToken: prepared.body.SyncToken,
+          requestHash: prepared.requestHash,
+          requestPayload: staged === undefined
+            ? prepared
+            : {
+                ...prepared,
+                categorizationEvidence: {
+                  version: 1,
+                  proposal: evidenceProposal(staged),
+                },
               },
-            },
-        beforeSnapshot,
-        responseSnapshot: null,
-        verification: null,
-        errorCode: null,
-        errorMessage: null,
-      },
+          beforeSnapshot,
+          responseSnapshot: null,
+          verification: null,
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
     });
     return { attempt, created: true };
   } catch (error) {
@@ -1996,10 +2259,16 @@ async function enterCommitting(
   owner: string,
   allowedStatuses: string[],
   finalQboProof?: () => Promise<void>,
+  liveAuthority?: {
+    readonly context: LiveMutationContext;
+    readonly proof: LiveMutationProof;
+    readonly input: AutopilotWritebackAuthorityInput;
+  },
 ): Promise<
   | { won: true; attempt: DurableAttempt }
   | { won: false; attempt: DurableAttempt }
 > {
+  const exhausted = (liveAuthority?.context.attemptCount ?? 0) >= 3;
   try {
     // Reacquisition may block behind a fenced staging transaction. Reload
     // every mutable authorization fact only after it returns so a stage that
@@ -2015,17 +2284,49 @@ async function enterCommitting(
     );
     if (finalQboProof) await finalQboProof();
   } catch (error) {
-    const retryable = await markRetryable(d, attempt, error);
+    const retryable = await markRetryable(
+      d,
+      attempt,
+      txn.companyId,
+      error,
+      exhausted,
+    );
+    if (retryable.attempt.status === 'FAILED') {
+      lifecycleError(
+        'LIVE_MUTATION_RETRY_EXHAUSTED',
+        LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+      );
+    }
     if (!retryable.won && retryable.attempt.status !== 'PREPARED') {
       return { won: false, attempt: retryable.attempt };
     }
     throw error;
   }
   try {
-    const guarded = await d.db.qboMutationAttempt.updateMany({
-      where: { id: attempt.id, status: 'PREPARED' },
-      data: { status: 'COMMITTING' },
-    });
+    const transition = async (tx: DurableWritebackDb): Promise<{ count: number }> => {
+      await lockCompanyMutationScope(tx, txn.companyId);
+      if (liveAuthority !== undefined) {
+        await assertLiveCommitAuthority(
+          tx as unknown as Prisma.TransactionClient,
+          liveAuthority.context,
+          liveAuthority.proof,
+          liveAuthority.input,
+        );
+        await loadAuthorizedStage(
+          txn.id,
+          txn.companyId,
+          attempt.expectedRevision,
+          actor.id,
+          { ...d, db: tx },
+          allowedStatuses,
+        );
+      }
+      return tx.qboMutationAttempt.updateMany({
+        where: { id: attempt.id, status: 'PREPARED' },
+        data: { status: 'COMMITTING' },
+      });
+    };
+    const guarded = await d.db.$transaction(transition);
     if (guarded.count === 1) {
       return { won: true, attempt: { ...attempt, status: 'COMMITTING' } };
     }
@@ -2034,7 +2335,29 @@ async function enterCommitting(
     });
     if (!latest) lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared before committing.');
     return { won: false, attempt: latest };
-  } catch {
+  } catch (error) {
+    if (
+      liveAuthority !== undefined
+      && typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'LIVE_AUTHORITY_DENIED'
+    ) {
+      const retryable = await markRetryable(
+        d,
+        attempt,
+        txn.companyId,
+        error,
+        exhausted,
+      );
+      if (retryable.attempt.status === 'FAILED') {
+        lifecycleError(
+          'LIVE_MUTATION_RETRY_EXHAUSTED',
+          LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+        );
+      }
+      throw error;
+    }
     const persistenceError = new WritebackLifecycleError(
       'PREWRITE_PERSISTENCE_FAILED',
       'The prepared write was not sent because its committing state could not be stored.',
@@ -2042,8 +2365,16 @@ async function enterCommitting(
     const retryable = await markRetryable(
       d,
       attempt,
+      txn.companyId,
       persistenceError,
+      exhausted,
     );
+    if (retryable.attempt.status === 'FAILED') {
+      lifecycleError(
+        'LIVE_MUTATION_RETRY_EXHAUSTED',
+        LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+      );
+    }
     if (!retryable.won && retryable.attempt.status !== 'PREPARED') {
       return { won: false, attempt: retryable.attempt };
     }
@@ -2110,6 +2441,7 @@ async function recordDryRun(
     },
   };
   await d.db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, txn.companyId);
     await tx.qboMutationAttempt.create({
       data: {
         transactionId: txn.id,
@@ -2152,7 +2484,80 @@ export async function commitStagedCategorization(
   input: CommitStagedCategorizationInput,
   deps?: DurableWritebackDeps,
 ): Promise<DurableMutationResult> {
-  const d = deps ?? (await defaultDurableDeps());
+  return commitStagedCategorizationInternal(input, deps);
+}
+
+/**
+ * The only null-actor write entry point. It accepts no caller-supplied
+ * authorization function: exact authority is hard-wired to persisted
+ * job/config/lease/reference state and fenced with PREPARED→COMMITTING.
+ */
+export async function commitGuardedLiveCategorization(
+  input: Omit<CommitStagedCategorizationInput, 'actor'>,
+  context: LiveMutationContext,
+  proof: LiveMutationProof,
+): Promise<DurableMutationResult> {
+  return commitStagedCategorizationInternal(
+    { ...input, actor: AUTOPILOT_ACTOR },
+    await defaultDurableDeps(),
+    { context, proof },
+  );
+}
+
+async function commitStagedCategorizationInternal(
+  input: CommitStagedCategorizationInput,
+  deps?: DurableWritebackDeps,
+  autopilot?: {
+    readonly context: LiveMutationContext;
+    readonly proof: LiveMutationProof;
+  },
+): Promise<DurableMutationResult> {
+  const base = deps ?? (await defaultDurableDeps());
+  let d = base;
+  const authorityInput: AutopilotWritebackAuthorityInput | undefined = autopilot === undefined
+    ? undefined
+    : {
+        companyId: input.companyId,
+        transactionId: input.transactionId,
+        expectedRevision: input.expectedRevision,
+        requestId: input.requestId,
+        owner: autopilot.context.owner,
+      };
+  if (autopilot !== undefined) {
+    if (
+      typeof autopilot.context.owner !== 'string'
+      || autopilot.context.owner.trim() === ''
+      || input.actor !== AUTOPILOT_ACTOR
+    ) {
+      lifecycleError('LIVE_AUTHORITY_DENIED', 'Guarded live authority is unavailable.');
+    }
+    d = {
+      ...base,
+      invocationId: () => autopilot.context.owner,
+      authorize: async (actorId, companyId) => {
+        if (
+          actorId !== null
+          || companyId !== input.companyId
+        ) {
+          lifecycleError('LIVE_AUTHORITY_DENIED', 'Guarded live authority is unavailable.');
+        }
+        return true;
+      },
+      onUncertainMutation: async (tx, outcome) => {
+        await pauseLiveCompanyInTransaction(
+          tx as unknown as Prisma.TransactionClient,
+          outcome.transaction.companyId,
+          outcome.errorCode === 'QBO_READBACK_MISMATCH'
+            ? 'READBACK_MISMATCH'
+            : 'UNCERTAIN_MUTATION',
+          outcome.errorCode === 'QBO_READBACK_MISMATCH'
+            ? 'Live mode is paused: A live mutation readback did not match durable intent.'
+            : 'Live mode is paused: A live mutation requires reconciliation.',
+          base.now(),
+        );
+      },
+    };
+  }
   const invocationOwner = d.invocationId();
   const preliminary = await preliminaryTransaction(d, input.transactionId);
   if (preliminary.companyId !== input.companyId) {
@@ -2164,7 +2569,53 @@ export async function commitStagedCategorization(
       operation: 'recategorize',
       expectedRevision: input.expectedRevision,
     };
-    const existing = await findRequestOrConflict(d, input.requestId, intent);
+    let existing = await findRequestOrConflict(d, input.requestId, intent);
+    if (
+      existing?.status === 'RETRYABLE'
+      && autopilot !== undefined
+      && authorityInput !== undefined
+    ) {
+      if (autopilot.context.attemptCount >= 3) {
+        await d.db.$transaction(async (tx) => {
+          await lockCompanyMutationScope(tx, input.companyId);
+          const exhausted = await tx.qboMutationAttempt.updateMany({
+            where: { id: existing!.id, status: 'RETRYABLE' },
+            data: {
+              status: 'FAILED',
+              errorCode: 'LIVE_MUTATION_RETRY_EXHAUSTED',
+              errorMessage: LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+            },
+          });
+          if (exhausted.count !== 1) {
+            lifecycleError('LIVE_AUTHORITY_DENIED', 'Guarded live retry authority was lost.');
+          }
+        });
+        lifecycleError(
+          'LIVE_MUTATION_RETRY_EXHAUSTED',
+          LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+        );
+      }
+      existing = await d.db.$transaction(async (tx) => {
+        await assertLiveRetryAuthority(
+          tx as unknown as Prisma.TransactionClient,
+          autopilot.context,
+          autopilot.proof,
+          authorityInput,
+        );
+        const rearmed = await tx.qboMutationAttempt.updateMany({
+          where: { id: existing!.id, status: 'RETRYABLE' },
+          data: {
+            status: 'PREPARED',
+            errorCode: null,
+            errorMessage: null,
+          },
+        });
+        if (rearmed.count !== 1) {
+          lifecycleError('LIVE_AUTHORITY_DENIED', 'Guarded live retry authority was lost.');
+        }
+        return { ...existing!, status: 'PREPARED', errorCode: null, errorMessage: null };
+      });
+    }
     if (existing) {
       if (existing.status !== 'PREPARED') {
         const txn = await loadAuthorizedRecordedAttempt(
@@ -2175,16 +2626,34 @@ export async function commitStagedCategorization(
         );
         return recordedAttemptResultWithOutcome(d, existing, txn);
       }
-      const { txn } = await loadAuthorizedAttempt(
-        d,
-        existing,
-        input.companyId,
-        input.actor.id,
-      );
-
+      let txn: DurableTransaction;
+      let client: QboClient;
+      try {
+        ({ txn } = await loadAuthorizedAttempt(
+          d,
+          existing,
+          input.companyId,
+          input.actor.id,
+        ));
+        client = await d.getClient(input.companyId);
+      } catch (error) {
+        const retryable = await markRetryable(
+          d,
+          existing,
+          input.companyId,
+          error,
+          (autopilot?.context.attemptCount ?? 0) >= 3,
+        );
+        if (retryable.attempt.status === 'FAILED') {
+          lifecycleError(
+            'LIVE_MUTATION_RETRY_EXHAUSTED',
+            LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE,
+          );
+        }
+        throw error;
+      }
       const prepared = preparedForAttempt(existing);
       const before = persistedSnapshot(existing.beforeSnapshot);
-      const client = await d.getClient(input.companyId);
       const entered = await enterCommitting(
         d,
         existing,
@@ -2208,6 +2677,13 @@ export async function commitStagedCategorization(
             lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared write could resume.');
           }
         },
+        autopilot === undefined
+          ? undefined
+          : {
+              context: autopilot.context,
+              proof: autopilot.proof,
+              input: authorityInput!,
+            },
       );
       if (!entered.won) {
         const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -2265,6 +2741,7 @@ export async function commitStagedCategorization(
     );
     const persisted = await persistPrepared(
       d,
+      txn.companyId,
       txn.id,
       input.expectedRevision,
       prepared,
@@ -2287,6 +2764,43 @@ export async function commitStagedCategorization(
       input.actor,
       invocationOwner,
       ['PENDING'],
+      autopilot === undefined
+        ? undefined
+        : async () => {
+            const [finalTxn, finalSnapshot] = await Promise.all([
+              client.fetchTxn('Purchase', txn.qboId),
+              client.fetchPurchaseSnapshot(txn.qboId),
+            ]);
+            if (
+              !finalTxn
+              || !finalSnapshot
+              || finalTxn.syncToken !== persisted.attempt.expectedSyncToken
+              || finalSnapshot.syncToken !== persisted.attempt.expectedSyncToken
+              || txn.qboSyncToken !== persisted.attempt.expectedSyncToken
+              || !snapshotEquals(finalSnapshot, before)
+            ) {
+              lifecycleError(
+                'QBO_STATE_DRIFT',
+                'Purchase changed immediately before the guarded live write.',
+              );
+            }
+            await d.renewLease(leaseKey(txn), invocationOwner);
+            await loadAuthorizedStage(
+              txn.id,
+              txn.companyId,
+              persisted.attempt.expectedRevision,
+              input.actor.id,
+              d,
+              ['PENDING'],
+            );
+          },
+      autopilot === undefined
+        ? undefined
+        : {
+            context: autopilot.context,
+            proof: autopilot.proof,
+            input: authorityInput!,
+          },
     );
     if (!entered.won) {
       const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -2334,6 +2848,10 @@ async function finalizeUnchanged(
   const unchangedStatus = prepared.operation === 'restore' ? 'POSTED' : 'PENDING';
   let transitioned = false;
   await d.db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, txn.companyId);
+    await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+    await assertCurrentReconciliationState(tx, attempt, txn);
+    throwIfReconciliationAborted(d.reconciliationSignal);
     const guarded = await tx.qboMutationAttempt.updateMany({
       where: { id: attempt.id, status: { in: ['COMMITTING', 'UNCERTAIN'] } },
       data: {
@@ -2346,13 +2864,20 @@ async function finalizeUnchanged(
     });
     if (guarded.count !== 1) return;
     transitioned = true;
-    await tx.transaction.update({
-      where: { id: txn.id },
-      data: {
+    await updateCurrentReconciliationTransaction(
+      tx,
+      attempt,
+      txn,
+      {
         status: unchangedStatus,
         errorCode: null,
         errorMessage: null,
       },
+    );
+    await d.onReconciledMutation?.(tx, {
+      attempt,
+      transaction: txn,
+      status: 'UNCHANGED',
     });
     await writeMutationAudit(
       d,
@@ -2384,6 +2909,90 @@ export async function reconcileMutationAttempt(
   deps?: DurableWritebackDeps,
 ): Promise<DurableMutationResult> {
   const d = deps ?? (await defaultDurableDeps());
+  return reconcileMutationAttemptInternal(input, d);
+}
+
+/**
+ * The only null-actor reconciliation path. It delegates the one fresh QBO read
+ * to the canonical durable reconciler and atomically updates the owning live
+ * run/job only after the exact persisted checkpoint remains bound.
+ */
+export async function reconcileGuardedLiveCategorization(
+  input: GuardedLiveReconciliationInput,
+  options: {
+    readonly signal?: AbortSignal;
+    readonly actor?: Actor;
+    readonly authorizeInTransaction?: (
+      db: Pick<DurableWritebackDb, '$queryRawUnsafe'>,
+    ) => Promise<boolean>;
+  } = {},
+): Promise<DurableMutationResult> {
+  const base = await defaultDurableDeps();
+  const actor = options.actor ?? AUTOPILOT_ACTOR;
+  const d: DurableWritebackDeps = {
+    ...base,
+    reconciliationSignal: options.signal,
+    authorizeReconciliationInTransaction:
+      options.authorizeInTransaction === undefined || actor.id === null
+        ? undefined
+        : async (tx, actorId, companyId) =>
+            actorId === actor.id
+            && companyId === input.companyId
+            && await options.authorizeInTransaction!(tx),
+    authorize: async (actorId, companyId) =>
+      companyId === input.companyId
+      && (
+        actorId === null
+          ? actor === AUTOPILOT_ACTOR
+          : actorId === actor.id
+            && authorizeLiveReconciliationAdmin(actorId, companyId)
+      ),
+    onUncertainMutation: async (tx, outcome) => {
+      if (outcome.errorCode === 'QBO_READBACK_MISMATCH') {
+        await finalizeGuardedLiveMismatch(tx, input, outcome);
+      }
+      await pauseLiveCompanyInTransaction(
+        tx as unknown as Prisma.TransactionClient,
+        outcome.transaction.companyId,
+        outcome.errorCode === 'QBO_READBACK_MISMATCH'
+          ? 'READBACK_MISMATCH'
+          : 'UNCERTAIN_MUTATION',
+        outcome.errorCode === 'QBO_READBACK_MISMATCH'
+          ? 'Live mode is paused: A live mutation readback did not match durable intent.'
+          : 'Live mode is paused: A live mutation requires reconciliation.',
+        base.now(),
+      );
+    },
+    onReconciledMutation: (tx, outcome) =>
+      finalizeGuardedLiveReconciliation(tx, input, outcome),
+  };
+  return reconcileMutationAttemptInternal(
+    { requestId: input.requestId, actor },
+    d,
+  );
+}
+
+async function authorizeLiveReconciliationAdmin(
+  actorId: string,
+  companyId: string,
+): Promise<boolean> {
+  const { prisma } = await import('../lib/prisma.js');
+  const user = await prisma.user.findUnique({
+    where: { id: actorId },
+    select: { isInstanceAdmin: true },
+  });
+  if (user?.isInstanceAdmin === true) return true;
+  const membership = await prisma.membership.findUnique({
+    where: { userId_companyId: { userId: actorId, companyId } },
+    select: { role: true },
+  });
+  return membership?.role === 'admin';
+}
+
+async function reconcileMutationAttemptInternal(
+  input: ReconcileMutationAttemptInput,
+  d: DurableWritebackDeps,
+): Promise<DurableMutationResult> {
   const invocationOwner = d.invocationId();
   const preliminaryAttempt = await d.db.qboMutationAttempt.findUnique({
     where: { requestId: input.requestId },
@@ -2428,9 +3037,13 @@ export async function reconcileMutationAttempt(
     const before = persistedSnapshot(attempt.beforeSnapshot);
     await d.renewLease(leaseKey(txn), invocationOwner);
     const client = await d.getClient(txn.companyId);
-    const actual = await client.fetchPurchaseSnapshot(txn.qboId);
+    const actual = await client.fetchPurchaseSnapshot(
+      txn.qboId,
+      d.reconciliationSignal,
+    );
+    throwIfReconciliationAborted(d.reconciliationSignal);
     if (!actual) {
-      return markUncertain(d, attempt, txn, input.actor, prepared);
+      return markUncertain(d, attempt, txn, input.actor, prepared, true);
     }
 
     const expectedVerification = verifyPurchaseResult(prepared.expected, actual);
@@ -2449,8 +3062,318 @@ export async function reconcileMutationAttempt(
     if (snapshotEquals(actual, before)) {
       return finalizeUnchanged(d, attempt, txn, input.actor, prepared, actual);
     }
-    return markUncertain(d, attempt, txn, input.actor, prepared);
+    return markUncertain(d, attempt, txn, input.actor, prepared, true);
   });
+}
+
+async function finalizeGuardedLiveReconciliation(
+  tx: DurableWritebackDb,
+  input: GuardedLiveReconciliationInput,
+  outcome: {
+    attempt: DurableAttempt;
+    transaction: DurableTransaction;
+    status: 'VERIFIED' | 'UNCHANGED';
+  },
+): Promise<void> {
+  if (
+    outcome.attempt.requestId !== input.requestId
+    || outcome.attempt.transactionId !== input.transactionId
+    || outcome.attempt.operation !== input.operation
+    || outcome.attempt.expectedRevision !== input.expectedRevision
+    || outcome.attempt.requestHash !== input.requestHash
+    || outcome.transaction.companyId !== input.companyId
+    || outcome.transaction.qboType !== input.qboType
+    || outcome.transaction.qboId !== input.qboId
+  ) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+  const rows = await tx.$queryRawUnsafe<{
+    runId: string;
+    checkpoint: unknown;
+    snapshotRevision: number;
+    decisionModel: string;
+    verifierModel: string;
+  }[]>(
+    `SELECT run."id" AS "runId",
+            run."verification" -> 'liveCheckpoint' AS checkpoint,
+            job."revision" AS "snapshotRevision",
+            run."decisionModel",
+            run."verifierModel"
+       FROM "AgentJob" job
+       JOIN "QboMutationAttempt" attempt
+         ON attempt."requestId" = job."id"
+        AND attempt."transactionId" = job."transactionId"
+       JOIN "AgentRun" run
+         ON run."jobId" = job."id"
+        AND run."companyId" = job."companyId"
+        AND run."transactionId" = job."transactionId"
+        AND run."revision" = job."revision"
+        AND run."configVersion" = job."configVersion"
+        AND run."status" = 'uncertain'
+        AND run."errorCode" IN (
+          'LIVE_RECONCILIATION_REQUIRED',
+          'QBO_READBACK_MISMATCH'
+        )
+        AND run."verification" ? 'liveCheckpoint'
+      WHERE job."id" = $1
+        AND job."companyId" = $2
+        AND job."transactionId" = $3
+        AND job."configVersion" = $4
+        AND job."revision" + 1 = $5
+        AND job."status" = 'terminal'
+        AND attempt."operation" = 'recategorize'
+        AND attempt."expectedRevision" = $5
+        AND attempt."requestHash" = $6
+        AND attempt."status" IN ('VERIFIED', 'UNCHANGED')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM "QboMutationAttempt" newer
+           WHERE newer."transactionId" = attempt."transactionId"
+             AND newer."id" <> attempt."id"
+             AND (
+               newer."expectedRevision" > attempt."expectedRevision"
+               OR (
+                 newer."expectedRevision" = attempt."expectedRevision"
+                 AND (
+                   newer."createdAt" > attempt."createdAt"
+                   OR (
+                     newer."createdAt" = attempt."createdAt"
+                     AND newer."id" > attempt."id"
+                   )
+                 )
+               )
+             )
+        )
+      ORDER BY run."attemptCount" DESC
+      LIMIT 1
+      FOR UPDATE OF job, run, attempt`,
+    input.requestId,
+    input.companyId,
+    input.transactionId,
+    input.configVersion,
+    input.expectedRevision,
+    input.requestHash,
+  );
+  const row = rows[0];
+  if (
+    row === undefined
+    || !isCanonicalLiveCheckpoint(row.checkpoint, row)
+    || createHash('sha256')
+      .update(canonicalJson(row.checkpoint), 'utf8')
+      .digest('hex') !== input.checkpointHash
+  ) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+  const runStatus = outcome.status === 'VERIFIED' ? 'posted_verified' : 'unchanged';
+  const liveOutcome = outcome.status === 'VERIFIED'
+    ? 'reconciled_posted'
+    : 'reconciled_unchanged';
+  const run = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `UPDATE "AgentRun"
+        SET "status" = $1,
+            "verification" = "verification" || jsonb_build_object(
+              'liveOutcome', $2::text,
+              'mutation', jsonb_build_object(
+                'requestId', $3::text,
+                'outcome', $4::text,
+                'status', $5::text,
+                'errorCode', NULL
+              )
+            ),
+            "errorCode" = NULL
+      WHERE "id" = $6
+        AND "status" = 'uncertain'
+        AND "errorCode" IN (
+          'LIVE_RECONCILIATION_REQUIRED',
+          'QBO_READBACK_MISMATCH'
+        )
+      RETURNING "id"`,
+    runStatus,
+    liveOutcome,
+    input.requestId,
+    outcome.status,
+    outcome.status === 'VERIFIED' ? 'POSTED' : 'PENDING',
+    row.runId,
+  );
+  const job = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `UPDATE "AgentJob"
+        SET "status" = 'completed',
+            "lastErrorCode" = NULL,
+            "updatedAt" = clock_timestamp()
+      WHERE "id" = $1
+        AND "companyId" = $2
+        AND "transactionId" = $3
+        AND "configVersion" = $4
+        AND "status" = 'terminal'
+      RETURNING "id"`,
+    input.requestId,
+    input.companyId,
+    input.transactionId,
+    input.configVersion,
+  );
+  if (run.length !== 1 || job.length !== 1) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+}
+
+async function finalizeGuardedLiveMismatch(
+  tx: DurableWritebackDb,
+  input: GuardedLiveReconciliationInput,
+  outcome: {
+    attempt: DurableAttempt;
+    transaction: DurableTransaction;
+    errorCode: 'QBO_WRITE_UNCERTAIN' | 'QBO_READBACK_MISMATCH';
+  },
+): Promise<void> {
+  if (
+    outcome.errorCode !== 'QBO_READBACK_MISMATCH'
+    || outcome.attempt.requestId !== input.requestId
+    || outcome.attempt.transactionId !== input.transactionId
+    || outcome.attempt.operation !== input.operation
+    || outcome.attempt.expectedRevision !== input.expectedRevision
+    || outcome.attempt.requestHash !== input.requestHash
+    || outcome.transaction.companyId !== input.companyId
+    || outcome.transaction.qboType !== input.qboType
+    || outcome.transaction.qboId !== input.qboId
+  ) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+  const rows = await tx.$queryRawUnsafe<{
+    runId: string;
+    checkpoint: unknown;
+    snapshotRevision: number;
+    decisionModel: string;
+    verifierModel: string;
+  }[]>(
+    `SELECT run."id" AS "runId",
+            run."verification" -> 'liveCheckpoint' AS checkpoint,
+            job."revision" AS "snapshotRevision",
+            run."decisionModel",
+            run."verifierModel"
+       FROM "AgentJob" job
+       JOIN "QboMutationAttempt" attempt
+         ON attempt."requestId" = job."id"
+        AND attempt."transactionId" = job."transactionId"
+       JOIN "AgentRun" run
+         ON run."jobId" = job."id"
+        AND run."companyId" = job."companyId"
+        AND run."transactionId" = job."transactionId"
+        AND run."revision" = job."revision"
+        AND run."configVersion" = job."configVersion"
+        AND run."status" = 'uncertain'
+        AND run."errorCode" IN (
+          'LIVE_RECONCILIATION_REQUIRED',
+          'QBO_READBACK_MISMATCH'
+        )
+        AND run."verification" ? 'liveCheckpoint'
+      WHERE job."id" = $1
+        AND job."companyId" = $2
+        AND job."transactionId" = $3
+        AND job."configVersion" = $4
+        AND job."revision" + 1 = $5
+        AND job."status" = 'terminal'
+        AND attempt."operation" = 'recategorize'
+        AND attempt."expectedRevision" = $5
+        AND attempt."requestHash" = $6
+        AND attempt."status" = 'UNCERTAIN'
+        AND attempt."errorCode" = 'QBO_READBACK_MISMATCH'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM "QboMutationAttempt" newer
+           WHERE newer."transactionId" = attempt."transactionId"
+             AND newer."id" <> attempt."id"
+             AND (
+               newer."expectedRevision" > attempt."expectedRevision"
+               OR (
+                 newer."expectedRevision" = attempt."expectedRevision"
+                 AND (
+                   newer."createdAt" > attempt."createdAt"
+                   OR (
+                     newer."createdAt" = attempt."createdAt"
+                     AND newer."id" > attempt."id"
+                   )
+                 )
+               )
+             )
+        )
+      ORDER BY run."attemptCount" DESC
+      LIMIT 1
+      FOR UPDATE OF job, run, attempt`,
+    input.requestId,
+    input.companyId,
+    input.transactionId,
+    input.configVersion,
+    input.expectedRevision,
+    input.requestHash,
+  );
+  const row = rows[0];
+  if (
+    row === undefined
+    || !isCanonicalLiveCheckpoint(row.checkpoint, row)
+    || createHash('sha256')
+      .update(canonicalJson(row.checkpoint), 'utf8')
+      .digest('hex') !== input.checkpointHash
+  ) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
+  const run = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `UPDATE "AgentRun"
+        SET "verification" = "verification" || jsonb_build_object(
+              'liveOutcome', 'readback_mismatch',
+              'mutation', jsonb_build_object(
+                'requestId', $1::text,
+                'outcome', 'UNCERTAIN',
+                'status', 'ERROR',
+                'errorCode', 'QBO_READBACK_MISMATCH'
+              )
+            ),
+            "errorCode" = 'QBO_READBACK_MISMATCH'
+      WHERE "id" = $2
+        AND "status" = 'uncertain'
+        AND "errorCode" IN (
+          'LIVE_RECONCILIATION_REQUIRED',
+          'QBO_READBACK_MISMATCH'
+        )
+      RETURNING "id"`,
+    input.requestId,
+    row.runId,
+  );
+  const job = await tx.$queryRawUnsafe<{ id: string }[]>(
+    `UPDATE "AgentJob"
+        SET "lastErrorCode" = 'QBO_READBACK_MISMATCH',
+            "updatedAt" = clock_timestamp()
+      WHERE "id" = $1
+        AND "companyId" = $2
+        AND "transactionId" = $3
+        AND "configVersion" = $4
+        AND "status" = 'terminal'
+      RETURNING "id"`,
+    input.requestId,
+    input.companyId,
+    input.transactionId,
+    input.configVersion,
+  );
+  if (run.length !== 1 || job.length !== 1) {
+    lifecycleError(
+      'LIVE_RECONCILIATION_BINDING_MISMATCH',
+      'Live reconciliation binding is unavailable.',
+    );
+  }
 }
 
 export async function undoCategorization(
@@ -2585,6 +3508,7 @@ export async function undoCategorization(
     );
     const persisted = await persistPrepared(
       d,
+      txn.companyId,
       txn.id,
       original.expectedRevision,
       restore,
