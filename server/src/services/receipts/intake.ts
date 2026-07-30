@@ -16,6 +16,7 @@ import { prisma } from '../../lib/prisma.js';
 import { runSerializableTransaction } from '../../lib/serializableTransaction.js';
 import type { AttachmentActor } from '../attachments/operations.js';
 import { ReceiptError } from './types.js';
+import { DEFAULT_RECEIPT_CONFIG_VERSION } from './settings.js';
 
 const RECEIPT_CONTENT_TYPES = new Set([
   'application/pdf',
@@ -31,16 +32,6 @@ const RECEIPT_SOURCE_KINDS = new Set<ReceiptSourceKind>([
 ]);
 const MAX_FILES = 20;
 const MAX_IDEMPOTENCY_KEY_BYTES = 128;
-const DEFAULT_CONFIG_VERSION = createHash('sha256')
-  .update(JSON.stringify({
-    provider: 'openrouter',
-    model: 'openai/gpt-4o-mini',
-    confidenceThreshold: 0.8,
-    autoMatchThreshold: 85,
-    autoMatchMargin: 15,
-    maxPages: 20,
-  }), 'utf8')
-  .digest('hex');
 
 const receiptInclude = {
   attempts: {
@@ -341,7 +332,7 @@ async function configVersion(
     where: { companyId },
     select: { configVersion: true },
   });
-  return config?.configVersion ?? DEFAULT_CONFIG_VERSION;
+  return config?.configVersion ?? DEFAULT_RECEIPT_CONFIG_VERSION;
 }
 
 function receiptIds(value: Prisma.JsonValue): string[] {

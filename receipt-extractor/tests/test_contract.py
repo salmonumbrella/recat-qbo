@@ -19,6 +19,23 @@ def test_request_is_strict_and_bounded() -> None:
         ExtractionRequest.model_validate({**valid_request(), "extra": True})
 
 
+@pytest.mark.parametrize(
+    "provider_headers",
+    [
+        {"Bad Header": "value"},
+        {"X-Title": "value\r\nInjected: true"},
+        {f"X-Header-{index}": "value" for index in range(21)},
+    ],
+)
+def test_provider_headers_are_strict_and_bounded(
+    provider_headers: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError):
+        ExtractionRequest.model_validate(
+            valid_request(provider_headers=provider_headers)
+        )
+
+
 @pytest.mark.parametrize("value", [float("nan"), "Infinity", Decimal("-Infinity")])
 def test_response_rejects_non_finite_money(value: object) -> None:
     with pytest.raises(ValidationError):

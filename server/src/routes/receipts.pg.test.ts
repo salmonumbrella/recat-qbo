@@ -272,6 +272,57 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
     expect(restored.body.revision).toBe(2);
   });
 
+  it('reprocesses once per idempotency key and generation-fences old work', async () => {
+    const app = application();
+    const firstCompany = await company();
+    const categorizer = await signedIn(firstCompany.id, 'categorizer');
+    const staged = await upload(app, firstCompany.id, categorizer);
+    const created = await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts`)
+      .set('Cookie', categorizer)
+      .send({
+        idempotencyKey: 'reprocess-source',
+        files: [{ uploadId: staged.id }],
+        sourceKind: 'WEB_UPLOAD',
+      });
+    const receiptId = created.body.receipts[0].id as string;
+    const body = {
+      expectedRevision: 0,
+      idempotencyKey: 'reprocess-once',
+    };
+
+    const first = await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/${receiptId}/reprocess`)
+      .set('Cookie', categorizer)
+      .send(body);
+    expect(first.status).toBe(202);
+    expect(first.body).toMatchObject({
+      generation: 2,
+      revision: 1,
+      status: 'QUEUED',
+    });
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/${receiptId}/reprocess`)
+      .set('Cookie', categorizer)
+      .send(body)
+      .expect(202);
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/${receiptId}/reprocess`)
+      .set('Cookie', categorizer)
+      .send({ expectedRevision: 0, idempotencyKey: 'different-request' })
+      .expect(409);
+
+    const jobs = await db.receiptProcessingJob.findMany({
+      where: { documentId: receiptId },
+      orderBy: { generation: 'asc' },
+      select: { generation: true, status: true },
+    });
+    expect(jobs).toEqual([
+      { generation: 1, status: 'cancelled' },
+      { generation: 2, status: 'queued' },
+    ]);
+  });
+
   it('falls back to attached local content when the primary blob is unavailable', async () => {
     const app = application();
     const firstCompany = await company();

@@ -66,6 +66,13 @@ const schema = z.object({
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_REFERER: z.string().optional(),
   OPENROUTER_TITLE: z.string().optional(),
+  RECEIPT_EXTRACTOR_URL: z
+    .string()
+    .url()
+    .default('http://receipt-extractor:8485'),
+  RECEIPT_EXTRACTOR_TOKEN: z.string().min(32).optional().default(
+    'dev-only-receipt-extractor-token',
+  ),
   QBO_MOCK: z
     .string()
     .default('false')
@@ -140,6 +147,11 @@ if (isProd) {
   if (env.ENCRYPTION_KEY === DEV_ENCRYPTION_KEY) {
     throw new Error(
       'Refusing to start: ENCRYPTION_KEY is the dev default. Set a random 32-byte (64 hex chars) ENCRYPTION_KEY before running in production.',
+    );
+  }
+  if (env.RECEIPT_EXTRACTOR_TOKEN === 'dev-only-receipt-extractor-token') {
+    throw new Error(
+      'Refusing to start: RECEIPT_EXTRACTOR_TOKEN is the dev default. Set a random 32+ character token before running in production.',
     );
   }
 }

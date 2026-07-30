@@ -336,6 +336,8 @@ def completion_kwargs(
         "drop_params": True,
         "timeout": 110,
     }
+    if request.provider_headers:
+        result["extra_headers"] = request.provider_headers
     result.update(
         reasoning_effort_kwargs(request.model, request.reasoning_effort)
     )

@@ -18,6 +18,18 @@ def finite_decimal(value: Decimal) -> Decimal:
 BoundedText = Annotated[str, Field(max_length=10_000)]
 FiniteDecimal = Annotated[Decimal, AfterValidator(finite_decimal)]
 Money = FiniteDecimal | None
+HeaderName = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$",
+    ),
+]
+HeaderValue = Annotated[
+    str,
+    Field(max_length=2_000, pattern=r"^[^\r\n]*$"),
+]
 
 
 class StrictModel(BaseModel):
@@ -45,6 +57,10 @@ class ExtractionRequest(StrictModel):
     model: Annotated[str, Field(min_length=1, max_length=200)]
     api_base: Annotated[str, Field(min_length=1, max_length=2000)]
     api_key: Annotated[str, Field(min_length=1, max_length=4096)]
+    provider_headers: dict[HeaderName, HeaderValue] = Field(
+        default_factory=dict,
+        max_length=20,
+    )
     temperature: float = Field(ge=0, le=2)
     max_tokens: int = Field(ge=256, le=32768)
     parse_retries: int = Field(ge=0, le=5)
