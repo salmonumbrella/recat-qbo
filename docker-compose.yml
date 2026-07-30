@@ -48,5 +48,33 @@ services:
       retries: 10
     restart: unless-stopped
 
+  receipt-extractor:
+    build:
+      context: ./receipt-extractor
+    environment:
+      RECEIPT_EXTRACTOR_TOKEN: ${RECEIPT_EXTRACTOR_TOKEN:?set RECEIPT_EXTRACTOR_TOKEN in .env}
+    expose:
+      - "8485"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8485/healthz')
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
   recat-pgdata:

@@ -1,0 +1,22 @@
+[project]
+name = "recat-receipt-extractor"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0,<1",
+  "uvicorn[standard]>=0.34.0,<1",
+  "python-multipart>=0.0.18,<1",
+  "litellm>=1.93.0,<2",
+  "PyMuPDF>=1.25.0,<2",
+  "Pillow>=11.0.0,<12",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0,<9",
+  "httpx>=0.28.0,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,14 @@
+**/.venv/
+**/.env
+**/.env.*
+**/.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+**/*.log
+**/*.pdf
+**/*.jpg
+**/*.jpeg
+**/*.png
+**/*.gif
+**/*.tif
+**/*.tiff
