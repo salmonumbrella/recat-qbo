@@ -44,6 +44,7 @@ function validOutcome(
     inputRevision: 1,
     requestId: 'request-generic',
     operation,
+    candidateContext: null,
     proposal: operation === 'posted'
       ? {
           taxCalculation: 'TaxInclusive',

@@ -302,7 +302,9 @@ export type AuditAction =
   | 'reverted'
   | 'superseded'
   | 'transfer'
-  | 'auto-posted';
+  | 'auto-posted'
+  | 'rule-candidate-dismissed'
+  | 'rule-candidate-activated';
 
 export interface MembershipDto {
   companyId: string;
@@ -475,6 +477,56 @@ export interface RuleDto {
   tagIds: string[];
   autoPost: boolean;
   createdAt: string;
+  reviewRequiredAt: string | null;
+  reviewReason: string | null;
+  origin: {
+    candidateId: string;
+    evidenceCount: number;
+    schemaVersion: string;
+    configVersion: string;
+  } | null;
+}
+
+export type RuleCandidateState =
+  | 'ready'
+  | 'conflict'
+  | 'stale'
+  | 'dismissed'
+  | 'activated';
+
+export interface RuleCandidateEvidenceDto {
+  transactionId: string;
+  source: 'user' | 'autopilot' | 'mcp';
+  observedAt: string;
+}
+
+export interface RuleCandidateDto {
+  id: string;
+  companyId: string;
+  state: RuleCandidateState;
+  matchField: 'payee';
+  matchText: string;
+  category: string | null;
+  categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
+  tagIds: string[];
+  evidenceCount: number;
+  conflictingEvidenceCount: number;
+  evidenceThreshold: number;
+  schemaVersion: string;
+  configVersion: string;
+  staleReasons: string[];
+  canActivate: boolean;
+  activatedRuleId: string | null;
+  provenance: {
+    user: number;
+    autopilot: number;
+    mcp: number;
+  };
+  evidence: RuleCandidateEvidenceDto[];
+  updatedAt: string;
 }
 
 export interface SavedReportConfig {

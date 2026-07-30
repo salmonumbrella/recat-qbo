@@ -29,6 +29,14 @@ export interface VerifiedCategorizationOutcome {
   requestId: string;
   operation: 'posted' | 'reverted';
   proposal: VerifiedCategorizationProposal | null;
+  candidateContext: {
+    schemaVersion: 'rule-candidate-v1';
+    matchField: 'payee';
+    matchText: string;
+    conditionFingerprint: string;
+    configVersion: string;
+    source: 'user' | 'autopilot' | 'mcp';
+  } | null;
 }
 
 export interface EvaluationRunRow {

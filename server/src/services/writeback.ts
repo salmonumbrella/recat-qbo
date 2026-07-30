@@ -46,6 +46,11 @@ import {
 } from './agent/liveMutationAuthority.js';
 import { pauseLiveCompanyInTransaction } from './agent/circuitBreaker.js';
 import { isCanonicalLiveCheckpoint } from './agent/liveCheckpoint.js';
+import { candidateContextFor } from './agent/ruleCandidates.js';
+import {
+  persistedEvidenceProposal,
+  persistedRuleCandidateContext,
+} from './categorizationEvidence.js';
 
 export interface Actor {
   /** userId, or null for 'system' */
@@ -820,6 +825,12 @@ export interface DurableWritebackDb {
       data: Record<string, unknown>;
     }): Promise<{ count: number }>;
   };
+  agentCompanyConfig: {
+    findUnique(args: {
+      where: { companyId: string };
+      select: { configVersion: true };
+    }): Promise<{ configVersion: string } | null>;
+  };
   qboAccount: {
     findMany(args: {
       where: { companyId: string; qboId: { in: string[] }; active: true };
@@ -985,8 +996,21 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
     invocationId: randomUUID,
     now: () => new Date(),
     onVerifiedCategorizationOutcome: async (outcome) => {
-      const { evaluateShadowRunAgainstOutcome } = await import('./agent/evaluation.js');
-      await evaluateShadowRunAgainstOutcome(outcome);
+      const [
+        { evaluateShadowRunAgainstOutcome },
+        { recordVerifiedRuleCandidateOutcome },
+      ] = await Promise.all([
+        import('./agent/evaluation.js'),
+        import('./agent/ruleCandidatePersistence.js'),
+      ]);
+      const results = await Promise.allSettled([
+        evaluateShadowRunAgainstOutcome(outcome),
+        recordVerifiedRuleCandidateOutcome(outcome),
+      ]);
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failure !== undefined) throw failure.reason;
     },
   };
 }
@@ -1226,98 +1250,6 @@ function evidenceProposal(staged: StagedCategorization): VerifiedCategorizationP
     })),
     tagIds: [...staged.tagIds],
   };
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
-}
-
-const EVIDENCE_UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const EVIDENCE_QBO_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
-
-function isEvidenceTagIds(value: unknown): value is string[] {
-  return (
-    isStringArray(value)
-    && value.length <= 50
-    && new Set(value).size === value.length
-    && value.every((tagId) => EVIDENCE_UUID_PATTERN.test(tagId))
-  );
-}
-
-function isEvidenceQboReference(value: unknown): value is string {
-  return (
-    typeof value === 'string'
-    && value.length <= 120
-    && EVIDENCE_QBO_REFERENCE_PATTERN.test(value)
-  );
-}
-
-function isVerifiedCategorizationProposal(
-  value: unknown,
-): value is VerifiedCategorizationProposal {
-  if (!isRuntimeRecord(value)) return false;
-  if (
-    value.taxCalculation !== 'TaxInclusive'
-    && value.taxCalculation !== 'TaxExcluded'
-    && value.taxCalculation !== 'NotApplicable'
-  ) {
-    return false;
-  }
-  if (
-    !isEvidenceTagIds(value.tagIds)
-    || !Array.isArray(value.lines)
-    || value.lines.length === 0
-    || value.lines.length > 20
-  ) {
-    return false;
-  }
-  const indexes = new Set<number>();
-  return value.lines.every((line) => {
-    if (!isRuntimeRecord(line)) return false;
-    if (
-      !Number.isSafeInteger(line.idx)
-      || (line.idx as number) < 0
-      || indexes.has(line.idx as number)
-    ) {
-      return false;
-    }
-    indexes.add(line.idx as number);
-    const subtotalCents = line.subtotalCents;
-    const taxCents = line.taxCents;
-    const totalCents = line.totalCents;
-    return (
-      Number.isSafeInteger(subtotalCents)
-      && Number.isSafeInteger(taxCents)
-      && Number.isSafeInteger(totalCents)
-      && Number.isSafeInteger((subtotalCents as number) + (taxCents as number))
-      && (subtotalCents as number) + (taxCents as number) === totalCents
-      && isEvidenceQboReference(line.categoryQboId)
-      && (
-        value.taxCalculation === 'NotApplicable'
-          ? line.taxCodeQboId === null
-          : isEvidenceQboReference(line.taxCodeQboId)
-      )
-      && (
-        line.memo === null
-        || (typeof line.memo === 'string' && line.memo.length <= 500)
-      )
-      && isEvidenceTagIds(line.tagIds)
-    );
-  });
-}
-
-function persistedEvidenceProposal(value: unknown): VerifiedCategorizationProposal | null {
-  if (!isRuntimeRecord(value)) return null;
-  const evidence = value.categorizationEvidence;
-  if (
-    !isRuntimeRecord(evidence)
-    || evidence.version !== 1
-    || !isVerifiedCategorizationProposal(evidence.proposal)
-  ) {
-    return null;
-  }
-  return evidence.proposal;
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -1652,9 +1584,12 @@ async function emitVerifiedCategorizationOutcome(
   const proposal = operation === 'posted'
     ? persistedEvidenceProposal(attempt.requestPayload)
     : null;
+  const candidateContext = operation === 'posted'
+    ? persistedRuleCandidateContext(attempt.requestPayload)
+    : null;
   // Legacy or corrupt recategorization attempts cannot prove the exact staged
   // proposal, so they are deliberately excluded instead of guessed from QBO.
-  if (operation === 'posted' && proposal === null) return;
+  if (operation === 'posted' && (proposal === null || candidateContext === null)) return;
   try {
     await d.onVerifiedCategorizationOutcome({
       companyId: txn.companyId,
@@ -1663,6 +1598,7 @@ async function emitVerifiedCategorizationOutcome(
       requestId: attempt.requestId,
       operation,
       proposal,
+      candidateContext,
     });
   } catch {
     // The QuickBooks readback and local VERIFIED state are already durable.
@@ -2119,10 +2055,27 @@ async function persistPrepared(
   prepared: QboPreparedWrite,
   beforeSnapshot: QboPurchaseSnapshot,
   staged?: StagedCategorization,
+  candidateInput?: {
+    payee: string;
+    source: 'user' | 'autopilot' | 'mcp';
+  },
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
     const attempt = await d.db.$transaction(async (tx) => {
       await lockCompanyMutationScope(tx, companyId);
+      const config = candidateInput === undefined
+        ? null
+        : await tx.agentCompanyConfig.findUnique({
+            where: { companyId },
+            select: { configVersion: true },
+          });
+      const candidateContext = candidateInput === undefined
+        ? null
+        : candidateContextFor(
+            candidateInput.payee,
+            config?.configVersion ?? 'verified-writeback-v1',
+            candidateInput.source,
+          );
       return tx.qboMutationAttempt.create({
         data: {
           transactionId,
@@ -2132,15 +2085,26 @@ async function persistPrepared(
           expectedRevision,
           expectedSyncToken: prepared.body.SyncToken,
           requestHash: prepared.requestHash,
-          requestPayload: staged === undefined
-            ? prepared
-            : {
-                ...prepared,
+          requestPayload: {
+            ...prepared,
+            ruleCandidateFold: { version: 1 },
+            ...(staged === undefined
+              ? {}
+              : {
                 categorizationEvidence: {
                   version: 1,
                   proposal: evidenceProposal(staged),
                 },
-              },
+                ...(candidateContext === null
+                  ? {}
+                  : {
+                      ruleCandidateEvidence: {
+                        version: 1,
+                        ...candidateContext,
+                      },
+                    }),
+                }),
+          },
           beforeSnapshot,
           responseSnapshot: null,
           verification: null,
@@ -2747,6 +2711,10 @@ async function commitStagedCategorizationInternal(
       prepared,
       before,
       staged,
+      {
+        payee: freshTxn.payee,
+        source: autopilot === undefined ? 'user' : 'autopilot',
+      },
     );
     if (!persisted.created) {
       const { txn: racedTxn } = await loadAuthorizedAttempt(
