@@ -5,6 +5,11 @@ import * as mcpNode from '@modelcontextprotocol/node';
 import * as mcpServer from '@modelcontextprotocol/server';
 import * as zodV3 from 'zod';
 import * as zodV4 from 'zod-v4';
+import { receiptToolDefinitions } from './receiptTools.js';
+import {
+  MCP_AUTHORED_SCHEMA_BOUNDS,
+  toBoundedJsonSchema,
+} from './schemaBounds.js';
 
 const packageJsonUrl = new URL('../../package.json', import.meta.url);
 
@@ -37,5 +42,25 @@ describe('MCP protocol dependency contract', () => {
     expect(zodV3.ZodFirstPartyTypeKind).toBeDefined();
     expect(zodV4.toJSONSchema).toBeTypeOf('function');
     expect(zodV4).not.toBe(zodV3);
+  });
+
+  it('serializes every receipt schema as a strict bounded MCP 2.0 contract', () => {
+    const schemas = receiptToolDefinitions.flatMap((definition) => [
+      toBoundedJsonSchema(
+        definition.inputSchema,
+        MCP_AUTHORED_SCHEMA_BOUNDS,
+      ),
+      toBoundedJsonSchema(
+        definition.outputSchema,
+        MCP_AUTHORED_SCHEMA_BOUNDS,
+      ),
+    ]);
+
+    expect(receiptToolDefinitions).toHaveLength(7);
+    for (const schema of schemas) {
+      expect(schema.additionalProperties).toBe(false);
+      expect(JSON.parse(JSON.stringify(schema))).toEqual(schema);
+      expect(JSON.stringify(schema)).not.toMatch(/base64|binary/i);
+    }
   });
 });

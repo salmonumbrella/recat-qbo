@@ -102,7 +102,9 @@ export interface McpAttachmentOperations {
   ): Promise<McpAttachmentOperationProjection>;
 }
 
-function actorFor(principal: McpPrincipal): AttachmentActor {
+export function attachmentActorForPrincipal(
+  principal: McpPrincipal,
+): AttachmentActor {
   return {
     kind: 'mcp',
     actorKey: `mcp:${principal.tokenId}`,
@@ -178,7 +180,7 @@ export const mcpAttachmentOperations: McpAttachmentOperations = Object.freeze({
     input: Parameters<McpAttachmentOperations['createUpload']>[1],
   ) =>
     issueAttachmentUploadGrant({
-      actor: actorFor(principal),
+      actor: attachmentActorForPrincipal(principal),
       companyId: input.companyId,
       maxFileCount: input.fileCount,
       maxEncodedRequestBytes: input.maxEncodedRequestBytes,
@@ -188,7 +190,7 @@ export const mcpAttachmentOperations: McpAttachmentOperations = Object.freeze({
     input: Parameters<McpAttachmentOperations['attachFiles']>[1],
   ) =>
     projectMcpAttachmentOperation(await attachTransactionFiles({
-      actor: actorFor(principal),
+      actor: attachmentActorForPrincipal(principal),
       companyId: input.companyId,
       transactionId: input.transactionId,
       idempotencyKey: input.idempotencyKey,
@@ -199,7 +201,7 @@ export const mcpAttachmentOperations: McpAttachmentOperations = Object.freeze({
     input: Parameters<McpAttachmentOperations['listAttachments']>[1],
   ) => ({
     attachments: await refreshTransactionAttachments(
-      actorFor(principal),
+      attachmentActorForPrincipal(principal),
       input.companyId,
       input.transactionId,
     ),
@@ -209,7 +211,7 @@ export const mcpAttachmentOperations: McpAttachmentOperations = Object.freeze({
     input: Parameters<McpAttachmentOperations['getDownload']>[1],
   ) =>
     issueAttachmentDownloadGrant({
-      actor: actorFor(principal),
+      actor: attachmentActorForPrincipal(principal),
       companyId: input.companyId,
       transactionId: input.transactionId,
       attachmentId: input.attachmentId,
@@ -219,7 +221,7 @@ export const mcpAttachmentOperations: McpAttachmentOperations = Object.freeze({
     input: Parameters<McpAttachmentOperations['deleteAttachment']>[1],
   ) =>
     projectMcpAttachmentOperation(await deleteTransactionAttachment({
-      actor: actorFor(principal),
+      actor: attachmentActorForPrincipal(principal),
       companyId: input.companyId,
       transactionId: input.transactionId,
       attachmentId: input.attachmentId,
@@ -323,7 +325,7 @@ export const attachmentOperationOutput = z.strictObject({
     requiresReconciliation: z.boolean(),
   }),
 });
-const attachmentOutput = z.strictObject({
+export const attachmentOutput = z.strictObject({
   id: uuid,
   transactionId: uuid,
   filename: z.string().min(1).max(255),

@@ -11,6 +11,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 function decimalString(
   maxAbsolute?: string,
   maxDecimalPlaces?: number,
+  minimum?: string,
 ) {
   return z.union([z.string().max(100), z.number()]).transform((value, ctx) => {
     const text = String(value);
@@ -26,6 +27,7 @@ function decimalString(
           maxDecimalPlaces !== undefined
           && decimal.decimalPlaces() > maxDecimalPlaces
         )
+        || (minimum !== undefined && decimal.lessThan(minimum))
       ) {
         throw new Error('out of range');
       }
@@ -88,9 +90,7 @@ const responseSchema = z.object({
   model: z.string().max(200),
   tokens_in: z.number().int().nonnegative().max(2_147_483_647),
   tokens_out: z.number().int().nonnegative().max(2_147_483_647),
-  cost_usd: decimalString('1000000', 8).refine(
-    (value) => new Prisma.Decimal(value).greaterThanOrEqualTo(0),
-  ),
+  cost_usd: decimalString('1000000', undefined, '0'),
   duration_ms: z.number().int().nonnegative().max(2_147_483_647),
 }).strict();
 
@@ -207,7 +207,11 @@ export async function extractReceipt(
       parse_retries: 2,
       reasoning_effort: 'none',
       max_pages: input.provider.settings.maxPages,
-      business: input.company,
+      business: {
+        names: input.company.names,
+        addresses: input.company.addresses,
+        tax_ids: input.company.taxIds,
+      },
       categories: input.categories,
     }));
     const fileBytes = new ArrayBuffer(bytes.byteLength);

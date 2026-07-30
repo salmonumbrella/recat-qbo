@@ -445,6 +445,20 @@ describe('RealQboClient attachment HTTP seam', () => {
     })).rejects.toBeInstanceOf(QboAttachmentAdapterError);
   });
 
+  it('treats QBO code 610 object-not-found attachment reads as absent', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Fault: {
+        Error: [{
+          code: '610',
+          Message: 'Object Not Found',
+          Detail: 'Something referenced by this object has been made inactive.',
+        }],
+      },
+    }), { status: 400 })));
+
+    await expect(realClient().client.getAttachment('A1')).resolves.toBeNull();
+  });
+
   it('fetches a temporary download internally and returns only the byte stream', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -667,6 +681,22 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     });
     await expect(client.fetchPurchaseSnapshot('missing')).resolves.toBeNull();
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase/P%2F1?minorversion=75');
+  });
+
+  it('treats a live-shaped QBO code 610 transaction read as absent', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Fault: {
+        Error: [{
+          code: '610',
+          Message: 'Object Not Found',
+          Detail: 'Something referenced by this object has been made inactive.',
+        }],
+      },
+    }), { status: 400 })));
+
+    await expect(
+      realClient().client.fetchTxn('Purchase', 'missing'),
+    ).resolves.toBeNull();
   });
 
   it('propagates reconciliation cancellation to the actual Purchase GET', async () => {

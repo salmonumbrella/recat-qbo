@@ -34,6 +34,12 @@ import {
   mcpAttachmentOperations,
   type McpAttachmentOperations,
 } from './attachmentTools.js';
+import {
+  RECEIPT_TOOL_NAMES,
+  mcpReceiptOperations,
+  receiptToolDefinitions,
+  type McpReceiptOperations,
+} from './receiptTools.js';
 
 const CORE_MUTATION_TOOL_NAMES = [
   'prepare_categorization',
@@ -49,9 +55,11 @@ const CORE_MUTATION_TOOL_NAMES = [
 export const MUTATION_TOOL_NAMES = [
   ...CORE_MUTATION_TOOL_NAMES,
   ...ATTACHMENT_TOOL_NAMES,
+  ...RECEIPT_TOOL_NAMES,
 ] as const;
 
-export interface McpMutationOperations extends McpAttachmentOperations {
+export interface McpMutationOperations
+  extends McpAttachmentOperations, McpReceiptOperations {
   prepareCategorization(
     principal: McpPrincipal,
     input: PrepareMcpCategorizationInput,
@@ -88,6 +96,7 @@ export interface McpMutationOperations extends McpAttachmentOperations {
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   ...mcpAttachmentOperations,
+  ...mcpReceiptOperations,
   prepareCategorization: prepareMcpCategorization,
   commitCategorization: commitMcpCategorization,
   getOperation: getMcpOperation,
@@ -551,6 +560,14 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       ),
   },
   ...attachmentToolDefinitions.map((definition) => ({
+    ...definition,
+    invoke: (
+      operations: McpMutationOperations,
+      principal: McpPrincipal,
+      input: unknown,
+    ) => definition.invoke(operations, principal, input),
+  })),
+  ...receiptToolDefinitions.map((definition) => ({
     ...definition,
     invoke: (
       operations: McpMutationOperations,
