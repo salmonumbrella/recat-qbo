@@ -16,6 +16,11 @@ import {
   type EntityLeaseFenceDb,
   type EntityLeaseKey,
 } from './entityLease.js';
+import {
+  assertLiveStageAuthority,
+  type LiveMutationContext,
+  type LiveMutationProof,
+} from './agent/liveMutationAuthority.js';
 
 interface TransactionRow {
   id: string;
@@ -524,13 +529,50 @@ export async function stageCategorization(
   input: StageCategorizationInput,
   deps?: CategorizationDeps,
 ): Promise<StagedCategorization> {
+  const resolved = deps ?? (await defaultCategorizationDeps());
+  return stageWithOwner(
+    input,
+    resolved.invocationId(),
+    resolved,
+  );
+}
+
+/**
+ * Production-only guarded staging. Authority construction is not injectable:
+ * the exact claimed job, leases, live configuration, provider binding, and tax
+ * references are proven inside the same transaction as the first mutation.
+ */
+export async function stageGuardedLiveCategorization(
+  input: StageCategorizationInput,
+  context: LiveMutationContext,
+  proof: LiveMutationProof,
+): Promise<StagedCategorization> {
+  const deps = await defaultCategorizationDeps();
+  return stageWithOwner(input, context.owner, deps, { context, proof });
+}
+
+async function stageWithOwner(
+  input: StageCategorizationInput,
+  owner: string,
+  deps: CategorizationDeps,
+  authority?: {
+    readonly context: LiveMutationContext;
+    readonly proof: LiveMutationProof;
+  },
+): Promise<StagedCategorization> {
   const {
     db,
     lease,
     fence,
-    invocationId,
     afterRevisionCas,
-  } = deps ?? (await defaultCategorizationDeps());
+  } = deps;
+  if (
+    typeof owner !== 'string'
+    || owner.trim() === ''
+    || (authority !== undefined && owner !== authority.context.owner)
+  ) {
+    throw new CategorizationError('INVALID_INPUT', 'Invalid categorization input.');
+  }
   const parsed = inputSchema.safeParse(input);
   if (!parsed.success) throw invalidInput(parsed.error);
   const locator = await db.transaction.findFirst({
@@ -551,12 +593,19 @@ export async function stageCategorization(
     qboType: locator.qboType,
     qboId: locator.qboId,
   };
-  const owner = invocationId();
   return lease(key, owner, async () => db.$transaction(async (tx) => {
     // This must be the first statement in the staging transaction. PostgreSQL
     // holds the lease-row lock through commit, preventing expiry takeover from
     // crossing the local mutation boundary.
     await fence(key, owner, tx);
+    if (authority !== undefined) {
+      await assertLiveStageAuthority(
+        tx as unknown as import('@prisma/client').Prisma.TransactionClient,
+        authority.context,
+        authority.proof,
+        parsed.data,
+      );
+    }
 
     // Reload every mutable fact after both the outer lease and transaction
     // fence are held, so validation and replacement share one snapshot/commit.

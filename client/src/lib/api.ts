@@ -7,6 +7,7 @@
 import type {
   AgentCompanySettingsDto,
   AgentRunStatus,
+  AutopilotRunOutcome,
   AuditEntryDto,
   AuthMethodsDto,
   CategorizeBody,
@@ -19,6 +20,8 @@ import type {
   DashboardDataDto,
   DashboardWidget,
   InstanceSettingsDto,
+  LivePauseStateDto,
+  LiveReadinessDto,
   PollInterval,
   QboAccountDto,
   QboConnectionTestDto,
@@ -48,6 +51,8 @@ import type {
   UserDto,
   ApiError as ApiErrorBody,
 } from '@recat/shared';
+
+export type { LivePauseStateDto, LiveReadinessDto } from '@recat/shared';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -270,7 +275,9 @@ export interface AutopilotOverviewDto {
 
 export interface AutopilotRunDto {
   id: string;
-  status: AgentRunStatus;
+  status: AgentRunStatus | 'unavailable';
+  outcome: AutopilotRunOutcome;
+  operationId: string | null;
   attemptCount: number;
   configVersion: string;
   proposal:
@@ -334,6 +341,16 @@ export interface AutopilotSettingsPatch {
   evidenceThreshold?: number;
   limits?: Partial<AgentCompanySettingsDto['limits']>;
 }
+
+export interface EnableLiveBody {
+  confirmation: string;
+  acceptedPolicyVersion: string;
+}
+
+export type LiveReconciliationResult = Omit<
+  CategorizationMutationResult,
+  'transactionId' | 'requestId'
+>;
 
 export interface PlReportParams {
   /** number of months (e.g. '6') or 'ytd'. TODO(server): confirm encoding. */
@@ -620,6 +637,25 @@ export const autopilot = {
     ),
   run: (companyId: string, runId: string) =>
     api.get<AutopilotRunDto>(`/api/companies/${companyId}/autopilot/runs/${runId}`),
+  getReadiness: (companyId: string) =>
+    api.get<LiveReadinessDto>(
+      `/api/companies/${companyId}/autopilot/live-readiness`,
+    ),
+  enableLive: (companyId: string, body: EnableLiveBody) =>
+    api.post<LiveReadinessDto>(
+      `/api/companies/${companyId}/autopilot/enable-live`,
+      body,
+    ),
+  pauseLive: (companyId: string) =>
+    api.post<LivePauseStateDto>(
+      `/api/companies/${companyId}/autopilot/pause-live`,
+      {},
+    ),
+  reconcileLive: (companyId: string, operationId: string) =>
+    api.post<LiveReconciliationResult>(
+      `/api/companies/${companyId}/autopilot/reconcile/${encodeURIComponent(operationId)}`,
+      {},
+    ),
   cancelQueued: (companyId: string) =>
     api.post<{ cancelled: number }>(
       `/api/companies/${companyId}/autopilot/cancel-queued`,

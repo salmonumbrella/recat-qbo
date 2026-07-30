@@ -20,6 +20,10 @@ import { classifyQboFailure } from '../lib/qbo/diagnostics.js';
 import { hasIntuitCredentials, qboFactory, testCompanyConnection } from '../lib/qbo/factory.js';
 import { requireInstanceAdmin, requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import {
+  disconnectCompanyWithLiveAuthority,
+  updateCompanySettingsWithLiveAuthority,
+} from '../services/companyLiveAuthority.js';
 import { syncCompany } from '../services/sync.js';
 import { createOauthState } from './qboOauth.js';
 import { teamRouter } from './team.js';
@@ -150,17 +154,7 @@ companiesRouter.patch(
       patch.holdingAccountIds !== undefined &&
       JSON.stringify(patch.holdingAccountIds) !== JSON.stringify(jsonStringArray(company.holdingAccountIds));
 
-    const updated = await prisma.company.update({
-      where: { id: company.id },
-      data: {
-        ...(patch.nickname !== undefined ? { nickname: patch.nickname } : {}),
-        ...(patch.syncMode !== undefined ? { syncMode: patch.syncMode } : {}),
-        ...(patch.pollIntervalMin !== undefined ? { pollIntervalMin: patch.pollIntervalMin } : {}),
-        ...(patch.holdingAccountIds !== undefined ? { holdingAccountIds: patch.holdingAccountIds } : {}),
-        ...(patch.dryRun !== undefined ? { dryRun: patch.dryRun } : {}),
-        ...(patch.tagsRequired !== undefined ? { tagsRequired: patch.tagsRequired } : {}),
-      },
-    });
+    const updated = await updateCompanySettingsWithLiveAuthority(company.id, patch);
 
     // Watching different holding accounts changes what the queue should hold —
     // kick a manual sync in the background.
@@ -182,16 +176,8 @@ companiesRouter.delete(
   withCompany({ allowDisconnected: true }),
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
-    await qboFactory.revoke(company.id);
-    await prisma.company.update({
-      where: { id: company.id },
-      data: {
-        disconnectedAt: company.disconnectedAt ?? new Date(),
-        accessToken: null,
-        refreshToken: null,
-        tokenExpiresAt: null,
-      },
-    });
+    const disconnected = await disconnectCompanyWithLiveAuthority(company.id);
+    await disconnected.revoke();
     res.json({ ok: true });
   }),
 );

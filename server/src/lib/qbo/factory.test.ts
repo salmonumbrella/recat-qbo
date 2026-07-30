@@ -46,6 +46,7 @@ import {
   inspectAuthorizedConnection,
   isMockRealmId,
   qboFactory,
+  revokeCapturedQboToken,
   testCompanyConnection,
 } from './factory.js';
 import { MockQboClient, MOCK_REALM_BLUEBIRD, MOCK_REALM_HARBOR } from './mock.js';
@@ -91,6 +92,21 @@ describe('isMockRealmId', () => {
     expect(isMockRealmId(MOCK_REALM_BLUEBIRD)).toBe(true);
     expect(isMockRealmId(REAL_REALM)).toBe(false);
     expect(isMockRealmId('')).toBe(false);
+  });
+});
+
+describe('revokeCapturedQboToken', () => {
+  it('uses the token snapshot captured before local token clearing', async () => {
+    const company = companyRow(REAL_REALM);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const revoking = revokeCapturedQboToken(company);
+    company.refreshToken = null;
+
+    await expect(revoking).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({ token: 'refresh' }));
   });
 });
 

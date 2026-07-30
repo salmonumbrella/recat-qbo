@@ -387,6 +387,15 @@ model AgentCompanyConfig {
   evidenceThreshold  Int      @default(50)
   limits             Json
   configVersion      String
+  liveRequested              Boolean   @default(false)
+  liveAcceptedPolicyVersion  String?
+  liveAcceptedConfigVersion  String?
+  liveAcceptedProviderBinding String?
+  liveEnabledAt              DateTime?
+  liveEnabledByUserId        String?
+  livePausedAt               DateTime?
+  livePauseCode              String?
+  livePauseMessage           String?
   updatedAt          DateTime @updatedAt
 }
 

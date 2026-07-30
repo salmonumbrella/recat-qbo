@@ -54,6 +54,50 @@ describe('verifyPurchaseResult', () => {
     expect(verifyPurchaseResult(expected, actual)).toEqual({ ok: true });
   });
 
+  it('accepts QBO non-taxable null/default normalization without accepting tax drift', () => {
+    const nonTaxableTarget = {
+      ...targetLine,
+      taxCodeQboId: null,
+      taxAmountCents: null,
+      taxInclusiveCents: null,
+    };
+    const nonTaxableExpected: ExpectedPurchaseResult = {
+      ...expected,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      targetLines: [nonTaxableTarget],
+      untouchedLineHashes: [],
+    };
+    const normalizedByQbo = {
+      ...actual,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: null,
+      lines: [{
+        ...nonTaxableTarget,
+        id: 'provider-assigned-target',
+        taxCodeQboId: 'PROVIDER_DEFAULT_NON_TAX',
+      }],
+    };
+
+    expect(verifyPurchaseResult(nonTaxableExpected, normalizedByQbo))
+      .toEqual({ ok: true });
+    expect(verifyPurchaseResult(nonTaxableExpected, {
+      ...normalizedByQbo,
+      totalTaxCents: -1,
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult({
+      ...nonTaxableExpected,
+      totalTaxCents: -1,
+    }, {
+      ...normalizedByQbo,
+      totalTaxCents: -1,
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(nonTaxableExpected, {
+      ...normalizedByQbo,
+      lines: [{ ...normalizedByQbo.lines[0], taxAmountCents: -1 }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
   it.each([
     ['Purchase ID', { qboId: 'purchase-2' }],
     ['total', { totalCents: -10_49 }],

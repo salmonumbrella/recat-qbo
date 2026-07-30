@@ -1,5 +1,6 @@
 import { prisma } from '../../lib/prisma.js';
 import type { AgentJobStatus } from '@recat/shared';
+import { lockCompanyMutationScopes } from '../companyMutationScope.js';
 import type { AgentModelErrorCode } from './core/model.js';
 
 export type { AgentJobStatus } from '@recat/shared';
@@ -19,7 +20,11 @@ const SAFE_ERROR_CODES = [
   'AGENT_MODEL_EXHAUSTED',
 ] as const satisfies readonly AgentModelErrorCode[];
 
-export type AgentJobErrorCode = AgentModelErrorCode | 'AGENT_SUPERSEDED' | 'AGENT_JOB_EXHAUSTED';
+export type AgentJobErrorCode =
+  | AgentModelErrorCode
+  | 'AGENT_SUPERSEDED'
+  | 'AGENT_JOB_EXHAUSTED'
+  | 'LIVE_MUTATION_RETRY_EXHAUSTED';
 
 export interface AgentJob {
   id: string;
@@ -127,6 +132,20 @@ export async function claimShadowJobs(
     );
     const claimAt = await currentTime(tx, deps);
     const leaseExpiresAt = new Date(claimAt.getTime() + LEASE_MS);
+    const activeCompanyRows = await tx.$queryRawUnsafe<{ companyId: string }[]>(
+      `SELECT DISTINCT "companyId"
+         FROM "AgentJob"
+        WHERE "status" IN ('queued', 'retry', 'running')
+        ORDER BY "companyId"`,
+    );
+    const activeCompanyIds = activeCompanyRows.map((row) => row.companyId);
+    // The capacity lock is already held. Acquire every company scope that the
+    // cancellation/claim queries can mutate before either query takes job-row
+    // locks, preserving capacity -> sorted company -> job/live-fact ordering.
+    await lockCompanyMutationScopes(
+      tx,
+      activeCompanyIds,
+    );
     await tx.$queryRawUnsafe(
       `WITH cancelled AS MATERIALIZED (
          UPDATE "AgentJob" AS job
@@ -142,13 +161,72 @@ export async function claimShadowJobs(
          WHERE job."transactionId" = txn."id"
            AND job."companyId" = txn."companyId"
            AND job."status" IN ('queued', 'retry', 'running')
+           AND job."companyId" = ANY($2::text[])
            AND (
-             txn."status" <> 'PENDING'
-             OR txn."revision" <> job."revision"
-             OR config."companyId" IS NULL
-             OR config."mode" <> 'shadow'
-             OR config."configVersion" <> job."configVersion"
-             OR company."disconnectedAt" IS NOT NULL
+             NOT (
+               (
+                 txn."status" = 'PENDING'
+                 AND txn."revision" = job."revision"
+               )
+               OR (
+                 txn."revision" = job."revision" + 1
+                 AND EXISTS (
+                   SELECT 1
+                     FROM "QboMutationAttempt" recovery_attempt
+                    WHERE recovery_attempt."transactionId" = job."transactionId"
+                      AND recovery_attempt."requestId" = job."id"
+                      AND recovery_attempt."expectedRevision" = txn."revision"
+                      AND recovery_attempt."operation" = 'recategorize'
+                      AND (
+                        (
+                          recovery_attempt."status" IN ('PREPARED', 'RETRYABLE', 'COMMITTING')
+                          AND txn."status" = 'PENDING'
+                        )
+                        OR (
+                          recovery_attempt."status" = 'UNCERTAIN'
+                          AND txn."status" = 'ERROR'
+                        )
+                        OR (
+                          recovery_attempt."status" = 'VERIFIED'
+                          AND txn."status" = 'POSTED'
+                        )
+                      )
+                 )
+               )
+             )
+             OR (
+               (
+                 config."companyId" IS NULL
+                 OR config."mode" <> 'shadow'
+                 OR config."configVersion" <> job."configVersion"
+                 OR company."disconnectedAt" IS NOT NULL
+               )
+               AND NOT (
+                 txn."revision" = job."revision" + 1
+                 AND EXISTS (
+                   SELECT 1
+                     FROM "QboMutationAttempt" recovery_attempt
+                    WHERE recovery_attempt."transactionId" = job."transactionId"
+                      AND recovery_attempt."requestId" = job."id"
+                      AND recovery_attempt."expectedRevision" = txn."revision"
+                      AND recovery_attempt."operation" = 'recategorize'
+                      AND (
+                        (
+                          recovery_attempt."status" IN ('PREPARED', 'RETRYABLE', 'COMMITTING')
+                          AND txn."status" = 'PENDING'
+                        )
+                        OR (
+                          recovery_attempt."status" = 'UNCERTAIN'
+                          AND txn."status" = 'ERROR'
+                        )
+                        OR (
+                          recovery_attempt."status" = 'VERIFIED'
+                          AND txn."status" = 'POSTED'
+                        )
+                      )
+                 )
+               )
+             )
            )
          RETURNING job."id", job."attemptCount"
        )
@@ -161,6 +239,7 @@ export async function claimShadowJobs(
          AND run."attemptCount" = cancelled."attemptCount"
          AND run."status" = 'running'`,
       claimAt,
+      activeCompanyIds,
     );
 
     const candidates = await tx.$queryRawUnsafe<ClaimCandidate[]>(
@@ -197,13 +276,47 @@ export async function claimShadowJobs(
            ON config."companyId" = job."companyId"
          JOIN "Company" AS company
            ON company."id" = job."companyId"
-          AND company."disconnectedAt" IS NULL
          LEFT JOIN active_by_company AS active
            ON active."companyId" = job."companyId"
-         WHERE txn."status" = 'PENDING'
-           AND txn."revision" = job."revision"
-           AND config."mode" = 'shadow'
-           AND config."configVersion" = job."configVersion"
+         WHERE (
+             (
+               txn."status" = 'PENDING'
+               AND txn."revision" = job."revision"
+             )
+             OR (
+               txn."revision" = job."revision" + 1
+               AND EXISTS (
+                 SELECT 1
+                   FROM "QboMutationAttempt" recovery_attempt
+                  WHERE recovery_attempt."transactionId" = job."transactionId"
+                    AND recovery_attempt."requestId" = job."id"
+                    AND recovery_attempt."expectedRevision" = txn."revision"
+                    AND recovery_attempt."operation" = 'recategorize'
+                    AND (
+                      (
+                        recovery_attempt."status" IN ('PREPARED', 'RETRYABLE', 'COMMITTING')
+                        AND txn."status" = 'PENDING'
+                      )
+                      OR (
+                        recovery_attempt."status" = 'UNCERTAIN'
+                        AND txn."status" = 'ERROR'
+                      )
+                      OR (
+                        recovery_attempt."status" = 'VERIFIED'
+                        AND txn."status" = 'POSTED'
+                      )
+                    )
+               )
+             )
+           )
+           AND (
+             (
+               config."mode" = 'shadow'
+               AND config."configVersion" = job."configVersion"
+               AND company."disconnectedAt" IS NULL
+             )
+             OR txn."revision" = job."revision" + 1
+           )
            AND (
              (
                job."status" IN ('queued', 'retry')
@@ -215,6 +328,7 @@ export async function claimShadowJobs(
                AND job."leaseExpiresAt" <= $1
              )
            )
+           AND job."companyId" = ANY($3::text[])
        )
        SELECT job."id", job."status", job."attemptCount"
        FROM "AgentJob" AS job
@@ -237,15 +351,46 @@ export async function claimShadowJobs(
        LIMIT (SELECT LEAST("slots", $2) FROM global_capacity)`,
       claimAt,
       boundedLimit,
+      activeCompanyIds,
     );
     const expiredJobIds = candidates
       .filter((candidate) => candidate.status === 'running')
       .map((candidate) => candidate.id);
     if (expiredJobIds.length > 0) {
+      const exhaustedMutationRows = await tx.$queryRawUnsafe<{ jobId: string }[]>(
+        `UPDATE "QboMutationAttempt" AS attempt
+         SET "status" = 'FAILED',
+             "errorCode" = 'LIVE_MUTATION_RETRY_EXHAUSTED',
+             "errorMessage" = 'The guarded live mutation exhausted its retry budget.',
+             "updatedAt" = $1
+         FROM "AgentJob" AS job
+         JOIN "Transaction" AS txn
+           ON txn."id" = job."transactionId"
+          AND txn."companyId" = job."companyId"
+         WHERE job."id" = ANY($2::text[])
+           AND job."status" = 'running'
+           AND job."attemptCount" >= ${MAX_ATTEMPTS}
+           AND job."leaseExpiresAt" <= $1
+           AND txn."status" = 'PENDING'
+           AND txn."revision" = job."revision" + 1
+           AND attempt."transactionId" = txn."id"
+           AND attempt."requestId" = job."id"
+           AND attempt."expectedRevision" = txn."revision"
+           AND attempt."operation" = 'recategorize'
+           AND attempt."status" IN ('PREPARED', 'RETRYABLE')
+         RETURNING job."id" AS "jobId"`,
+        claimAt,
+        expiredJobIds,
+      );
+      const exhaustedMutationJobIds = exhaustedMutationRows.map((row) => row.jobId);
       await tx.$queryRawUnsafe(
         `UPDATE "AgentRun" AS run
          SET "status" = 'failed',
-             "errorCode" = 'AGENT_RUN_ABANDONED',
+             "errorCode" = CASE
+               WHEN run."jobId" = ANY($3::text[])
+                 THEN 'LIVE_MUTATION_RETRY_EXHAUSTED'
+               ELSE 'AGENT_RUN_ABANDONED'
+             END,
              "completedAt" = $1
          FROM "AgentJob" AS job
          WHERE job."id" = ANY($2::text[])
@@ -254,6 +399,7 @@ export async function claimShadowJobs(
            AND run."status" = 'running'`,
         claimAt,
         expiredJobIds,
+        exhaustedMutationJobIds,
       );
       await tx.$queryRawUnsafe(
         `UPDATE "AgentJob"
@@ -261,7 +407,11 @@ export async function claimShadowJobs(
              "dueAt" = $1,
              "lockOwner" = NULL,
              "leaseExpiresAt" = NULL,
-             "lastErrorCode" = 'AGENT_JOB_EXHAUSTED',
+             "lastErrorCode" = CASE
+               WHEN "id" = ANY($3::text[])
+                 THEN 'LIVE_MUTATION_RETRY_EXHAUSTED'
+               ELSE 'AGENT_JOB_EXHAUSTED'
+             END,
              "updatedAt" = $1
          WHERE "id" = ANY($2::text[])
            AND "status" = 'running'
@@ -269,6 +419,7 @@ export async function claimShadowJobs(
            AND "leaseExpiresAt" <= $1`,
         claimAt,
         expiredJobIds,
+        exhaustedMutationJobIds,
       );
     }
 

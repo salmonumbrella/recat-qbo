@@ -2118,7 +2118,11 @@ export default function Queue() {
       </div>
 
       {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
-        <AutopilotQueueStatus key={activeCompanyId} companyId={activeCompanyId} />
+        <AutopilotQueueStatus
+          key={activeCompanyId}
+          companyId={activeCompanyId}
+          surface="queue"
+        />
       )}
 
       {taxReadiness?.status !== 'ready' && (

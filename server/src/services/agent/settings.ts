@@ -4,7 +4,11 @@ import {
   type AgentLimits,
 } from './core/runner.js';
 import { prisma } from '../../lib/prisma.js';
-import { getInstanceSettings } from '../instanceSettings.js';
+import { runSerializableTransaction } from '../../lib/serializableTransaction.js';
+import {
+  getInstanceSettings,
+  type InstanceSettingsDb,
+} from '../instanceSettings.js';
 import type {
   AgentCompanySettingsDto,
   AgentLimitsDto,
@@ -31,6 +35,13 @@ export interface AgentCompanyConfigRow {
   evidenceThreshold: number;
   limits: unknown;
   configVersion: string;
+  liveRequested?: boolean;
+  liveAcceptedPolicyVersion?: string | null;
+  liveAcceptedConfigVersion?: string | null;
+  liveAcceptedProviderBinding?: string | null;
+  livePausedAt?: Date | null;
+  livePauseCode?: string | null;
+  livePauseMessage?: string | null;
 }
 
 type AgentCompanyConfigData = Omit<AgentCompanyConfigRow, 'companyId'> & { companyId: string };
@@ -41,7 +52,8 @@ export interface AgentSettingsDb {
     upsert(args: {
       where: { companyId: string };
       create: AgentCompanyConfigData;
-      update: Omit<AgentCompanyConfigData, 'companyId'>;
+      update: Omit<AgentCompanyConfigData, 'companyId'> & Partial<Pick<AgentCompanyConfigRow,
+        'liveAcceptedPolicyVersion' | 'liveAcceptedConfigVersion' | 'liveAcceptedProviderBinding' | 'livePausedAt' | 'livePauseCode' | 'livePauseMessage'>>;
     }): Promise<AgentCompanyConfigRow>;
   };
 }
@@ -55,14 +67,24 @@ export interface ConfiguredAgentProviderSettings {
   openrouterApiKey: string;
 }
 
-export interface AgentSettingsDeps {
+export interface AgentSettingsReadDeps {
   db: AgentSettingsDb;
-  getInstanceSettings(): Promise<ConfiguredAgentProviderSettings>;
+  getInstanceSettings(db?: InstanceSettingsDb): Promise<ConfiguredAgentProviderSettings>;
+}
+
+export interface AgentSettingsDeps extends AgentSettingsReadDeps {
+  withSerializableTransaction<T>(
+    callback: (db: AgentSettingsDb) => Promise<T>,
+  ): Promise<T>;
 }
 
 const defaultDeps: AgentSettingsDeps = {
   db: prisma as unknown as AgentSettingsDb,
   getInstanceSettings,
+  withSerializableTransaction: (callback) => runSerializableTransaction(
+    prisma,
+    (transaction) => callback(transaction as unknown as AgentSettingsDb),
+  ),
 };
 
 export class AgentSettingError extends Error {
@@ -101,7 +123,7 @@ export type UpdateShadowSettingsPatch = z.input<typeof patchSchema>;
  */
 export async function getAgentSettings(
   companyId: string,
-  deps: AgentSettingsDeps = defaultDeps,
+  deps: AgentSettingsReadDeps = defaultDeps,
 ): Promise<AgentCompanySettingsDto> {
   assertCompanyId(companyId);
   const row = await deps.db.agentCompanyConfig.findUnique({ where: { companyId } });
@@ -120,24 +142,39 @@ export async function updateShadowSettings(
   const parsed = patchSchema.safeParse(patch);
   if (!parsed.success) throw invalid(parsed.error.issues.map((issue) => issue.message).join(' '));
 
-  const row = await deps.db.agentCompanyConfig.findUnique({ where: { companyId } });
-  const instance = await deps.getInstanceSettings();
-  const current = row === null ? defaultsFrom(instance) : toDto(row);
-  const next = {
-    ...current,
-    ...parsed.data,
-    limits: { ...current.limits, ...parsed.data.limits },
-  };
-  validateConfiguredModels(next, instance);
+  return deps.withSerializableTransaction(async (db) => {
+    const row = await db.agentCompanyConfig.findUnique({ where: { companyId } });
+    const instance = await deps.getInstanceSettings(db as unknown as InstanceSettingsDb);
+    const current = row === null ? defaultsFrom(instance) : toDto(row);
+    const next = {
+      ...current,
+      ...parsed.data,
+      limits: { ...current.limits, ...parsed.data.limits },
+    };
+    validateConfiguredModels(next, instance);
 
-  const configVersion = versionFor(next);
-  const data: AgentCompanyConfigData = { ...next, companyId, configVersion };
-  const stored = await deps.db.agentCompanyConfig.upsert({
-    where: { companyId },
-    create: data,
-    update: omitCompanyId(data),
+    const configVersion = versionFor(next);
+    const data: AgentCompanyConfigData = { ...next, companyId, configVersion };
+    const invalidateLiveAcceptance = row?.liveRequested === true && row.configVersion !== configVersion;
+    const stored = await db.agentCompanyConfig.upsert({
+      where: { companyId },
+      create: data,
+      update: {
+        ...omitCompanyId(data),
+        ...(invalidateLiveAcceptance
+          ? {
+              liveAcceptedPolicyVersion: null,
+              liveAcceptedConfigVersion: null,
+              liveAcceptedProviderBinding: null,
+              livePausedAt: new Date(),
+              livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+              livePauseMessage: 'Live mode is paused: The current live policy must be accepted.',
+            }
+          : {}),
+      },
+    });
+    return toDto(stored);
   });
-  return toDto(stored);
 }
 
 function defaultsFrom(instance: ConfiguredAgentProviderSettings): AgentCompanySettingsDto {

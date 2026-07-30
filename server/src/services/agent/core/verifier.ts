@@ -29,7 +29,8 @@ export type AgentVerificationFailureCode =
   | 'AGENT_EVIDENCE_CATEGORY_INVALID'
   | 'AGENT_EVIDENCE_CATEGORY_INCONSISTENT'
   | 'AGENT_EVIDENCE_TAX_INVALID'
-  | 'AGENT_EVIDENCE_TAX_INCONSISTENT';
+  | 'AGENT_EVIDENCE_TAX_INCONSISTENT'
+  | 'AGENT_DISTINCT_REVIEW_REJECTED';
 
 export type AgentVerification =
   | {
@@ -67,7 +68,66 @@ const FAILURE_MESSAGES: Readonly<Record<AgentVerificationFailureCode, string>> =
   AGENT_EVIDENCE_CATEGORY_INCONSISTENT: 'Category evidence is inconsistent with the proposal.',
   AGENT_EVIDENCE_TAX_INVALID: 'Proposal evidence references an unavailable tax code.',
   AGENT_EVIDENCE_TAX_INCONSISTENT: 'Tax evidence is inconsistent with the proposal.',
+  AGENT_DISTINCT_REVIEW_REJECTED: 'Distinct live review did not approve the proposal.',
 };
+
+export const agentLiveReviewSchemaName = 'recat_live_review_v1';
+export const agentLiveReviewIssueCodes = [
+  'DECISION_NOT_SUPPORTED',
+  'SNAPSHOT_MISMATCH',
+  'EVIDENCE_INSUFFICIENT',
+  'REFERENCE_INVALID',
+  'TAX_INVALID',
+] as const;
+export type AgentLiveReviewIssueCode = (typeof agentLiveReviewIssueCodes)[number];
+export interface AgentLiveReview {
+  readonly approved: boolean;
+  readonly issues: readonly AgentLiveReviewIssueCode[];
+}
+
+export const agentLiveReviewJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['approved', 'issues'],
+  properties: {
+    approved: { type: 'boolean' },
+    issues: {
+      type: 'array',
+      maxItems: agentLiveReviewIssueCodes.length,
+      uniqueItems: true,
+      items: { type: 'string', enum: [...agentLiveReviewIssueCodes] },
+    },
+  },
+} as const;
+
+export function parseAgentLiveReview(value: unknown): AgentLiveReview {
+  if (!isPlainRecord(value)) throw new Error('Invalid live review.');
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 2
+    || !keys.includes('approved')
+    || !keys.includes('issues')
+    || typeof value.approved !== 'boolean'
+    || !Array.isArray(value.issues)
+    || value.issues.length > agentLiveReviewIssueCodes.length
+  ) {
+    throw new Error('Invalid live review.');
+  }
+  const allowed = new Set<string>(agentLiveReviewIssueCodes);
+  const issues = value.issues;
+  if (
+    issues.some((issue) => typeof issue !== 'string' || !allowed.has(issue))
+    || new Set(issues).size !== issues.length
+    || (value.approved && issues.length !== 0)
+    || (!value.approved && issues.length === 0)
+  ) {
+    throw new Error('Invalid live review.');
+  }
+  return deepFreeze({
+    approved: value.approved,
+    issues: [...issues] as AgentLiveReviewIssueCode[],
+  });
+}
 
 export function verifyAgentDecision(
   snapshot: AgentTransactionSnapshot,
@@ -252,4 +312,17 @@ function deepFreeze<Value>(value: Value): Value {
     }
   }
   return value;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Reflect.ownKeys(value).every((key) => {
+    if (typeof key !== 'string') return false;
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined
+      && descriptor.enumerable
+      && 'value' in descriptor;
+  });
 }

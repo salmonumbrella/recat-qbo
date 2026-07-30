@@ -115,8 +115,8 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
       data: [{
         companyId: company.id,
         qboId: 'source-bank',
-        name: 'Private account 123456789',
-        fullName: 'Private account 123456789',
+        name: 'Sensitive source label',
+        fullName: 'Sensitive source label',
         classification: 'Bank',
         accountType: 'Bank',
         active: true,
@@ -160,12 +160,12 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         date: new Date('2026-07-20T00:00:00.000Z'),
         payee: 'Earlier verified merchant',
         amount: '-10.00',
-        bankAccount: 'Private account 123456789',
+        bankAccount: 'Sensitive source label',
         status: 'POSTED',
         revision: 2,
         taxCalculation: 'NotApplicable',
         rawData: {
-          CurrencyRef: { value: 'CAD' },
+          CurrencyRef: { value: 'XDR' },
           AccountRef: { value: 'source-bank' },
         },
         splitLines: {
@@ -202,12 +202,12 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         date: new Date('2026-07-19T00:00:00.000Z'),
         payee: 'Earlier dry-run merchant',
         amount: '-10.00',
-        bankAccount: 'Private account 123456789',
+        bankAccount: 'Sensitive source label',
         status: 'DRY_RUN',
         revision: 1,
         taxCalculation: 'NotApplicable',
         rawData: {
-          CurrencyRef: { value: 'CAD' },
+          CurrencyRef: { value: 'XDR' },
           AccountRef: { value: 'source-bank' },
         },
         splitLines: {
@@ -245,10 +245,10 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         payee: 'Generic merchant',
         memo: 'Generic memo',
         amount: '-10.00',
-        bankAccount: 'Private account 123456789',
+        bankAccount: 'Sensitive source label',
         rawData: {
-          CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
-          AccountRef: { value: 'source-bank', name: 'Private account 123456789' },
+          CurrencyRef: { value: 'XDR', name: 'Generic Currency' },
+          AccountRef: { value: 'source-bank', name: 'Sensitive source label' },
           privatePayload: 'must-not-persist',
         },
       },
@@ -353,7 +353,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         decisionModel: 'decision-model',
         verifierModel: 'review-model',
       });
-      expect(JSON.stringify(runs[0]?.snapshot)).not.toMatch(/privatePayload|123456789/);
+      expect(JSON.stringify(runs[0]?.snapshot)).not.toMatch(/privatePayload|Sensitive source label/);
       expect(runs[0]?.snapshot).toMatchObject({
         similarVerifiedTransactions: [{
           transactionId: fixture.verifiedHistoryId,
@@ -475,8 +475,8 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         data: {
           companyId: fixture.companyId,
           qboId: 'source-bank-duplicate',
-          name: 'Private account 123456789',
-          fullName: 'Private account 123456789',
+          name: 'Sensitive source label',
+          fullName: 'Sensitive source label',
           classification: 'Bank',
           accountType: 'Bank',
           active: true,
@@ -486,7 +486,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         where: { id: fixture.transactionId },
         data: {
           rawData: {
-            CurrencyRef: { value: 'CAD' },
+            CurrencyRef: { value: 'XDR' },
           },
         },
       });
@@ -514,7 +514,7 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
         data: {
           qboType: 'JournalEntry',
           rawData: {
-            CurrencyRef: { value: 'CAD' },
+            CurrencyRef: { value: 'XDR' },
             Line: [{
               JournalEntryLineDetail: {
                 PostingType: 'Credit',

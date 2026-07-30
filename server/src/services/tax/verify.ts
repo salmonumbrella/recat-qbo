@@ -1,4 +1,8 @@
 import type { QboPurchaseSnapshot } from '../../lib/qbo/types.js';
+import {
+  purchaseTargetLineMatches,
+  purchaseTotalTaxMatches,
+} from '../../lib/qbo/purchaseTax.js';
 
 type PurchaseLine = QboPurchaseSnapshot['lines'][number];
 
@@ -30,19 +34,6 @@ export function canonicalPurchaseLineHash(line: PurchaseLine): string {
   ]);
 }
 
-function targetLineHash(line: PurchaseLine): string {
-  return JSON.stringify([
-    line.amountCents,
-    line.description,
-    line.accountQboId,
-    line.customerQboId,
-    line.classQboId,
-    line.taxCodeQboId,
-    line.taxAmountCents,
-    line.taxInclusiveCents,
-  ]);
-}
-
 function drift(message: string): PurchaseVerification {
   return { ok: false, code: 'QBO_STATE_DRIFT', message };
 }
@@ -57,11 +48,22 @@ export function verifyPurchaseResult(
   if (actual.date !== expected.date) return drift('Purchase date changed.');
   if (actual.direction !== expected.direction) return drift('Purchase direction changed.');
   if (actual.globalTaxCalculation !== expected.globalTaxCalculation) return drift('Purchase global tax mode changed.');
-  if (actual.totalTaxCents !== expected.totalTaxCents) return drift('Purchase total tax changed.');
+  if (!purchaseTotalTaxMatches(
+    expected.globalTaxCalculation,
+    expected.totalTaxCents,
+    actual.totalTaxCents,
+  )) return drift('Purchase total tax changed.');
 
   const remainingLines = [...actual.lines];
   for (const targetLine of expected.targetLines) {
-    const targetIndex = remainingLines.findIndex((line) => targetLineHash(line) === targetLineHash(targetLine));
+    const targetIndex = remainingLines.findIndex((line) =>
+      purchaseTargetLineMatches(
+        expected.globalTaxCalculation,
+        expected.totalTaxCents,
+        actual.totalTaxCents,
+        targetLine,
+        line,
+      ));
     if (targetIndex === -1) return drift('Expected target Purchase line is missing or changed.');
     remainingLines.splice(targetIndex, 1);
   }

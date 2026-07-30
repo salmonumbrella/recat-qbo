@@ -24,9 +24,12 @@ const mocks = vi.hoisted(() => ({
   companyFindUnique: vi.fn(),
   membershipFindUnique: vi.fn(),
   mutationAttemptFindUnique: vi.fn(),
+  isLiveReconciliationOwnedRequest: vi.fn(),
+  loadLiveReconciliationRequest: vi.fn(),
   postTransaction: vi.fn(),
   qboAccountFindFirst: vi.fn(),
   reconcileMutationAttempt: vi.fn(),
+  reconcileLiveMutation: vi.fn(),
   retryError: vi.fn(),
   ruleFindMany: vi.fn(),
   ruleTagFindMany: vi.fn(),
@@ -76,6 +79,12 @@ vi.mock('../lib/prisma.js', () => ({
 
 vi.mock('../services/categorization.js', () => ({
   stageCategorization: mocks.stageCategorization,
+}));
+
+vi.mock('../services/agent/liveReconciliation.js', () => ({
+  isLiveReconciliationOwnedRequest: mocks.isLiveReconciliationOwnedRequest,
+  loadLiveReconciliationRequest: mocks.loadLiveReconciliationRequest,
+  reconcileLiveMutation: mocks.reconcileLiveMutation,
 }));
 
 vi.mock('../services/writeback.js', () => ({
@@ -204,6 +213,9 @@ beforeEach(() => {
   mocks.stageCategorization.mockResolvedValue(stagedResult);
   mocks.commitStagedCategorization.mockResolvedValue(verifiedResult);
   mocks.reconcileMutationAttempt.mockResolvedValue(verifiedResult);
+  mocks.isLiveReconciliationOwnedRequest.mockResolvedValue(false);
+  mocks.loadLiveReconciliationRequest.mockResolvedValue(null);
+  mocks.reconcileLiveMutation.mockResolvedValue(verifiedResult);
   mocks.undoCategorization.mockResolvedValue({
     ...verifiedResult,
     requestId: UNDO_REQUEST_ID,
@@ -836,6 +848,68 @@ describe('tax-aware categorization action routes', () => {
       actor: { id: 'transaction-route-user', label: 'Generic categorizer' },
     });
     expect(mocks.retryError).not.toHaveBeenCalled();
+  });
+
+  it('requires admin authority and the exact live service for a live recheck', async () => {
+    const liveInput = {
+      companyId: COMPANY_ID,
+      transactionId: TRANSACTION_ID,
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      requestId: REQUEST_ID,
+      operation: 'recategorize',
+      expectedRevision: 1,
+      configVersion: 'config-v1',
+      requestHash: 'a'.repeat(64),
+      checkpointHash: 'b'.repeat(64),
+    };
+    mocks.isLiveReconciliationOwnedRequest.mockResolvedValue(true);
+    mocks.loadLiveReconciliationRequest.mockResolvedValue(liveInput);
+
+    const denied = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/reconcile`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+    expect(denied.status).toBe(403);
+    expect(mocks.reconcileLiveMutation).not.toHaveBeenCalled();
+
+    role = 'admin';
+    const allowed = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/reconcile`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+    expect(allowed.status).toBe(200);
+    expect(mocks.reconcileLiveMutation).toHaveBeenCalledWith(
+      liveInput,
+      {
+        actor: {
+          id: 'transaction-route-user',
+          label: 'Generic categorizer',
+        },
+      },
+    );
+    expect(mocks.reconcileMutationAttempt).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for a live-owned request whose exact binding has drifted', async () => {
+    mocks.isLiveReconciliationOwnedRequest.mockResolvedValue(true);
+    mocks.loadLiveReconciliationRequest.mockResolvedValue(null);
+
+    const denied = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/reconcile`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+    expect(denied.status).toBe(403);
+    expect(mocks.reconcileMutationAttempt).not.toHaveBeenCalled();
+
+    role = 'admin';
+    const drifted = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/reconcile`)
+      .set(sessionHeaders)
+      .send({ requestId: REQUEST_ID });
+    expect(drifted.status).toBe(409);
+    expect(mocks.reconcileMutationAttempt).not.toHaveBeenCalled();
+    expect(mocks.reconcileLiveMutation).not.toHaveBeenCalled();
   });
 
   it('rejects a reconcile request scoped to another transaction before service mutation', async () => {

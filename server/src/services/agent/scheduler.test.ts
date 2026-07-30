@@ -3,9 +3,15 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AgentModel } from './core/model.js';
 import type { ClaimedAgentJob } from './jobs.js';
 import {
+  getLiveWorkerHealth,
+  markLiveWorkerStopped,
+} from './liveWorkerHealth.js';
+import {
   buildAgentModels,
   createAgentScheduler,
+  guardScheduledLiveCompany,
   listScheduledShadowCompanies,
+  reconcileScheduledLiveMutations,
   runScheduledShadowJob,
   type AgentSchedulerDeps,
   type AgentSchedulerModelConfig,
@@ -87,6 +93,78 @@ function model(provider: 'openrouter' | 'custom', name: string): AgentModel {
 }
 
 describe('shadow agent scheduler', () => {
+  it('keeps shadow evidence when live authorization is absent even if a request exists', async () => {
+    const claimed = job('job-shadow-fallback', 'company-generic');
+    const runClaimedJob = vi.fn(async () => undefined);
+    const runClaimedLiveJob = vi.fn(async () => undefined);
+
+    await runScheduledShadowJob(claimed, 'opaque-worker', {
+      getCompanySettings: async () => companySettings(),
+      getProviderSettings: async () => ({
+        aiEndpoint: '',
+        aiApiKey: '',
+        openrouterApiKey: 'opaque-key',
+        openrouterReferer: '',
+        openrouterTitle: '',
+      }),
+      createModel: (config) => model(config.provider, config.model),
+      isLiveAuthorized: vi.fn(async () => false),
+      runClaimedLiveJob,
+      runClaimedJob,
+      terminalize: vi.fn(),
+      supersede: vi.fn(),
+    });
+
+    expect(runClaimedLiveJob).not.toHaveBeenCalled();
+    expect(runClaimedJob).toHaveBeenCalledOnce();
+  });
+
+  it('dispatches live only after current persisted authority and worker health pass', async () => {
+    const claimed = job('job-live', 'company-generic');
+    const runClaimedJob = vi.fn(async () => undefined);
+    const runClaimedLiveJob = vi.fn(async () => undefined);
+
+    await runScheduledShadowJob(claimed, 'opaque-worker', {
+      getCompanySettings: async () => companySettings(),
+      getProviderSettings: async () => ({
+        aiEndpoint: '',
+        aiApiKey: '',
+        openrouterApiKey: 'opaque-key',
+        openrouterReferer: '',
+        openrouterTitle: '',
+      }),
+      createModel: (config) => model(config.provider, config.model),
+      isLiveAuthorized: vi.fn(async () => true),
+      runClaimedLiveJob,
+      runClaimedJob,
+      terminalize: vi.fn(),
+      supersede: vi.fn(),
+    });
+
+    expect(runClaimedLiveJob).toHaveBeenCalledOnce();
+    expect(runClaimedJob).not.toHaveBeenCalled();
+  });
+
+  it('reports healthy only after a running scheduler completes a claim cycle and expires stale heartbeats', async () => {
+    markLiveWorkerStopped('opaque-worker');
+    let now = NOW;
+    const scheduler = createAgentScheduler(schedulerDeps({
+      now: () => now,
+      claimJobs: async () => [],
+    }));
+
+    expect(getLiveWorkerHealth('company-generic', now)).toEqual({ healthy: false });
+    scheduler.start();
+    expect(getLiveWorkerHealth('company-generic', now)).toEqual({ healthy: false });
+    await scheduler.tick();
+    expect(getLiveWorkerHealth('company-generic', now)).toEqual({ healthy: true });
+
+    now = new Date(NOW.getTime() + 120_001);
+    expect(getLiveWorkerHealth('company-generic', now)).toEqual({ healthy: false });
+    scheduler.stop();
+    expect(getLiveWorkerHealth('company-generic', NOW)).toEqual({ healthy: false });
+  });
+
   it('lists only connected companies for production shadow scheduling', async () => {
     const findMany = vi.fn(async () => []);
 
@@ -99,7 +177,7 @@ describe('shadow agent scheduler', () => {
         mode: 'shadow',
         company: { disconnectedAt: null },
       },
-      select: { companyId: true, scheduleMinutes: true },
+      select: { companyId: true, scheduleMinutes: true, liveRequested: true },
       orderBy: { companyId: 'asc' },
     });
   });
@@ -107,7 +185,7 @@ describe('shadow agent scheduler', () => {
   it('does not overlap ticks in one process', async () => {
     const discovery = deferred<void>();
     const listShadowCompanies = vi.fn(async () => [
-      { companyId: 'company-1', scheduleMinutes: 10 },
+      { companyId: 'company-1', scheduleMinutes: 10, liveRequested: false },
     ]);
     const discoverJobs = vi.fn(async () => discovery.promise);
     const scheduler = createAgentScheduler(schedulerDeps({
@@ -137,9 +215,9 @@ describe('shadow agent scheduler', () => {
 
   it('discovers only deterministic due companies and remains restart-safe', async () => {
     const listShadowCompanies = vi.fn(async () => [
-      { companyId: 'due-10', scheduleMinutes: 10 },
-      { companyId: 'not-due-7', scheduleMinutes: 7 },
-      { companyId: 'due-4', scheduleMinutes: 4 },
+      { companyId: 'due-10', scheduleMinutes: 10, liveRequested: false },
+      { companyId: 'not-due-7', scheduleMinutes: 7, liveRequested: false },
+      { companyId: 'due-4', scheduleMinutes: 4, liveRequested: false },
     ]);
     const firstDiscover = vi.fn(async () => undefined);
     const secondDiscover = vi.fn(async () => undefined);
@@ -157,12 +235,230 @@ describe('shadow agent scheduler', () => {
     expect(secondDiscover.mock.calls).toEqual(firstDiscover.mock.calls);
   });
 
+  it('guards every company each cycle and isolates one unhealthy company', async () => {
+    const guardCompany = vi.fn(async (company: { companyId: string }) => {
+      if (company.companyId === 'company-unhealthy') throw new Error('bounded failure');
+    });
+    const discoverJobs = vi.fn(async () => undefined);
+    const scheduler = createAgentScheduler(schedulerDeps({
+      listShadowCompanies: async () => [
+        { companyId: 'company-unhealthy', scheduleMinutes: 10, liveRequested: true },
+        { companyId: 'company-healthy', scheduleMinutes: 10, liveRequested: true },
+      ],
+      guardCompany,
+      discoverJobs,
+    }));
+
+    await scheduler.tick();
+    await scheduler.tick();
+
+    expect(guardCompany.mock.calls).toEqual([
+      [expect.objectContaining({ companyId: 'company-unhealthy' })],
+      [expect.objectContaining({ companyId: 'company-healthy' })],
+      [expect.objectContaining({ companyId: 'company-unhealthy' })],
+      [expect.objectContaining({ companyId: 'company-healthy' })],
+    ]);
+    expect(discoverJobs).toHaveBeenCalledTimes(4);
+  });
+
+  it('isolates one company discovery failure from every other due company', async () => {
+    const discoverJobs = vi.fn(async (companyId: string) => {
+      if (companyId === 'company-unhealthy') throw new Error('bounded failure');
+    });
+    const scheduler = createAgentScheduler(schedulerDeps({
+      listShadowCompanies: async () => [
+        { companyId: 'company-unhealthy', scheduleMinutes: 10, liveRequested: false },
+        { companyId: 'company-healthy', scheduleMinutes: 10, liveRequested: false },
+      ],
+      discoverJobs,
+    }));
+
+    await expect(scheduler.tick()).resolves.toBeUndefined();
+    expect(discoverJobs).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds company discovery concurrency to the configured global capacity', async () => {
+    const release = deferred<void>();
+    let active = 0;
+    let maximum = 0;
+    const discoverJobs = vi.fn(async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await release.promise;
+      active -= 1;
+    });
+    const scheduler = createAgentScheduler(schedulerDeps({
+      globalConcurrency: 3,
+      listShadowCompanies: async () =>
+        Array.from({ length: 8 }, (_, index) => ({
+          companyId: `company-${index}`,
+          scheduleMinutes: 10,
+          liveRequested: false,
+        })),
+      discoverJobs,
+    }));
+
+    const ticking = scheduler.tick();
+    await vi.waitFor(() => expect(discoverJobs).toHaveBeenCalledTimes(3));
+    expect(maximum).toBe(3);
+    release.resolve();
+    await ticking;
+    expect(discoverJobs).toHaveBeenCalledTimes(8);
+  });
+
+  it('reaches durable live recovery even when mutable company mode removes ordinary scheduling', async () => {
+    const recoverLiveMutations = vi.fn(async () => undefined);
+    const scheduler = createAgentScheduler(schedulerDeps({
+      listShadowCompanies: async () => [],
+      recoverLiveMutations,
+    }));
+
+    await scheduler.tick();
+
+    expect(recoverLiveMutations).toHaveBeenCalledOnce();
+  });
+
+  it('skips credential-backed breaker probes without live intent', async () => {
+    const evaluate = vi.fn(async () => undefined);
+
+    await guardScheduledLiveCompany({
+      companyId: 'company-generic',
+      scheduleMinutes: 10,
+      liveRequested: false,
+    }, {
+      evaluate,
+    });
+
+    expect(evaluate).not.toHaveBeenCalled();
+  });
+
+  it('evaluates breakers for requested live companies even when already paused', async () => {
+    const evaluate = vi.fn(async () => undefined);
+    await guardScheduledLiveCompany({
+      companyId: 'company-generic',
+      scheduleMinutes: 10,
+      liveRequested: true,
+    }, {
+      evaluate,
+    });
+
+    expect(evaluate).toHaveBeenCalledOnce();
+    expect(evaluate).toHaveBeenCalledWith('company-generic');
+  });
+
+  it('reconciles globally enumerated durable mutations without evaluating provider health', async () => {
+    const candidate = {
+      companyId: 'company-generic',
+      transactionId: 'transaction-generic',
+      qboType: 'Purchase' as const,
+      qboId: 'purchase-generic',
+      requestId: 'request-generic',
+      operation: 'recategorize' as const,
+      expectedRevision: 1,
+      configVersion: 'config-v1',
+      requestHash: 'a'.repeat(64),
+      checkpointHash: 'b'.repeat(64),
+    };
+    const reconcile = vi.fn(async () => ({
+      transactionId: 'transaction-generic',
+      requestId: 'request-generic',
+      ok: false,
+      status: 'ERROR' as const,
+      outcome: 'IN_PROGRESS' as const,
+    }));
+
+    await reconcileScheduledLiveMutations({
+      listCandidates: vi.fn(async () => [candidate]),
+      reconcile,
+    });
+
+    expect(reconcile).toHaveBeenCalledWith(
+      candidate,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('aborts a hung recovery and durably defers only that exact operation', async () => {
+    vi.useFakeTimers();
+    try {
+      const candidate = {
+        companyId: 'company-generic',
+        transactionId: 'transaction-generic',
+        qboType: 'Purchase' as const,
+        qboId: 'purchase-generic',
+        requestId: 'request-generic',
+        operation: 'recategorize' as const,
+        expectedRevision: 1,
+        configVersion: 'config-v1',
+        requestHash: 'a'.repeat(64),
+        checkpointHash: 'b'.repeat(64),
+      };
+      const defer = vi.fn(async () => undefined);
+      const reconciling = reconcileScheduledLiveMutations({
+        listCandidates: vi.fn(async () => [candidate]),
+        reconcile: vi.fn(async (_input, signal?: AbortSignal) =>
+          new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')));
+          })),
+        defer,
+        timeoutMs: 1_000,
+        concurrency: 1,
+      });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await reconciling;
+
+      expect(defer).toHaveBeenCalledWith(candidate);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('continues its bounded page when stale-binding backoff itself fails', async () => {
+    const candidates = ['first', 'second'].map((suffix) => ({
+      companyId: `company-${suffix}`,
+      transactionId: `transaction-${suffix}`,
+      qboType: 'Purchase' as const,
+      qboId: `purchase-${suffix}`,
+      requestId: `request-${suffix}`,
+      operation: 'recategorize' as const,
+      expectedRevision: 1,
+      configVersion: 'config-v1',
+      requestHash: 'a'.repeat(64),
+      checkpointHash: 'b'.repeat(64),
+    }));
+    const reconcile = vi.fn()
+      .mockRejectedValueOnce(new Error('bounded read failure'))
+      .mockResolvedValueOnce({
+        transactionId: 'transaction-second',
+        requestId: 'request-second',
+        ok: true,
+        status: 'POSTED',
+        outcome: 'VERIFIED',
+      });
+
+    await reconcileScheduledLiveMutations({
+      listCandidates: vi.fn(async () => candidates),
+      reconcile,
+      defer: vi.fn(async () => {
+        throw new Error('stale exact binding');
+      }),
+      concurrency: 1,
+    });
+
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
   it('does not let a pre-stop tick claim when restarted before discovery resolves', async () => {
     const discovery = deferred<void>();
     const discoverJobs = vi.fn(async () => discovery.promise);
     const claimJobs = vi.fn(async () => []);
     const scheduler = createAgentScheduler(schedulerDeps({
-      listShadowCompanies: async () => [{ companyId: 'company-1', scheduleMinutes: 10 }],
+      listShadowCompanies: async () => [{
+        companyId: 'company-1',
+        scheduleMinutes: 10,
+        liveRequested: false,
+      }],
       discoverJobs,
       claimJobs,
     }));
@@ -316,6 +612,29 @@ describe('shadow agent scheduler', () => {
       'opaque-worker',
       'AGENT_MODEL_CONFIG_INVALID',
     );
+  });
+
+  it('resumes an exact live recovery before loading unusable current model settings', async () => {
+    const claimed = job('job-recovery', 'company-generic');
+    const runClaimedLiveRecovery = vi.fn(async () => true);
+    const terminalize = vi.fn();
+
+    await runScheduledShadowJob(claimed, 'opaque-worker', {
+      getCompanySettings: async () => {
+        throw new Error('current settings must not gate exact recovery');
+      },
+      getProviderSettings: async () => {
+        throw new Error('current provider settings must not gate exact recovery');
+      },
+      createModel: vi.fn(),
+      runClaimedJob: vi.fn(),
+      runClaimedLiveRecovery,
+      terminalize,
+      supersede: vi.fn(),
+    });
+
+    expect(runClaimedLiveRecovery).toHaveBeenCalledWith(claimed, 'opaque-worker');
+    expect(terminalize).not.toHaveBeenCalled();
   });
 
   it('does not terminalize a valid claim for an infrastructure settings read failure', async () => {

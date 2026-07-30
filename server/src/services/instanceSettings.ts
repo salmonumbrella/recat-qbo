@@ -6,6 +6,7 @@ import type { InstanceSettingsDto, SuggestionProvider, SuggestionSetting } from 
 import { env, redirectUri } from '../env.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { prisma } from '../lib/prisma.js';
+import { runSerializableTransaction } from '../lib/serializableTransaction.js';
 
 const SETTING_KEYS = [
   'intuitClientId',
@@ -36,6 +37,20 @@ const ENCRYPTED_KEYS: ReadonlySet<SettingKey> = new Set([
   'aiApiKey',
   'openrouterApiKey',
   'smtpPass',
+]);
+
+const LIVE_AUTHORITY_SETTING_KEYS: ReadonlySet<SettingKey> = new Set([
+  'intuitClientId',
+  'intuitClientSecret',
+  'suggestionProvider',
+  'suggestionModel',
+  'agentDecisionModel',
+  'agentVerifierModel',
+  'aiEndpoint',
+  'aiApiKey',
+  'openrouterApiKey',
+  'openrouterReferer',
+  'openrouterTitle',
 ]);
 
 export interface InstanceSettingsDb {
@@ -210,16 +225,33 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
 }
 
 export async function updateInstanceSettings(patch: InstanceSettingsPatch): Promise<void> {
-  for (const key of SETTING_KEYS) {
-    const rawValue = patch[key];
-    if (rawValue === undefined) continue;
-    const raw = String(rawValue); // smtpPort arrives as a number; AppConfig stores strings
-    const shouldEncrypt = ENCRYPTED_KEYS.has(key) && raw !== '';
-    const value = shouldEncrypt ? encrypt(raw) : raw;
-    await prisma.appConfig.upsert({
-      where: { key },
-      update: { value, encrypted: shouldEncrypt },
-      create: { key, value, encrypted: shouldEncrypt },
-    });
-  }
+  await runSerializableTransaction(prisma, async (transaction) => {
+    let invalidatesLiveAuthority = false;
+    for (const key of SETTING_KEYS) {
+      const rawValue = patch[key];
+      if (rawValue === undefined) continue;
+      const raw = String(rawValue); // smtpPort arrives as a number; AppConfig stores strings
+      const shouldEncrypt = ENCRYPTED_KEYS.has(key) && raw !== '';
+      const value = shouldEncrypt ? encrypt(raw) : raw;
+      await transaction.appConfig.upsert({
+        where: { key },
+        update: { value, encrypted: shouldEncrypt },
+        create: { key, value, encrypted: shouldEncrypt },
+      });
+      invalidatesLiveAuthority ||= LIVE_AUTHORITY_SETTING_KEYS.has(key);
+    }
+    if (invalidatesLiveAuthority) {
+      await transaction.agentCompanyConfig.updateMany({
+        where: { liveRequested: true },
+        data: {
+          liveAcceptedPolicyVersion: null,
+          liveAcceptedConfigVersion: null,
+          liveAcceptedProviderBinding: null,
+          livePausedAt: new Date(),
+          livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+          livePauseMessage: 'Live mode is paused: The current live policy must be accepted.',
+        },
+      });
+    }
+  });
 }

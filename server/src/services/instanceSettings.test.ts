@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   openrouterReferer: '',
   openrouterTitle: '',
   appConfig: { findMany: vi.fn(), upsert: vi.fn() },
+  agentCompanyConfig: { updateMany: vi.fn() },
+  transaction: vi.fn(),
   user: { count: vi.fn() },
 }));
 
@@ -43,7 +45,14 @@ vi.mock('../env.js', () => ({
   webhookUrl: 'http://localhost:5173/webhooks/qbo',
 }));
 
-vi.mock('../lib/prisma.js', () => ({ prisma: { appConfig: mocks.appConfig, user: mocks.user } }));
+vi.mock('../lib/prisma.js', () => ({
+  prisma: {
+    appConfig: mocks.appConfig,
+    agentCompanyConfig: mocks.agentCompanyConfig,
+    user: mocks.user,
+    $transaction: mocks.transaction,
+  },
+}));
 vi.mock('../middleware/auth.js', () => {
   const allow: RequestHandler = (_req, _res, next) => next();
   return { requireUser: allow, requireInstanceAdmin: allow };
@@ -68,6 +77,11 @@ beforeEach(() => {
   mocks.openrouterTitle = '';
   mocks.appConfig.findMany.mockResolvedValue([]);
   mocks.appConfig.upsert.mockResolvedValue({});
+  mocks.agentCompanyConfig.updateMany.mockResolvedValue({ count: 0 });
+  mocks.transaction.mockImplementation(async (callback) => callback({
+    appConfig: mocks.appConfig,
+    agentCompanyConfig: mocks.agentCompanyConfig,
+  }));
   mocks.user.count.mockResolvedValue(1);
 });
 
@@ -141,6 +155,30 @@ describe('suggestion model setting precedence', () => {
 });
 
 describe('agent model settings', () => {
+  it.each([
+    ['agentDecisionModel', 'decision-model-v2'],
+    ['agentVerifierModel', 'verifier-model-v2'],
+    ['aiEndpoint', 'https://models.example/v2'],
+    ['aiApiKey', 'custom-key-v2'],
+    ['openrouterApiKey', 'router-key-v2'],
+  ] as const)('atomically pauses every requested live company when %s changes', async (key, value) => {
+    await updateInstanceSettings({ [key]: value });
+
+    expect(mocks.transaction).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({ isolationLevel: 'Serializable' }),
+    );
+    expect(mocks.agentCompanyConfig.updateMany).toHaveBeenCalledWith({
+      where: { liveRequested: true },
+      data: expect.objectContaining({
+        liveAcceptedPolicyVersion: null,
+        liveAcceptedConfigVersion: null,
+        liveAcceptedProviderBinding: null,
+        livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+      }),
+    });
+  });
+
   it('defaults both agent models dynamically to the effective environment suggestion model', async () => {
     mocks.suggestionModel = 'environment-suggestion-model';
     mocks.appConfig.findMany.mockResolvedValue([

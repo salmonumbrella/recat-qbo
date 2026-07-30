@@ -35,8 +35,8 @@ vi.mock('../lib/qbo/factory.js', () => ({
   qboFactory: {
     authorizeUrl: vi.fn(),
     forCompany: vi.fn(),
-    revoke: vi.fn(),
   },
+  revokeCapturedQboToken: vi.fn(),
   testCompanyConnection: mocks.testCompanyConnection,
 }));
 

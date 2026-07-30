@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   EntityLeaseError,
   acquireEntityLease,
+  renewEntityLease,
   releaseEntityLease,
   withEntityLease,
   type EntityLeaseDb,
@@ -28,8 +29,15 @@ class FakeLeaseDb implements EntityLeaseDb {
           candidate.companyId === where.companyId &&
           candidate.qboType === where.qboType &&
           candidate.qboId === where.qboId &&
-          (candidate.owner === where.OR[1]!.owner ||
-            candidate.leaseExpiresAt.getTime() <= where.OR[0]!.leaseExpiresAt.lte.getTime()),
+          ('OR' in where
+            ? (
+                candidate.owner === where.OR[1]!.owner ||
+                candidate.leaseExpiresAt.getTime() <= where.OR[0]!.leaseExpiresAt.lte.getTime()
+              )
+            : (
+                candidate.owner === where.owner
+                && candidate.leaseExpiresAt.getTime() > where.leaseExpiresAt.gt.getTime()
+              )),
       );
       if (!row) return { count: 0 };
       Object.assign(row, data);
@@ -108,7 +116,7 @@ describe('entity leases', () => {
     });
 
     expect(query).toHaveBeenCalledWith(
-      expect.stringMatching(/FOR UPDATE/),
+      expect.stringMatching(/"leaseExpiresAt" > CURRENT_TIMESTAMP[\s\S]*FOR UPDATE/),
       key.companyId,
       key.qboType,
       key.qboId,
@@ -197,6 +205,92 @@ describe('entity leases', () => {
       now: async () => new Date(at.getTime() + 1_000),
     });
     expect(db.rows[0]?.leaseExpiresAt.getTime()).toBe(at.getTime() + 31_000);
+  });
+
+  it('strict renewal refuses to resurrect an expired same-owner lease', async () => {
+    const db = new FakeLeaseDb();
+    await acquireEntityLease(key, 'owner-b', { db, now: async () => at });
+
+    await expect(renewEntityLease(key, 'owner-b', {
+      db,
+      now: async () => new Date(at.getTime() + 30_001),
+    })).rejects.toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+  });
+
+  it('keeps an outer lease held when the same async owner reenters and releases once', async () => {
+    const db = new FakeLeaseDb();
+    let releases = 0;
+    const originalDelete = db.qboEntityLease.deleteMany;
+    db.qboEntityLease.deleteMany = async (args) => {
+      releases += 1;
+      return originalDelete(args);
+    };
+
+    await withEntityLease(key, 'owner-a', async () => {
+      expect(db.rows).toHaveLength(1);
+      await Promise.resolve();
+      await withEntityLease(key, 'owner-a', async () => {
+        expect(db.rows).toMatchObject([{ owner: 'owner-a' }]);
+      }, { db, now: async () => at });
+      expect(db.rows).toMatchObject([{ owner: 'owner-a' }]);
+      expect(releases).toBe(0);
+    }, { db, now: async () => at });
+
+    expect(releases).toBe(1);
+    expect(db.rows).toHaveLength(0);
+  });
+
+  it('does not let a different owner bypass a propagated reentrant context', async () => {
+    const db = new FakeLeaseDb();
+    await withEntityLease(key, 'owner-a', async () => {
+      await Promise.resolve();
+      await expect(withEntityLease(
+        key,
+        'owner-b',
+        async () => undefined,
+        { db, now: async () => at },
+      )).rejects.toMatchObject<EntityLeaseError>({ code: 'ENTITY_BUSY' });
+      expect(db.rows).toMatchObject([{ owner: 'owner-a' }]);
+    }, { db, now: async () => at });
+  });
+
+  it('strictly renews and DB-fences a reentrant owner before nested mutation', async () => {
+    const db = new FakeLeaseDb();
+    let now = at;
+    await expect(withEntityLease(key, 'owner-a', async () => {
+      now = new Date(at.getTime() + 30_001);
+      await withEntityLease(key, 'owner-a', async () => undefined, {
+        db,
+        now: async () => now,
+      });
+    }, { db, now: async () => now })).rejects.toMatchObject<EntityLeaseError>({
+      code: 'ENTITY_BUSY',
+    });
+  });
+
+  it('does not treat an inherited but detached async context as lease authority', async () => {
+    const db = new FakeLeaseDb();
+    let releaseDetached!: () => void;
+    const detachedGate = new Promise<void>((resolve) => {
+      releaseDetached = resolve;
+    });
+    let detached!: Promise<void>;
+
+    await withEntityLease(key, 'owner-a', async () => {
+      detached = Promise.resolve().then(async () => {
+        await detachedGate;
+        await withEntityLease(key, 'owner-a', async () => undefined, {
+          db,
+          now: async () => at,
+        });
+      });
+    }, { db, now: async () => at });
+
+    releaseDetached();
+    await expect(detached).rejects.toMatchObject<EntityLeaseError>({
+      code: 'ENTITY_BUSY',
+    });
+    expect(db.rows).toHaveLength(0);
   });
 
   it('releases only for the matching owner', async () => {

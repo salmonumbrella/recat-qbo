@@ -4,6 +4,8 @@ import { parseAgentDecision } from './core/decision.js';
 const DEFAULT_EVIDENCE_THRESHOLD = 50;
 const MIN_EVIDENCE_THRESHOLD = 25;
 const MAX_EVIDENCE_THRESHOLD = 1000;
+/** Live readiness uses one rolling 30-day window for all shadow evidence. */
+export const LIVE_EVIDENCE_WINDOW_MS = 30 * 24 * 60 * 60 * 1_000;
 
 export interface VerifiedCategorizationProposal {
   taxCalculation: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
@@ -61,6 +63,7 @@ export interface EvaluationDb {
         configVersion?: string;
         status?: string;
         verifierKind?: string;
+        completedAt?: { gte: Date; lte: Date };
       };
     }): Promise<EvaluationRunRow[]>;
     update(args: {
@@ -91,6 +94,7 @@ export interface EvaluationDb {
 
 export interface EvaluationDeps {
   db: EvaluationDb;
+  now?: () => Date;
 }
 
 export type EvaluationQueryDb = Pick<
@@ -104,6 +108,18 @@ export interface ShadowEvidenceSummary {
   disagreements: number;
   threshold: number;
   thresholdMet: boolean;
+}
+
+export interface LiveEvidenceWindow {
+  completedSince: Date;
+  completedThrough: Date;
+}
+
+export function liveEvidenceWindow(completedThrough: Date): LiveEvidenceWindow {
+  return {
+    completedSince: new Date(completedThrough.getTime() - LIVE_EVIDENCE_WINDOW_MS),
+    completedThrough,
+  };
 }
 
 const defaultDeps: EvaluationDeps = {
@@ -290,9 +306,10 @@ function threshold(value: number): number {
 export async function getShadowEvidenceSummary(
   companyId: string,
   deps: EvaluationDeps = defaultDeps,
+  window = liveEvidenceWindow(deps.now?.() ?? new Date()),
 ): Promise<ShadowEvidenceSummary> {
   return deps.db.$transaction(
-    (tx) => getShadowEvidenceSummaryInTransaction(companyId, tx),
+    (tx) => getShadowEvidenceSummaryInTransaction(companyId, tx, window),
     { isolationLevel: 'RepeatableRead' },
   );
 }
@@ -300,6 +317,7 @@ export async function getShadowEvidenceSummary(
 export async function getShadowEvidenceSummaryInTransaction(
   companyId: string,
   db: EvaluationQueryDb,
+  window = liveEvidenceWindow(new Date()),
 ): Promise<ShadowEvidenceSummary> {
   const config = await db.agentCompanyConfig.findUnique({ where: { companyId } });
   const required = threshold(config?.evidenceThreshold ?? DEFAULT_EVIDENCE_THRESHOLD);
@@ -319,6 +337,10 @@ export async function getShadowEvidenceSummaryInTransaction(
         configVersion: config.configVersion,
         status: 'verified',
         verifierKind: 'distinct_model',
+        completedAt: {
+          gte: window.completedSince,
+          lte: window.completedThrough,
+        },
       },
     }),
     db.transaction.findMany({

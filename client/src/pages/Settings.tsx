@@ -201,7 +201,12 @@ export default function Settings() {
           <TaxCard />
 
           {(role === 'categorizer' || role === 'admin') && (
-            <AutopilotCard key={activeCompany.id} companyId={activeCompany.id} role={role} />
+            <AutopilotCard
+              key={activeCompany.id}
+              companyId={activeCompany.id}
+              companyName={activeCompany.legalName}
+              role={role}
+            />
           )}
 
           {/* dry run */}

@@ -1,6 +1,7 @@
 import { isUsableTaxCodeDto, type TaxReadinessDto, type TaxSupportStatus } from '@recat/shared';
 import type { QboClient, QboTaxCodeInfo, QboTaxProfile, QboTaxRateInfo } from '../../lib/qbo/types.js';
 import { isSupportedTaxRateValue } from '../../lib/qbo/purchaseTax.js';
+import { lockCompanyMutationScope } from '../companyMutationScope.js';
 
 export const TAX_REFERENCE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -34,6 +35,18 @@ type TaxCodeRow = {
   sourceUpdatedAt: Date | null;
 };
 
+export interface TaxReadinessQueryDb {
+  company: {
+    findUniqueOrThrow(args: { where: { id: string } }): Promise<TaxReferenceCompany>;
+  };
+  qboTaxCode: {
+    findMany(args: {
+      where: { companyId: string };
+      orderBy: { qboId: 'asc' };
+    }): Promise<TaxCodeRow[]>;
+  };
+}
+
 type TaxCacheModel = {
   findMany(args: { where: { companyId: string }; orderBy?: { qboId: 'asc' } }): Promise<TaxRateRow[] | TaxCodeRow[]>;
   upsert(args: {
@@ -62,6 +75,7 @@ export interface TaxReferenceDb {
   };
   qboTaxRate: TaxCacheModel;
   qboTaxCode: TaxCacheModel;
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   $transaction<T>(
     callback: (tx: TaxReferenceDb) => Promise<T>,
     options?: { isolationLevel: 'RepeatableRead' },
@@ -149,6 +163,14 @@ async function replaceTaxCache(
   const readiness = readinessStatus(profile, codes, ratesById);
 
   await db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, companyId);
+    await tx.$queryRawUnsafe(
+      `SELECT "id"
+         FROM "Company"
+        WHERE "id" = $1
+        FOR UPDATE`,
+      companyId,
+    );
     for (const rate of ratesById.values()) {
       const data = {
         name: rate.name,
@@ -225,19 +247,28 @@ function taxCodesForReadiness(rows: TaxCodeRow[]): TaxReadinessDto['taxCodes'] {
 }
 
 async function getCachedReference(companyId: string, db: TaxReferenceDb): Promise<TaxReadinessDto> {
-  return db.$transaction(async (tx) => {
-    const [company, codeRows] = await Promise.all([
-      tx.company.findUniqueOrThrow({ where: { id: companyId } }),
-      tx.qboTaxCode.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
-    ]);
-    return {
-      status: company.taxSupportStatus as TaxSupportStatus,
-      reason: company.taxSupportReason,
-      usingSalesTax: company.taxUsingSalesTax,
-      refreshedAt: company.taxReferenceRefreshedAt?.toISOString() ?? null,
-      taxCodes: taxCodesForReadiness(codeRows as TaxCodeRow[]),
-    };
-  }, { isolationLevel: 'RepeatableRead' });
+  return db.$transaction(
+    (tx) => getTaxReadinessInTransaction(companyId, tx as unknown as TaxReadinessQueryDb),
+    { isolationLevel: 'RepeatableRead' },
+  );
+}
+
+/** Reads cached tax readiness inside an already-open transaction without nesting one. */
+export async function getTaxReadinessInTransaction(
+  companyId: string,
+  db: TaxReadinessQueryDb,
+): Promise<TaxReadinessDto> {
+  const [company, codeRows] = await Promise.all([
+    db.company.findUniqueOrThrow({ where: { id: companyId } }),
+    db.qboTaxCode.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
+  ]);
+  return {
+    status: company.taxSupportStatus as TaxSupportStatus,
+    reason: company.taxSupportReason,
+    usingSalesTax: company.taxUsingSalesTax,
+    refreshedAt: company.taxReferenceRefreshedAt?.toISOString() ?? null,
+    taxCodes: taxCodesForReadiness(codeRows),
+  };
 }
 
 async function recordRefreshFailure(db: TaxReferenceDb, companyId: string): Promise<void> {

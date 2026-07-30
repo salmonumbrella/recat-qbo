@@ -109,6 +109,20 @@ export async function runClaimedShadowJob(
   await completeRunAndJob(job, prepared.runId, result, deps);
 }
 
+/**
+ * Reuses the durable claimed-job/run start fence for the outer live worker.
+ * Live orchestration refreshes QBO and rechecks authority only after this
+ * bounded database transaction has committed.
+ */
+export async function beginClaimedLiveRun(
+  job: ClaimedAgentJob,
+  deps: ShadowWorkerDeps,
+): Promise<{ readonly runId: string } | null> {
+  validateInvocation(job, deps);
+  const prepared = await prepareRun(job, deps);
+  return prepared.kind === 'ready' ? { runId: prepared.runId } : null;
+}
+
 async function prepareRun(
   job: ClaimedAgentJob,
   deps: ShadowWorkerDeps,

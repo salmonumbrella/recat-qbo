@@ -408,10 +408,24 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
       renewLease: async (key, owner) => {
         renewCount += 1;
         if (renewCount === 2) finalRenewStarted.resolve();
-        await acquireEntityLease(key, owner, {
-          db: attemptClient as unknown as EntityLeaseDb,
-          ttlMs: 20,
-        });
+        for (let retries = 0; retries < 100; retries += 1) {
+          try {
+            await acquireEntityLease(key, owner, {
+              db: attemptClient as unknown as EntityLeaseDb,
+              ttlMs: 20,
+            });
+            return;
+          } catch (error) {
+            if (
+              typeof error !== 'object'
+              || error === null
+              || !('code' in error)
+              || error.code !== 'ENTITY_BUSY'
+            ) throw error;
+            await delay(5);
+          }
+        }
+        throw new Error('Timed out waiting to reacquire the test entity lease.');
       },
       invocationId: randomUUID,
       now: () => new Date(),

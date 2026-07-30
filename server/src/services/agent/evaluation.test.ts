@@ -15,6 +15,7 @@ const RUN_ID = '00000000-0000-4000-8000-000000000003';
 const JOB_ID = '00000000-0000-4000-8000-000000000004';
 const TAG_ID = '00000000-0000-4000-8000-000000000005';
 const CONFIG_VERSION = 'config-current';
+const NOW = new Date('2026-07-29T12:00:00.000Z');
 
 function proposal(categoryQboId = 'expense-generic') {
   return {
@@ -103,7 +104,7 @@ class FakeEvaluationDb implements EvaluationDb {
       toolCalls: 1,
     },
     verifierKind: 'distinct_model',
-    completedAt: new Date('2026-07-29T12:00:00.000Z'),
+    completedAt: new Date(),
   }];
 
   agentCompanyConfig = {
@@ -113,8 +114,23 @@ class FakeEvaluationDb implements EvaluationDb {
 
   agentRun = {
     findMany: async ({ where }: { where: Record<string, unknown> }) =>
-      this.runs.filter((run) => Object.entries(where).every(([key, value]) =>
-        value === undefined || run[key as keyof RunRow] === value)),
+      this.runs.filter((run) => Object.entries(where).every(([key, value]) => {
+        if (value === undefined) return true;
+        if (
+          key === 'completedAt'
+          && typeof value === 'object'
+          && value !== null
+          && 'gte' in value
+          && value.gte instanceof Date
+          && 'lte' in value
+          && value.lte instanceof Date
+        ) {
+          return run.completedAt !== null
+            && run.completedAt >= value.gte
+            && run.completedAt <= value.lte;
+        }
+        return run[key as keyof RunRow] === value;
+      })),
     update: async ({ where, data }: {
       where: { id: string };
       data: { verification: unknown };
@@ -157,6 +173,34 @@ describe('shadow evidence evaluation', () => {
       agreements: 1,
       disagreements: 0,
       threshold: 50,
+      thresholdMet: false,
+    });
+  });
+
+  it('excludes otherwise eligible evidence completed outside the rolling 30-day window', async () => {
+    const db = new FakeEvaluationDb();
+    db.runs[0]!.completedAt = new Date('2026-06-29T11:59:59.999Z');
+
+    await evaluateShadowRunAgainstOutcome(validOutcome(), { db });
+
+    expect(await getShadowEvidenceSummary(COMPANY_ID, { db, now: () => NOW })).toMatchObject({
+      eligibleRuns: 0,
+      agreements: 0,
+      disagreements: 0,
+      thresholdMet: false,
+    });
+  });
+
+  it('excludes otherwise eligible evidence completed after the captured window upper bound', async () => {
+    const db = new FakeEvaluationDb();
+    db.runs[0]!.completedAt = new Date('2026-07-29T12:00:00.001Z');
+
+    await evaluateShadowRunAgainstOutcome(validOutcome(), { db });
+
+    expect(await getShadowEvidenceSummary(COMPANY_ID, { db, now: () => NOW })).toMatchObject({
+      eligibleRuns: 0,
+      agreements: 0,
+      disagreements: 0,
       thresholdMet: false,
     });
   });
