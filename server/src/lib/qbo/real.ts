@@ -16,6 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import {
+  QboAttachmentNotFoundError,
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
@@ -105,6 +106,13 @@ const OAUTH_TOKEN_TIMEOUT_MS = 30_000;
 const REVOKE_TIMEOUT_MS = 5_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
+
+class QboHttpNotFoundError extends Error {
+  constructor() {
+    super('QuickBooks resource was not found.');
+    this.name = 'QboHttpNotFoundError';
+  }
+}
 
 export type QboEnvironment = 'sandbox' | 'production';
 
@@ -1169,6 +1177,7 @@ export class RealQboClient implements QboClient {
     const first = errors[0];
     // 5010 = "Stale Object Error": the entity was edited after our read.
     if (errors.some((e) => e.code === '5010')) return new QboSyncTokenConflict();
+    if (status === 404) return new QboHttpNotFoundError();
     if (status === 401 || status === 403) {
       return new QboAuthError(first?.Message ?? `QuickBooks auth error (${status})`);
     }
@@ -1273,7 +1282,7 @@ export class RealQboClient implements QboClient {
         raw: body.Attachable,
       };
     } catch (error) {
-      if (error instanceof Error && /not\s*found/iu.test(error.message)) {
+      if (error instanceof QboHttpNotFoundError) {
         return null;
       }
       throw error;
@@ -1286,7 +1295,7 @@ export class RealQboClient implements QboClient {
 
   async openAttachmentDownload(id: string): Promise<QboAttachmentDownload> {
     const current = await this.getRawAttachment(id);
-    if (!current) throw new Error('QuickBooks attachment was not found.');
+    if (!current) throw new QboAttachmentNotFoundError();
     const downloadUri = attachableDownloadUri(current.raw);
     if (!downloadUri) {
       throw new Error(
@@ -1315,6 +1324,9 @@ export class RealQboClient implements QboClient {
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       clearTimeout(timeout);
+      if (response.status === 404) {
+        throw new QboAttachmentNotFoundError();
+      }
       throw this.toError(response.status, text);
     }
     if (!response.body) {

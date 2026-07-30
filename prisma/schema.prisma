@@ -73,6 +73,24 @@ enum AttachmentBlobState {
   READY
 }
 
+enum ReceiptDocumentStatus {
+  RECEIVED
+  QUEUED
+  PROCESSING
+  NEEDS_REVIEW
+  READY
+  MATCHED
+  ATTACHING
+  ATTACHED
+  FAILED
+}
+
+enum ReceiptSourceKind {
+  WEB_UPLOAD
+  API_UPLOAD
+  MCP_UPLOAD
+}
+
 model User {
   id              String           @id @default(uuid())
   email           String           @unique
@@ -87,6 +105,9 @@ model User {
   sessions        Session[]
   memberships     Membership[]
   mcpTokens       McpToken[]
+  receiptsCreated  ReceiptDocument[] @relation("ReceiptCreatedBy")
+  receiptsApproved ReceiptDocument[] @relation("ReceiptApprovedBy")
+  receiptEvents    ReceiptEvent[]
 }
 
 /// Per-company role (handoff §5 matrix, scoped per specs.md §2).
@@ -195,6 +216,11 @@ model Company {
   attachmentOperations AttachmentOperation[]
   attachmentUploadGrants AttachmentUploadGrant[]
   attachmentDownloadGrants AttachmentDownloadGrant[]
+  receiptDocuments ReceiptDocument[]
+  receiptProcessingJobs ReceiptProcessingJob[]
+  receiptIntakeOperations ReceiptIntakeOperation[]
+  receiptCompanyConfig ReceiptCompanyConfig?
+  receiptEvents ReceiptEvent[]
 }
 
 model Transaction {
@@ -231,6 +257,8 @@ model Transaction {
   autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
   attachments TransactionAttachment[]
   attachmentOperations AttachmentOperation[]
+  matchedReceipts ReceiptDocument[]
+  receiptMatchCandidates ReceiptMatchCandidate[]
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
@@ -250,6 +278,7 @@ model AttachmentBlob {
   chunks      AttachmentBlobChunk[]
   stagedFiles StagedAttachment[]
   attachments TransactionAttachment[]
+  receiptDocuments ReceiptDocument[]
 
   @@unique([companyId, sha256])
   @@index([companyId, state])
@@ -307,6 +336,7 @@ model TransactionAttachment {
   updatedAt        DateTime                  @updatedAt
   operationFiles   AttachmentOperationFile[]
   downloadGrants   AttachmentDownloadGrant[]
+  receiptDocument  ReceiptDocument?
 
   @@unique([companyId, qboAttachableId])
   @@index([companyId, transactionId, status])
@@ -379,6 +409,195 @@ model AttachmentDownloadGrant {
   createdAt    DateTime              @default(now())
 
   @@index([companyId, actorKey, expiresAt])
+}
+
+model ReceiptDocument {
+  id                         String                     @id @default(uuid())
+  companyId                  String
+  company                    Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  blobId                     String?
+  blob                       AttachmentBlob?            @relation(fields: [blobId], references: [id], onDelete: SetNull)
+  originalFilename           String                     @db.VarChar(255)
+  contentType                String                     @db.VarChar(120)
+  sizeBytes                  BigInt
+  sha256                     String                     @db.Char(64)
+  sourceKind                 ReceiptSourceKind
+  sourceExternalId           String?                    @db.VarChar(200)
+  status                     ReceiptDocumentStatus      @default(RECEIVED)
+  generation                 Int                        @default(1)
+  revision                   Int                        @default(0)
+  pageCount                  Int?
+  retainLocally              Boolean                    @default(true)
+  userNotes                  String?                    @db.Text
+  manuallyEdited             Boolean                    @default(false)
+  lastExportedAt             DateTime?
+  createdByUserId            String?
+  createdByUser              User?                      @relation("ReceiptCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  matchedTransactionId       String?
+  matchedTransaction         Transaction?               @relation(fields: [matchedTransactionId], references: [id], onDelete: SetNull)
+  matchedTransactionRevision Int?
+  transactionAttachmentId    String?                    @unique
+  transactionAttachment      TransactionAttachment?     @relation(fields: [transactionAttachmentId], references: [id], onDelete: SetNull)
+  approvedAt                 DateTime?
+  approvedByUserId           String?
+  approvedByUser             User?                      @relation("ReceiptApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  deletedAt                  DateTime?
+  createdAt                  DateTime                   @default(now())
+  updatedAt                  DateTime                   @updatedAt
+  jobs                       ReceiptProcessingJob[]
+  attempts                   ReceiptExtractionAttempt[]
+  candidates                 ReceiptMatchCandidate[]
+  events                     ReceiptEvent[]
+
+  @@unique([companyId, blobId])
+  @@unique([companyId, sha256])
+  @@unique([companyId, sourceKind, sourceExternalId])
+  @@index([companyId, status, createdAt])
+  @@index([companyId, deletedAt, createdAt])
+}
+
+model ReceiptProcessingJob {
+  id             String                     @id @default(uuid())
+  documentId     String
+  document       ReceiptDocument            @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  companyId      String
+  company        Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  generation     Int
+  configVersion  String                     @db.Char(64)
+  status         String                     @db.VarChar(16)
+  dueAt          DateTime
+  lockOwner      String?                    @db.VarChar(200)
+  leaseExpiresAt DateTime?
+  attemptCount   Int                        @default(0)
+  lastErrorCode  String?                    @db.VarChar(64)
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+  attempts       ReceiptExtractionAttempt[]
+
+  @@unique([documentId, generation])
+  @@index([status, dueAt])
+  @@index([companyId, status])
+}
+
+model ReceiptIntakeOperation {
+  id             String   @id @default(uuid())
+  actorKey       String   @db.VarChar(160)
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  idempotencyKey String   @db.VarChar(128)
+  requestHash    String   @db.Char(64)
+  receiptIds     Json
+  createdAt      DateTime @default(now())
+
+  @@unique([actorKey, companyId, idempotencyKey])
+  @@index([companyId, createdAt])
+}
+
+model ReceiptExtractionAttempt {
+  id                   String                   @id @default(uuid())
+  jobId                String
+  job                  ReceiptProcessingJob     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  documentId           String
+  document             ReceiptDocument          @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  generation           Int
+  attemptCount         Int
+  status               String                   @db.VarChar(16)
+  result               Json?
+  receiptDate          DateTime?                @db.Date
+  documentTitle        String?                  @db.VarChar(500)
+  vendorName           String?                  @db.VarChar(500)
+  vendorTaxId          String?                  @db.VarChar(200)
+  vendorReceiptId      String?                  @db.VarChar(200)
+  clientName           String?                  @db.VarChar(500)
+  clientTaxId          String?                  @db.VarChar(200)
+  description          String?                  @db.Text
+  lineItems            Json?
+  subtotal             Decimal?                 @db.Decimal(18, 4)
+  taxAmount            Decimal?                 @db.Decimal(18, 4)
+  totalAmount          Decimal?                 @db.Decimal(18, 4)
+  currency             String?                  @db.VarChar(3)
+  convertedAmount      Decimal?                 @db.Decimal(18, 4)
+  conversionRate       Decimal?                 @db.Decimal(18, 8)
+  paymentMethod        String?                  @db.VarChar(80)
+  paymentIdentifier    String?                  @db.VarChar(200)
+  language             String?                  @db.VarChar(16)
+  additionalFields     Json?
+  rawExtractedText     String?                  @db.Text
+  documentType         String?                  @db.VarChar(80)
+  category             String?                  @db.VarChar(500)
+  extractionConfidence Decimal?                 @db.Decimal(5, 4)
+  taxComponents        Json?
+  parseSalvaged        Boolean                  @default(false)
+  warnings             Json?
+  model                String                   @db.VarChar(200)
+  promptVersion        String                   @db.VarChar(120)
+  schemaVersion        String                   @db.VarChar(120)
+  tokensIn             Int                      @default(0)
+  tokensOut            Int                      @default(0)
+  costUsd              Decimal?                 @db.Decimal(14, 8)
+  durationMs           Int?
+  errorCode            String?                  @db.VarChar(64)
+  startedAt            DateTime                 @default(now())
+  completedAt          DateTime?
+  candidates           ReceiptMatchCandidate[]
+  searchVector         Unsupported("tsvector")? @default(dbgenerated("to_tsvector('simple'::regconfig, (((((((((((((COALESCE(\"documentTitle\", ''::character varying))::text || ' '::text) || (COALESCE(\"vendorName\", ''::character varying))::text) || ' '::text) || (COALESCE(\"vendorTaxId\", ''::character varying))::text) || ' '::text) || (COALESCE(\"vendorReceiptId\", ''::character varying))::text) || ' '::text) || COALESCE(description, ''::text)) || ' '::text) || COALESCE(\"rawExtractedText\", ''::text)) || ' '::text) || (COALESCE(currency, ''::character varying))::text))")) @map("search_vector")
+
+  @@unique([jobId, attemptCount])
+  @@index([documentId, generation])
+  @@index([documentId, completedAt])
+  @@index([searchVector], type: Gin)
+}
+
+model ReceiptMatchCandidate {
+  id                  String                   @id @default(uuid())
+  documentId          String
+  document            ReceiptDocument          @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  extractionAttemptId String
+  extractionAttempt   ReceiptExtractionAttempt @relation(fields: [extractionAttemptId], references: [id], onDelete: Cascade)
+  transactionId       String
+  transaction         Transaction              @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transactionRevision Int
+  score               Int
+  evidence            Json
+  rank                Int
+  state               String                   @default("proposed") @db.VarChar(16)
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  @@unique([extractionAttemptId, transactionId])
+  @@index([documentId, rank])
+  @@index([transactionId, state])
+}
+
+model ReceiptCompanyConfig {
+  companyId           String   @id
+  company             Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  enabled             Boolean  @default(true)
+  provider            String   @default("openrouter") @db.VarChar(32)
+  model               String   @default("openai/gpt-4o-mini") @db.VarChar(200)
+  confidenceThreshold Decimal  @default(0.8) @db.Decimal(5, 4)
+  autoMatchThreshold  Int      @default(85)
+  autoMatchMargin     Int      @default(15)
+  maxPages            Int      @default(20)
+  configVersion       String   @db.Char(64)
+  updatedAt           DateTime @updatedAt
+}
+
+model ReceiptEvent {
+  id          String          @id @default(uuid())
+  companyId   String
+  company     Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  documentId  String
+  document    ReceiptDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  actorUserId String?
+  actorUser   User?           @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  action      String          @db.VarChar(64)
+  before      Json?
+  after       Json?
+  createdAt   DateTime        @default(now())
+
+  @@index([documentId, createdAt])
+  @@index([companyId, createdAt])
 }
 
 model Tag {

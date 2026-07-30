@@ -38,6 +38,7 @@ import {
 import { usersRouter } from './routes/users.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { mcpTokensRouter } from './routes/mcpTokens.js';
+import { receiptsRouter } from './routes/receipts.js';
 import { createRecatBearerAuth, createRecatTokenVerifier } from './mcp/auth.js';
 import { createMcpHttpGuards } from './mcp/httpGuards.js';
 import {
@@ -112,6 +113,7 @@ app.use(
 );
 app.use('/api/attachment-uploads', attachmentUploadsRouter);
 app.use('/api/attachment-downloads', attachmentDownloadsRouter);
+app.use('/api/companies/:companyId/receipts', receiptsRouter);
 app.use('/api/companies/:companyId/transactions', companyTransactionsRouter);
 app.use('/api/companies/:companyId/transfer-candidates', transferCandidatesRouter);
 app.use('/api/companies/:companyId/tags', tagsRouter);

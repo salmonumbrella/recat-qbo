@@ -464,6 +464,221 @@ export type AttachmentSourceInput =
   | { kind: 'upload'; uploadId: string }
   | { kind: 'https'; url: string };
 
+export type ReceiptDocumentStatus =
+  | 'RECEIVED'
+  | 'QUEUED'
+  | 'PROCESSING'
+  | 'NEEDS_REVIEW'
+  | 'READY'
+  | 'MATCHED'
+  | 'ATTACHING'
+  | 'ATTACHED'
+  | 'FAILED';
+
+export type ReceiptSourceKind = 'WEB_UPLOAD' | 'API_UPLOAD' | 'MCP_UPLOAD';
+
+export interface ReceiptTaxComponentDto {
+  label: string;
+  rate: string | null;
+  amount: string | null;
+  confidence: number | null;
+}
+
+export interface ReceiptLineItemDto {
+  description: string;
+  quantity: string | null;
+  unitPrice: string | null;
+}
+
+export interface ReceiptExtractionDto {
+  id: string;
+  generation: number;
+  status: 'running' | 'succeeded' | 'failed';
+  receiptDate: string | null;
+  documentTitle: string | null;
+  vendorName: string | null;
+  vendorTaxId: string | null;
+  vendorReceiptId: string | null;
+  clientName: string | null;
+  clientTaxId: string | null;
+  description: string | null;
+  lineItems: ReceiptLineItemDto[];
+  subtotal: string | null;
+  taxAmount: string | null;
+  totalAmount: string | null;
+  currency: string | null;
+  convertedAmount: string | null;
+  conversionRate: string | null;
+  paymentMethod: string | null;
+  paymentIdentifier: string | null;
+  language: string | null;
+  additionalFields: Array<{ key: string; value: string }>;
+  rawExtractedText: string | null;
+  documentType: string | null;
+  category: string | null;
+  extractionConfidence: number | null;
+  taxComponents: ReceiptTaxComponentDto[];
+  parseSalvaged: boolean;
+  warnings: string[];
+  model: string;
+  promptVersion: string;
+  schemaVersion: string;
+  tokensIn: number;
+  tokensOut: number;
+  costUsd: string | null;
+  durationMs: number | null;
+  errorCode: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+export interface ReceiptMatchEvidenceDto {
+  amountPoints: number;
+  currencyPoints: number;
+  datePoints: number;
+  vendorPoints: number;
+  paymentPoints: number;
+  amountDifferenceCents: number;
+  dateDifferenceDays: number | null;
+  vendorSimilarity: number | null;
+}
+
+export interface ReceiptMatchCandidateDto {
+  transactionId: string;
+  transactionRevision: number;
+  rank: number;
+  score: number;
+  state: 'proposed' | 'rejected' | 'confirmed' | 'stale';
+  evidence: ReceiptMatchEvidenceDto;
+  transaction: Pick<
+    TransactionDto,
+    'id' | 'date' | 'payee' | 'memo' | 'amount' | 'status' | 'revision'
+  >;
+}
+
+export interface ReceiptDto {
+  id: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: string;
+  sha256: string;
+  sourceKind: ReceiptSourceKind;
+  status: ReceiptDocumentStatus;
+  generation: number;
+  revision: number;
+  pageCount: number | null;
+  retentionPolicy: boolean;
+  retainedLocally: boolean;
+  approved: boolean;
+  userNotes: string | null;
+  manuallyEdited: boolean;
+  lastExportedAt: string | null;
+  matchedTransactionId: string | null;
+  transactionAttachmentId: string | null;
+  currentExtraction: ReceiptExtractionDto | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReceiptEventDto {
+  id: string;
+  action: string;
+  actorUserId: string | null;
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface ReceiptDetailDto extends ReceiptDto {
+  previousId: string | null;
+  nextId: string | null;
+  attempts: ReceiptExtractionDto[];
+  candidates: ReceiptMatchCandidateDto[];
+  events: ReceiptEventDto[];
+  attachment: AttachmentDto | null;
+}
+
+export interface ReceiptListResponse {
+  receipts: ReceiptDto[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface ReceiptStatsDto {
+  received: number;
+  needsReview: number;
+  queued: number;
+  processing: number;
+  failed: number;
+  totalByCurrency: Array<{ currency: string; amount: string }>;
+  totalTaxByCurrency: Array<{ currency: string; amount: string }>;
+  processingCostUsd: string;
+  recentActivity: ReceiptEventDto[];
+}
+
+export interface ReceiptStatsRange {
+  dateFrom?: string;
+  dateTo?: string;
+}
+
+export interface ReceiptDuplicateGroupDto {
+  key: string;
+  reason: 'content_hash' | 'document_identity';
+  receipts: ReceiptDto[];
+}
+
+export interface ReceiptCompanySettingsDto {
+  enabled: boolean;
+  provider: SuggestionProvider;
+  model: string;
+  confidenceThreshold: number;
+  autoMatchThreshold: number;
+  autoMatchMargin: number;
+  maxPages: number;
+  configVersion: string;
+}
+
+export interface CreateReceiptsBody {
+  idempotencyKey: string;
+  files: Array<{ uploadId: string; sourceExternalId?: string }>;
+  sourceKind: ReceiptSourceKind;
+}
+
+export interface CreateReceiptsResult {
+  receipts: ReceiptDto[];
+}
+
+export interface PatchReceiptBody {
+  expectedRevision: number;
+  patch: Record<string, unknown>;
+}
+
+export interface ReceiptRevisionBody {
+  expectedRevision: number;
+}
+
+export interface ConfirmReceiptMatchBody {
+  expectedReceiptRevision: number;
+  expectedTransactionRevision: number;
+}
+
+export interface ReceiptListParams {
+  statuses?: ReceiptDocumentStatus[];
+  documentTypes?: string[];
+  dateFrom?: string;
+  dateTo?: string;
+  sourceKinds?: ReceiptSourceKind[];
+  missingInfo?: boolean;
+  duplicate?: boolean;
+  matched?: boolean;
+  search?: string;
+  sortBy?: 'createdAt' | 'receiptDate' | 'vendorName' | 'totalAmount' | 'status';
+  sortOrder?: 'asc' | 'desc';
+  page?: number;
+  pageSize?: number;
+}
+
 export interface QboPreflightDto {
   ok: boolean;
   clientIdConfigured: boolean;

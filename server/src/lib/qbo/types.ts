@@ -375,6 +375,15 @@ export class QboRequestTimeout extends Error {
   }
 }
 
+export class QboAttachmentNotFoundError extends Error {
+  code = 'QBO_ATTACHMENT_NOT_FOUND' as const;
+
+  constructor(message = 'QuickBooks attachment was not found.') {
+    super(message);
+    this.name = 'QboAttachmentNotFoundError';
+  }
+}
+
 /**
  * Per-realm QuickBooks client. Token persistence is the caller's job: every
  * method may refresh tokens; `onTokensRefreshed` fires so the caller can

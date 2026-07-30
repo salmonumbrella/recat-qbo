@@ -4,6 +4,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  QboAttachmentNotFoundError,
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
@@ -471,6 +472,21 @@ describe('RealQboClient attachment HTTP seam', () => {
     expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
       'https://download.example/capability',
     );
+  });
+
+  it('uses a typed error when an attachment disappears before download', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Attachable: rawAttachable({
+          TempDownloadUri: 'https://download.example/capability',
+        }),
+      })))
+      .mockResolvedValueOnce(new Response('', { status: 404 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      realClient().client.openAttachmentDownload('A1'),
+    ).rejects.toBeInstanceOf(QboAttachmentNotFoundError);
   });
 
   it('bounds a stalled temporary attachment download', async () => {
