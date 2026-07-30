@@ -99,6 +99,7 @@ export async function runAttachmentCleanup(
       expiresAt: { lte: now },
       stagedFiles: { none: {} },
       attachments: { none: {} },
+      receiptDocuments: { none: {} },
     },
     orderBy: [{ expiresAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
     take: stagingLimit,
@@ -114,6 +115,7 @@ export async function runAttachmentCleanup(
           expiresAt: { lte: now },
           stagedFiles: { none: {} },
           attachments: { none: {} },
+          receiptDocuments: { none: {} },
         },
       });
       return deleted.count;
@@ -178,12 +180,35 @@ export async function runAttachmentCleanup(
             select: { id: true },
             take: 1,
           },
+          receiptDocuments: {
+            where: {
+              OR: [
+                {
+                  jobs: {
+                    some: { status: { in: ['queued', 'retry', 'running'] } },
+                  },
+                },
+                {
+                  attachmentOperations: {
+                    some: {
+                      status: {
+                        in: ['PREPARED', 'COMMITTING', 'PARTIAL', 'UNCERTAIN', 'DELETING'],
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+            select: { id: true },
+            take: 1,
+          },
         },
       });
       if (
         blockers === null
         || blockers.stagedFiles.length > 0
         || blockers.attachments.length > 0
+        || blockers.receiptDocuments.length > 0
       ) return 0;
       const deleted = await transaction.attachmentBlob.deleteMany({
         where: {
@@ -191,6 +216,26 @@ export async function runAttachmentCleanup(
           state: 'READY',
           expiresAt: { lte: now },
           stagedFiles: { none: {} },
+          receiptDocuments: {
+            none: {
+              OR: [
+                {
+                  jobs: {
+                    some: { status: { in: ['queued', 'retry', 'running'] } },
+                  },
+                },
+                {
+                  attachmentOperations: {
+                    some: {
+                      status: {
+                        in: ['PREPARED', 'COMMITTING', 'PARTIAL', 'UNCERTAIN', 'DELETING'],
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          },
         },
       });
       return deleted.count;

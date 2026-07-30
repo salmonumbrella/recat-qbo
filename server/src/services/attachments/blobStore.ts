@@ -444,6 +444,7 @@ export async function releaseAttachmentBlob(
         id: attachment.blobId,
         stagedFiles: { none: {} },
         attachments: { none: {} },
+        receiptDocuments: { none: {} },
       },
     });
   });
@@ -466,6 +467,7 @@ export async function collectUnreferencedBlobs(
       where: {
         stagedFiles: { none: {} },
         attachments: { none: {} },
+        receiptDocuments: { none: {} },
         OR: [
           { state: 'READY' },
           { state: 'STAGING', expiresAt: { lte: now } },
@@ -481,6 +483,7 @@ export async function collectUnreferencedBlobs(
         id: { in: candidates.map((candidate) => candidate.id) },
         stagedFiles: { none: {} },
         attachments: { none: {} },
+        receiptDocuments: { none: {} },
         OR: [
           { state: 'READY' },
           { state: 'STAGING', expiresAt: { lte: now } },

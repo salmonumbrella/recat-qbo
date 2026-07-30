@@ -350,6 +350,8 @@ model AttachmentOperation {
   company        Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   transactionId  String
   transaction    Transaction               @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  receiptDocumentId String?
+  receiptDocument   ReceiptDocument?        @relation(fields: [receiptDocumentId], references: [id], onDelete: Cascade)
   idempotencyKey String                    @db.VarChar(128)
   requestHash    String                    @db.Char(64)
   inputHash      String                    @db.Char(64)
@@ -363,6 +365,7 @@ model AttachmentOperation {
 
   @@unique([actorKey, companyId, transactionId, idempotencyKey])
   @@index([companyId, transactionId, status])
+  @@index([receiptDocumentId, status])
 }
 
 model AttachmentOperationFile {
@@ -448,6 +451,7 @@ model ReceiptDocument {
   attempts                   ReceiptExtractionAttempt[]
   candidates                 ReceiptMatchCandidate[]
   events                     ReceiptEvent[]
+  attachmentOperations       AttachmentOperation[]
 
   @@unique([companyId, blobId])
   @@unique([companyId, sha256])

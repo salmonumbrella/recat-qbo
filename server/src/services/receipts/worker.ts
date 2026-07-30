@@ -14,6 +14,7 @@ import {
   receiptRetryDelayMs,
   type ClaimedReceiptJob,
 } from './jobs.js';
+import { buildReceiptMatches } from './matching.js';
 import {
   DEFAULT_RECEIPT_CONFIG_VERSION,
   resolveReceiptProvider,
@@ -61,6 +62,7 @@ export interface ReceiptWorkerDeps {
     job: ClaimedReceiptJob,
     failure: ReceiptFailure,
   ): Promise<boolean>;
+  buildMatches(documentId: string, generation: number): Promise<unknown>;
   heartbeatMs?: number;
 }
 
@@ -73,6 +75,8 @@ const defaultDeps: ReceiptWorkerDeps = {
   renew: (job, owner) => renewReceiptJob(job, owner),
   persistOwnedSuccess,
   persistOwnedFailure,
+  buildMatches: (documentId, generation) =>
+    buildReceiptMatches(documentId, generation),
   heartbeatMs: 20_000,
 };
 
@@ -92,6 +96,7 @@ export async function runClaimedReceiptJob(
     }, deps.heartbeatMs ?? 20_000);
     heartbeat.unref();
   }
+  let persistedSuccess = false;
   try {
     const provider = await deps.resolveProvider(job.companyId);
     if (!provider.settings.enabled) {
@@ -110,7 +115,7 @@ export async function runClaimedReceiptJob(
       company: document.company,
       categories: document.categories,
     });
-    await deps.persistOwnedSuccess(
+    persistedSuccess = await deps.persistOwnedSuccess(
       job,
       result,
       provider.settings.confidenceThreshold,
@@ -119,6 +124,9 @@ export async function runClaimedReceiptJob(
     await deps.persistOwnedFailure(job, classifyReceiptFailure(error));
   } finally {
     if (heartbeat !== undefined) clearInterval(heartbeat);
+  }
+  if (persistedSuccess) {
+    await deps.buildMatches(job.documentId, job.generation).catch(() => undefined);
   }
 }
 
@@ -376,9 +384,11 @@ export async function reprocessReceipt(
       id: string;
       revision: number;
       generation: number;
+      status: string;
       transactionAttachmentId: string | null;
     }>>`
-      SELECT "id", "revision", "generation", "transactionAttachmentId"
+      SELECT "id", "revision", "generation", "status",
+             "transactionAttachmentId"
         FROM "ReceiptDocument"
        WHERE "id" = ${receiptId}
          AND "companyId" = ${companyId}
@@ -404,7 +414,12 @@ export async function reprocessReceipt(
         'The idempotency key is already bound to another reprocess request.',
       );
     }
-    if (receipt.revision !== expectedRevision) {
+    if (
+      receipt.revision !== expectedRevision
+      || receipt.status === 'ATTACHING'
+      || receipt.status === 'ATTACHED'
+      || receipt.transactionAttachmentId !== null
+    ) {
       throw new ReceiptError('RECEIPT_STALE', 'Receipt revision is stale.');
     }
     const config = await tx.receiptCompanyConfig.findUnique({

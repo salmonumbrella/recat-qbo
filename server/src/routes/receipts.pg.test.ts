@@ -217,6 +217,25 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
       .set('Cookie', otherCategorizer)
       .send({ expectedRevision: 0 })
       .expect(404);
+    for (const action of ['attach', 'undo']) {
+      await request(app)
+        .post(
+          `/api/companies/${firstCompany.id}/receipts/${receiptId}/${action}`,
+        )
+        .set('Cookie', viewer)
+        .send({
+          expectedReceiptRevision: 0,
+          expectedTransactionRevision: 0,
+        })
+        .expect(403);
+      await request(app)
+        .post(
+          `/api/companies/${firstCompany.id}/receipts/${receiptId}/${action}`,
+        )
+        .set('Cookie', categorizer)
+        .send({ expectedReceiptRevision: -1 })
+        .expect(400);
+    }
   });
 
   it('revision-fences delete and restore mutations', async () => {
@@ -270,6 +289,199 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
       .send({ expectedRevision: 1 });
     expect(restored.status).toBe(200);
     expect(restored.body.revision).toBe(2);
+  });
+
+  it('rejects delete and reprocess while attachment work is in flight', async () => {
+    const app = application();
+    const firstCompany = await company();
+    const categorizer = await signedIn(firstCompany.id, 'categorizer');
+    const staged = await upload(app, firstCompany.id, categorizer);
+    const created = await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts`)
+      .set('Cookie', categorizer)
+      .send({
+        idempotencyKey: 'attachment-state-guard',
+        files: [{ uploadId: staged.id }],
+        sourceKind: 'WEB_UPLOAD',
+      });
+    const receiptId = created.body.receipts[0].id as string;
+    await db.receiptDocument.update({
+      where: { id: receiptId },
+      data: { status: 'ATTACHING' },
+    });
+
+    await request(app)
+      .delete(
+        `/api/companies/${firstCompany.id}/receipts/${receiptId}`
+        + '?expectedRevision=0',
+      )
+      .set('Cookie', categorizer)
+      .expect(409);
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/${receiptId}/reprocess`)
+      .set('Cookie', categorizer)
+      .send({
+        expectedRevision: 0,
+        idempotencyKey: 'attachment-state-reprocess',
+      })
+      .expect(409);
+  });
+
+  it('authorizes and revision-fences rematch and confirmation routes', async () => {
+    const app = application();
+    const firstCompany = await company();
+    const categorizer = await signedIn(firstCompany.id, 'categorizer');
+    const viewer = await signedIn(firstCompany.id, 'viewer');
+    const blob = await db.attachmentBlob.create({
+      data: {
+        companyId: firstCompany.id,
+        state: 'READY',
+        sha256: '7'.repeat(64),
+        sizeBytes: 3n,
+        contentType: 'image/png',
+        chunkCount: 1,
+      },
+    });
+    const receipt = await db.receiptDocument.create({
+      data: {
+        companyId: firstCompany.id,
+        blobId: blob.id,
+        originalFilename: 'route-match.png',
+        contentType: 'image/png',
+        sizeBytes: 3n,
+        sha256: '7'.repeat(64),
+        sourceKind: 'WEB_UPLOAD',
+        status: 'READY',
+        jobs: {
+          create: {
+            companyId: firstCompany.id,
+            generation: 1,
+            configVersion: 'd'.repeat(64),
+            status: 'completed',
+            dueAt: new Date(),
+          },
+        },
+      },
+    });
+    const job = await db.receiptProcessingJob.findUniqueOrThrow({
+      where: {
+        documentId_generation: {
+          documentId: receipt.id,
+          generation: 1,
+        },
+      },
+    });
+    await db.receiptExtractionAttempt.create({
+      data: {
+        jobId: job.id,
+        documentId: receipt.id,
+        generation: 1,
+        attemptCount: 1,
+        status: 'succeeded',
+        receiptDate: new Date('2026-07-30T00:00:00.000Z'),
+        vendorName: 'Synthetic Route Vendor',
+        totalAmount: '10.00',
+        currency: 'CAD',
+        documentType: 'expense_receipt',
+        extractionConfidence: 0.9,
+        model: 'synthetic/model',
+        promptVersion: 'synthetic-v1',
+        schemaVersion: 'synthetic-v1',
+        completedAt: new Date(),
+      },
+    });
+    const transactions = await Promise.all([0, 1].map((index) =>
+      db.transaction.create({
+        data: {
+          companyId: firstCompany.id,
+          qboId: `route-match-${index}-${randomUUID()}`,
+          qboType: 'Purchase',
+          qboSyncToken: '0',
+          date: new Date('2026-07-30T00:00:00.000Z'),
+          payee: 'Synthetic Route Vendor',
+          amount: -10,
+          bankAccount: 'Synthetic Bank',
+          status: 'PENDING',
+          rawData: { CurrencyRef: { value: 'CAD' } },
+        },
+      })));
+
+    await request(app)
+      .post(
+        `/api/companies/${firstCompany.id}/receipts/${receipt.id}/rematch`,
+      )
+      .set('Cookie', viewer)
+      .send({ expectedReceiptRevision: 0 })
+      .expect(403);
+    await request(app)
+      .post(
+        `/api/companies/${firstCompany.id}/receipts/${receipt.id}/rematch`,
+      )
+      .set('Cookie', categorizer)
+      .send({ expectedReceiptRevision: -1 })
+      .expect(400);
+
+    const rematched = await request(app)
+      .post(
+        `/api/companies/${firstCompany.id}/receipts/${receipt.id}/rematch`,
+      )
+      .set('Cookie', categorizer)
+      .send({ expectedReceiptRevision: 0 });
+    expect(rematched.status).toBe(200);
+    expect(rematched.body).toMatchObject({
+      id: receipt.id,
+      revision: 1,
+      status: 'READY',
+    });
+    expect(rematched.body.candidates).toHaveLength(2);
+
+    await db.qboEntityLease.create({
+      data: {
+        companyId: firstCompany.id,
+        qboType: transactions[0]!.qboType,
+        qboId: transactions[0]!.qboId,
+        owner: 'synthetic-concurrent-writer',
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+      },
+    });
+    await request(app)
+      .post(
+        `/api/companies/${firstCompany.id}/receipts/${receipt.id}`
+        + `/matches/${transactions[0]!.id}/confirm`,
+      )
+      .set('Cookie', categorizer)
+      .send({
+        expectedReceiptRevision: 1,
+        expectedTransactionRevision: 0,
+      })
+      .expect(409);
+    await db.qboEntityLease.delete({
+      where: {
+        companyId_qboType_qboId: {
+          companyId: firstCompany.id,
+          qboType: transactions[0]!.qboType,
+          qboId: transactions[0]!.qboId,
+        },
+      },
+    });
+
+    const confirmed = await request(app)
+      .post(
+        `/api/companies/${firstCompany.id}/receipts/${receipt.id}`
+        + `/matches/${transactions[0]!.id}/confirm`,
+      )
+      .set('Cookie', categorizer)
+      .send({
+        expectedReceiptRevision: 1,
+        expectedTransactionRevision: 0,
+      });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body).toMatchObject({
+      id: receipt.id,
+      revision: 2,
+      status: 'MATCHED',
+      matchedTransactionId: transactions[0]!.id,
+    });
   });
 
   it('reprocesses once per idempotency key and generation-fences old work', async () => {

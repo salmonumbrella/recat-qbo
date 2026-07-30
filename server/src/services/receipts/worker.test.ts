@@ -67,12 +67,14 @@ function extraction(): ReceiptExtractionResult {
 function fakeDeps(): ReceiptWorkerDeps & {
   status: string;
   attempts: string[];
+  matchBuilds: Array<{ documentId: string; generation: number }>;
   blobDeleted: boolean;
   finishOwned: boolean;
 } {
   const state = {
     status: 'QUEUED',
     attempts: [] as string[],
+    matchBuilds: [] as Array<{ documentId: string; generation: number }>,
     blobDeleted: false,
     finishOwned: true,
   };
@@ -128,11 +130,16 @@ function fakeDeps(): ReceiptWorkerDeps & {
       state.status = failure.transient ? 'QUEUED' : 'NEEDS_REVIEW';
       return true;
     },
+    buildMatches: async (documentId, generation) => {
+      state.matchBuilds.push({ documentId, generation });
+    },
     heartbeatMs: 0,
     get status() { return state.status; },
     set status(value: string) { state.status = value; },
     get attempts() { return state.attempts; },
     set attempts(value: string[]) { state.attempts = value; },
+    get matchBuilds() { return state.matchBuilds; },
+    set matchBuilds(value) { state.matchBuilds = value; },
     get blobDeleted() { return state.blobDeleted; },
     set blobDeleted(value: boolean) { state.blobDeleted = value; },
     get finishOwned() { return state.finishOwned; },
@@ -173,6 +180,9 @@ describe('receipt extraction worker', () => {
     await runClaimedReceiptJob(job(), fake);
     expect(fake.attempts).toEqual(['Synthetic Vendor']);
     expect(fake.status).toBe('READY');
+    expect(fake.matchBuilds).toEqual([
+      { documentId: 'document-1', generation: 1 },
+    ]);
   });
 
   it('keeps the blob and marks permanent failure NEEDS_REVIEW', async () => {
@@ -190,5 +200,18 @@ describe('receipt extraction worker', () => {
     fake.finishOwned = false;
     await runClaimedReceiptJob(job(), fake);
     expect(fake.attempts).toHaveLength(0);
+    expect(fake.matchBuilds).toHaveLength(0);
+  });
+
+  it('keeps a completed extraction when matching fails', async () => {
+    const fake = fakeDeps();
+    fake.buildMatches = async () => {
+      throw new Error('synthetic matching failure');
+    };
+
+    await runClaimedReceiptJob(job(), fake);
+
+    expect(fake.attempts).toEqual(['Synthetic Vendor']);
+    expect(fake.status).toBe('READY');
   });
 });

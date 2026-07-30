@@ -457,7 +457,13 @@ export async function setReceiptDeleted(
         id: receiptId,
         companyId,
       },
-      select: { id: true, revision: true, deletedAt: true },
+      select: {
+        id: true,
+        revision: true,
+        status: true,
+        deletedAt: true,
+        transactionAttachmentId: true,
+      },
     });
     if (!existing) {
       throw new ReceiptError('RECEIPT_NOT_FOUND', 'Receipt was not found.');
@@ -465,6 +471,9 @@ export async function setReceiptDeleted(
     if (
       existing.revision !== expectedRevision
       || (existing.deletedAt !== null) === deleted
+      || existing.status === 'ATTACHING'
+      || existing.status === 'ATTACHED'
+      || existing.transactionAttachmentId !== null
     ) {
       throw new ReceiptError(
         'RECEIPT_STALE',
