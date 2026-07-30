@@ -30,6 +30,7 @@ import type {
   Role,
   ReconcileCategorizationBody,
   RuleDto,
+  RuleCandidateDto,
   RuleTestResult,
   SavedReportConfig,
   SavedReportDto,
@@ -548,6 +549,25 @@ export const rules = {
   /** Dry-run a draft rule (placed at top priority) against recent transactions. */
   test: (companyId: string, matchText: string) =>
     api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),
+};
+
+export const ruleCandidates = {
+  list: (companyId: string, cursor?: string) =>
+    api.get<{ candidates: RuleCandidateDto[]; nextCursor: string | null }>(
+      `/api/companies/${companyId}/rule-candidates${qs({ cursor })}`,
+    ),
+  get: (companyId: string, candidateId: string) =>
+    api.get<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}`,
+    ),
+  dismiss: (companyId: string, candidateId: string) =>
+    api.post<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}/dismiss`,
+    ),
+  activate: (companyId: string, candidateId: string) =>
+    api.post<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}/activate`,
+    ),
 };
 
 export const savedReports = {

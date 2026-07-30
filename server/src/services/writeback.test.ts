@@ -740,6 +740,10 @@ class FakeDurableDb {
 
   $queryRawUnsafe = vi.fn(async () => [{ locked: 1 }]);
 
+  agentCompanyConfig = {
+    findUnique: vi.fn(async () => ({ configVersion: 'verified-writeback-v1' })),
+  };
+
   transaction = {
     findUnique: vi.fn(async () => this.transactionRow),
     update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
@@ -1166,6 +1170,14 @@ describe('commitStagedCategorization durable lifecycle', () => {
             tagIds: [DURABLE_TAG_ID],
           }],
           tagIds: [DURABLE_TAG_ID],
+        },
+        candidateContext: {
+          schemaVersion: 'rule-candidate-v1',
+          matchField: 'payee',
+          matchText: 'generic supplier',
+          conditionFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          configVersion: 'verified-writeback-v1',
+          source: 'user',
         },
       });
     });
