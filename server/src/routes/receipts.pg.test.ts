@@ -100,6 +100,7 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
     app: ReturnType<typeof application>,
     companyId: string,
     cookie: string,
+    suffix = '',
   ) {
     const grantResponse = await request(app)
       .post(`/api/companies/${companyId}/attachment-upload-grants`)
@@ -110,7 +111,7 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
     const staged = await request(app)
       .post(grant.uploadUrl)
       .set('Authorization', `Bearer ${grant.grant}`)
-      .attach('files', Buffer.from('%PDF-1.7\nsynthetic receipt'), {
+      .attach('files', Buffer.from(`%PDF-1.7\nsynthetic receipt${suffix}`), {
         filename: 'synthetic.pdf',
         contentType: 'application/pdf',
       });
@@ -162,6 +163,83 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
     expect(preview.headers['content-security-policy']).toContain(
       "default-src 'none'",
     );
+  });
+
+  it('keeps workspace, batch, and export endpoints company scoped', async () => {
+    const app = application();
+    const firstCompany = await company();
+    const categorizer = await signedIn(firstCompany.id, 'categorizer');
+    const viewer = await signedIn(firstCompany.id, 'viewer');
+    const staged = await upload(app, firstCompany.id, categorizer);
+    const created = await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts`)
+      .set('Cookie', categorizer)
+      .send({
+        idempotencyKey: 'workspace-route',
+        files: [{ uploadId: staged.id }],
+        sourceKind: 'WEB_UPLOAD',
+      });
+    const receiptId = created.body.receipts[0].id as string;
+
+    await request(app)
+      .get(`/api/companies/${firstCompany.id}/receipts/stats`)
+      .set('Cookie', viewer)
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.received).toBe(1);
+      });
+    await request(app)
+      .get(`/api/companies/${firstCompany.id}/receipts/duplicates`)
+      .set('Cookie', viewer)
+      .expect(200)
+      .expect([]);
+    const edited = await request(app)
+      .patch(`/api/companies/${firstCompany.id}/receipts/${receiptId}`)
+      .set('Cookie', categorizer)
+      .send({
+        expectedRevision: 0,
+        patch: {
+          vendorName: 'Invented Workspace Vendor',
+          totalAmount: '12.34',
+          currency: 'USD',
+        },
+      });
+    expect(edited.status).toBe(200);
+    expect(edited.body).toMatchObject({
+      revision: 1,
+      currentExtraction: null,
+    });
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/batch/approve`)
+      .set('Cookie', categorizer)
+      .send({
+        receipts: [{ id: receiptId, expectedRevision: 1 }],
+      })
+      .expect(200)
+      .expect({ updated: 1 });
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/batch/delete`)
+      .set('Cookie', viewer)
+      .send({
+        receipts: [{ id: receiptId, expectedRevision: 2 }],
+      })
+      .expect(403);
+    const exported = await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/export`)
+      .set('Cookie', viewer)
+      .send({ documentIds: [receiptId] })
+      .buffer(true)
+      .parse((response, callback) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => callback(null, Buffer.concat(chunks)));
+      });
+    expect(exported.status).toBe(200);
+    expect(exported.headers['content-type']).toMatch(/application\/zip/u);
+    expect(exported.headers['content-disposition']).toContain(
+      'recat-receipts-',
+    );
+    expect(Buffer.isBuffer(exported.body)).toBe(true);
   });
 
   it('returns 403 for a viewer mutation and 404 outside company scope', async () => {
@@ -325,6 +403,46 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
         idempotencyKey: 'attachment-state-reprocess',
       })
       .expect(409);
+  });
+
+  it('rolls back a batch reprocess when any selected revision is stale', async () => {
+    const app = application();
+    const firstCompany = await company();
+    const categorizer = await signedIn(firstCompany.id, 'categorizer');
+    const receiptIds: string[] = [];
+    for (const idempotencyKey of ['batch-reprocess-first', 'batch-reprocess-second']) {
+      const staged = await upload(
+        app,
+        firstCompany.id,
+        categorizer,
+        idempotencyKey,
+      );
+      const created = await request(app)
+        .post(`/api/companies/${firstCompany.id}/receipts`)
+        .set('Cookie', categorizer)
+        .send({
+          idempotencyKey,
+          files: [{ uploadId: staged.id }],
+          sourceKind: 'WEB_UPLOAD',
+        });
+      receiptIds.push(created.body.receipts[0].id as string);
+    }
+
+    await request(app)
+      .post(`/api/companies/${firstCompany.id}/receipts/batch/reprocess`)
+      .set('Cookie', categorizer)
+      .send({
+        idempotencyKey: 'batch-reprocess-atomic',
+        receipts: [
+          { id: receiptIds[0], expectedRevision: 0 },
+          { id: receiptIds[1], expectedRevision: 1 },
+        ],
+      })
+      .expect(409);
+
+    await expect(db.receiptDocument.findUniqueOrThrow({
+      where: { id: receiptIds[0] },
+    })).resolves.toMatchObject({ generation: 1, revision: 0, status: 'QUEUED' });
   });
 
   it('authorizes and revision-fences rematch and confirmation routes', async () => {

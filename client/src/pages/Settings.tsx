@@ -23,6 +23,7 @@ import TeamCard from './settings/TeamCard';
 import TaxCard from './settings/TaxCard';
 import McpTokensCard from './settings/McpTokensCard';
 import AttachmentRetentionCard from './settings/AttachmentRetentionCard';
+import ReceiptProcessingCard from './settings/ReceiptProcessingCard';
 import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
@@ -203,6 +204,8 @@ export default function Settings() {
           />
 
           <AttachmentRetentionCard />
+
+          {isAdmin && <ReceiptProcessingCard companyId={activeCompany.id} />}
 
           <TaxCard />
 

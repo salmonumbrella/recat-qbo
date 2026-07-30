@@ -108,3 +108,12 @@ input, select, button { font-family:inherit; }
 .rr .hov-full:hover { opacity:1 !important; }
 /* inputs whose focus state is border-color:var(--acc) */
 .rr .foc-acc:focus { border-color:var(--acc) !important; }
+.rr .receipt-dropzone:focus-visible {
+  outline:3px solid var(--acc);
+  outline-offset:3px;
+}
+@media (max-width: 760px) {
+  .rr .receipt-detail-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}

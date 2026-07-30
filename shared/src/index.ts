@@ -612,6 +612,11 @@ export interface ReceiptStatsDto {
   processing: number;
   failed: number;
   totalByCurrency: Array<{ currency: string; amount: string }>;
+  totalByCategory: Array<{
+    category: string;
+    currency: string;
+    amount: string;
+  }>;
   totalTaxByCurrency: Array<{ currency: string; amount: string }>;
   processingCostUsd: string;
   recentActivity: ReceiptEventDto[];
@@ -651,11 +656,55 @@ export interface CreateReceiptsResult {
 
 export interface PatchReceiptBody {
   expectedRevision: number;
-  patch: Record<string, unknown>;
+  patch: ReceiptEditablePatch;
+}
+
+export interface ReceiptEditablePatch {
+  receiptDate?: string | null;
+  documentTitle?: string | null;
+  vendorName?: string | null;
+  vendorTaxId?: string | null;
+  vendorReceiptId?: string | null;
+  clientName?: string | null;
+  clientTaxId?: string | null;
+  description?: string | null;
+  subtotal?: string | null;
+  taxAmount?: string | null;
+  totalAmount?: string | null;
+  currency?: string | null;
+  paymentMethod?: string | null;
+  paymentIdentifier?: string | null;
+  language?: string | null;
+  documentType?: string | null;
+  category?: string | null;
+  userNotes?: string | null;
+  lineItems?: ReceiptLineItemDto[];
+  taxComponents?: ReceiptTaxComponentDto[];
+  additionalFields?: Array<{ key: string; value: string }>;
+  approved?: boolean;
 }
 
 export interface ReceiptRevisionBody {
   expectedRevision: number;
+}
+
+export interface ReceiptBatchItem {
+  id: string;
+  expectedRevision: number;
+}
+
+export interface ReceiptBatchBody {
+  receipts: ReceiptBatchItem[];
+  idempotencyKey?: string;
+}
+
+export interface ReceiptBatchResult {
+  updated: number;
+}
+
+export interface ReceiptExportBody {
+  documentIds?: string[];
+  filters?: ReceiptListParams;
 }
 
 export interface ConfirmReceiptMatchBody {

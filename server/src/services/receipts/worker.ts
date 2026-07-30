@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { openAttachmentBlob } from '../attachments/blobStore.js';
 import { AttachmentError } from '../attachments/types.js';
@@ -376,105 +376,163 @@ export async function reprocessReceipt(
   expectedRevision: number,
   idempotencyKey: string,
 ): Promise<void> {
-  if (idempotencyKey.trim() === '' || idempotencyKey.length > 128) {
+  await batchReprocessReceipts(companyId, actorUserId, [{
+    id: receiptId,
+    expectedRevision,
+    idempotencyKey,
+  }]);
+}
+
+export interface BatchReprocessReceiptItem {
+  id: string;
+  expectedRevision: number;
+  idempotencyKey: string;
+}
+
+export async function batchReprocessReceipts(
+  companyId: string,
+  actorUserId: string,
+  receipts: BatchReprocessReceiptItem[],
+): Promise<void> {
+  const ids = new Set(receipts.map((receipt) => receipt.id));
+  if (
+    companyId.trim() === ''
+    || actorUserId.trim() === ''
+    || receipts.length < 1
+    || receipts.length > 100
+    || ids.size !== receipts.length
+    || receipts.some((receipt) =>
+      receipt.id.trim() === ''
+      || !Number.isInteger(receipt.expectedRevision)
+      || receipt.expectedRevision < 0
+      || receipt.idempotencyKey.trim() === ''
+      || receipt.idempotencyKey.length > 128)
+  ) {
     throw new ReceiptError('RECEIPT_INVALID_INPUT', 'Invalid reprocess request.');
   }
   await prisma.$transaction(async (tx) => {
+    const orderedIds = [...ids].sort();
     const rows = await tx.$queryRaw<Array<{
       id: string;
       revision: number;
       generation: number;
       status: string;
       transactionAttachmentId: string | null;
-    }>>`
+    }>>(Prisma.sql`
       SELECT "id", "revision", "generation", "status",
              "transactionAttachmentId"
         FROM "ReceiptDocument"
-       WHERE "id" = ${receiptId}
+       WHERE "id" IN (${Prisma.join(orderedIds)})
          AND "companyId" = ${companyId}
          AND "deletedAt" IS NULL
-       FOR UPDATE`;
-    const receipt = rows[0];
-    if (!receipt) {
-      throw new ReceiptError('RECEIPT_NOT_FOUND', 'Receipt not found.');
-    }
-    const prior = await tx.$queryRaw<Array<{ expectedRevision: number }>>`
-      SELECT ("before"->>'revision')::integer AS "expectedRevision"
-        FROM "ReceiptEvent"
-       WHERE "documentId" = ${receiptId}
-         AND "actorUserId" = ${actorUserId}
-         AND "action" = 'reprocess'
-         AND "after"->>'idempotencyKey' = ${idempotencyKey}
-       ORDER BY "createdAt" DESC
-       LIMIT 1`;
-    if (prior[0]) {
-      if (prior[0].expectedRevision === expectedRevision) return;
-      throw new ReceiptError(
-        'RECEIPT_IDEMPOTENCY_CONFLICT',
-        'The idempotency key is already bound to another reprocess request.',
-      );
-    }
-    if (
-      receipt.revision !== expectedRevision
-      || receipt.status === 'ATTACHING'
-      || receipt.status === 'ATTACHED'
-      || receipt.transactionAttachmentId !== null
-    ) {
-      throw new ReceiptError('RECEIPT_STALE', 'Receipt revision is stale.');
+       ORDER BY "id"
+       FOR UPDATE`);
+    const rowsById = new Map(rows.map((receipt) => [receipt.id, receipt]));
+    const replayed = new Set<string>();
+    for (const requested of receipts) {
+      const receipt = rowsById.get(requested.id);
+      if (!receipt) {
+        throw new ReceiptError('RECEIPT_NOT_FOUND', 'Receipt not found.');
+      }
+      const prior = await tx.$queryRaw<Array<{ expectedRevision: number }>>`
+        SELECT ("before"->>'revision')::integer AS "expectedRevision"
+          FROM "ReceiptEvent"
+         WHERE "documentId" = ${requested.id}
+           AND "companyId" = ${companyId}
+           AND "actorUserId" = ${actorUserId}
+           AND "action" = 'reprocess'
+           AND "after"->>'idempotencyKey' = ${requested.idempotencyKey}
+         ORDER BY "createdAt" DESC
+         LIMIT 1`;
+      if (prior[0]) {
+        if (prior[0].expectedRevision === requested.expectedRevision) {
+          replayed.add(requested.id);
+          continue;
+        }
+        throw new ReceiptError(
+          'RECEIPT_IDEMPOTENCY_CONFLICT',
+          'The idempotency key is already bound to another reprocess request.',
+        );
+      }
+      if (
+        receipt.revision !== requested.expectedRevision
+        || receipt.status === 'ATTACHING'
+        || receipt.status === 'ATTACHED'
+        || receipt.transactionAttachmentId !== null
+      ) {
+        throw new ReceiptError('RECEIPT_STALE', 'Receipt revision is stale.');
+      }
     }
     const config = await tx.receiptCompanyConfig.findUnique({
       where: { companyId },
       select: { configVersion: true },
     });
-    const generation = receipt.generation + 1;
-    await tx.receiptProcessingJob.updateMany({
-      where: {
-        documentId: receiptId,
-        status: { in: ['queued', 'retry', 'running'] },
-      },
-      data: {
-        status: 'cancelled',
-        lockOwner: null,
-        leaseExpiresAt: null,
-        lastErrorCode: 'RECEIPT_SUPERSEDED',
-      },
-    });
-    await tx.receiptDocument.update({
-      where: { id: receiptId },
-      data: {
-        generation,
-        revision: { increment: 1 },
-        status: 'QUEUED',
-        pageCount: null,
-        ...(receipt.transactionAttachmentId === null
-          ? {
-            matchedTransactionId: null,
-            matchedTransactionRevision: null,
-            approvedAt: null,
-            approvedByUserId: null,
-          }
-          : {}),
-      },
-    });
-    await tx.receiptProcessingJob.create({
-      data: {
-        documentId: receiptId,
-        companyId,
-        generation,
-        configVersion: config?.configVersion ?? DEFAULT_RECEIPT_CONFIG_VERSION,
-        status: 'queued',
-        dueAt: new Date(),
-      },
-    });
-    await tx.receiptEvent.create({
-      data: {
-        companyId,
-        documentId: receiptId,
-        actorUserId,
-        action: 'reprocess',
-        before: { generation: receipt.generation, revision: receipt.revision },
-        after: { generation, idempotencyKey },
-      },
-    });
+    const dueAt = new Date();
+    for (const requested of receipts) {
+      if (replayed.has(requested.id)) continue;
+      const receipt = rowsById.get(requested.id)!;
+      const generation = receipt.generation + 1;
+      await tx.receiptProcessingJob.updateMany({
+        where: {
+          documentId: requested.id,
+          companyId,
+          status: { in: ['queued', 'retry', 'running'] },
+        },
+        data: {
+          status: 'cancelled',
+          lockOwner: null,
+          leaseExpiresAt: null,
+          lastErrorCode: 'RECEIPT_SUPERSEDED',
+        },
+      });
+      const updated = await tx.receiptDocument.updateMany({
+        where: {
+          id: requested.id,
+          companyId,
+          revision: requested.expectedRevision,
+          deletedAt: null,
+        },
+        data: {
+          generation,
+          revision: { increment: 1 },
+          status: 'QUEUED',
+          pageCount: null,
+          matchedTransactionId: null,
+          matchedTransactionRevision: null,
+          approvedAt: null,
+          approvedByUserId: null,
+        },
+      });
+      if (updated.count !== 1) {
+        throw new ReceiptError('RECEIPT_STALE', 'Receipt revision is stale.');
+      }
+      await tx.receiptProcessingJob.create({
+        data: {
+          documentId: requested.id,
+          companyId,
+          generation,
+          configVersion:
+            config?.configVersion ?? DEFAULT_RECEIPT_CONFIG_VERSION,
+          status: 'queued',
+          dueAt,
+        },
+      });
+      await tx.receiptEvent.create({
+        data: {
+          companyId,
+          documentId: requested.id,
+          actorUserId,
+          action: 'reprocess',
+          before: {
+            generation: receipt.generation,
+            revision: receipt.revision,
+          },
+          after: {
+            generation,
+            idempotencyKey: requested.idempotencyKey,
+          },
+        },
+      });
+    }
   });
 }

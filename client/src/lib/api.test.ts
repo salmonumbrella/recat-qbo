@@ -4,6 +4,7 @@ import {
   attachments,
   autopilot,
   createCategorizationRequestId,
+  receipts,
   transactions,
 } from './api';
 
@@ -233,6 +234,72 @@ describe('attachment requests', () => {
       2,
       '/api/companies/company-1/transactions/transaction-1/attachments/attachment-1?scope=everywhere&idempotencyKey=00000000-0000-4000-8000-000000000042',
       expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+});
+
+describe('receipt workspace requests', () => {
+  it('stages files then consumes upload IDs as receipts', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        uploadUrl: '/api/attachment-uploads/grant-1',
+        grant: 'receipt-grant',
+        expiresAt: '2026-07-30T00:00:00.000Z',
+        maxFileCount: 1,
+        maxEncodedRequestBytes: 100_000_000,
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        uploads: [{ id: 'upload-1' }],
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        receipts: [{ id: 'receipt-1', status: 'QUEUED' }],
+      }), { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('crypto', {
+      randomUUID: vi.fn(() => '00000000-0000-4000-8000-000000000051'),
+    });
+    const file = new File(['x'], 'synthetic.png', { type: 'image/png' });
+
+    const result = await receipts.upload('company-1', [file], 'WEB_UPLOAD');
+
+    expect(result.receipts[0]?.id).toBe('receipt-1');
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      '/api/companies/company-1/receipts',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          idempotencyKey: '00000000-0000-4000-8000-000000000051',
+          files: [{ uploadId: 'upload-1' }],
+          sourceKind: 'WEB_UPLOAD',
+        }),
+      }),
+    );
+  });
+
+  it('encodes bounded receipt filters', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      receipts: [],
+      total: 0,
+      page: 2,
+      pageSize: 20,
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await receipts.list('company-1', {
+      statuses: ['READY', 'NEEDS_REVIEW'],
+      page: 2,
+      pageSize: 20,
+      sortBy: 'receiptDate',
+      sortOrder: 'desc',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'status=READY%2CNEEDS_REVIEW&page=2&pageSize=20'
+        + '&sortBy=receiptDate&sortOrder=desc',
+      ),
+      expect.objectContaining({ method: 'GET' }),
     );
   });
 });

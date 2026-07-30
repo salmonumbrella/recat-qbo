@@ -18,6 +18,7 @@ const ALL_TABS: Tab[] = [
   { label: 'Rules', to: '/rules' },
   { label: 'Dashboard', to: '/dashboard' },
   { label: 'Reports', to: '/reports' },
+  { label: 'Receipts', to: '/receipts' },
   { label: 'Audit log', to: '/audit' },
   { label: 'Tags', to: '/tags' },
   { label: 'Settings', to: '/settings' },
@@ -26,7 +27,10 @@ const ALL_TABS: Tab[] = [
 /** Tabs by per-company role; no membership in the active company → viewer-like. */
 function tabsForRole(role: Role | null): Tab[] {
   if (role === null || role === 'viewer') {
-    return ALL_TABS.filter((t) => t.label === 'Dashboard' || t.label === 'Reports');
+    return ALL_TABS.filter((t) =>
+      t.label === 'Dashboard'
+      || t.label === 'Reports'
+      || t.label === 'Receipts');
   }
   if (role === 'categorizer') return ALL_TABS.filter((t) => t.label !== 'Settings');
   return ALL_TABS;
