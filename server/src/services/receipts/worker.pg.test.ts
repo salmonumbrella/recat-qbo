@@ -17,6 +17,7 @@ import { persistOwnedSuccess } from './worker.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 function result(confidence = 0.9): ReceiptExtractionResult {
   return {
@@ -128,6 +129,7 @@ describePostgres('receipt worker ownership fence on PostgreSQL', () => {
         sizeBytes: 3n,
         contentType: 'image/png',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
         chunks: {
           create: { ordinal: 0, content: Buffer.from([1, 2, 3]) },
         },
