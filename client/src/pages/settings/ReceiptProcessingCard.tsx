@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { ReceiptCompanySettingsDto } from '@recat/shared';
 import { receipts } from '../../lib/api';
 import { useApp } from '../../state/AppContext';
@@ -17,6 +17,7 @@ export default function ReceiptProcessingCard({
   const [draft, setDraft] = useState<ReceiptCompanySettingsDto | null>(null);
   const [saving, setSaving] = useState(false);
   const request = useRef(0);
+  const egressDisclosureId = useId();
 
   useEffect(() => {
     const sequence = ++request.current;
@@ -105,6 +106,9 @@ export default function ReceiptProcessingCard({
     background: 'var(--sur)',
     color: 'var(--ink)',
   };
+  const providerLabel = draft.provider === 'openrouter'
+    ? 'OpenRouter'
+    : 'the configured custom OpenAI-compatible provider';
   return (
     <section style={{
       border: '1px solid var(--bd2)',
@@ -118,9 +122,18 @@ export default function ReceiptProcessingCard({
         Extract receipt metadata and propose transaction matches. Provider
         credentials come from instance AI settings and are never stored per company.
       </p>
+      <p
+        id={egressDisclosureId}
+        role="note"
+        style={{ fontSize: 13, color: 'var(--amT)', lineHeight: 1.5 }}
+      >
+        When enabled, receipt files and extracted text are sent to {providerLabel}{' '}
+        using {draft.model}. Review that provider&apos;s data-handling terms before enabling.
+      </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 13 }}>
         <input
           type="checkbox"
+          aria-describedby={egressDisclosureId}
           checked={draft.enabled}
           disabled={saving}
           onChange={(event) => {

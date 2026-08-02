@@ -44,6 +44,21 @@ beforeEach(() => {
 });
 
 describe('ReceiptProcessingCard', () => {
+  it('discloses external data egress before opt-in', async () => {
+    mocks.get.mockResolvedValue({ ...settings, enabled: false });
+    render(<ReceiptProcessingCard companyId="company-1" />);
+
+    const checkbox = await screen.findByRole('checkbox', {
+      name: 'Enable receipt processing',
+    });
+    expect(checkbox).not.toBeChecked();
+    expect(checkbox).toHaveAccessibleDescription(
+      /receipt files and extracted text are sent to OpenRouter using openai\/gpt-4o-mini/i,
+    );
+    expect(screen.getByLabelText('Receipt provider')).toBeEnabled();
+    expect(screen.getByLabelText('Vision model')).toBeEnabled();
+  });
+
   it('edits thresholds without rendering provider secrets', async () => {
     render(<ReceiptProcessingCard companyId="company-1" />);
 
