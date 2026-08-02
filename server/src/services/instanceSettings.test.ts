@@ -1,3 +1,5 @@
+import express, { type RequestHandler } from 'express';
+import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -38,9 +40,22 @@ vi.mock('../env.js', () => ({
     ENCRYPTION_KEY: '0'.repeat(64),
   },
   redirectUri: 'http://localhost:5173/auth/qbo/callback',
+  webhookUrl: 'http://localhost:5173/webhooks/qbo',
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: { appConfig: mocks.appConfig, user: mocks.user } }));
+vi.mock('../middleware/auth.js', () => {
+  const allow: RequestHandler = (_req, _res, next) => next();
+  return { requireUser: allow, requireInstanceAdmin: allow };
+});
+vi.mock('../lib/mailer.js', () => ({
+  invalidateMailerCache: vi.fn(),
+  isSmtpConfigured: vi.fn(async () => false),
+  sendMail: vi.fn(),
+}));
+vi.mock('../lib/qbo/factory.js', () => ({ getIntuitCredentialPreflight: vi.fn() }));
+vi.mock('./devLogin.js', () => ({ devLoginAllowed: vi.fn(async () => false) }));
+vi.mock('./magicLink.js', () => ({ issueMagicLink: vi.fn() }));
 
 import { getInstanceSettings, getInstanceSettingsDto, updateInstanceSettings } from './instanceSettings.js';
 
@@ -122,5 +137,115 @@ describe('suggestion model setting precedence', () => {
 
   it('defaults to gpt-4o-mini when neither environment nor storage supplies a model', async () => {
     await expect(getInstanceSettings()).resolves.toMatchObject({ suggestionModel: 'gpt-4o-mini' });
+  });
+});
+
+describe('agent model settings', () => {
+  it('defaults both agent models dynamically to the effective environment suggestion model', async () => {
+    mocks.suggestionModel = 'environment-suggestion-model';
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionModel', value: 'stored-suggestion-model', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionModel: 'environment-suggestion-model',
+      agentDecisionModel: 'environment-suggestion-model',
+      agentVerifierModel: 'environment-suggestion-model',
+    });
+  });
+
+  it('lets each explicitly stored agent model win independently', async () => {
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionModel', value: 'stored-suggestion-model', encrypted: false },
+      { key: 'agentDecisionModel', value: 'stored-decision-model', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionModel: 'stored-suggestion-model',
+      agentDecisionModel: 'stored-decision-model',
+      agentVerifierModel: 'stored-suggestion-model',
+    });
+
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionModel', value: 'stored-suggestion-model', encrypted: false },
+      { key: 'agentVerifierModel', value: 'stored-verifier-model', encrypted: false },
+    ]);
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      suggestionModel: 'stored-suggestion-model',
+      agentDecisionModel: 'stored-suggestion-model',
+      agentVerifierModel: 'stored-verifier-model',
+    });
+  });
+
+  it('treats blank stored agent model names as unset', async () => {
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'suggestionModel', value: 'stored-suggestion-model', encrypted: false },
+      { key: 'agentDecisionModel', value: '', encrypted: false },
+      { key: 'agentVerifierModel', value: '', encrypted: false },
+    ]);
+
+    await expect(getInstanceSettings()).resolves.toMatchObject({
+      agentDecisionModel: 'stored-suggestion-model',
+      agentVerifierModel: 'stored-suggestion-model',
+    });
+  });
+
+  it('persists both model names independently as non-secret values', async () => {
+    await updateInstanceSettings({
+      agentDecisionModel: 'decision-model',
+      agentVerifierModel: 'verifier-model',
+    });
+
+    expect(mocks.appConfig.upsert).toHaveBeenCalledTimes(2);
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith({
+      where: { key: 'agentDecisionModel' },
+      update: { value: 'decision-model', encrypted: false },
+      create: { key: 'agentDecisionModel', value: 'decision-model', encrypted: false },
+    });
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith({
+      where: { key: 'agentVerifierModel' },
+      update: { value: 'verifier-model', encrypted: false },
+      create: { key: 'agentVerifierModel', value: 'verifier-model', encrypted: false },
+    });
+  });
+
+  it('includes both non-secret effective names in the admin DTO', async () => {
+    mocks.appConfig.findMany.mockResolvedValue([
+      { key: 'agentDecisionModel', value: 'decision-model', encrypted: false },
+      { key: 'agentVerifierModel', value: 'verifier-model', encrypted: false },
+    ]);
+
+    const dto = await getInstanceSettingsDto();
+
+    expect(dto).toMatchObject({
+      agentDecisionModel: 'decision-model',
+      agentVerifierModel: 'verifier-model',
+    });
+  });
+
+  it('passes both model overrides through the admin PATCH API and allows independent clearing', async () => {
+    const { instanceRouter } = await import('../routes/instance.js');
+    const app = express();
+    app.use(express.json());
+    app.use('/api/instance', instanceRouter);
+
+    const response = await request(app)
+      .patch('/api/instance/settings')
+      .send({
+        agentDecisionModel: ' decision-model ',
+        agentVerifierModel: '',
+      });
+
+    expect(response.status).toBe(200);
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith({
+      where: { key: 'agentDecisionModel' },
+      update: { value: 'decision-model', encrypted: false },
+      create: { key: 'agentDecisionModel', value: 'decision-model', encrypted: false },
+    });
+    expect(mocks.appConfig.upsert).toHaveBeenCalledWith({
+      where: { key: 'agentVerifierModel' },
+      update: { value: '', encrypted: false },
+      create: { key: 'agentVerifierModel', value: '', encrypted: false },
+    });
   });
 });
