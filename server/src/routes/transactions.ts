@@ -5,25 +5,40 @@
 // Action routes load the txn by id and scope everything through its companyId.
 // Paths and shapes mirror client/src/lib/api.ts exactly (THE contract).
 
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import type { User } from '@prisma/client';
-import type { SuggestionDto, TransactionDto, TxnStatus } from '@recat/shared';
+import {
+  MAX_EXPECTED_TRANSACTION_REVISION,
+  type CategorizationMutationResult,
+  type CommitCategorizationBody,
+  type ReconcileCategorizationBody,
+  type StageCategorizationBody,
+  type SuggestionDto,
+  type TransactionDto,
+  type TxnStatus,
+  type UndoCategorizationBody,
+} from '@recat/shared';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
+import { stageCategorization } from '../services/categorization.js';
 import {
   bulkPost,
+  commitStagedCategorization,
   postTransaction,
+  reconcileMutationAttempt,
   retryError,
   splitLineDtos,
+  undoCategorization,
   undoPost,
   validateSplits,
   type Actor,
+  type DurableMutationResult,
 } from '../services/writeback.js';
 
 /** Every txn query in this file loads split lines (with their tags) so the DTO
@@ -31,6 +46,16 @@ import {
 const txnInclude = {
   txnTags: true,
   splitLines: { include: { tags: true }, orderBy: { idx: 'asc' as const } },
+  qboMutationAttempts: {
+    where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+    orderBy: { createdAt: 'desc' as const },
+    take: 1,
+    select: {
+      requestId: true,
+      operation: true,
+      status: true,
+    },
+  },
 } satisfies Prisma.TransactionInclude;
 
 type TxnRow = Prisma.TransactionGetPayload<{ include: typeof txnInclude }>;
@@ -46,6 +71,9 @@ const STATUS_WORDS: Record<TxnStatus, string> = {
   SUPERSEDED: 'superseded',
   REVERTED: 'reverted',
 };
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function actorFor(user: User): Actor {
   return { id: user.id, label: user.name ?? user.email.split('@')[0] ?? user.email };
@@ -64,6 +92,16 @@ function requestUser(req: { user?: User }): User {
 async function assertCategorizerFor(user: User, companyId: string): Promise<void> {
   const role = await effectiveRole(user, companyId);
   if (role === null || roleRank(role) < roleRank('categorizer')) {
+    throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
+  }
+}
+
+async function assertCategorizationRouteAccess(user: User, companyId: string): Promise<void> {
+  const role = await effectiveRole(user, companyId);
+  if (role === null) {
+    throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+  }
+  if (roleRank(role) < roleRank('categorizer')) {
     throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
   }
 }
@@ -97,6 +135,20 @@ export async function transactionDtos(
   const out: TransactionDto[] = [];
   for (const r of rows) {
     const amount = Number(r.amount);
+    const activeAttempt = r.qboMutationAttempts[0];
+    const activeCategorizationAttempt: TransactionDto['activeCategorizationAttempt'] =
+      activeAttempt !== undefined &&
+      UUID_PATTERN.test(activeAttempt.requestId) &&
+      (activeAttempt.operation === 'recategorize' || activeAttempt.operation === 'restore') &&
+      (activeAttempt.status === 'PREPARED' ||
+        activeAttempt.status === 'COMMITTING' ||
+        activeAttempt.status === 'UNCERTAIN')
+        ? {
+            requestId: activeAttempt.requestId,
+            operation: activeAttempt.operation,
+            status: activeAttempt.status,
+          }
+        : null;
     // Live pipeline first (rule edits must reflect instantly); fall back to the
     // snapshot computed at sync time (covers seeded/demo history suggestions
     // and AI suggestions stored by refreshSuggestions).
@@ -115,8 +167,12 @@ export async function transactionDtos(
       amount,
       bankAccount: r.bankAccount,
       status: r.status,
+      revision: r.revision,
       category: r.category,
       categoryQboId: r.categoryQboId,
+      taxCalculation: r.taxCalculation as TransactionDto['taxCalculation'],
+      taxCode: r.taxCode,
+      taxCodeQboId: r.taxCodeQboId,
       splits: splitLineDtos(r.splitLines),
       tagIds: r.txnTags.map((t) => t.tagId),
       suggestion,
@@ -126,6 +182,7 @@ export async function transactionDtos(
           : null,
       postedAt: r.postedAt?.toISOString() ?? null,
       postedBy: r.postedByUserId !== null ? (posterLabel.get(r.postedByUserId) ?? null) : null,
+      activeCategorizationAttempt,
       transferCandidateId: candidates.get(r.id) ?? null,
     });
   }
@@ -324,6 +381,254 @@ const transferBody = z.object({ counterpartTxnId: z.string().min(1) });
 
 const bulkPostBody = z.object({ ids: z.array(z.string().min(1)).min(1).max(500) });
 
+const transactionIdSchema = z.string().uuid();
+const expectedRevisionSchema = z.number().int().min(0).max(MAX_EXPECTED_TRANSACTION_REVISION);
+const qboReferenceSchema = z.string().trim().min(1).max(120);
+const requestIdSchema = z.string().uuid();
+const uniqueTagIdsSchema = z.array(z.string().uuid()).max(50)
+  .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.');
+
+const stageCategorizationLineSchema: z.ZodType<StageCategorizationBody['lines'][number]> = z.object({
+  grossCents: z.number().refine(Number.isSafeInteger, 'Line cents must be a safe integer.'),
+  categoryQboId: qboReferenceSchema,
+  taxCodeQboId: qboReferenceSchema.nullable(),
+  memo: z.string().max(500).optional(),
+  tagIds: uniqueTagIdsSchema,
+}).strict();
+
+const stageCategorizationBodySchema: z.ZodType<StageCategorizationBody> = z.object({
+  expectedRevision: expectedRevisionSchema,
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+  lines: z.array(stageCategorizationLineSchema).min(1).max(20),
+  tagIds: uniqueTagIdsSchema,
+}).strict().superRefine((body, context) => {
+  for (const [lineIndex, line] of body.lines.entries()) {
+    if (body.taxCalculation === 'NotApplicable' && line.taxCodeQboId !== null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'NotApplicable lines must use a null taxCodeQboId.',
+        path: ['lines', lineIndex, 'taxCodeQboId'],
+      });
+    }
+    if (body.taxCalculation !== 'NotApplicable' && line.taxCodeQboId === null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Taxed lines require a taxCodeQboId.',
+        path: ['lines', lineIndex, 'taxCodeQboId'],
+      });
+    }
+  }
+});
+
+const commitCategorizationBodySchema: z.ZodType<CommitCategorizationBody> = z.object({
+  expectedRevision: expectedRevisionSchema,
+  requestId: requestIdSchema,
+}).strict();
+
+const reconcileCategorizationBodySchema: z.ZodType<ReconcileCategorizationBody> = z.object({
+  requestId: requestIdSchema,
+}).strict();
+
+const undoCategorizationBodySchema: z.ZodType<UndoCategorizationBody> = z.object({
+  requestId: requestIdSchema,
+}).strict();
+
+const safeCentsSchema = z.number().refine(Number.isSafeInteger, 'Cents must be a safe integer.');
+const stageCategorizationResponseSchema = z.object({
+  transactionId: z.string().uuid(),
+  revision: z.number().int().min(1).max(MAX_EXPECTED_TRANSACTION_REVISION + 1),
+  taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
+  totals: z.object({
+    subtotalCents: safeCentsSchema,
+    taxCents: safeCentsSchema,
+    totalCents: safeCentsSchema,
+  }),
+  lines: z.array(z.object({
+    idx: z.number().int().min(0).max(19),
+    subtotalCents: safeCentsSchema,
+    taxCents: safeCentsSchema,
+    totalCents: safeCentsSchema,
+    categoryQboId: qboReferenceSchema,
+    taxCodeQboId: qboReferenceSchema.nullable(),
+    memo: z.string().max(500).nullable(),
+    tagIds: uniqueTagIdsSchema,
+  })).min(1).max(20),
+  tagIds: uniqueTagIdsSchema,
+});
+
+function boundedStageCategorizationResponse(
+  value: unknown,
+  expectedTransactionId: string,
+): z.infer<typeof stageCategorizationResponseSchema> {
+  const parsed = stageCategorizationResponseSchema.parse(value);
+  if (parsed.transactionId !== expectedTransactionId) {
+    throw new HttpError(500, 'Internal server error');
+  }
+  return parsed;
+}
+
+interface CategorizationScope {
+  transactionId: string;
+  companyId: string;
+}
+
+async function loadCategorizationScope(untrustedId: string | undefined): Promise<CategorizationScope> {
+  const transactionId = validate(transactionIdSchema)(untrustedId);
+  const txn = await prisma.transaction.findUnique({
+    where: { id: transactionId },
+    select: { id: true, companyId: true },
+  });
+  if (!txn) throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+  return { transactionId: txn.id, companyId: txn.companyId };
+}
+
+async function assertCompanyConnected(companyId: string): Promise<void> {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    select: { disconnectedAt: true },
+  });
+  if (!company) throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+  if (company.disconnectedAt !== null) {
+    throw new HttpError(
+      409,
+      'This company is disconnected from QuickBooks.',
+      'COMPANY_DISCONNECTED',
+    );
+  }
+}
+
+async function assertLegacyCategorizationAllowed(
+  txn: Pick<TxnRow, 'companyId' | 'qboType'>,
+): Promise<void> {
+  if (txn.qboType !== 'Purchase') return;
+  const company = await prisma.company.findUnique({
+    where: { id: txn.companyId },
+    select: { taxSupportStatus: true, taxUsingSalesTax: true },
+  });
+  if (!company) throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+  if (company.taxSupportStatus === 'ready' && company.taxUsingSalesTax === true) {
+    throw new HttpError(
+      409,
+      'Tax-ready Purchases must use staged categorization.',
+      'TAX_AWARE_STAGING_REQUIRED',
+    );
+  }
+}
+
+async function assertAttemptScope(requestId: string, transactionId: string): Promise<void> {
+  const attempt = await prisma.qboMutationAttempt.findUnique({
+    where: { requestId },
+    select: { transactionId: true },
+  });
+  if (!attempt || attempt.transactionId !== transactionId) {
+    throw new HttpError(404, 'Mutation attempt not found', 'ATTEMPT_NOT_FOUND');
+  }
+}
+
+const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> = {
+  ATTEMPT_CORRUPT: { status: 500, message: 'Mutation state could not be verified.' },
+  ATTEMPT_NOT_FOUND: { status: 404, message: 'Mutation attempt not found.' },
+  COMPANY_DISCONNECTED: { status: 409, message: 'This company is disconnected from QuickBooks.' },
+  ENTITY_BUSY: { status: 409, message: 'Another write is already in progress.' },
+  FORBIDDEN: { status: 403, message: 'You do not have permission to do that.' },
+  INVALID_ACCOUNT: { status: 400, message: 'One or more category accounts are unavailable for this company.' },
+  INVALID_INPUT: { status: 400, message: 'The categorization request is invalid.' },
+  INVALID_STAGE: { status: 409, message: 'The staged categorization is no longer valid.' },
+  INVALID_STATUS: { status: 409, message: 'The transaction cannot be changed from its current status.' },
+  INVALID_TAG: { status: 400, message: 'One or more tags are unavailable for this company.' },
+  INVALID_TRANSACTION_AMOUNT: { status: 400, message: 'The transaction amount cannot be categorized safely.' },
+  MUTATION_BLOCKED: {
+    status: 409,
+    message: 'This transaction has a prepared write that must be resumed or verified.',
+  },
+  PREWRITE_PERSISTENCE_FAILED: { status: 503, message: 'The prepared write was not sent. Retry with a new request.' },
+  QBO_PURCHASE_UNSUPPORTED: { status: 400, message: 'This transaction cannot use tax-aware Purchase writeback.' },
+  QBO_STATE_DRIFT: { status: 409, message: 'The QuickBooks transaction changed. Reload before continuing.' },
+  RECONCILE_NOT_ALLOWED: { status: 409, message: 'This mutation attempt does not require reconciliation.' },
+  REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
+  STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
+  TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
+  TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
+  TAX_AWARE_STAGING_REQUIRED: { status: 409, message: 'Tax-ready Purchases must use staged categorization.' },
+  TAX_CODE_INACTIVE: { status: 400, message: 'A selected tax code is unavailable.' },
+  TAX_CODE_MALFORMED: { status: 400, message: 'A selected tax code is unsupported.' },
+  TAX_CODE_SALES_ONLY: { status: 400, message: 'A selected tax code is unsupported.' },
+  TAX_CODE_UNAVAILABLE: { status: 400, message: 'A selected tax code is unavailable.' },
+  TAX_COMPANY_MISMATCH: { status: 400, message: 'A selected tax reference is unavailable for this company.' },
+  TAX_NOT_READY: { status: 409, message: 'Purchase tax references are not ready.' },
+  TAX_RATE_INACTIVE: { status: 400, message: 'A selected tax code is unavailable.' },
+  TAX_RATE_MALFORMED: { status: 400, message: 'A selected tax code is unsupported.' },
+  TAX_RATE_UNAVAILABLE: { status: 400, message: 'A selected tax code is unavailable.' },
+  TAX_RATE_UNSUPPORTED: { status: 400, message: 'A selected tax code is unsupported.' },
+  TAX_REQUIRES_PURCHASE: { status: 400, message: 'Tax selection is supported only for Purchase transactions.' },
+  TAX_TREATMENT_AMBIGUOUS: { status: 400, message: 'A selected tax code is unsupported.' },
+  TRANSACTION_NOT_FOUND: { status: 404, message: 'Transaction not found.' },
+  UNBALANCED_TOTAL: { status: 400, message: 'Categorization lines do not balance to the transaction total.' },
+  VERIFIED_POST_REQUIRED: { status: 409, message: 'Undo requires a verified posted categorization.' },
+};
+
+function mappedServiceHttpError(error: unknown): HttpError | null {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  if (typeof code === 'string') {
+    const safe = SAFE_SERVICE_ERRORS[code];
+    if (safe) return new HttpError(safe.status, safe.message, code);
+  }
+  return null;
+}
+
+function throwMappedServiceError(error: unknown): never {
+  const mapped = mappedServiceHttpError(error);
+  if (mapped) throw mapped;
+  throw error;
+}
+
+const SAFE_OUTCOME_ERRORS: Partial<Record<
+  DurableMutationResult['outcome'],
+  { code: string; message: string }
+>> = {
+  IN_PROGRESS: {
+    code: 'MUTATION_IN_PROGRESS',
+    message: 'This prepared write is already in progress and will not be sent again.',
+  },
+  RETRYABLE: {
+    code: 'RETRYABLE',
+    message: 'The prepared write was not sent. Create a new request to retry.',
+  },
+  UNCERTAIN: {
+    code: 'QBO_WRITE_UNCERTAIN',
+    message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+  },
+};
+
+function sendMutationResult(
+  res: Response,
+  result: DurableMutationResult,
+  expected: { transactionId: string; requestId: string },
+): void {
+  if (
+    result.transactionId !== expected.transactionId ||
+    result.requestId !== expected.requestId
+  ) {
+    throw new HttpError(500, 'Mutation result identity could not be verified.');
+  }
+  const safe: CategorizationMutationResult = {
+    transactionId: result.transactionId,
+    requestId: result.requestId,
+    ok: result.ok,
+    status: result.status,
+    outcome: result.outcome,
+  };
+  const safeError = SAFE_OUTCOME_ERRORS[result.outcome];
+  if (!result.ok && safeError) safe.error = safeError;
+  const status = result.outcome === 'IN_PROGRESS' ? 202
+    : result.outcome === 'UNCERTAIN' || result.outcome === 'RETRYABLE' ? 409
+      : 200;
+  res.status(status).json(safe);
+}
+
 async function resolveCategoryQboId(
   companyId: string,
   name: string,
@@ -357,6 +662,114 @@ async function loadRuleLikes(companyId: string): Promise<RuleLike[]> {
 export const transactionActionsRouter = Router();
 transactionActionsRouter.use(requireUser);
 
+transactionActionsRouter.post(
+  '/:id/categorization/stage',
+  asyncHandler(async (req, res) => {
+    const body = validate(stageCategorizationBodySchema)(req.body);
+    const scope = await loadCategorizationScope(req.params.id);
+    await assertCategorizationRouteAccess(requestUser(req), scope.companyId);
+    await assertCompanyConnected(scope.companyId);
+    try {
+      const staged = await stageCategorization({
+        transactionId: scope.transactionId,
+        companyId: scope.companyId,
+        expectedRevision: body.expectedRevision,
+        proposal: {
+          taxCalculation: body.taxCalculation,
+          lines: body.lines,
+          tagIds: body.tagIds,
+        },
+      });
+      res.json(boundedStageCategorizationResponse(staged, scope.transactionId));
+    } catch (error) {
+      throwMappedServiceError(error);
+    }
+  }),
+);
+
+transactionActionsRouter.post(
+  '/:id/categorization/commit',
+  asyncHandler(async (req, res) => {
+    const body = validate(commitCategorizationBodySchema)(req.body);
+    const scope = await loadCategorizationScope(req.params.id);
+    const user = requestUser(req);
+    await assertCategorizationRouteAccess(user, scope.companyId);
+    try {
+      const result = await commitStagedCategorization({
+        transactionId: scope.transactionId,
+        companyId: scope.companyId,
+        expectedRevision: body.expectedRevision,
+        requestId: body.requestId,
+        actor: actorFor(user),
+      });
+      sendMutationResult(res, result, {
+        transactionId: scope.transactionId,
+        requestId: body.requestId,
+      });
+    } catch (error) {
+      throwMappedServiceError(error);
+    }
+  }),
+);
+
+async function reconcileCategorizationRequest(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const body = validate(reconcileCategorizationBodySchema)(req.body);
+  const scope = await loadCategorizationScope(req.params.id);
+  const user = requestUser(req);
+  await assertCategorizationRouteAccess(user, scope.companyId);
+  await assertCompanyConnected(scope.companyId);
+  await assertAttemptScope(body.requestId, scope.transactionId);
+  try {
+    const result = await reconcileMutationAttempt({
+      requestId: body.requestId,
+      actor: actorFor(user),
+    });
+    sendMutationResult(res, result, {
+      transactionId: scope.transactionId,
+      requestId: body.requestId,
+    });
+  } catch (error) {
+    throwMappedServiceError(error);
+  }
+}
+
+transactionActionsRouter.post(
+  '/:id/categorization/reconcile',
+  asyncHandler(reconcileCategorizationRequest),
+);
+
+transactionActionsRouter.post(
+  '/:id/categorization/retry',
+  asyncHandler(reconcileCategorizationRequest),
+);
+
+transactionActionsRouter.post(
+  '/:id/categorization/undo',
+  asyncHandler(async (req, res) => {
+    const body = validate(undoCategorizationBodySchema)(req.body);
+    const scope = await loadCategorizationScope(req.params.id);
+    const user = requestUser(req);
+    await assertCategorizationRouteAccess(user, scope.companyId);
+    try {
+      const result = await undoCategorization({
+        transactionId: scope.transactionId,
+        companyId: scope.companyId,
+        requestId: body.requestId,
+        actor: actorFor(user),
+      });
+      sendMutationResult(res, result, {
+        transactionId: scope.transactionId,
+        requestId: body.requestId,
+      });
+    } catch (error) {
+      throwMappedServiceError(error);
+    }
+  }),
+);
+
 // Stage category/splits/tags locally — never writes to QBO.
 transactionActionsRouter.post(
   '/:id/categorize',
@@ -366,6 +779,7 @@ transactionActionsRouter.post(
     const body = validate(categorizeBody)(req.body);
     const txn = await loadTxn(id);
     await assertCategorizerFor(requestUser(req), txn.companyId);
+    await assertLegacyCategorizationAllowed(txn);
     if (txn.status !== 'PENDING' && txn.status !== 'ERROR') {
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
@@ -468,6 +882,8 @@ transactionActionsRouter.post(
     try {
       result = await postTransaction(id, actorFor(user));
     } catch (err) {
+      const mapped = mappedServiceHttpError(err);
+      if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'POST_FAILED');
     }
 
@@ -501,6 +917,8 @@ transactionActionsRouter.post(
     try {
       await undoPost(id, actorFor(user));
     } catch (err) {
+      const mapped = mappedServiceHttpError(err);
+      if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
     }
     res.json(await dtoById(id));

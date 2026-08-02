@@ -17,11 +17,18 @@ import type {
   CompanyPatchBody,
   QboAccountDto,
   Role,
+  TaxReadinessDto,
   TagDto,
   UserDto,
 } from '@recat/shared';
 import { roleFor } from '@recat/shared';
-import { auth, companies as companiesApi, tags as tagsApi, transactions as txnApi } from '../lib/api';
+import {
+  auth,
+  companies as companiesApi,
+  tags as tagsApi,
+  tax as taxApi,
+  transactions as txnApi,
+} from '../lib/api';
 
 export type Theme = 'light' | 'dark';
 
@@ -59,6 +66,10 @@ export interface AppContextValue {
   tags: TagDto[];
   refreshAccounts: () => Promise<void>;
   refreshTags: () => Promise<void>;
+  taxReadiness: TaxReadinessDto | null;
+  taxReadinessLoading: boolean;
+  refreshTaxReadiness: () => Promise<void>;
+  refreshTaxReferences: () => Promise<void>;
 
   /** PENDING txn count for the active company — the Queue tab badge. */
   pendingCount: number;
@@ -97,6 +108,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const [accounts, setAccounts] = useState<QboAccountDto[]>([]);
   const [tags, setTags] = useState<TagDto[]>([]);
+  const [taxReadiness, setTaxReadiness] = useState<TaxReadinessDto | null>(null);
+  const [taxReadinessLoading, setTaxReadinessLoading] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
 
   const [theme, setTheme] = useState<Theme>(() =>
@@ -206,24 +219,62 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (refDataCompanyRef.current === cid) setPendingCount(res.pendingCount);
   }, [activeCompanyId]);
 
+  const refreshTaxReadiness = useCallback(async () => {
+    const cid = activeCompanyId;
+    if (!cid) return;
+    setTaxReadinessLoading(true);
+    try {
+      const readiness = await taxApi.get(cid);
+      if (refDataCompanyRef.current === cid) setTaxReadiness(readiness);
+    } finally {
+      if (refDataCompanyRef.current === cid) setTaxReadinessLoading(false);
+    }
+  }, [activeCompanyId]);
+
+  const refreshTaxReferences = useCallback(async () => {
+    const cid = activeCompanyId;
+    if (!cid) return;
+    setTaxReadinessLoading(true);
+    try {
+      const result = await taxApi.refresh(cid);
+      if (refDataCompanyRef.current === cid) setTaxReadiness(result.readiness);
+    } finally {
+      if (refDataCompanyRef.current === cid) setTaxReadinessLoading(false);
+    }
+  }, [activeCompanyId]);
+
   useEffect(() => {
     if (!session || !activeCompanyId) {
       refDataCompanyRef.current = null;
       setAccounts([]);
       setTags([]);
+      setTaxReadiness(null);
+      setTaxReadinessLoading(false);
       setPendingCount(0);
       return;
     }
     refDataCompanyRef.current = activeCompanyId;
     setAccounts([]);
     setTags([]);
+    setTaxReadiness(null);
+    setTaxReadinessLoading(true);
     const swallow = () => {
       // screens surface their own errors; the shell just stays empty
     };
     refreshAccounts().catch(swallow);
     refreshTags().catch(swallow);
+    refreshTaxReadiness().catch(() => {
+      if (refDataCompanyRef.current === activeCompanyId) setTaxReadinessLoading(false);
+    });
     refreshPendingCount().catch(swallow);
-  }, [session, activeCompanyId, refreshAccounts, refreshTags, refreshPendingCount]);
+  }, [
+    session,
+    activeCompanyId,
+    refreshAccounts,
+    refreshTags,
+    refreshTaxReadiness,
+    refreshPendingCount,
+  ]);
 
   // ---- theme ----
   const toggleTheme = useCallback(() => {
@@ -263,6 +314,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setCompanies([]);
     setAccounts([]);
     setTags([]);
+    setTaxReadiness(null);
+    setTaxReadinessLoading(false);
     setPendingCount(0);
   }, []);
 
@@ -285,6 +338,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tags,
       refreshAccounts,
       refreshTags,
+      taxReadiness,
+      taxReadinessLoading,
+      refreshTaxReadiness,
+      refreshTaxReferences,
       pendingCount,
       setPendingCount,
       refreshPendingCount,
@@ -310,6 +367,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tags,
       refreshAccounts,
       refreshTags,
+      taxReadiness,
+      taxReadinessLoading,
+      refreshTaxReadiness,
+      refreshTaxReferences,
       pendingCount,
       refreshPendingCount,
       theme,

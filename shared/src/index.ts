@@ -61,6 +61,112 @@ export interface TaxReadinessDto {
   taxCodes: TaxCodeDto[];
 }
 
+export interface CategorizationProposalLine {
+  /** Signed cents matching the transaction direction. */
+  grossCents: number;
+  categoryQboId: string;
+  /** Required for taxable staging and omitted for NotApplicable. */
+  taxCodeQboId?: string | null;
+  memo?: string;
+  tagIds: string[];
+}
+
+/** A normalized, client-authored categorization proposal.
+ * Tax totals are deliberately absent: the server calculates them. */
+export interface CategorizationProposal {
+  taxCalculation: TaxCalculation;
+  lines: CategorizationProposalLine[];
+  tagIds: string[];
+}
+
+export interface StageCategorizationInput {
+  transactionId: string;
+  companyId: string;
+  expectedRevision: number;
+  proposal: CategorizationProposal;
+}
+
+export interface StagedCategorizationLine {
+  idx: number;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  categoryQboId: string;
+  taxCodeQboId: string | null;
+  memo: string | null;
+  /** Present on stage responses; optional for older internal prepared-write fixtures. */
+  tagIds?: string[];
+}
+
+export interface StagedCategorization {
+  transactionId: string;
+  revision: number;
+  taxCalculation: TaxCalculation;
+  totals: {
+    subtotalCents: number;
+    taxCents: number;
+    totalCents: number;
+  };
+  lines: StagedCategorizationLine[];
+  tagIds: string[];
+}
+
+/** Largest revision that can be atomically incremented into a Prisma Int. */
+export const MAX_EXPECTED_TRANSACTION_REVISION = 2_147_483_646;
+
+/** Strict POST /api/transactions/:id/categorization/stage request body. */
+export interface StageCategorizationBody {
+  expectedRevision: number;
+  taxCalculation: TaxCalculation;
+  lines: Array<{
+    grossCents: number;
+    categoryQboId: string;
+    taxCodeQboId: string | null;
+    memo?: string;
+    tagIds: string[];
+  }>;
+  tagIds: string[];
+}
+
+/** Strict POST /api/transactions/:id/categorization/commit request body. */
+export interface CommitCategorizationBody {
+  expectedRevision: number;
+  requestId: string;
+}
+
+/** Reconciliation and reconciliation-only retry reuse the original request ID. */
+export interface ReconcileCategorizationBody {
+  requestId: string;
+}
+
+/** Undo starts a distinct durable mutation attempt. */
+export interface UndoCategorizationBody {
+  requestId: string;
+}
+
+export type CategorizationMutationOutcome =
+  | 'VERIFIED'
+  | 'UNCERTAIN'
+  | 'IN_PROGRESS'
+  | 'UNCHANGED'
+  | 'DRY_RUN'
+  | 'RETRYABLE';
+
+export interface CategorizationMutationResult {
+  transactionId: string;
+  requestId: string;
+  ok: boolean;
+  status: TxnStatus;
+  outcome: CategorizationMutationOutcome;
+  error?: { code: string; message: string };
+}
+
+export interface ActiveCategorizationAttemptDto {
+  requestId: string;
+  operation: 'recategorize' | 'restore';
+  status: 'PREPARED' | 'COMMITTING' | 'UNCERTAIN';
+}
+
 export type QboDiagnosticCode =
   | 'INVALID_CLIENT_CREDENTIALS'
   | 'REDIRECT_URI_MISMATCH'
@@ -157,6 +263,8 @@ export interface SplitDto {
   amount: number; // splits must sum to Transaction.amount (absolute value semantics: signed like txn)
   category: string; // display name
   categoryQboId?: string;
+  taxCode?: string | null;
+  taxCodeQboId?: string | null;
   tagIds: string[];
   memo?: string;
 }
@@ -183,14 +291,21 @@ export interface TransactionDto {
   amount: number; // signed; + = money in
   bankAccount: string;
   status: TxnStatus;
+  /** Current local staging revision; tax-aware staging must send this exact value. */
+  revision: number;
   category: string | null;
   categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
   splits: SplitDto[] | null;
   tagIds: string[];
   suggestion: SuggestionDto | null;
   error: { code: string; message: string } | null;
   postedAt: string | null;
   postedBy: string | null;
+  /** Latest unresolved durable write attempt, reduced to reconciliation-safe fields. */
+  activeCategorizationAttempt: ActiveCategorizationAttemptDto | null;
   /** id of a detected transfer counterpart (equal |amount|, opposite sign, different account, ≤3 days) */
   transferCandidateId?: string | null;
 }
@@ -240,6 +355,9 @@ export interface RuleDto {
   matchText: string;
   category: string;
   categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
   tagIds: string[];
   autoPost: boolean;
   createdAt: string;
