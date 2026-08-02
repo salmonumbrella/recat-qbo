@@ -17,6 +17,8 @@ import type {
   DashboardDataDto,
   DashboardWidget,
   InstanceSettingsDto,
+  CreateMcpTokenResponse,
+  McpTokenListResponse,
   PollInterval,
   QboAccountDto,
   QboConnectionTestDto,
@@ -476,6 +478,14 @@ export const dashboardLayout = {
   /** null → user has never customized; use the default widget set. TODO(server): confirm. */
   get: () => api.get<{ widgets: DashboardWidget[] | null }>('/api/me/dashboard-layout'),
   save: (widgets: DashboardWidget[]) => api.put<void>('/api/me/dashboard-layout', { widgets }),
+};
+
+export const mcpTokens = {
+  list: (params: { limit?: number; cursor?: string } = {}) =>
+    api.get<McpTokenListResponse>(`/api/me/mcp-tokens${qs(params)}`),
+  create: (body: { label: string; expiresInDays?: number }) =>
+    api.post<CreateMcpTokenResponse>('/api/me/mcp-tokens', body),
+  revoke: (id: string) => api.del<void>(`/api/me/mcp-tokens/${id}`),
 };
 
 export const audit = {

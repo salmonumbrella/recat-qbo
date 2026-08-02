@@ -15,7 +15,6 @@ import {
   type CommitCategorizationBody,
   type ReconcileCategorizationBody,
   type StageCategorizationBody,
-  type SuggestionDto,
   type TransactionDto,
   type TxnStatus,
   type UndoCategorizationBody,
@@ -24,8 +23,17 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { effectiveRole, requireRole, requireUser, roleRank } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
-import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/suggestions.js';
+import { ruleSuggestion, type RuleLike } from '../services/suggestions.js';
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
+import {
+  filterTransactionDtos,
+  sortTransactionRows,
+  transactionDtos,
+  transactionReadInclude,
+  type TransactionReadRow,
+} from '../services/companyReads.js';
+
+export { transactionDtos } from '../services/companyReads.js';
 import { stageCategorization } from '../services/categorization.js';
 import {
   bulkPost,
@@ -33,7 +41,6 @@ import {
   postTransaction,
   reconcileMutationAttempt,
   retryError,
-  splitLineDtos,
   undoCategorization,
   undoPost,
   validateSplits,
@@ -41,39 +48,7 @@ import {
   type DurableMutationResult,
 } from '../services/writeback.js';
 
-/** Every txn query in this file loads split lines (with their tags) so the DTO
- * boundary can translate the SplitLine relation back into SplitDto[]. */
-const txnInclude = {
-  txnTags: true,
-  splitLines: { include: { tags: true }, orderBy: { idx: 'asc' as const } },
-  qboMutationAttempts: {
-    where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
-    orderBy: { createdAt: 'desc' as const },
-    take: 1,
-    select: {
-      requestId: true,
-      operation: true,
-      status: true,
-    },
-  },
-} satisfies Prisma.TransactionInclude;
-
-type TxnRow = Prisma.TransactionGetPayload<{ include: typeof txnInclude }>;
-
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const STATUS_WORDS: Record<TxnStatus, string> = {
-  PENDING: 'pending',
-  POSTING: 'posting',
-  POSTED: 'posted',
-  DRY_RUN: 'dry run',
-  ERROR: 'error failed',
-  SUPERSEDED: 'superseded',
-  REVERTED: 'reverted',
-};
-
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+type TxnRow = TransactionReadRow;
 
 export function actorFor(user: User): Actor {
   return { id: user.id, label: user.name ?? user.email.split('@')[0] ?? user.email };
@@ -106,91 +81,8 @@ async function assertCategorizationRouteAccess(user: User, companyId: string): P
   }
 }
 
-// ---------------------------------------------------------------------------
-// DTO mapping
-// ---------------------------------------------------------------------------
-
-/**
- * Map DB rows to TransactionDto. Suggestions for PENDING txns are recomputed
- * live via suggestForMany (rules + history loaded ONCE for the whole page; no
- * AI calls from the list path) so rule edits reflect instantly in the queue.
- */
-export async function transactionDtos(
-  companyId: string,
-  rows: TxnRow[],
-  candidatesIn?: Map<string, string>,
-): Promise<TransactionDto[]> {
-  const candidates = candidatesIn ?? (await transferCandidates(companyId));
-  const posterIds = [...new Set(rows.map((r) => r.postedByUserId).filter((v): v is string => v !== null))];
-  const posters = posterIds.length > 0 ? await prisma.user.findMany({ where: { id: { in: posterIds } } }) : [];
-  const posterLabel = new Map(posters.map((u) => [u.id, u.name ?? u.email.split('@')[0] ?? u.email]));
-
-  const pendingRows = rows.filter((r) => r.status === 'PENDING');
-  const liveSuggestions = await suggestForMany(
-    companyId,
-    pendingRows.map((r) => ({ payee: r.payee, memo: r.memo, amount: Number(r.amount) })),
-  );
-  const liveSuggestionByTxnId = new Map(pendingRows.map((r, i) => [r.id, liveSuggestions[i] ?? null]));
-
-  const out: TransactionDto[] = [];
-  for (const r of rows) {
-    const amount = Number(r.amount);
-    const activeAttempt = r.qboMutationAttempts[0];
-    const activeCategorizationAttempt: TransactionDto['activeCategorizationAttempt'] =
-      activeAttempt !== undefined &&
-      UUID_PATTERN.test(activeAttempt.requestId) &&
-      (activeAttempt.operation === 'recategorize' || activeAttempt.operation === 'restore') &&
-      (activeAttempt.status === 'PREPARED' ||
-        activeAttempt.status === 'COMMITTING' ||
-        activeAttempt.status === 'UNCERTAIN')
-        ? {
-            requestId: activeAttempt.requestId,
-            operation: activeAttempt.operation,
-            status: activeAttempt.status,
-          }
-        : null;
-    // Live pipeline first (rule edits must reflect instantly); fall back to the
-    // snapshot computed at sync time (covers seeded/demo history suggestions
-    // and AI suggestions stored by refreshSuggestions).
-    const suggestion: SuggestionDto | null =
-      r.status === 'PENDING'
-        ? ((liveSuggestionByTxnId.get(r.id) ?? null) ?? (r.suggestion as SuggestionDto | null))
-        : null;
-    out.push({
-      id: r.id,
-      companyId: r.companyId,
-      qboId: r.qboId,
-      qboType: r.qboType as TransactionDto['qboType'],
-      date: r.date.toISOString(),
-      payee: r.payee,
-      memo: r.memo,
-      amount,
-      bankAccount: r.bankAccount,
-      status: r.status,
-      revision: r.revision,
-      category: r.category,
-      categoryQboId: r.categoryQboId,
-      taxCalculation: r.taxCalculation as TransactionDto['taxCalculation'],
-      taxCode: r.taxCode,
-      taxCodeQboId: r.taxCodeQboId,
-      splits: splitLineDtos(r.splitLines),
-      tagIds: r.txnTags.map((t) => t.tagId),
-      suggestion,
-      error:
-        r.status === 'ERROR' && (r.errorCode !== null || r.errorMessage !== null)
-          ? { code: r.errorCode ?? 'QBO_ERROR', message: r.errorMessage ?? 'Unknown error' }
-          : null,
-      postedAt: r.postedAt?.toISOString() ?? null,
-      postedBy: r.postedByUserId !== null ? (posterLabel.get(r.postedByUserId) ?? null) : null,
-      activeCategorizationAttempt,
-      transferCandidateId: candidates.get(r.id) ?? null,
-    });
-  }
-  return out;
-}
-
 async function loadTxn(id: string): Promise<TxnRow> {
-  const txn = await prisma.transaction.findUnique({ where: { id }, include: txnInclude });
+  const txn = await prisma.transaction.findUnique({ where: { id }, include: transactionReadInclude });
   if (!txn) throw new HttpError(404, 'Transaction not found', 'TXN_NOT_FOUND');
   return txn;
 }
@@ -200,44 +92,6 @@ async function dtoById(id: string): Promise<TransactionDto> {
   const [dto] = await transactionDtos(txn.companyId, [txn]);
   if (!dto) throw new HttpError(500, 'Could not build transaction');
   return dto;
-}
-
-// ---------------------------------------------------------------------------
-// Search (server-side, matching the prototype's client-side matcher)
-// ---------------------------------------------------------------------------
-
-function formatQueueDate(iso: string): string {
-  const d = new Date(iso);
-  return `${MONTHS[d.getUTCMonth()] ?? ''} ${d.getUTCDate()}`;
-}
-
-function haystack(dto: TransactionDto, fullNameOf: Map<string, string>): string {
-  const abs = Math.abs(dto.amount).toFixed(2);
-  const parts = [
-    dto.payee,
-    dto.memo ?? '',
-    dto.bankAccount,
-    formatQueueDate(dto.date),
-    dto.category ?? '',
-    dto.category !== null ? (fullNameOf.get(dto.category) ?? '') : '',
-    ...(dto.splits ?? []).flatMap((s) => [s.category, fullNameOf.get(s.category) ?? '']),
-    dto.suggestion?.category ?? '',
-    dto.suggestion !== null ? (fullNameOf.get(dto.suggestion.category) ?? '') : '',
-    STATUS_WORDS[dto.status],
-    abs,
-    `$${abs}`,
-    `${dto.amount < 0 ? '-' : '+'}$${abs}`,
-  ];
-  return parts.join(' ').toLowerCase();
-}
-
-function matchesSearch(dto: TransactionDto, search: string, fullNameOf: Map<string, string>): boolean {
-  const hay = haystack(dto, fullNameOf);
-  return search
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length > 0)
-    .every((token) => hay.includes(token));
 }
 
 // ---------------------------------------------------------------------------
@@ -280,29 +134,20 @@ companyTransactionsRouter.get(
     // Prototype order: date ascending as entered.
     const rows = await prisma.transaction.findMany({
       where: { companyId: company.id, status: { not: 'SUPERSEDED' } },
-      include: txnInclude,
+      include: transactionReadInclude,
       orderBy: { date: 'asc' },
     });
     // Same-date rows keep QBO entry order (ids are numeric strings — uuid
     // secondary sort would shuffle them run to run).
-    rows.sort((a, b) => {
-      const d = a.date.getTime() - b.date.getTime();
-      if (d !== 0) return d;
-      const an = Number(a.qboId);
-      const bn = Number(b.qboId);
-      if (Number.isFinite(an) && Number.isFinite(bn) && an !== bn) return an - bn;
-      return a.qboId.localeCompare(b.qboId);
-    });
+    sortTransactionRows(rows);
     let dtos = await transactionDtos(company.id, rows);
 
-    if (query.status !== undefined) dtos = dtos.filter((d) => d.status === query.status);
-    if (query.account !== undefined && query.account !== '' && query.account !== 'all') {
-      dtos = dtos.filter((d) => d.bankAccount === query.account);
-    }
     if (query.search !== undefined && query.search.trim() !== '') {
       const accounts = await prisma.qboAccount.findMany({ where: { companyId: company.id } });
       const fullNameOf = new Map(accounts.map((a) => [a.name, a.fullName]));
-      dtos = dtos.filter((d) => matchesSearch(d, query.search ?? '', fullNameOf));
+      dtos = filterTransactionDtos(dtos, query, fullNameOf);
+    } else {
+      dtos = filterTransactionDtos(dtos, query);
     }
 
     res.json({ transactions: dtos, nextCursor: null, pendingCount });
@@ -335,7 +180,10 @@ transferCandidatesRouter.get(
 
     const ids = pairIds.flat();
     const rows = ids.length > 0
-      ? await prisma.transaction.findMany({ where: { id: { in: ids }, companyId: company.id }, include: txnInclude })
+      ? await prisma.transaction.findMany({
+          where: { id: { in: ids }, companyId: company.id },
+          include: transactionReadInclude,
+        })
       : [];
     const dtos = await transactionDtos(company.id, rows, candidates);
     const byId = new Map(dtos.map((d) => [d.id, d]));
@@ -977,7 +825,10 @@ transactionActionsRouter.post(
 
     const results = await bulkPost(ids, actorFor(user));
 
-    const rows = await prisma.transaction.findMany({ where: { id: { in: ids } }, include: txnInclude });
+    const rows = await prisma.transaction.findMany({
+      where: { id: { in: ids } },
+      include: transactionReadInclude,
+    });
     const byCompany = new Map<string, TxnRow[]>();
     for (const row of rows) {
       const list = byCompany.get(row.companyId) ?? [];

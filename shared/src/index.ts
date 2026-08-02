@@ -206,6 +206,31 @@ export interface UserDto {
   memberships: MembershipDto[];
 }
 
+export type McpTokenStatus = 'active' | 'expired' | 'revoked';
+
+/** Safe token metadata. Plaintext and digests are never part of list responses. */
+export interface McpTokenDto {
+  id: string;
+  prefix: string;
+  label: string;
+  status: McpTokenStatus;
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+export interface McpTokenListResponse {
+  items: McpTokenDto[];
+  nextCursor: string | null;
+}
+
+/** The plaintext token is returned by POST exactly once. */
+export interface CreateMcpTokenResponse {
+  token: string;
+  mcpToken: McpTokenDto;
+}
+
 /** Effective role for a company: instance admins are admin everywhere. */
 export function roleFor(user: UserDto, companyId: string | null): Role | null {
   if (user.isInstanceAdmin) return 'admin';

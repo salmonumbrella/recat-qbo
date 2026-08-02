@@ -225,6 +225,20 @@ beforeEach(() => {
 });
 
 describe('tax-aware categorization action routes', () => {
+  it('keeps explicit SUPERSEDED queue reads empty', async () => {
+    mocks.transactionFindMany.mockResolvedValue([]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions?status=SUPERSEDED`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body.transactions).toEqual([]);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: COMPANY_ID, status: { not: 'SUPERSEDED' } },
+    }));
+  });
+
   it('exposes the current revision and staged transaction tax identity for reloads', async () => {
     mocks.splitLineDtos.mockReturnValue(null);
 
