@@ -46,11 +46,11 @@ describe('receipt processing settings', () => {
     deps = createDeps();
   });
 
-  it('defaults to enabled OpenRouter vision extraction without secrets', async () => {
+  it('defaults to disabled OpenRouter vision extraction without secrets', async () => {
     const settings = await getReceiptSettings('company-1', deps);
 
     expect(settings).toMatchObject({
-      enabled: true,
+      enabled: false,
       provider: 'openrouter',
       model: 'openai/gpt-4o-mini',
       confidenceThreshold: 0.8,
@@ -61,6 +61,25 @@ describe('receipt processing settings', () => {
     expect(settings).not.toHaveProperty('apiKey');
     expect(JSON.stringify(settings)).not.toContain('private-key');
     expect(deps.rows).toHaveLength(0);
+  });
+
+  it('preserves an existing explicit opt-in', async () => {
+    deps.rows.set('company-1', {
+      companyId: 'company-1',
+      enabled: true,
+      provider: 'openrouter',
+      model: 'openai/gpt-4o-mini',
+      confidenceThreshold: 0.8,
+      autoMatchThreshold: 85,
+      autoMatchMargin: 15,
+      maxPages: 20,
+      configVersion: 'b'.repeat(64),
+    });
+
+    await expect(getReceiptSettings('company-1', deps)).resolves.toMatchObject({
+      enabled: true,
+      configVersion: 'b'.repeat(64),
+    });
   });
 
   it('requires the selected provider credentials before enabling', async () => {
@@ -147,6 +166,7 @@ describe('receipt processing settings', () => {
   });
 
   it('resolves provider secrets only through the server-internal boundary', async () => {
+    await updateReceiptSettings('company-1', { enabled: true }, deps);
     const openrouter = await resolveReceiptProvider('company-1', deps);
     expect(openrouter).toEqual({
       settings: await getReceiptSettings('company-1', deps),
@@ -160,7 +180,7 @@ describe('receipt processing settings', () => {
 
     await updateReceiptSettings(
       'company-1',
-      { provider: 'custom' },
+      { enabled: true, provider: 'custom' },
       deps,
     );
     await expect(resolveReceiptProvider('company-1', deps)).resolves.toMatchObject({

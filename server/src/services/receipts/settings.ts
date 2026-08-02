@@ -28,7 +28,7 @@ type ReceiptSettingsWithoutVersion = Omit<
 >;
 
 export const DEFAULT_RECEIPT_SETTINGS: Readonly<ReceiptSettingsWithoutVersion> = {
-  enabled: true,
+  enabled: false,
   provider: 'openrouter',
   model: 'openai/gpt-4o-mini',
   confidenceThreshold: 0.8,

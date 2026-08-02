@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ClaimedReceiptJob } from './jobs.js';
 import {
   runClaimedReceiptJob,
@@ -141,6 +141,33 @@ function fakeDeps(): ReceiptWorkerDeps & {
 }
 
 describe('receipt extraction worker', () => {
+  it('performs zero blob or provider calls while processing is disabled', async () => {
+    const fake = fakeDeps();
+    fake.resolveProvider = vi.fn(async () => ({
+      settings: {
+        enabled: false,
+        provider: 'openrouter',
+        model: 'synthetic/model',
+        confidenceThreshold: 0.8,
+        autoMatchThreshold: 85,
+        autoMatchMargin: 15,
+        maxPages: 20,
+        configVersion: 'a'.repeat(64),
+      },
+      apiBase: '',
+      apiKey: '',
+      headers: {},
+    }));
+    fake.openBlob = vi.fn(fake.openBlob);
+    fake.extract = vi.fn(fake.extract);
+
+    await runClaimedReceiptJob(job(), fake);
+
+    expect(fake.resolveProvider).toHaveBeenCalledOnce();
+    expect(fake.openBlob).not.toHaveBeenCalled();
+    expect(fake.extract).not.toHaveBeenCalled();
+  });
+
   it('persists one immutable successful attempt and advances to READY', async () => {
     const fake = fakeDeps();
     await runClaimedReceiptJob(job(), fake);
