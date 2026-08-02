@@ -5,7 +5,14 @@
 // demo mode, so its arithmetic has to match production.
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getMockRealm, MockQboClient, MOCK_REALM_HARBOR, resetMockRealms } from './mock.js';
+import {
+  getMockRealm,
+  mergePersistedMockRealm,
+  MockQboClient,
+  MOCK_REALM_BLUEBIRD,
+  MOCK_REALM_HARBOR,
+  resetMockRealms,
+} from './mock.js';
 
 const HOLDING_IDS = ['4', '5']; // Harbor: Ask My Accountant + Uncategorized Expense
 
@@ -92,5 +99,153 @@ describe('MockQboClient multi-line entity safety', () => {
     expect(sysco?.lines).toHaveLength(1);
     expect(sysco?.lines[0]?.accountQboId).toBe('10');
     expect(sysco?.amount).toBe(-50);
+  });
+});
+
+describe('MockQboClient tax fixtures', () => {
+  it('hydrates pre-tax persisted mutations over current fixture defaults', () => {
+    const current = getMockRealm(MOCK_REALM_BLUEBIRD);
+    const persistedBeforePurchaseTax = {
+      realmId: MOCK_REALM_BLUEBIRD,
+      legalName: 'Stale persisted fixture name',
+      accounts: [],
+      txns: current.txns.map((txn) =>
+        txn.qboId === '14'
+          ? { ...txn, syncToken: 7, memo: 'Persisted user mutation' }
+          : txn,
+      ),
+      transfers: [
+        {
+          qboId: 'transfer-1000',
+          amount: 25,
+          fromAccountQboId: '1',
+          toAccountQboId: '2',
+          date: '2026-07-15',
+          memo: 'Persisted transfer',
+          lastUpdated: '2026-07-15T08:00:00.000Z',
+        },
+      ],
+      nextId: 1001,
+    };
+
+    const hydrated = mergePersistedMockRealm(current, persistedBeforePurchaseTax);
+
+    expect(hydrated.legalName).toBe('Bluebird Salon LLC');
+    expect(hydrated.accounts).toBe(current.accounts);
+    expect(hydrated.taxProfile).toEqual({ usingSalesTax: true, partnerTaxEnabled: false });
+    expect(hydrated.taxCodes).toHaveLength(3);
+    expect(hydrated.taxRates).toHaveLength(2);
+    expect(hydrated.purchaseSnapshots).toHaveLength(2);
+    expect(hydrated.txns.find((txn) => txn.qboId === '14')).toMatchObject({
+      syncToken: 7,
+      memo: 'Persisted user mutation',
+    });
+    expect(hydrated.transfers).toEqual(persistedBeforePurchaseTax.transfers);
+    expect(hydrated.nextId).toBe(1001);
+  });
+
+  it('ignores malformed persisted mutable state', () => {
+    const current = getMockRealm(MOCK_REALM_BLUEBIRD);
+
+    expect(() =>
+      mergePersistedMockRealm(current, {
+        txns: [{ qboId: '14', lines: null }],
+        transfers: 'not-an-array',
+        nextId: -1,
+      }),
+    ).not.toThrow();
+    expect(
+      mergePersistedMockRealm(current, {
+        txns: [{ qboId: '14', lines: null }],
+        transfers: 'not-an-array',
+        nextId: -1,
+      }),
+    ).toEqual(current);
+  });
+
+  it('keeps tax-disabled and tax-enabled realm fixtures isolated', async () => {
+    const harbor = client();
+    const bluebird = new MockQboClient(MOCK_REALM_BLUEBIRD, ['3', '4']);
+
+    await expect(harbor.getTaxProfile()).resolves.toEqual({ usingSalesTax: false, partnerTaxEnabled: null });
+    await expect(harbor.listTaxCodes()).resolves.toEqual([]);
+    await expect(harbor.listTaxRates()).resolves.toEqual([]);
+    await expect(bluebird.getTaxProfile()).resolves.toEqual({ usingSalesTax: true, partnerTaxEnabled: false });
+  });
+
+  it('returns deterministic single-rate, multi-component, and inactive tax codes', async () => {
+    const bluebird = new MockQboClient(MOCK_REALM_BLUEBIRD, ['3', '4']);
+
+    await expect(bluebird.listTaxRates()).resolves.toEqual([
+      { qboId: 'GST5', name: 'GST 5%', description: null, active: true, rateValue: 5, sourceUpdatedAt: null },
+      { qboId: 'PST7', name: 'PST 7%', description: null, active: true, rateValue: 7, sourceUpdatedAt: null },
+    ]);
+    await expect(bluebird.listTaxCodes()).resolves.toEqual([
+      {
+        qboId: 'GST',
+        name: 'GST',
+        description: 'Goods and services tax',
+        active: true,
+        taxable: true,
+        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        sourceUpdatedAt: null,
+      },
+      {
+        qboId: 'GST-PST',
+        name: 'GST + PST',
+        description: null,
+        active: true,
+        taxable: true,
+        purchaseRates: [
+          { taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' },
+          { taxRateQboId: 'PST7', taxTypeApplicable: 'TaxOnAmount' },
+        ],
+        sourceUpdatedAt: null,
+      },
+      {
+        qboId: 'OLD-GST',
+        name: 'Old GST',
+        description: null,
+        active: false,
+        taxable: true,
+        purchaseRates: [{ taxRateQboId: 'GST5', taxTypeApplicable: 'TaxOnAmount' }],
+        sourceUpdatedAt: null,
+      },
+    ]);
+  });
+
+  it('returns signed purchase and refund snapshots with complete account-expense detail', async () => {
+    const bluebird = new MockQboClient(MOCK_REALM_BLUEBIRD, ['3', '4']);
+
+    await expect(bluebird.fetchPurchaseSnapshot('14')).resolves.toEqual({
+      qboId: '14',
+      syncToken: '0',
+      totalCents: -21430,
+      accountQboId: '1',
+      date: '2026-07-10',
+      direction: 'purchase',
+      globalTaxCalculation: 'TaxExcluded',
+      totalTaxCents: -2572,
+      lines: [
+        {
+          id: '1',
+          amountCents: -21430,
+          description: 'Color stock',
+          accountQboId: '3',
+          customerQboId: 'customer-1',
+          classQboId: 'class-1',
+          taxCodeQboId: 'UNKNOWN-PURCHASE-TAX',
+          taxAmountCents: -2572,
+          taxInclusiveCents: null,
+        },
+      ],
+    });
+
+    await expect(bluebird.fetchPurchaseSnapshot('refund-14')).resolves.toMatchObject({
+      totalCents: 21430,
+      direction: 'refund',
+      totalTaxCents: 2572,
+      lines: [{ amountCents: 21430, taxAmountCents: 2572 }],
+    });
   });
 });

@@ -23,12 +23,18 @@ import {
   type QboCompanyInfo,
   type QboStatement,
   type QboStatementRow,
+  type QboPurchaseSnapshot,
+  type QboTaxCodeInfo,
+  type QboTaxProfile,
+  type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
 import { classifyIntuitOAuthBody } from './diagnostics.js';
+import { moneyToCents } from '../../services/tax/model.js';
+import { isSupportedTaxRateValue } from './purchaseTax.js';
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -62,6 +68,10 @@ interface QboRef {
   name?: string;
 }
 
+interface RawMetaData {
+  LastUpdatedTime?: string;
+}
+
 interface RawAccount {
   Id: string;
   Name: string;
@@ -76,7 +86,14 @@ export interface RawPurchaseLine {
   Amount?: number;
   Description?: string;
   DetailType?: string;
-  AccountBasedExpenseLineDetail?: { AccountRef?: QboRef };
+  AccountBasedExpenseLineDetail?: {
+    AccountRef?: QboRef;
+    CustomerRef?: QboRef;
+    ClassRef?: QboRef;
+    TaxCodeRef?: QboRef;
+    TaxAmount?: number;
+    TaxInclusiveAmt?: number;
+  };
 }
 
 export interface RawPurchase {
@@ -93,7 +110,34 @@ export interface RawPurchase {
   /** the bank / credit-card account the purchase was paid from */
   AccountRef?: QboRef;
   Line?: RawPurchaseLine[];
+  GlobalTaxCalculation?: string;
+  TxnTaxDetail?: { TotalTax?: number };
   status?: string; // CDC: 'Deleted'
+}
+
+export interface RawPreferences {
+  TaxPrefs?: { UsingSalesTax?: boolean; PartnerTaxEnabled?: boolean };
+}
+
+export interface RawTaxRate {
+  Id: string;
+  Name: string;
+  Description?: string;
+  Active?: boolean;
+  RateValue?: number;
+  MetaData?: RawMetaData;
+}
+
+export interface RawTaxCode {
+  Id: string;
+  Name: string;
+  Description?: string;
+  Active?: boolean;
+  Taxable?: boolean;
+  PurchaseTaxRateList?: {
+    TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
+  };
+  MetaData?: RawMetaData;
 }
 
 export interface RawDepositLine {
@@ -147,6 +191,9 @@ interface OAuthTokenResponse {
 interface QueryBody {
   QueryResponse?: {
     Account?: RawAccount[];
+    Preferences?: RawPreferences[];
+    TaxCode?: RawTaxCode[];
+    TaxRate?: RawTaxRate[];
     Purchase?: RawPurchase[];
     Deposit?: RawDeposit[];
     JournalEntry?: RawJournalEntry[];
@@ -414,6 +461,101 @@ function mapAccount(raw: RawAccount): QboAccountInfo {
     classification: normalizeClassification(raw.AccountType, raw.Classification),
     accountType: raw.AccountType ?? '',
     active: raw.Active !== false,
+  };
+}
+
+function requiredTaxIdentity(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`Malformed QuickBooks tax ${field}.`);
+  }
+  return value;
+}
+
+function activeOrDefault(value: unknown, entity: string): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== 'boolean') {
+    throw new Error(`Malformed QuickBooks ${entity} Active value.`);
+  }
+  return value;
+}
+
+export function mapTaxProfile(raw: RawPreferences | undefined): QboTaxProfile {
+  return {
+    usingSalesTax: typeof raw?.TaxPrefs?.UsingSalesTax === 'boolean' ? raw.TaxPrefs.UsingSalesTax : null,
+    partnerTaxEnabled: typeof raw?.TaxPrefs?.PartnerTaxEnabled === 'boolean' ? raw.TaxPrefs.PartnerTaxEnabled : null,
+  };
+}
+
+function sourceUpdatedAt(metadata: RawMetaData | undefined): string | null {
+  const value: unknown = metadata?.LastUpdatedTime;
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error('Malformed QuickBooks source timestamp.');
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error('Malformed QuickBooks source timestamp.');
+  return new Date(timestamp).toISOString();
+}
+
+export function mapTaxRate(raw: RawTaxRate): QboTaxRateInfo {
+  return {
+    qboId: requiredTaxIdentity(raw.Id, 'rate Id'),
+    name: raw.Name,
+    description: raw.Description ?? null,
+    active: activeOrDefault(raw.Active, 'tax-rate'),
+    rateValue: isSupportedTaxRateValue(raw.RateValue) ? raw.RateValue : null,
+    sourceUpdatedAt: sourceUpdatedAt(raw.MetaData),
+  };
+}
+
+export function mapTaxCode(raw: RawTaxCode): QboTaxCodeInfo {
+  return {
+    qboId: requiredTaxIdentity(raw.Id, 'code Id'),
+    name: raw.Name,
+    description: raw.Description ?? null,
+    active: activeOrDefault(raw.Active, 'tax-code'),
+    taxable: typeof raw.Taxable === 'boolean' ? raw.Taxable : null,
+    purchaseRates: (raw.PurchaseTaxRateList?.TaxRateDetail ?? []).map((detail) => ({
+      taxRateQboId: requiredTaxIdentity(detail.TaxRateRef?.value, 'purchase rate reference'),
+      taxTypeApplicable: requiredTaxIdentity(detail.TaxTypeApplicable, 'component type'),
+    })),
+    sourceUpdatedAt: sourceUpdatedAt(raw.MetaData),
+  };
+}
+
+export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
+  const direction = raw.Credit === true ? 'refund' : 'purchase';
+  const signedCents = (amount: number): number => {
+    const cents = moneyToCents(amount);
+    if (cents === 0) return 0;
+    return direction === 'refund' ? Math.abs(cents) : -Math.abs(cents);
+  };
+  return {
+    qboId: raw.Id,
+    syncToken: raw.SyncToken,
+    totalCents: signedCents(raw.TotalAmt ?? 0),
+    accountQboId: raw.AccountRef?.value ?? null,
+    date: raw.TxnDate ?? '',
+    direction,
+    globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
+    totalTaxCents: raw.TxnTaxDetail?.TotalTax === undefined ? null : signedCents(raw.TxnTaxDetail.TotalTax),
+    lines: (raw.Line ?? []).map((line) => ({
+      id: line.Id ?? null,
+      amountCents: signedCents(line.Amount ?? 0),
+      description: line.Description ?? null,
+      accountQboId: line.AccountBasedExpenseLineDetail?.AccountRef?.value ?? null,
+      customerQboId: line.AccountBasedExpenseLineDetail?.CustomerRef?.value ?? null,
+      classQboId: line.AccountBasedExpenseLineDetail?.ClassRef?.value ?? null,
+      taxCodeQboId: line.AccountBasedExpenseLineDetail?.TaxCodeRef?.value ?? null,
+      taxAmountCents:
+        line.AccountBasedExpenseLineDetail?.TaxAmount === undefined
+          ? null
+          : signedCents(line.AccountBasedExpenseLineDetail.TaxAmount),
+      taxInclusiveCents:
+        line.AccountBasedExpenseLineDetail?.TaxInclusiveAmt === undefined
+          ? null
+          : signedCents(line.AccountBasedExpenseLineDetail.TaxInclusiveAmt),
+    })),
   };
 }
 
@@ -879,6 +1021,31 @@ export class RealQboClient implements QboClient {
   async listAccounts(): Promise<QboAccountInfo[]> {
     const rows = await this.queryAll('select * from Account', 'Account');
     return rows.map(mapAccount);
+  }
+
+  async getTaxProfile(): Promise<QboTaxProfile> {
+    const rows = await this.queryAll('select * from Preferences', 'Preferences');
+    return mapTaxProfile(rows[0]);
+  }
+
+  async listTaxCodes(): Promise<QboTaxCodeInfo[]> {
+    const rows = await this.queryAll('select * from TaxCode', 'TaxCode');
+    return rows.map(mapTaxCode);
+  }
+
+  async listTaxRates(): Promise<QboTaxRateInfo[]> {
+    const rows = await this.queryAll('select * from TaxRate', 'TaxRate');
+    return rows.map(mapTaxRate);
+  }
+
+  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+    try {
+      const body = await this.request<{ Purchase?: RawPurchase }>('GET', `/purchase/${encodeURIComponent(qboId)}`);
+      return body.Purchase ? mapPurchaseSnapshot(body.Purchase) : null;
+    } catch (err) {
+      if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
+      throw err;
+    }
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {

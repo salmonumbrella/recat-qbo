@@ -28,6 +28,39 @@ export type TxnStatus =
 
 export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
+export type TaxCalculation = 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+export type TaxSupportStatus = 'unsupported' | 'needs_setup' | 'ready';
+
+export interface TaxCodeDto {
+  qboId: string;
+  name: string;
+  active: boolean;
+  taxable: boolean | null;
+  combinedPurchaseRate: number | null;
+}
+
+export function isUsableTaxCodeDto(code: TaxCodeDto): boolean {
+  return (
+    code.active &&
+    (
+      (code.taxable === true &&
+        code.combinedPurchaseRate !== null &&
+        Number.isFinite(code.combinedPurchaseRate) &&
+        code.combinedPurchaseRate >= 0 &&
+        code.combinedPurchaseRate <= 999.999999) ||
+      (code.taxable === false && code.combinedPurchaseRate === null)
+    )
+  );
+}
+
+export interface TaxReadinessDto {
+  status: TaxSupportStatus;
+  reason: string | null;
+  usingSalesTax: boolean | null;
+  refreshedAt: string | null;
+  taxCodes: TaxCodeDto[];
+}
+
 export type QboDiagnosticCode =
   | 'INVALID_CLIENT_CREDENTIALS'
   | 'REDIRECT_URI_MISMATCH'

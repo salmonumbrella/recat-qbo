@@ -5,10 +5,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { QboAuthError } from './types.js';
 import {
+  RealQboClient,
   exchangeAuthCode,
   mapDeposit,
   mapJournalEntry,
   mapPurchase,
+  mapPurchaseSnapshot,
+  mapTaxCode,
+  mapTaxProfile,
+  mapTaxRate,
   parseStatementReport,
   parseTransactionListReport,
   rebuildDepositLines,
@@ -67,7 +72,369 @@ describe('OAuth token errors', () => {
   });
 });
 
+function realClient(
+  onTokensRefreshed = vi.fn(async () => undefined),
+  holdingAccountQboIds: string[] = [],
+) {
+  return {
+    client: new RealQboClient({
+      realmId: 'realm/1',
+      environment: 'sandbox',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      tokens: {
+        accessToken: 'access-token',
+        refreshToken: 'refresh-token',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      },
+      holdingAccountQboIds,
+      onTokensRefreshed,
+    }),
+    onTokensRefreshed,
+  };
+}
+
+describe('RealQboClient purchase-tax HTTP seam', () => {
+  it('requests and normalizes valid and malformed tax profiles', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ TaxPrefs: { UsingSalesTax: true, PartnerTaxEnabled: false } }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ TaxPrefs: { UsingSalesTax: 'yes' } }] },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    await expect(client.getTaxProfile()).resolves.toEqual({ usingSalesTax: true, partnerTaxEnabled: false });
+    await expect(client.getTaxProfile()).resolves.toEqual({ usingSalesTax: null, partnerTaxEnabled: null });
+    expect(decodeURIComponent(String(fetchMock.mock.calls[0]?.[0]))).toContain(
+      'select * from Preferences startposition 1 maxresults 1000',
+    );
+  });
+
+  it.each([
+    ['TaxCode', 'listTaxCodes', (index: number) => ({ Id: `C${index}`, Name: `Code ${index}`, Taxable: true })],
+    ['TaxRate', 'listTaxRates', (index: number) => ({ Id: `R${index}`, Name: `Rate ${index}`, RateValue: 5 })],
+  ] as const)('paginates %s queries and normalizes every page', async (entity, method, row) => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { [entity]: Array.from({ length: 1_000 }, (_, index) => row(index)) },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { [entity]: [row(1_000)] },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    const result = await client[method]();
+
+    expect(result).toHaveLength(1_001);
+    expect(result[0]?.qboId).toBe(entity === 'TaxCode' ? 'C0' : 'R0');
+    expect(result.at(-1)?.sourceUpdatedAt).toBeNull();
+    expect(decodeURIComponent(String(fetchMock.mock.calls[1]?.[0]))).toContain(
+      `select * from ${entity} startposition 1001 maxresults 1000`,
+    );
+  });
+
+  it('propagates a later tax-reference page failure', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: {
+          TaxCode: Array.from({ length: 1_000 }, (_, index) => ({ Id: `C${index}`, Name: `Code ${index}` })),
+        },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Fault: { Error: [{ Detail: 'later page sentinel' }] },
+      }), { status: 500 })));
+
+    await expect(realClient().client.listTaxCodes()).rejects.toThrow('later page sentinel');
+  });
+
+  it('reads a signed Purchase snapshot and returns null for a QBO not-found response', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Purchase: {
+          Id: 'P/1',
+          SyncToken: '2',
+          TotalAmt: 10,
+          Line: [{ Amount: 10, AccountBasedExpenseLineDetail: { TaxAmount: 1 } }],
+        },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Fault: { Error: [{ Detail: 'Object Not Found' }] },
+      }), { status: 404 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { client } = realClient();
+
+    await expect(client.fetchPurchaseSnapshot('P/1')).resolves.toMatchObject({
+      qboId: 'P/1',
+      direction: 'purchase',
+      totalCents: -1_000,
+      lines: [{ amountCents: -1_000, taxAmountCents: -100 }],
+    });
+    await expect(client.fetchPurchaseSnapshot('missing')).resolves.toBeNull();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase/P%2F1?minorversion=75');
+  });
+
+  it('refreshes once after a 401 and retries a tax-profile request', async () => {
+    const onTokensRefreshed = vi.fn(async () => undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'retry-access',
+        refresh_token: 'retry-refresh',
+        expires_in: 3600,
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ TaxPrefs: { UsingSalesTax: true } }] },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient(onTokensRefreshed).client.getTaxProfile()).resolves.toMatchObject({ usingSalesTax: true });
+    expect(onTokensRefreshed).toHaveBeenCalledWith(expect.objectContaining({ accessToken: 'retry-access' }));
+    expect(fetchMock.mock.calls[2]?.[1]?.headers).toMatchObject({ Authorization: 'Bearer retry-access' });
+  });
+
+  it('posts a complete non-tax Purchase recategorization payload without adding tax fields', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Purchase: { SyncToken: '4' },
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+    const raw = twoLinePurchase();
+    const txn = mapPurchase(raw, new Set(['4']));
+
+    await expect(
+      realClient(undefined, ['4']).client.recategorize(txn, [
+        { amount: -100, accountQboId: '17', memo: 'client dinner' },
+      ]),
+    ).resolves.toEqual({ ok: true, newSyncToken: '4' });
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase?minorversion=75');
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as RawPurchase;
+    expect(body).toMatchObject({
+      Id: raw.Id,
+      AccountRef: raw.AccountRef,
+      EntityRef: raw.EntityRef,
+      SyncToken: txn.syncToken,
+    });
+    expect(body.Line?.[0]).toEqual(raw.Line?.[1]);
+    expect(body.Line?.[1]).toMatchObject({
+      Amount: 100,
+      Description: 'client dinner',
+      AccountBasedExpenseLineDetail: { AccountRef: { value: '17' } },
+    });
+    expect(JSON.stringify(body)).not.toMatch(/TaxCodeRef|TaxAmount|TaxInclusiveAmt/);
+  });
+});
+
 const HOLDING = new Set(['4']);
+
+describe('tax read normalization', () => {
+  it('normalizes purchase rate components without retaining the raw response', () => {
+    expect(
+      mapTaxCode({
+        Id: 'GST5',
+        Name: 'GST 5%',
+        Active: true,
+        Taxable: true,
+        PurchaseTaxRateList: {
+          TaxRateDetail: [{ TaxRateRef: { value: 'RATE5' }, TaxTypeApplicable: 'TaxOnAmount' }],
+        },
+      }),
+    ).toEqual({
+      qboId: 'GST5',
+      name: 'GST 5%',
+      description: null,
+      active: true,
+      taxable: true,
+      purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+      sourceUpdatedAt: null,
+    });
+  });
+
+  it('rejects a malformed purchase component before it reaches the cache', () => {
+    expect(() =>
+      mapTaxCode({
+        Id: 'GST-PST',
+        Name: 'GST + PST',
+        PurchaseTaxRateList: {
+          TaxRateDetail: [
+            { TaxRateRef: { value: 'GST5' }, TaxTypeApplicable: 'TaxOnAmount' },
+            { TaxTypeApplicable: 'TaxOnTax' },
+          ],
+        },
+      }),
+    ).toThrow(/rate reference/i);
+  });
+
+  it('normalizes profile, rate, and purchase snapshot fields into safe values', () => {
+    expect(mapTaxProfile({ TaxPrefs: { UsingSalesTax: true, PartnerTaxEnabled: false } })).toEqual({
+      usingSalesTax: true,
+      partnerTaxEnabled: false,
+    });
+    expect(
+      mapTaxRate({ Id: 'RATE5', Name: 'GST', Description: 'Goods and services tax', Active: true, RateValue: 5 }),
+    ).toEqual({
+      qboId: 'RATE5',
+      name: 'GST',
+      description: 'Goods and services tax',
+      active: true,
+      rateValue: 5,
+      sourceUpdatedAt: null,
+    });
+    expect(
+      mapPurchaseSnapshot({
+        Id: 'P-1',
+        SyncToken: '7',
+        TxnDate: '2026-07-27',
+        TotalAmt: 105,
+        Credit: true,
+        AccountRef: { value: 'bank-1' },
+        GlobalTaxCalculation: 'TaxInclusive',
+        TxnTaxDetail: { TotalTax: 5 },
+        Line: [
+          {
+            Id: '1',
+            Amount: 105,
+            Description: 'Lunch',
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: '17' },
+              CustomerRef: { value: 'customer-1' },
+              ClassRef: { value: 'class-1' },
+              TaxCodeRef: { value: 'UNKNOWN-CODE' },
+              TaxAmount: 5,
+              TaxInclusiveAmt: 105,
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      qboId: 'P-1',
+      syncToken: '7',
+      totalCents: 10500,
+      accountQboId: 'bank-1',
+      date: '2026-07-27',
+      direction: 'refund',
+      globalTaxCalculation: 'TaxInclusive',
+      totalTaxCents: 500,
+      lines: [
+        {
+          id: '1',
+          amountCents: 10500,
+          description: 'Lunch',
+          accountQboId: '17',
+          customerQboId: 'customer-1',
+          classQboId: 'class-1',
+          taxCodeQboId: 'UNKNOWN-CODE',
+          taxAmountCents: 500,
+          taxInclusiveCents: 10500,
+        },
+      ],
+    });
+  });
+
+  it('normalizes all purchase monetary fields as negative without double-inverting negative raw values', () => {
+    expect(
+      mapPurchaseSnapshot({
+        Id: 'P-2',
+        SyncToken: '1',
+        TotalAmt: -105,
+        Credit: false,
+        TxnTaxDetail: { TotalTax: -5 },
+        Line: [
+          {
+            Amount: -105,
+            AccountBasedExpenseLineDetail: {
+              TaxAmount: -5,
+              TaxInclusiveAmt: -105,
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({
+      totalCents: -10_500,
+      direction: 'purchase',
+      totalTaxCents: -500,
+      lines: [
+        {
+          amountCents: -10_500,
+          taxAmountCents: -500,
+          taxInclusiveCents: -10_500,
+        },
+      ],
+    });
+  });
+
+  it('preserves malformed tax preferences and rates as unavailable metadata', () => {
+    expect(mapTaxProfile({ TaxPrefs: {} })).toEqual({
+      usingSalesTax: null,
+      partnerTaxEnabled: null,
+    });
+    expect(mapTaxProfile({ TaxPrefs: { UsingSalesTax: 'yes' } } as never).usingSalesTax).toBeNull();
+    expect(mapTaxRate({ Id: 'MISSING', Name: 'Missing' }).rateValue).toBeNull();
+    expect(mapTaxRate({ Id: 'NEGATIVE', Name: 'Negative', RateValue: -1 }).rateValue).toBeNull();
+    expect(mapTaxRate({ Id: 'TOO_HIGH', Name: 'Too high', RateValue: 1_000 }).rateValue).toBeNull();
+  });
+
+  it('normalizes optional source timestamps and rejects malformed timestamps', () => {
+    expect(
+      mapTaxCode({
+        Id: 'GST5',
+        Name: 'GST 5%',
+        MetaData: { LastUpdatedTime: '2026-07-27T09:10:11-07:00' },
+      }).sourceUpdatedAt,
+    ).toBe('2026-07-27T16:10:11.000Z');
+    expect(mapTaxRate({ Id: 'RATE5', Name: 'GST' }).sourceUpdatedAt).toBeNull();
+    expect(() =>
+      mapTaxRate({
+        Id: 'BROKEN',
+        Name: 'Broken',
+        MetaData: { LastUpdatedTime: 'not-a-timestamp' },
+      }),
+    ).toThrow(/source timestamp/i);
+  });
+
+  it.each(['false', 0, null])('rejects a present non-boolean Active value %j', (active) => {
+    expect(() =>
+      mapTaxCode({ Id: 'CODE', Name: 'Code', Active: active } as never),
+    ).toThrow(/Active/i);
+    expect(() =>
+      mapTaxRate({ Id: 'RATE', Name: 'Rate', Active: active, RateValue: 5 } as never),
+    ).toThrow(/Active/i);
+  });
+
+  it('defaults absent Active to true but rejects empty tax identities', () => {
+    expect(mapTaxCode({ Id: 'CODE', Name: 'Code' }).active).toBe(true);
+    expect(mapTaxRate({ Id: 'RATE', Name: 'Rate', RateValue: 5 }).active).toBe(true);
+    expect(() => mapTaxCode({ Id: ' ', Name: 'Code' })).toThrow(/Id/i);
+    expect(() => mapTaxRate({ Id: '', Name: 'Rate', RateValue: 5 })).toThrow(/Id/i);
+    expect(() =>
+      mapTaxCode({
+        Id: 'CODE',
+        Name: 'Code',
+        PurchaseTaxRateList: {
+          TaxRateDetail: [{ TaxRateRef: { value: '' }, TaxTypeApplicable: 'TaxOnAmount' }],
+        },
+      }),
+    ).toThrow(/rate reference/i);
+  });
+
+  it.each([123, {}, '', 'not-a-timestamp'])(
+    'rejects malformed source timestamp %j',
+    (lastUpdatedTime) => {
+      expect(() =>
+        mapTaxRate({
+          Id: 'RATE',
+          Name: 'Rate',
+          RateValue: 5,
+          MetaData: { LastUpdatedTime: lastUpdatedTime },
+        } as never),
+      ).toThrow(/source timestamp/i);
+    },
+  );
+});
 
 /** Two-line purchase: $100 parked in holding + $50 already categorized. */
 function twoLinePurchase(): RawPurchase {
@@ -139,6 +506,20 @@ describe('rebuildPurchaseLines (multi-line write safety)', () => {
     // Entity total unchanged: 50 + 60 + 40 = 150.
     const total = rebuilt.reduce((a, l) => a + (l.Amount ?? 0), 0);
     expect(total).toBeCloseTo(150, 2);
+  });
+
+  it('does not add tax fields to existing categorization payload lines', () => {
+    const rebuilt = rebuildPurchaseLines(twoLinePurchase(), HOLDING, [
+      { amount: -100, accountQboId: '17', memo: 'client dinner' },
+    ]);
+    const detail = rebuilt.find(
+      (line) => line.AccountBasedExpenseLineDetail?.AccountRef?.value === '17',
+    )?.AccountBasedExpenseLineDetail;
+
+    expect(detail).toEqual({ AccountRef: { value: '17' } });
+    expect(detail).not.toHaveProperty('TaxCodeRef');
+    expect(detail).not.toHaveProperty('TaxAmount');
+    expect(detail).not.toHaveProperty('TaxInclusiveAmt');
   });
 });
 

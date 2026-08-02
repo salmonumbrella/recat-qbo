@@ -95,12 +95,18 @@ model Company {
   connectedAt       DateTime      @default(now())
   disconnectedAt    DateTime?
   lastSyncedAt      DateTime?
+  taxReferenceRefreshedAt DateTime?
+  taxUsingSalesTax        Boolean?
+  taxSupportStatus        String        @default("needs_setup")
+  taxSupportReason        String?
   transactions      Transaction[]
   tags              Tag[]
   rules             Rule[]
   savedReports      SavedReport[]
   auditEntries      AuditEntry[]
   qboAccounts       QboAccount[]
+  qboTaxRates       QboTaxRate[]
+  qboTaxCodes       QboTaxCode[]
   syncLogs          SyncLog[]
   memberships       Membership[]
   logTags           LogTag[]
@@ -265,6 +271,38 @@ model QboAccount {
   accountType    String?
   active         Boolean  @default(true)
   updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, qboId])
+}
+
+model QboTaxRate {
+  id          String   @id @default(uuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId       String
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  rateValue   Decimal  @db.Decimal(9, 6)
+  sourceUpdatedAt DateTime?
+  updatedAt   DateTime @updatedAt
+
+  @@unique([companyId, qboId])
+}
+
+model QboTaxCode {
+  id                      String   @id @default(uuid())
+  companyId               String
+  company                 Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId                   String
+  name                    String
+  description             String?
+  active                  Boolean  @default(true)
+  taxable                 Boolean?
+  purchaseTaxRateList     Json
+  combinedPurchaseRate    Decimal? @db.Decimal(9, 6)
+  sourceUpdatedAt         DateTime?
+  updatedAt               DateTime @updatedAt
 
   @@unique([companyId, qboId])
 }

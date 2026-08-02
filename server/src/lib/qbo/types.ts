@@ -60,6 +60,52 @@ export interface QboCompanyInfo {
   legalName: string;
 }
 
+export interface QboTaxProfile {
+  usingSalesTax: boolean | null;
+  partnerTaxEnabled: boolean | null;
+}
+
+export interface QboTaxRateInfo {
+  qboId: string;
+  name: string;
+  description: string | null;
+  active: boolean;
+  rateValue: number | null;
+  sourceUpdatedAt: string | null;
+}
+
+export interface QboTaxCodeInfo {
+  qboId: string;
+  name: string;
+  description: string | null;
+  active: boolean;
+  taxable: boolean | null;
+  purchaseRates: { taxRateQboId: string; taxTypeApplicable: string }[];
+  sourceUpdatedAt: string | null;
+}
+
+export interface QboPurchaseSnapshot {
+  qboId: string;
+  syncToken: string;
+  totalCents: number;
+  accountQboId: string | null;
+  date: string;
+  direction: 'purchase' | 'refund';
+  globalTaxCalculation: string | null;
+  totalTaxCents: number | null;
+  lines: {
+    id: string | null;
+    amountCents: number;
+    description: string | null;
+    accountQboId: string | null;
+    customerQboId: string | null;
+    classQboId: string | null;
+    taxCodeQboId: string | null;
+    taxAmountCents: number | null;
+    taxInclusiveCents: number | null;
+  }[];
+}
+
 /** One normalized row of a QBO-computed financial statement (values in dollars). */
 export interface QboStatementRow {
   label: string;
@@ -143,6 +189,10 @@ export interface QboClient {
 
   getCompanyInfo(): Promise<QboCompanyInfo>;
   listAccounts(): Promise<QboAccountInfo[]>;
+  getTaxProfile(): Promise<QboTaxProfile>;
+  listTaxCodes(): Promise<QboTaxCodeInfo[]>;
+  listTaxRates(): Promise<QboTaxRateInfo[]>;
+  fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null>;
 
   /**
    * All txns (Purchase/Deposit/JournalEntry) with a line posting to any of the

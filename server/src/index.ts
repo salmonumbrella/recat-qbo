@@ -21,6 +21,7 @@ import { qboOauthRouter } from './routes/qboOauth.js';
 import { reportsRouter } from './routes/reports.js';
 import { rulesRouter } from './routes/rules.js';
 import { tagsRouter } from './routes/tags.js';
+import { taxRouter } from './routes/tax.js';
 import {
   companyTransactionsRouter,
   transactionActionsRouter,
@@ -54,6 +55,7 @@ app.use('/api/users', usersRouter);
 app.use('/api/companies/:companyId/transactions', companyTransactionsRouter);
 app.use('/api/companies/:companyId/transfer-candidates', transferCandidatesRouter);
 app.use('/api/companies/:companyId/tags', tagsRouter);
+app.use('/api/companies/:companyId/tax', taxRouter);
 app.use('/api/companies/:companyId/rules', rulesRouter);
 app.use('/api/companies/:companyId/reports', reportsRouter);
 app.use('/api/companies/:companyId/dashboard', dashboardRouter);
