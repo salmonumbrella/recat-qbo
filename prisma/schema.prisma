@@ -572,7 +572,7 @@ model ReceiptMatchCandidate {
 model ReceiptCompanyConfig {
   companyId           String   @id
   company             Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  enabled             Boolean  @default(true)
+  enabled             Boolean  @default(false)
   provider            String   @default("openrouter") @db.VarChar(32)
   model               String   @default("openai/gpt-4o-mini") @db.VarChar(200)
   confidenceThreshold Decimal  @default(0.8) @db.Decimal(5, 4)

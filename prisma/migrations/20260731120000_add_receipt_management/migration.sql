@@ -149,7 +149,7 @@ CREATE TABLE "ReceiptMatchCandidate" (
 -- CreateTable
 CREATE TABLE "ReceiptCompanyConfig" (
     "companyId" TEXT NOT NULL,
-    "enabled" BOOLEAN NOT NULL DEFAULT true,
+    "enabled" BOOLEAN NOT NULL DEFAULT false,
     "provider" VARCHAR(32) NOT NULL DEFAULT 'openrouter',
     "model" VARCHAR(200) NOT NULL DEFAULT 'openai/gpt-4o-mini',
     "confidenceThreshold" DECIMAL(5,4) NOT NULL DEFAULT 0.8,
