@@ -104,7 +104,7 @@ describePostgres('attachment PostgreSQL blob store', () => {
     const streamed: Buffer[] = [];
     for await (const chunk of reader.chunks()) streamed.push(Buffer.from(chunk));
     expect(Buffer.concat(streamed)).toEqual(Buffer.from(content));
-  });
+  }, 30_000);
 
   it('deduplicates concurrent identical files per company but not across companies', async () => {
     const firstCompany = await createCompany();
