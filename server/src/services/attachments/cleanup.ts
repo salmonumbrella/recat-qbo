@@ -121,8 +121,8 @@ export async function runAttachmentCleanup(
   }
 
   // Expired staging handles are no longer usable. Removing them permits their
-  // immutable READY blobs to be collected below, but referenced transaction
-  // attachments still protect the underlying bytes.
+  // immutable READY blobs to be collected below; durable metadata references
+  // survive byte expiry through nullable foreign keys.
   const expiredStaged = await db.stagedAttachment.findMany({
     where: { expiresAt: { lte: now } },
     orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
@@ -141,22 +141,56 @@ export async function runAttachmentCleanup(
   const blobCandidates = await db.attachmentBlob.findMany({
     where: {
       state: 'READY',
+      expiresAt: { lte: now },
       stagedFiles: { none: {} },
-      attachments: { none: {} },
     },
-    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
     take: blobLimit,
     select: { id: true },
   });
   let blobs = 0;
   for (const candidate of blobCandidates) {
     blobs += await db.$transaction(async (transaction) => {
+      const locked = await transaction.$queryRaw<Array<{ id: string }>>`
+        SELECT "id"
+          FROM "AttachmentBlob"
+         WHERE "id" = ${candidate.id}
+           AND "state" = 'READY'
+           AND "expiresAt" <= ${now}
+         FOR UPDATE SKIP LOCKED`;
+      if (locked.length !== 1) return 0;
+      const blockers = await transaction.attachmentBlob.findUnique({
+        where: { id: candidate.id },
+        select: {
+          stagedFiles: { select: { id: true }, take: 1 },
+          attachments: {
+            where: {
+              operationFiles: {
+                some: {
+                  operation: {
+                    status: {
+                      in: ['PREPARED', 'COMMITTING', 'PARTIAL', 'UNCERTAIN', 'DELETING'],
+                    },
+                  },
+                },
+              },
+            },
+            select: { id: true },
+            take: 1,
+          },
+        },
+      });
+      if (
+        blockers === null
+        || blockers.stagedFiles.length > 0
+        || blockers.attachments.length > 0
+      ) return 0;
       const deleted = await transaction.attachmentBlob.deleteMany({
         where: {
           id: candidate.id,
           state: 'READY',
+          expiresAt: { lte: now },
           stagedFiles: { none: {} },
-          attachments: { none: {} },
         },
       });
       return deleted.count;

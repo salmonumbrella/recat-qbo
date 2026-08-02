@@ -15,6 +15,8 @@ export interface CompanySettingsPatch {
   dryRun?: boolean;
   tagsRequired?: boolean;
   retainAttachmentFiles?: boolean;
+  attachmentQuotaBytes?: bigint | null;
+  attachmentRetentionDays?: number | null;
 }
 
 export interface CompanyLiveAuthorityDeps {

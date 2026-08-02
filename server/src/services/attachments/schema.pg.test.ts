@@ -11,6 +11,7 @@ interface AttachmentBlobClient {
     data: {
       companyId: string;
       state: 'READY';
+      expiresAt: Date;
       sha256: string;
       sizeBytes: bigint;
       contentType: string;
@@ -61,6 +62,7 @@ describePostgres('attachment schema constraints', () => {
       data: {
         companyId,
         state: 'READY',
+        expiresAt: new Date('2099-01-01T00:00:00.000Z'),
         sha256,
         sizeBytes: 1n,
         contentType: 'image/png',

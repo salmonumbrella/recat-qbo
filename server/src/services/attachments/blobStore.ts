@@ -15,25 +15,28 @@ import {
   normalizeAttachmentFilename,
   QBO_MAX_UPLOAD_REQUEST_BYTES,
 } from './validation.js';
+import {
+  attachmentRetentionDeadline,
+  resolveAttachmentStoragePolicy,
+  type AttachmentStoragePolicyDefaults,
+} from './policy.js';
+import {
+  getAttachmentStoragePolicyDefaults,
+  ATTACHMENT_STORAGE_INSTANCE_LOCK,
+  type AttachmentPolicyConfigDb,
+} from './policyStore.js';
 
 const CHUNK_READ_PAGE = 16;
+const COMPANY_STORAGE_LOCK_SEED = 1_991_011_991n;
 
 export interface AttachmentBlobStoreDeps {
   readonly db?: PrismaClient;
   readonly now?: () => Date;
+  readonly policyDefaults?: AttachmentStoragePolicyDefaults;
 }
 
 function resolvedDb(deps?: AttachmentBlobStoreDeps): PrismaClient {
   return deps?.db ?? prisma;
-}
-
-function isUniqueConstraint(error: unknown): boolean {
-  return (
-    typeof error === 'object'
-    && error !== null
-    && 'code' in error
-    && error.code === 'P2002'
-  );
 }
 
 function assertStageInput(input: StageAttachmentInput, now: Date): void {
@@ -222,61 +225,73 @@ export async function stageAttachment(
       input.declaredContentType,
     );
     const sha256 = hash.digest('hex');
-    try {
-      const staged = await db.$transaction(async (transaction) => {
-        await transaction.attachmentBlob.update({
-          where: { id: provisional.id },
-          data: {
-            state: 'READY',
-            sha256,
-            sizeBytes: BigInt(budget.usedBytes),
-            contentType: detected.contentType,
-            chunkCount,
-            expiresAt: null,
-          },
-        });
-        return transaction.stagedAttachment.create({
-          data: {
-            companyId: input.companyId,
-            actorKey: input.actorKey,
-            blobId: provisional.id,
-            originalFilename: filename,
-            contentType: detected.contentType,
-            sizeBytes: BigInt(budget.usedBytes),
-            sourceKind: input.sourceKind,
-            retainLocally: input.retainLocally,
-            expiresAt: input.expiresAt,
-          },
-        });
+    const finalizedAt = (deps?.now ?? (() => new Date()))();
+    const sizeBytes = BigInt(budget.usedBytes);
+    const staged = await db.$transaction(async (transaction) => {
+      await transaction.$queryRaw`
+        SELECT pg_advisory_xact_lock(${ATTACHMENT_STORAGE_INSTANCE_LOCK})::text`;
+      await transaction.$queryRaw`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(${input.companyId}, ${COMPANY_STORAGE_LOCK_SEED})
+        )::text`;
+
+      const company = await transaction.company.findUnique({
+        where: { id: input.companyId },
+        select: {
+          attachmentQuotaBytes: true,
+          attachmentRetentionDays: true,
+        },
       });
-      return stagedDto(staged, sha256);
-    } catch (error) {
-      if (!isUniqueConstraint(error)) throw error;
-      const staged = await db.$transaction(async (transaction) => {
-        const canonical = await transaction.attachmentBlob.findUnique({
-          where: {
-            companyId_sha256: {
-              companyId: input.companyId,
-              sha256,
-            },
+      if (company === null) {
+        throw new AttachmentError(
+          'ATTACHMENT_NOT_FOUND',
+          'Attachment company was not found.',
+        );
+      }
+      const policy = resolveAttachmentStoragePolicy(
+        company,
+        deps?.policyDefaults
+          ?? await getAttachmentStoragePolicyDefaults(
+            transaction as unknown as AttachmentPolicyConfigDb,
+          ),
+      );
+      const retentionDeadline = attachmentRetentionDeadline(
+        finalizedAt,
+        policy.retentionDays,
+      );
+      const canonical = await transaction.attachmentBlob.findUnique({
+        where: {
+          companyId_sha256: {
+            companyId: input.companyId,
+            sha256,
           },
-          select: {
-            id: true,
-            state: true,
-            sizeBytes: true,
-            contentType: true,
-          },
-        });
+        },
+        select: {
+          id: true,
+          state: true,
+          sizeBytes: true,
+          contentType: true,
+          expiresAt: true,
+        },
+      });
+      if (canonical !== null) {
         if (
-          canonical?.state !== 'READY'
+          canonical.state !== 'READY'
           || canonical.contentType !== detected.contentType
-          || canonical.sizeBytes !== BigInt(budget.usedBytes)
+          || canonical.sizeBytes !== sizeBytes
+          || canonical.expiresAt === null
         ) {
           throw new AttachmentError(
             'ATTACHMENT_BUSY',
             'An identical attachment is still being finalized.',
             true,
           );
+        }
+        if (canonical.expiresAt < retentionDeadline) {
+          await transaction.attachmentBlob.update({
+            where: { id: canonical.id },
+            data: { expiresAt: retentionDeadline },
+          });
         }
         const reference = await transaction.stagedAttachment.create({
           data: {
@@ -285,7 +300,7 @@ export async function stageAttachment(
             blobId: canonical.id,
             originalFilename: filename,
             contentType: detected.contentType,
-            sizeBytes: BigInt(budget.usedBytes),
+            sizeBytes,
             sourceKind: input.sourceKind,
             retainLocally: input.retainLocally,
             expiresAt: input.expiresAt,
@@ -295,9 +310,57 @@ export async function stageAttachment(
           where: { id: provisional.id },
         });
         return reference;
+      }
+
+      const [instanceUsage, companyUsage] = await Promise.all([
+        transaction.attachmentBlob.aggregate({
+          where: { state: 'READY' },
+          _sum: { sizeBytes: true },
+        }),
+        transaction.attachmentBlob.aggregate({
+          where: { companyId: input.companyId, state: 'READY' },
+          _sum: { sizeBytes: true },
+        }),
+      ]);
+      if ((instanceUsage._sum.sizeBytes ?? 0n) + sizeBytes > policy.instanceQuotaBytes) {
+        throw new AttachmentError(
+          'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED',
+          'Attachment storage exceeds the instance quota.',
+        );
+      }
+      if ((companyUsage._sum.sizeBytes ?? 0n) + sizeBytes > policy.companyQuotaBytes) {
+        throw new AttachmentError(
+          'ATTACHMENT_COMPANY_QUOTA_EXCEEDED',
+          'Attachment storage exceeds the company quota.',
+        );
+      }
+
+      await transaction.attachmentBlob.update({
+        where: { id: provisional.id },
+        data: {
+          state: 'READY',
+          sha256,
+          sizeBytes,
+          contentType: detected.contentType,
+          chunkCount,
+          expiresAt: retentionDeadline,
+        },
       });
-      return stagedDto(staged, sha256);
-    }
+      return transaction.stagedAttachment.create({
+        data: {
+          companyId: input.companyId,
+          actorKey: input.actorKey,
+          blobId: provisional.id,
+          originalFilename: filename,
+          contentType: detected.contentType,
+          sizeBytes,
+          sourceKind: input.sourceKind,
+          retainLocally: input.retainLocally,
+          expiresAt: input.expiresAt,
+        },
+      });
+    });
+    return stagedDto(staged, sha256);
   } catch (error) {
     await removeProvisionalBlob(db, provisional.id);
     throw error;

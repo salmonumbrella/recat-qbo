@@ -26,7 +26,9 @@ import {
   transactionAttachmentsRouter,
 } from './attachments.js';
 import { companiesRouter } from './companies.js';
+import { instanceRouter } from './instance.js';
 import { issueAttachmentDownloadGrant } from '../services/attachments/grants.js';
+import { ATTACHMENT_POLICY_CONFIG_KEYS } from '../services/attachments/policyStore.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -57,6 +59,9 @@ describePostgres('attachment HTTP routes on PostgreSQL', () => {
     if (users.length > 0) {
       await db.user.deleteMany({ where: { id: { in: users } } });
     }
+    await db.appConfig.deleteMany({
+      where: { key: { in: Object.values(ATTACHMENT_POLICY_CONFIG_KEYS) } },
+    });
   });
 
   afterAll(async () => {
@@ -78,6 +83,7 @@ describePostgres('attachment HTTP routes on PostgreSQL', () => {
     app.use('/api/attachment-uploads', attachmentUploadsRouter);
     app.use('/api/attachment-downloads', attachmentDownloadsRouter);
     app.use('/api/companies', companiesRouter);
+    app.use('/api/instance', instanceRouter);
     app.use(errorMiddleware);
     return app;
   }
@@ -109,10 +115,12 @@ describePostgres('attachment HTTP routes on PostgreSQL', () => {
   async function signedIn(
     companyId: string,
     role: 'viewer' | 'categorizer' | 'admin',
+    isInstanceAdmin = false,
   ) {
     const user = await db.user.create({
       data: {
         email: `${randomUUID()}@example.invalid`,
+        isInstanceAdmin,
         memberships: { create: { companyId, role } },
       },
     });
@@ -340,6 +348,115 @@ describePostgres('attachment HTTP routes on PostgreSQL', () => {
       .send({ retainAttachmentFiles: false });
     expect(patched.status).toBe(200);
     expect(patched.body.retainAttachmentFiles).toBe(false);
+  });
+
+  it('exposes exact usage and restricts quota overrides to instance admins', async () => {
+    const app = application();
+    const { company } = await fixture();
+    const viewer = await signedIn(company.id, 'viewer');
+    const companyAdmin = await signedIn(company.id, 'admin');
+    const instanceAdmin = await signedIn(company.id, 'admin', true);
+    const categorizer = await signedIn(company.id, 'categorizer');
+
+    const initial = await request(app)
+      .get(`/api/companies/${company.id}/attachment-storage-policy`)
+      .set('Cookie', viewer);
+    expect(initial.status).toBe(200);
+    expect(initial.body).toMatchObject({
+      companyQuotaBytes: '1073741824',
+      instanceQuotaBytes: '10737418240',
+      companyUsageBytes: '0',
+      retentionDays: 365,
+      companyQuotaOverrideBytes: null,
+    });
+
+    await request(app)
+      .patch(`/api/companies/${company.id}`)
+      .set('Cookie', companyAdmin)
+      .send({ attachmentQuotaBytes: '1048576' })
+      .expect(403);
+
+    const patched = await request(app)
+      .patch(`/api/companies/${company.id}`)
+      .set('Cookie', instanceAdmin)
+      .send({
+        attachmentQuotaBytes: '1048576',
+        attachmentRetentionDays: 30,
+      });
+    expect(patched.status).toBe(200);
+
+    const policy = await request(app)
+      .get(`/api/companies/${company.id}/attachment-storage-policy`)
+      .set('Cookie', viewer);
+    expect(policy.body).toMatchObject({
+      companyQuotaBytes: '1048576',
+      companyUsageBytes: '0',
+      retentionDays: 30,
+      companyQuotaOverrideBytes: '1048576',
+      companyRetentionOverrideDays: 30,
+    });
+
+    const grantResponse = await request(app)
+      .post(`/api/companies/${company.id}/attachment-upload-grants`)
+      .set('Cookie', categorizer)
+      .send({});
+    const pdfHeader = Buffer.from('%PDF-1.7\n');
+    const rejected = await request(app)
+      .post(grantResponse.body.uploadUrl as string)
+      .set('Authorization', `Bearer ${grantResponse.body.grant as string}`)
+      .attach('files', Buffer.concat([
+        pdfHeader,
+        Buffer.alloc(1_048_577 - pdfHeader.byteLength, 7),
+      ]), {
+        filename: 'over-quota.pdf',
+        contentType: 'application/pdf',
+      });
+    expect(rejected.status).toBe(413);
+    expect(rejected.body).toMatchObject({
+      code: 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED',
+    });
+  }, 30_000);
+
+  it('persists bounded instance defaults through the instance-admin API', async () => {
+    const app = application();
+    const { company } = await fixture();
+    const companyAdmin = await signedIn(company.id, 'admin');
+    const instanceAdmin = await signedIn(company.id, 'admin', true);
+
+    await request(app)
+      .get('/api/instance/attachment-storage-policy')
+      .set('Cookie', companyAdmin)
+      .expect(403);
+
+    const patched = await request(app)
+      .patch('/api/instance/attachment-storage-policy')
+      .set('Cookie', instanceAdmin)
+      .send({
+        companyQuotaBytes: '2097152',
+        instanceQuotaBytes: '4194304',
+        retentionDays: 60,
+      });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({
+      companyQuotaBytes: '2097152',
+      instanceQuotaBytes: '4194304',
+      instanceUsageBytes: '0',
+      retentionDays: 60,
+    });
+
+    const stored = await db.appConfig.findMany({
+      where: { key: { in: Object.values(ATTACHMENT_POLICY_CONFIG_KEYS) } },
+      orderBy: { key: 'asc' },
+      select: { key: true, value: true, encrypted: true },
+    });
+    expect(stored).toHaveLength(3);
+    expect(stored.every((row) => row.encrypted === false)).toBe(true);
+
+    await request(app)
+      .patch('/api/instance/attachment-storage-policy')
+      .set('Cookie', instanceAdmin)
+      .send({ instanceQuotaBytes: '1048575' })
+      .expect(400);
   });
 
   it('refreshes provider-only metadata and saves external bytes locally', async () => {

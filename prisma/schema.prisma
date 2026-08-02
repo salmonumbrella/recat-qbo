@@ -160,6 +160,8 @@ model Company {
   dryRun            Boolean       @default(true)
   tagsRequired      Boolean       @default(false)
   retainAttachmentFiles Boolean   @default(true)
+  attachmentQuotaBytes BigInt?
+  attachmentRetentionDays Int?
   accessToken       String? // encrypted (AES-256-GCM)
   refreshToken      String? // encrypted (AES-256-GCM)
   tokenExpiresAt    DateTime?
@@ -250,6 +252,7 @@ model AttachmentBlob {
   attachments TransactionAttachment[]
 
   @@unique([companyId, sha256])
+  @@index([companyId, state])
   @@index([state, expiresAt])
 }
 

@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { parseLocalAdminConfig } from './services/localAdminConfig.js';
+import { ATTACHMENT_POLICY_BOUNDS } from './services/attachments/policy.js';
 
 // Load the repo-root .env (Node ≥20.12 built-in; no dotenv dependency).
 // Values already present in the environment win — .env only fills gaps.
@@ -26,8 +27,25 @@ for (const k of Object.keys(process.env)) {
   if (process.env[k] === '') delete process.env[k];
 }
 
+export const attachmentPolicyEnvManaged = Object.freeze({
+  companyQuotaBytes: process.env.ATTACHMENT_COMPANY_QUOTA_BYTES !== undefined,
+  instanceQuotaBytes: process.env.ATTACHMENT_INSTANCE_QUOTA_BYTES !== undefined,
+  retentionDays: process.env.ATTACHMENT_RETENTION_DAYS !== undefined,
+});
+
 const DEV_SESSION_SECRET = 'dev-only-session-secret-change-me';
 const DEV_ENCRYPTION_KEY = '0'.repeat(64);
+
+function byteLimit(defaultValue: bigint, minimum: bigint, maximum: bigint) {
+  return z.string()
+    .regex(/^\d+$/, 'attachment byte limits must be positive integers')
+    .default(defaultValue.toString())
+    .transform((value) => BigInt(value))
+    .refine(
+      (value) => value >= minimum && value <= maximum,
+      'attachment byte limit is outside the supported range',
+    );
+}
 
 const schema = z.object({
   APP_URL: z.string().url().default('http://localhost:5173'),
@@ -62,6 +80,20 @@ const schema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true' || v === '1'),
+  ATTACHMENT_COMPANY_QUOTA_BYTES: byteLimit(
+    1_073_741_824n,
+    ATTACHMENT_POLICY_BOUNDS.companyQuotaMinBytes,
+    ATTACHMENT_POLICY_BOUNDS.companyQuotaMaxBytes,
+  ),
+  ATTACHMENT_INSTANCE_QUOTA_BYTES: byteLimit(
+    10_737_418_240n,
+    ATTACHMENT_POLICY_BOUNDS.instanceQuotaMinBytes,
+    ATTACHMENT_POLICY_BOUNDS.instanceQuotaMaxBytes,
+  ),
+  ATTACHMENT_RETENTION_DAYS: z.coerce.number().int()
+    .min(ATTACHMENT_POLICY_BOUNDS.retentionMinDays)
+    .max(ATTACHMENT_POLICY_BOUNDS.retentionMaxDays)
+    .default(365),
   // DANGER: forces magic-link URLs into API responses even when real books
   // are connected — anyone with the link IS that user. Normally unneeded:
   // devLink is auto-allowed while the instance has no real company connected
@@ -78,6 +110,12 @@ const schema = z.object({
 });
 
 const parsedEnv = schema.parse(process.env);
+
+if (parsedEnv.ATTACHMENT_INSTANCE_QUOTA_BYTES < parsedEnv.ATTACHMENT_COMPANY_QUOTA_BYTES) {
+  throw new Error(
+    'ATTACHMENT_INSTANCE_QUOTA_BYTES must be greater than or equal to ATTACHMENT_COMPANY_QUOTA_BYTES.',
+  );
+}
 
 export const localAdminConfig = parseLocalAdminConfig(
   parsedEnv.LOCAL_ADMIN_EMAIL,

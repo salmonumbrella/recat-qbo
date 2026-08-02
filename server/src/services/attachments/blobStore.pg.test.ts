@@ -7,9 +7,11 @@ import {
   stageAttachment,
 } from './blobStore.js';
 import { BLOB_CHUNK_BYTES } from './validation.js';
+import type { AttachmentStoragePolicyDefaults } from './policy.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const MIB = 1024n * 1024n;
 
 async function* irregularChunks(content: Uint8Array) {
   const widths = [17, 700_003, 31, 1_200_001, 65_537];
@@ -67,7 +69,12 @@ describePostgres('attachment PostgreSQL blob store', () => {
     companyId: string,
     content: Uint8Array,
     actorKey = `user:${randomUUID()}`,
+    options: {
+      policyDefaults?: AttachmentStoragePolicyDefaults;
+      now?: () => Date;
+    } = {},
   ) {
+    const stagedAt = options.now?.() ?? new Date();
     return stageAttachment({
       companyId,
       actorKey,
@@ -76,8 +83,8 @@ describePostgres('attachment PostgreSQL blob store', () => {
       filename: 'receipt.pdf',
       declaredContentType: 'application/pdf',
       content: irregularChunks(content),
-      expiresAt: new Date(Date.now() + 60_000),
-    }, { db });
+      expiresAt: new Date(stagedAt.getTime() + 60_000),
+    }, { db, ...options });
   }
 
   it('streams a 2.5 MiB file into ordered chunks no larger than one MiB', async () => {
@@ -125,7 +132,75 @@ describePostgres('attachment PostgreSQL blob store', () => {
     await expect(db.attachmentBlob.count({
       where: { companyId: secondCompany.id, state: 'READY' },
     })).resolves.toBe(1);
+    await expect(db.attachmentBlob.aggregate({
+      where: { state: 'READY', companyId: { in: [firstCompany.id, secondCompany.id] } },
+      _sum: { sizeBytes: true },
+    })).resolves.toMatchObject({ _sum: { sizeBytes: 512_000n } });
   });
+
+  it('stores a finite retention deadline from the effective company policy', async () => {
+    const company = await createCompany();
+    const now = new Date('2026-08-02T12:00:00.000Z');
+    const staged = await stage(company.id, pdfFixture(4096, 17), undefined, {
+      now: () => now,
+      policyDefaults: {
+        companyQuotaBytes: MIB,
+        instanceQuotaBytes: 10n * MIB,
+        retentionDays: 30,
+      },
+    });
+
+    const row = await db.stagedAttachment.findUniqueOrThrow({
+      where: { id: staged.id },
+      include: { blob: true },
+    });
+    expect(row.blob.expiresAt?.toISOString()).toBe('2026-09-01T12:00:00.000Z');
+  });
+
+  it('accepts the company boundary and rejects one additional physical blob', async () => {
+    const company = await createCompany();
+    const policyDefaults = {
+      companyQuotaBytes: MIB,
+      instanceQuotaBytes: 10n * MIB,
+      retentionDays: 365,
+    };
+    await stage(company.id, pdfFixture(Number(MIB), 23), undefined, { policyDefaults });
+
+    await expect(stage(
+      company.id,
+      pdfFixture(16, 24),
+      undefined,
+      { policyDefaults },
+    )).rejects.toMatchObject({ code: 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED' });
+    await expect(db.attachmentBlob.count({
+      where: { companyId: company.id, state: 'STAGING' },
+    })).resolves.toBe(0);
+  }, 30_000);
+
+  it('serializes concurrent companies at the instance boundary', async () => {
+    const firstCompany = await createCompany();
+    const secondCompany = await createCompany();
+    const policyDefaults = {
+      companyQuotaBytes: MIB,
+      instanceQuotaBytes: MIB,
+      retentionDays: 365,
+    };
+    const results = await Promise.allSettled([
+      stage(firstCompany.id, pdfFixture(700_000, 31), undefined, { policyDefaults }),
+      stage(secondCompany.id, pdfFixture(700_000, 32), undefined, { policyDefaults }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ code: 'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED' }),
+    });
+    await expect(db.attachmentBlob.aggregate({
+      where: { companyId: { in: [firstCompany.id, secondCompany.id] }, state: 'READY' },
+      _sum: { sizeBytes: true },
+    })).resolves.toMatchObject({ _sum: { sizeBytes: 700_000n } });
+  }, 30_000);
 
   it('garbage-collects only blobs whose staged and transaction references are gone', async () => {
     const company = await createCompany();
