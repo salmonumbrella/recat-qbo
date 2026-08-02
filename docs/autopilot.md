@@ -1,0 +1,111 @@
+---
+last_edited: 2026-08-02
+---
+
+# Autopilot shadow-provider boundary
+
+The shadow decision core can ask OpenRouter or a custom OpenAI-compatible
+endpoint to propose a categorization. In this release it is a pure library: it
+has no scheduler, database, MCP, or QuickBooks write dependency, and nothing
+invokes it automatically. Any caller that enables a real model sends the
+bounded context below to that external provider.
+
+## Provider request
+
+OpenRouter requests go to `https://openrouter.ai/api/v1/chat/completions`.
+Custom-provider requests go to the configured HTTP(S) base URL with
+`/chat/completions` appended. Review that provider's data-handling, retention,
+training, residency, and deletion terms before configuring credentials. Recat
+cannot control or verify what an external provider retains after a request.
+
+Every request contains the configured model name, a versioned system
+instruction, the structured-decision JSON Schema, the four fixed read-only tool
+schemas, and one immutable transaction snapshot. Review requests also contain
+the candidate structured decision. Later turns can repeat bounded assistant
+tool calls and tool results derived only from that same snapshot.
+
+The serialized snapshot contains exactly these fields:
+
+- `schemaVersion`, `featureVersion`, and `configurationVersion`;
+- transaction UUID and local revision;
+- transaction date, signed amount in integer cents, and three-letter currency;
+- source account display name and coarse type (`BANK`, `CREDIT_CARD`, `CASH`, or
+  `OTHER`);
+- normalized payee/vendor text and optional memo;
+- candidate categories, each with its QuickBooks reference ID and display name;
+- tax readiness status, supported calculation modes, and eligible tax-code
+  reference IDs and labels;
+- active tag UUIDs and names;
+- applicable rules: rule UUID, priority, payee match text, category reference,
+  tax calculation and tax-code reference, and tag UUIDs;
+- up to 20 similar verified transactions: transaction UUID, date, signed cents,
+  currency, payee, optional memo, tax calculation, tag UUIDs, verification
+  timestamp, and up to 20 lines containing signed cents, category and tax-code
+  references, optional memo, and tag UUIDs.
+
+The provider can call four fixed tools:
+
+- `search_categories` accepts `{query, limit}`, where `query` is 1–160
+  characters and `limit` is an integer from 1–100, and returns matching
+  candidate-category items;
+- `list_tax_codes` accepts `{}` and returns eligible tax-reference items;
+- `list_rules` accepts `{}` and returns applicable-rule items; and
+- `find_similar_transactions` accepts the same bounded `{query, limit}` shape
+  and returns matching verified-transaction items.
+
+Each provider tool call exposes its call ID, tool name, and arguments. Its
+result is returned in an `{items: [...]}` envelope containing an ordered subset
+of the corresponding snapshot collection. Results contain at most 20 items and
+cannot introduce a value that was not already in the snapshot, even when the
+provider requests a larger limit.
+
+## Explicit exclusions
+
+The accounting context and tool results do not include OAuth tokens, session
+tokens, provider API credentials, a dedicated bank or credit-card account-number
+field, raw QuickBooks payloads, unrelated transactions, unbounded company
+history, unrestricted database access, or any mutation tool. The destination
+provider still receives its own credential in the request `Authorization`
+header.
+
+Snapshot free text is normalized and rejected if it contains an account-number
+shaped sequence of eight or more digits, including digits separated by spaces
+or hyphens. That heuristic does not guarantee removal of shorter or differently
+formatted account numbers. Callers must sanitize source account display names,
+payees, memos, rules, and verified-history text before building a snapshot.
+
+This boundary reduces disclosure; it does not anonymize the request. Payee,
+memo, account display name, transaction identifiers, category/tax references,
+rules, tags, and verified history may still be sensitive bookkeeping data.
+
+## Hard limits
+
+- Snapshot: 64 KiB serialized maximum.
+- Candidate categories, tax references, tags, rules, and similar history: at
+  most 20 retained items each; nested lines and ID lists: at most 20.
+- Provider history: at most 40 entries and 64 KiB.
+- Review candidate and provider response: 32 KiB each.
+- Default run: four turns, eight total tool calls, 64 KiB context, 32 KiB response,
+  and 30 seconds wall-clock time.
+- Tool search query: 160 characters; requested results are capped to 20 even
+  when a provider asks for more.
+- The provider adapter separately rejects a single response or assistant
+  history entry containing more than 20 tool calls.
+
+The adapter does not log or persist request bodies, prompt history, tool-result
+bodies, or provider response bodies. It structurally validates the provider
+response envelope and tool turns, then returns either raw decision JSON or a
+tool turn plus bounded token-usage metadata when the provider supplies it. The
+runner parses and validates decision JSON against the decision schema. The pure
+core converts invalid, oversized, timed-out, cancelled, or ambiguous output
+into a typed error or structured abstention and has no path to stage or write
+accounting data.
+
+## Verification boundary
+
+Deterministic verification checks balances, active category/tag/tax references,
+tax eligibility, and evidence references. The runner records the validated
+snapshot transaction revision in its result metadata. An optional review model
+receives the same sanitized snapshot and candidate decision. Same-model review
+is labeled as such and is not independent verification. No model response is
+authorization to write to QuickBooks.

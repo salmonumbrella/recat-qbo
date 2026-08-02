@@ -14,6 +14,8 @@ const SETTING_KEYS = [
   'suggestionSource',
   'suggestionProvider',
   'suggestionModel',
+  'agentDecisionModel',
+  'agentVerifierModel',
   'aiEndpoint',
   'aiApiKey',
   'openrouterApiKey',
@@ -44,6 +46,8 @@ export interface InstanceSettings {
   suggestionSource: SuggestionSetting;
   suggestionProvider: SuggestionProvider;
   suggestionModel: string;
+  agentDecisionModel: string;
+  agentVerifierModel: string;
   aiEndpoint: string;
   aiApiKey: string;
   openrouterApiKey: string;
@@ -65,6 +69,8 @@ export interface InstanceSettingsPatch {
   suggestionSource?: SuggestionSetting;
   suggestionProvider?: SuggestionProvider;
   suggestionModel?: string;
+  agentDecisionModel?: string;
+  agentVerifierModel?: string;
   aiEndpoint?: string;
   aiApiKey?: string;
   openrouterApiKey?: string;
@@ -112,6 +118,10 @@ export async function getInstanceSettings(): Promise<InstanceSettings> {
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).
   const smtpFromEnv = env.SMTP_HOST !== '';
+  const suggestionModel =
+    env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
+      ? env.SUGGESTION_MODEL
+      : (stored.suggestionModel || 'gpt-4o-mini');
   return {
     // env vars take precedence over DB values
     intuitClientId: env.QBO_CLIENT_ID !== '' ? env.QBO_CLIENT_ID : (stored.intuitClientId ?? ''),
@@ -123,10 +133,9 @@ export async function getInstanceSettings(): Promise<InstanceSettings> {
       env.SUGGESTION_PROVIDER !== undefined && env.SUGGESTION_PROVIDER !== ''
         ? normalizeSuggestionProvider(env.SUGGESTION_PROVIDER)
         : normalizeSuggestionProvider(stored.suggestionProvider),
-    suggestionModel:
-      env.SUGGESTION_MODEL !== undefined && env.SUGGESTION_MODEL !== ''
-        ? env.SUGGESTION_MODEL
-        : (stored.suggestionModel || 'gpt-4o-mini'),
+    suggestionModel,
+    agentDecisionModel: stored.agentDecisionModel || suggestionModel,
+    agentVerifierModel: stored.agentVerifierModel || suggestionModel,
     aiEndpoint: stored.aiEndpoint ?? '',
     aiApiKey: stored.aiApiKey ?? '',
     openrouterApiKey:
@@ -170,6 +179,8 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
     suggestionSource: settings.suggestionSource,
     suggestionProvider: settings.suggestionProvider,
     suggestionModel: settings.suggestionModel,
+    agentDecisionModel: settings.agentDecisionModel,
+    agentVerifierModel: settings.agentVerifierModel,
     aiEndpoint: settings.aiEndpoint !== '' ? settings.aiEndpoint : null,
     aiKeySet: settings.aiApiKey !== '',
     openrouterKeySet: settings.openrouterApiKey !== '',
