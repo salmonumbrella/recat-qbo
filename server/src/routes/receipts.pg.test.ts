@@ -24,6 +24,7 @@ import { receiptsRouter } from './receipts.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 describePostgres('receipt HTTP routes on PostgreSQL', () => {
   let db: PrismaClient;
@@ -297,6 +298,7 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
         sizeBytes: BigInt(fallbackContent.byteLength),
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
         chunks: {
           create: { ordinal: 0, content: fallbackContent },
         },

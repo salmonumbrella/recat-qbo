@@ -7,6 +7,7 @@ import { createReceipts } from './intake.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 describePostgres('receipt schema', () => {
   let db: PrismaClient;
@@ -62,6 +63,7 @@ describePostgres('receipt schema', () => {
         sizeBytes: 8n,
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const staged = await Promise.all(Array.from(
@@ -116,6 +118,7 @@ describePostgres('receipt schema', () => {
         sizeBytes: 4n,
         contentType: 'image/png',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
 
@@ -175,6 +178,7 @@ describePostgres('receipt schema', () => {
         sizeBytes: 8n,
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const staged = await db.stagedAttachment.create({
@@ -291,6 +295,7 @@ describePostgres('receipt schema', () => {
         sizeBytes: 8n,
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const secondStaged = await db.stagedAttachment.create({

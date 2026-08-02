@@ -9,6 +9,7 @@ import {
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 const DEFAULT_QUERY: ReceiptQuery = {
   statuses: [],
@@ -61,6 +62,7 @@ describePostgres('receipt library queries', () => {
         sizeBytes: 4n,
         contentType: 'image/png',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const receipt = await db.receiptDocument.create({
@@ -205,6 +207,7 @@ describePostgres('receipt library queries', () => {
         sizeBytes: 4n,
         contentType: 'image/png',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const receipt = await db.receiptDocument.create({
