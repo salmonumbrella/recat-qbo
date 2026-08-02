@@ -201,4 +201,60 @@ describePostgres('attachment cleanup on PostgreSQL', () => {
     });
   });
 
+  it('preserves receipt bytes during active processing, then expires only the bytes', async () => {
+    const fixture = await company();
+    const now = new Date('2026-07-30T00:00:00.000Z');
+    const blob = await db.attachmentBlob.create({
+      data: {
+        companyId: fixture.id,
+        state: 'READY',
+        sha256: 'e'.repeat(64),
+        sizeBytes: 10n,
+        contentType: 'application/pdf',
+        chunkCount: 1,
+        expiresAt: new Date('2026-07-29T00:00:00.000Z'),
+      },
+    });
+    const receipt = await db.receiptDocument.create({
+      data: {
+        companyId: fixture.id,
+        blobId: blob.id,
+        originalFilename: 'receipt.pdf',
+        contentType: 'application/pdf',
+        sizeBytes: 10n,
+        sha256: 'e'.repeat(64),
+        sourceKind: 'WEB_UPLOAD',
+        jobs: {
+          create: {
+            companyId: fixture.id,
+            generation: 1,
+            configVersion: 'f'.repeat(64),
+            status: 'running',
+            dueAt: now,
+            lockOwner: 'receipt-cleanup-test',
+            leaseExpiresAt: new Date('2026-07-30T00:01:00.000Z'),
+          },
+        },
+      },
+    });
+
+    await expect(runAttachmentCleanup({ now }, { db })).resolves.toMatchObject({ blobs: 0 });
+    await expect(db.attachmentBlob.findUnique({ where: { id: blob.id } })).resolves.not.toBeNull();
+
+    await db.receiptProcessingJob.updateMany({
+      where: { documentId: receipt.id },
+      data: { status: 'completed', lockOwner: null, leaseExpiresAt: null },
+    });
+    await expect(runAttachmentCleanup({ now }, { db })).resolves.toMatchObject({ blobs: 1 });
+    await expect(db.attachmentBlob.findUnique({ where: { id: blob.id } })).resolves.toBeNull();
+    await expect(db.receiptDocument.findUniqueOrThrow({
+      where: { id: receipt.id },
+      select: { blobId: true, originalFilename: true, sha256: true },
+    })).resolves.toEqual({
+      blobId: null,
+      originalFilename: 'receipt.pdf',
+      sha256: 'e'.repeat(64),
+    });
+  });
+
 });

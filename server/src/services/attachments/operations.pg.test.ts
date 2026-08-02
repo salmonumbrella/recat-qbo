@@ -31,6 +31,7 @@ import {
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 function pdf(content: string): Uint8Array {
   return Buffer.from(`%PDF-1.7\n${content}`);
@@ -133,6 +134,7 @@ describePostgres('attachment operation PostgreSQL lifecycle', () => {
         sizeBytes: BigInt(content.byteLength),
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
         chunks: { create: { ordinal: 0, content } },
       },
     });

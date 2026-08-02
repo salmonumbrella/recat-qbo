@@ -340,6 +340,7 @@ describePostgres('receipt HTTP routes on PostgreSQL', () => {
         sizeBytes: 3n,
         contentType: 'image/png',
         chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
       },
     });
     const receipt = await db.receiptDocument.create({
