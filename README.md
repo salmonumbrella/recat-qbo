@@ -1,3 +1,7 @@
+---
+last_edited: 2026-08-02
+---
+
 <p align="center">
   <img src="client/public/icon.svg" alt="Recat QBO logo" width="128" height="128">
 </p>
@@ -185,6 +189,10 @@ Everything can be configured in the UI (setup wizard / Settings). Env vars are o
 | `DRY_RUN` | `true` = never write to QuickBooks, log payloads instead |
 
 Full list with comments in [.env.example](.env.example).
+
+The optional provider-neutral shadow decision core and the exact bookkeeping
+fields it can send to an external model are documented in
+[docs/autopilot.md](docs/autopilot.md).
 
 ## Architecture
 
