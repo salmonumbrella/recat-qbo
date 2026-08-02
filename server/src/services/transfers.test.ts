@@ -5,10 +5,12 @@ import {
   isTransferPair,
   pairTransfers,
   pickCounterpartAccount,
+  recordTransfer,
   transferCandidates,
   type CounterpartAccountLike,
   type PairableTxn,
   type PairTransferStats,
+  type RecordTransferDeps,
 } from './transfers.js';
 
 function t(id: string, amount: number, bankAccount: string, date: string): PairableTxn {
@@ -185,5 +187,276 @@ describe('pickCounterpartAccount', () => {
     expect(() =>
       pickCounterpartAccount([acct('1', 'Checking'), acct('2', 'Checking')], 'Checking'),
     ).toThrow(/ambiguous/);
+  });
+});
+
+describe('recordTransfer durable wrapper', () => {
+  function wrapperFixture(overrides: {
+    state?: 'VERIFIED' | 'DRY_RUN' | 'PARTIAL' | 'RETRYABLE' | 'UNCERTAIN';
+    priorState?: 'PREPARED' | 'PARTIAL' | 'RETRYABLE' | 'UNCERTAIN';
+  } = {}) {
+    const rows = new Map([
+      ['txn-z', {
+        id: 'txn-z',
+        companyId: 'company-generic',
+        revision: 7,
+        status: 'POSTED',
+      }],
+      ['txn-a', {
+        id: 'txn-a',
+        companyId: 'company-generic',
+        revision: 11,
+        status: 'ERROR',
+      }],
+    ]);
+    const prepare = vi.fn(async () => ({
+      operationId: 'operation-generic',
+      state: 'PREPARED' as const,
+      expiresAt: '2026-07-29T18:15:00.000Z',
+      preview: {
+        action: 'record_transfer' as const,
+        direction: 'between_accounts' as const,
+        totalCents: 1000,
+        legCount: 2 as const,
+        preparationDigest: 'a'.repeat(64),
+      },
+    }));
+    const state = overrides.state ?? 'VERIFIED';
+    const resultFor = (
+      resultState: 'VERIFIED' | 'DRY_RUN' | 'PARTIAL' | 'RETRYABLE' | 'UNCERTAIN',
+      operationId = 'operation-generic',
+    ) => ({
+      operationId,
+      state: resultState,
+      complete: resultState === 'VERIFIED' || resultState === 'DRY_RUN',
+      firstLeg: {
+        outcome: resultState === 'DRY_RUN'
+          ? 'DRY_RUN' as const
+          : resultState === 'RETRYABLE'
+            ? 'RETRYABLE' as const
+            : 'VERIFIED' as const,
+      },
+      secondLeg: {
+        outcome: resultState === 'VERIFIED'
+          ? 'VERIFIED' as const
+          : resultState === 'DRY_RUN'
+            ? 'DRY_RUN' as const
+            : resultState === 'UNCERTAIN'
+              ? 'UNCERTAIN' as const
+              : 'RETRYABLE' as const,
+      },
+      ...(resultState === 'PARTIAL'
+        ? {
+            error: {
+              code: 'TRANSFER_PARTIAL',
+              message: 'One transfer leg is durable, but the other leg still requires recovery.',
+            },
+          }
+        : resultState === 'UNCERTAIN'
+          ? {
+              error: {
+                code: 'QBO_WRITE_UNCERTAIN',
+                message: 'A transfer write may have succeeded in QuickBooks. Verify the operation before retrying.',
+              },
+            }
+          : resultState === 'RETRYABLE'
+            ? {
+                error: {
+                  code: 'TRANSFER_RETRYABLE',
+                  message: 'The transfer was not sent. Prepare a new operation before retrying.',
+                },
+              }
+            : {}),
+    });
+    const commit = vi.fn(async () => resultFor(state));
+    const priorState = overrides.priorState ?? 'PREPARED';
+    const get = vi.fn(async () => ({
+      operationId: 'operation-generic',
+      state: priorState,
+      complete: false,
+      firstLeg: {
+        outcome: priorState === 'PARTIAL'
+          ? 'VERIFIED' as const
+          : priorState === 'RETRYABLE'
+            ? 'RETRYABLE' as const
+            : priorState === 'UNCERTAIN'
+              ? 'UNCERTAIN' as const
+              : 'IN_PROGRESS' as const,
+      },
+      secondLeg: {
+        outcome: priorState === 'PARTIAL' || priorState === 'RETRYABLE'
+          ? 'RETRYABLE' as const
+          : 'IN_PROGRESS' as const,
+      },
+    }));
+    const retry = vi.fn(async () => ({
+      operationId: 'retry-operation-generic',
+      retryOfId: 'operation-generic',
+      state: 'PREPARED' as const,
+      complete: false,
+      firstLeg: { outcome: 'IN_PROGRESS' as const },
+      secondLeg: { outcome: 'IN_PROGRESS' as const },
+    }));
+    const deps = {
+      db: {
+        transaction: {
+          findUnique: vi.fn(async ({ where }) => rows.get(where.id) ?? null),
+        },
+      },
+      prepare,
+      get,
+      retry,
+      commit: commit as RecordTransferDeps['commit'],
+    } as unknown as RecordTransferDeps;
+    return { rows, prepare, get, retry, commit, deps, resultFor };
+  }
+
+  it('derives one stable idempotency key from actor, canonical pair, and both revisions', async () => {
+    const first = wrapperFixture();
+    const second = wrapperFixture();
+    const actor = { id: 'actor-generic', label: 'Generic Actor' };
+
+    await recordTransfer('txn-z', 'txn-a', actor, first.deps);
+    await recordTransfer('txn-a', 'txn-z', actor, second.deps);
+
+    const firstInput = first.prepare.mock.calls[0]![0];
+    const secondInput = second.prepare.mock.calls[0]![0];
+    expect(firstInput.idempotencyKey).toMatch(/^ui-transfer:[0-9a-f]{64}$/);
+    expect(secondInput.idempotencyKey).toBe(firstInput.idempotencyKey);
+    expect(firstInput).toMatchObject({
+      companyId: 'company-generic',
+      transactionId: 'txn-z',
+      counterpartTransactionId: 'txn-a',
+      expectedRevision: 7,
+      counterpartExpectedRevision: 11,
+      actor,
+    });
+    expect(first.commit).toHaveBeenCalledWith(
+      'operation-generic',
+      actor,
+    );
+  });
+
+  it('recovers an exact prior partial replay before requiring current PENDING statuses', async () => {
+    const f = wrapperFixture();
+
+    await expect(recordTransfer(
+      'txn-z',
+      'txn-a',
+      { id: 'actor-generic', label: 'Generic Actor' },
+      f.deps,
+    )).resolves.toEqual({ status: 'POSTED' });
+
+    expect(f.rows.get('txn-z')?.status).toBe('POSTED');
+    expect(f.rows.get('txn-a')?.status).toBe('ERROR');
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+    expect(f.commit).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps durable dry-run completion to the route-compatible status result', async () => {
+    const f = wrapperFixture({ state: 'DRY_RUN' });
+
+    await expect(recordTransfer(
+      'txn-z',
+      'txn-a',
+      { id: 'actor-generic', label: 'Generic Actor' },
+      f.deps,
+    )).resolves.toEqual({ status: 'DRY_RUN' });
+  });
+
+  it('never reports POSTED for an inconsistent mixed verified and dry-run result', async () => {
+    const f = wrapperFixture();
+    f.commit.mockResolvedValueOnce({
+      operationId: 'operation-generic',
+      state: 'VERIFIED',
+      complete: true,
+      firstLeg: { outcome: 'VERIFIED' },
+      secondLeg: { outcome: 'DRY_RUN' },
+    });
+
+    await expect(recordTransfer(
+      'txn-z',
+      'txn-a',
+      { id: 'actor-generic', label: 'Generic Actor' },
+      f.deps,
+    )).rejects.toMatchObject({
+      code: 'TRANSFER_RECONCILIATION_REQUIRED',
+      message:
+        'The transfer may be partially recorded. Verify both transactions in QuickBooks before retrying.',
+    });
+  });
+
+  it.each(['PARTIAL', 'UNCERTAIN'] as const)(
+    'surfaces fixed honest %s recovery guidance instead of reporting success',
+    async (state) => {
+      const f = wrapperFixture({ state });
+
+      await expect(recordTransfer(
+        'txn-z',
+        'txn-a',
+        { id: 'actor-generic', label: 'Generic Actor' },
+        f.deps,
+      )).rejects.toMatchObject({
+        code: 'TRANSFER_RECONCILIATION_REQUIRED',
+        message:
+          'The transfer may be partially recorded. Verify both transactions in QuickBooks before retrying.',
+      });
+
+      expect(f.commit).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ['both safely unsent', 'RETRYABLE'],
+    ['verified first leg', 'PARTIAL'],
+  ] as const)(
+    'creates and commits the one safe child on a new user call for %s',
+    async (_label, parentState) => {
+      const f = wrapperFixture({
+        state: parentState,
+        priorState: parentState,
+      });
+      f.commit
+        .mockResolvedValueOnce(f.resultFor(parentState))
+        .mockResolvedValueOnce(
+          f.resultFor('VERIFIED', 'retry-operation-generic'),
+        );
+
+      await expect(recordTransfer(
+        'txn-z',
+        'txn-a',
+        { id: 'actor-generic', label: 'Generic Actor' },
+        f.deps,
+      )).resolves.toEqual({ status: 'POSTED' });
+
+      expect(f.retry).toHaveBeenCalledWith(
+        'operation-generic',
+        { id: 'actor-generic', label: 'Generic Actor' },
+      );
+      expect(f.commit.mock.calls).toEqual([
+        ['operation-generic', { id: 'actor-generic', label: 'Generic Actor' }],
+        ['retry-operation-generic', { id: 'actor-generic', label: 'Generic Actor' }],
+      ]);
+    },
+  );
+
+  it('does not create a child in the same call that first terminalizes the parent safely', async () => {
+    const f = wrapperFixture({
+      state: 'RETRYABLE',
+      priorState: 'PREPARED',
+    });
+
+    await expect(recordTransfer(
+      'txn-z',
+      'txn-a',
+      { id: 'actor-generic', label: 'Generic Actor' },
+      f.deps,
+    )).rejects.toMatchObject({
+      code: 'TRANSFER_RETRYABLE',
+      message: 'The transfer was not sent. Retry this transfer.',
+    });
+
+    expect(f.retry).not.toHaveBeenCalled();
+    expect(f.commit).toHaveBeenCalledTimes(1);
   });
 });

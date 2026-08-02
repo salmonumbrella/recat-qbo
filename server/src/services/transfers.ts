@@ -11,11 +11,22 @@
 // withdrawal's line posts to the credit-card account and vice versa. The two
 // existing entities become the two legs; no extra Transfer entity is created.
 
-import type { PrismaClient, Prisma } from '@prisma/client';
-import type { AuditAction, TxnStatus } from '@recat/shared';
+import { createHash } from 'node:crypto';
+import type { TxnStatus } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
-import type { QboClient, QboTxn } from '../lib/qbo/types.js';
 import type { Actor } from './writeback.js';
+import {
+  commitTransfer,
+  getTransferOperation,
+  retryTransferOperation,
+  type RetryTransferOperationDto,
+  type TransferOperationDto,
+} from './transferExecution.js';
+import {
+  prepareTransfer,
+  type PrepareTransferInput,
+  type PreparedTransferDto,
+} from './transferOperations.js';
 import {
   isTransferPair,
   MAX_TRANSFER_DISCOVERY_TRANSACTIONS,
@@ -43,25 +54,6 @@ export {
 // ---------------------------------------------------------------------------
 // Recording
 // ---------------------------------------------------------------------------
-
-function jsonStringArray(v: unknown): string[] {
-  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
-}
-
-interface AuditEntryInput {
-  companyId: string;
-  actorId?: string | null;
-  actorLabel: string;
-  txnId?: string;
-  payee: string;
-  amount: number;
-  action: AuditAction;
-  before: string;
-  after: string;
-  payload?: unknown;
-}
-
-type AuditFn = (txOrPrisma: Prisma.TransactionClient | PrismaClient, entry: AuditEntryInput) => Promise<unknown>;
 
 export interface CounterpartAccountLike {
   qboId: string;
@@ -91,157 +83,168 @@ export function pickCounterpartAccount(
   return first;
 }
 
-async function firstHoldingName(companyId: string, holdingIds: string[]): Promise<string> {
-  const first = holdingIds[0];
-  if (!first) return 'Holding account';
-  const row = await prisma.qboAccount.findFirst({ where: { companyId, qboId: first } });
-  return row?.name ?? 'Holding account';
+interface RecordTransferRow {
+  id: string;
+  companyId: string;
+  revision: number;
+}
+
+export interface RecordTransferDeps {
+  db: {
+    transaction: {
+      findUnique(args: {
+        where: { id: string };
+        select: { id: true; companyId: true; revision: true };
+      }): Promise<RecordTransferRow | null>;
+    };
+  };
+  prepare(input: PrepareTransferInput): Promise<PreparedTransferDto>;
+  get(
+    operationId: string,
+    actor: Actor,
+  ): Promise<TransferOperationDto>;
+  retry(
+    operationId: string,
+    actor: Actor,
+  ): Promise<RetryTransferOperationDto>;
+  commit(
+    operationId: string,
+    actor: Actor,
+  ): Promise<TransferOperationDto>;
+}
+
+export type RecordTransferConflictCode =
+  | 'TRANSFER_RETRYABLE'
+  | 'TRANSFER_RECONCILIATION_REQUIRED';
+
+const RECORD_TRANSFER_CONFLICT_MESSAGES:
+Readonly<Record<RecordTransferConflictCode, string>> = {
+  TRANSFER_RETRYABLE: 'The transfer was not sent. Retry this transfer.',
+  TRANSFER_RECONCILIATION_REQUIRED:
+    'The transfer may be partially recorded. Verify both transactions in QuickBooks before retrying.',
+};
+
+export class RecordTransferConflictError extends Error {
+  constructor(readonly code: RecordTransferConflictCode) {
+    super(RECORD_TRANSFER_CONFLICT_MESSAGES[code]);
+    this.name = 'RecordTransferConflictError';
+  }
+}
+
+const defaultRecordTransferDeps: RecordTransferDeps = {
+  db: prisma,
+  prepare: prepareTransfer,
+  get: getTransferOperation,
+  retry: retryTransferOperation,
+  commit: commitTransfer,
+};
+
+function transferIdempotencyKey(
+  actorId: string,
+  rows: [RecordTransferRow, RecordTransferRow],
+): string {
+  const legs = rows
+    .map((row) => ({
+      transactionId: row.id,
+      revision: row.revision,
+    }))
+    .sort((left, right) =>
+      left.transactionId.localeCompare(right.transactionId)
+    );
+  const digest = createHash('sha256')
+    .update(JSON.stringify({ actorId, legs }))
+    .digest('hex');
+  return `ui-transfer:${digest}`;
 }
 
 export async function recordTransfer(
   txnId: string,
   counterpartId: string,
   actor: Actor,
+  dependencies: RecordTransferDeps = defaultRecordTransferDeps,
 ): Promise<{ status: TxnStatus }> {
-  if (txnId === counterpartId) throw new Error('A transaction cannot be its own transfer counterpart.');
+  if (txnId === counterpartId) {
+    throw new Error('A transaction cannot be its own transfer counterpart.');
+  }
+  if (typeof actor.id !== 'string' || actor.id.trim() === '') {
+    throw new Error('A current user is required to record a transfer.');
+  }
 
   const [a, b] = await Promise.all([
-    prisma.transaction.findUnique({ where: { id: txnId }, include: { company: true } }),
-    prisma.transaction.findUnique({ where: { id: counterpartId }, include: { company: true } }),
+    dependencies.db.transaction.findUnique({
+      where: { id: txnId },
+      select: { id: true, companyId: true, revision: true },
+    }),
+    dependencies.db.transaction.findUnique({
+      where: { id: counterpartId },
+      select: { id: true, companyId: true, revision: true },
+    }),
   ]);
   if (!a || !b) throw new Error('Transfer transaction not found');
-  if (a.companyId !== b.companyId) throw new Error('Transfer legs must belong to the same company');
-  if (a.status !== 'PENDING' || b.status !== 'PENDING') {
-    throw new Error('Both transactions must be pending to record a transfer');
+  if (a.companyId !== b.companyId) {
+    throw new Error('Transfer legs must belong to the same company');
   }
-  const pairA: PairableTxn = { id: a.id, amount: Number(a.amount), bankAccount: a.bankAccount, date: a.date };
-  const pairB: PairableTxn = { id: b.id, amount: Number(b.amount), bankAccount: b.bankAccount, date: b.date };
-  if (!isTransferPair(pairA, pairB)) {
-    throw new Error('These transactions do not look like the two legs of one transfer');
+  const prepared = await dependencies.prepare({
+    companyId: a.companyId,
+    transactionId: a.id,
+    counterpartTransactionId: b.id,
+    expectedRevision: a.revision,
+    counterpartExpectedRevision: b.revision,
+    idempotencyKey: transferIdempotencyKey(actor.id, [a, b]),
+    actor,
+  });
+  const beforeCommit = await dependencies.get(prepared.operationId, actor);
+  let committed = await dependencies.commit(prepared.operationId, actor);
+  if (
+    isSafelyRetryableTransfer(beforeCommit)
+    && isSafelyRetryableTransfer(committed)
+  ) {
+    const child = await dependencies.retry(prepared.operationId, actor);
+    committed = await dependencies.commit(child.operationId, actor);
   }
-
-  const company = a.company;
-  const from = pairA.amount < 0 ? a : b; // money left this account
-  const to = pairA.amount < 0 ? b : a; // and arrived here
-  // env is imported lazily so the pure pairing helpers above stay importable
-  // without a fully configured environment (unit tests).
-  const { env } = await import('../env.js');
-  const dryRun = company.dryRun || env.DRY_RUN;
-  const holdingIds = jsonStringArray(company.holdingAccountIds);
-  const { qboFactory } = await import('../lib/qbo/factory.js');
-  const client: QboClient = await qboFactory.forCompany(company.id);
-  const { writeAudit } = await import('./audit.js');
-  const audit: AuditFn = writeAudit;
-  const status: TxnStatus = dryRun ? 'DRY_RUN' : 'POSTED';
-  const now = new Date();
-
-  // Each leg's holding line is recategorized to the OTHER leg's bank account.
-  interface Leg {
-    txn: typeof a;
-    counterpartTxnId: string;
-    targetBankName: string;
+  if (
+    committed.state === 'VERIFIED'
+    && committed.complete
+    && committed.firstLeg.outcome === 'VERIFIED'
+    && committed.secondLeg.outcome === 'VERIFIED'
+  ) {
+    return { status: 'POSTED' };
   }
-  const legA: Leg = { txn: a, counterpartTxnId: b.id, targetBankName: (a.id === from.id ? to : from).bankAccount };
-  const legB: Leg = { txn: b, counterpartTxnId: a.id, targetBankName: (b.id === from.id ? to : from).bankAccount };
-
-  // Post ONE leg completely — QBO write, then status + audit committed in one
-  // DB transaction — before the next leg starts. There is no way to make the
-  // two QBO writes atomic, so we never pretend they are: if leg B fails, leg A
-  // stays honestly posted and leg B lands in ERROR.
-  const postLeg = async (leg: Leg): Promise<void> => {
-    const candidates = await prisma.qboAccount.findMany({
-      where: { companyId: company.id, name: leg.targetBankName },
-      select: { qboId: true, name: true, active: true },
-    });
-    const target = pickCounterpartAccount(candidates, leg.targetBankName);
-
-    // Fresh read even in dry-run — the audit payload must be the exact QBO
-    // payload that would be sent, current SyncToken included.
-    const fresh = await client.fetchTxn(leg.txn.qboType as QboTxn['qboType'], leg.txn.qboId);
-    const holdingLine = fresh?.lines.find((l) => holdingIds.includes(l.accountQboId));
-    if (!fresh || !holdingLine) {
-      throw new Error(`"${leg.txn.payee}" was already categorized inside QuickBooks — re-sync and try again.`);
-    }
-    const before = holdingLine.accountName;
-
-    // Amount from the fresh read (the holding-line sum as QBO sees it NOW),
-    // not from our possibly-stale mirror.
-    const splits = [{ amount: fresh.amount, accountQboId: target.qboId, memo: leg.txn.memo ?? undefined }];
-    const payload = {
-      qboType: leg.txn.qboType,
-      qboId: leg.txn.qboId,
-      syncToken: fresh.syncToken,
-      splits,
-      counterpartTxnId: leg.counterpartTxnId,
-      dryRun,
-    };
-
-    let newSyncToken: string | null = null;
-    if (!dryRun) {
-      const result = await client.recategorize(fresh, splits);
-      newSyncToken = result.newSyncToken;
-    }
-
-    await prisma.$transaction(async (tx) => {
-      await tx.transaction.update({
-        where: { id: leg.txn.id },
-        data: {
-          status,
-          postedAt: now,
-          postedByUserId: actor.id,
-          errorCode: null,
-          errorMessage: null,
-          ...(newSyncToken !== null ? { qboSyncToken: newSyncToken } : {}),
-        },
-      });
-      await audit(tx, {
-        companyId: company.id,
-        actorId: actor.id,
-        actorLabel: actor.label,
-        txnId: leg.txn.id,
-        payee: leg.txn.payee,
-        amount: fresh.amount,
-        action: 'transfer',
-        before,
-        after: `Transfer to ${to.bankAccount}`,
-        payload,
-      });
-    });
-  };
-
-  await postLeg(legA); // throws with nothing written if it fails
-  try {
-    await postLeg(legB);
-  } catch (err) {
-    // Leg A is already posted and committed. Be honest about it: mark leg B
-    // ERROR (with audit) and surface a message that says exactly what state
-    // the books are in.
-    const message = err instanceof Error ? err.message : String(err);
-    const holdingName = await firstHoldingName(company.id, holdingIds);
-    await prisma
-      .$transaction(async (tx) => {
-        await tx.transaction.update({
-          where: { id: legB.txn.id },
-          data: { status: 'ERROR', errorCode: 'TRANSFER_LEG_FAILED', errorMessage: message },
-        });
-        await audit(tx, {
-          companyId: company.id,
-          actorId: actor.id,
-          actorLabel: actor.label,
-          txnId: legB.txn.id,
-          payee: legB.txn.payee,
-          amount: Number(legB.txn.amount),
-          action: 'error',
-          before: holdingName,
-          after: `Transfer to ${to.bankAccount}`,
-          payload: { counterpartTxnId: legA.txn.id, dryRun, error: message },
-        });
-      })
-      .catch((markErr) => console.error(`[transfers] could not mark leg B ${legB.txn.id} as ERROR:`, markErr));
-    throw new Error(
-      `The first transfer leg ("${legA.txn.payee}") posted, but the second leg ("${legB.txn.payee}") failed: ${message}`,
-    );
+  if (
+    committed.state === 'DRY_RUN'
+    && committed.complete
+    && committed.firstLeg.outcome === 'DRY_RUN'
+    && committed.secondLeg.outcome === 'DRY_RUN'
+  ) {
+    return { status: 'DRY_RUN' };
   }
+  if (
+    committed.state === 'PREPARED'
+    || committed.state === 'RETRYABLE'
+  ) {
+    throw new RecordTransferConflictError('TRANSFER_RETRYABLE');
+  }
+  throw new RecordTransferConflictError(
+    'TRANSFER_RECONCILIATION_REQUIRED',
+  );
+}
 
-  return { status };
+function isSafelyRetryableTransfer(
+  operation: TransferOperationDto,
+): boolean {
+  const outcomes = [
+    operation.firstLeg.outcome,
+    operation.secondLeg.outcome,
+  ];
+  return (
+    (operation.state === 'RETRYABLE' || operation.state === 'PARTIAL')
+    && outcomes.some((outcome) =>
+      outcome === 'RETRYABLE' || outcome === 'UNCHANGED'
+    )
+    && outcomes.every((outcome) =>
+      outcome === 'VERIFIED'
+      || outcome === 'RETRYABLE'
+      || outcome === 'UNCHANGED'
+    )
+  );
 }

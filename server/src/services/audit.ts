@@ -21,7 +21,7 @@ export interface MutationAuditInput {
   requestId: string;
   outcome: MutationAuditOutcome;
   references: {
-    operation: 'recategorize' | 'restore';
+    operation: 'recategorize' | 'restore' | 'transfer';
     qboType: string;
     qboId: string;
     accountQboIds: string[];

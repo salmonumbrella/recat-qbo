@@ -759,6 +759,7 @@ class FakeDurableDb {
   failCommittingOnce = false;
   failRetryableOnce = false;
   raceAttemptOnCreate = false;
+  raceDifferentActiveAttemptOnCreate = false;
   raceAttemptHashOverride: string | null = null;
   private sequence = 0;
   private failNextAttemptRead = false;
@@ -798,6 +799,23 @@ class FakeDurableDb {
       return rows.at(-1) ?? null;
     }),
     create: vi.fn(async ({ data }: { data: Omit<DurableAttemptRow, 'id' | 'createdAt' | 'updatedAt'> }) => {
+      if (this.raceDifferentActiveAttemptOnCreate) {
+        this.raceDifferentActiveAttemptOnCreate = false;
+        const now = new Date('2026-07-28T12:00:00.000Z');
+        this.attempts.push({
+          ...structuredClone(data),
+          id: `attempt-${++this.sequence}`,
+          requestId: 'request-concurrent-other',
+          requestHash: 'concurrent-other-hash',
+          requestPayload: { kind: 'concurrent-other-request' },
+          status: 'PREPARED',
+          createdAt: now,
+          updatedAt: now,
+        });
+        const error = new Error('active transaction attempt unique');
+        Object.assign(error, { code: 'P2002' });
+        throw error;
+      }
       if (this.attempts.some((row) => row.requestId === data.requestId)) {
         const error = new Error('unique');
         Object.assign(error, { code: 'P2002' });
@@ -1481,6 +1499,23 @@ describe('commitStagedCategorization durable lifecycle', () => {
     await expect(
       commitStagedCategorization(commitInput(), fixture.deps),
     ).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a different active request wins the attempt persistence race', async () => {
+    const fixture = durableDeps();
+    fixture.db.raceDifferentActiveAttemptOnCreate = true;
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'MUTATION_BLOCKED' });
+
+    expect(fixture.db.attempts).toHaveLength(1);
+    expect(fixture.db.attempts[0]).toMatchObject({
+      transactionId: DURABLE_TRANSACTION_ID,
+      requestId: 'request-concurrent-other',
+      status: 'PREPARED',
+    });
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 

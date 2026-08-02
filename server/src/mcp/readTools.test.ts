@@ -129,7 +129,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine reads and six conservatively annotated mutation tools', async () => {
+  it('registers exactly nine reads and eight conservatively annotated mutation tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -145,8 +145,10 @@ describe('Recat MCP read tools', () => {
       'retry_operation',
       'prepare_undo',
       'commit_undo',
+      'prepare_transfer',
+      'commit_transfer',
     ]);
-    expect(tools).toHaveLength(15);
+    expect(tools).toHaveLength(17);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -207,6 +209,24 @@ describe('Recat MCP read tools', () => {
       },
       {
         name: 'commit_undo',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'prepare_transfer',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'commit_transfer',
         annotations: {
           readOnlyHint: false,
           destructiveHint: true,

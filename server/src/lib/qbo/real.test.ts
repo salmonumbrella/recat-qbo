@@ -7,6 +7,7 @@ import {
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
+  type QboPreparedLineWrite,
   type QboPreparedWrite,
 } from './types.js';
 import {
@@ -30,6 +31,7 @@ import {
   type RawPurchase,
   type RawReport,
 } from './real.js';
+import { hashLineWriteContent } from './lineWrite.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -202,9 +204,14 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
   });
 
   it('posts a complete non-tax Purchase recategorization payload without adding tax fields', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      Purchase: { SyncToken: '4' },
-    })));
+    const fetchMock = vi.fn().mockImplementation(
+      async (_url: unknown, init: RequestInit | undefined) => {
+        const body = JSON.parse(String(init?.body)) as RawPurchase;
+        return new Response(JSON.stringify({
+          Purchase: { ...body, SyncToken: '4' },
+        }));
+      },
+    );
     vi.stubGlobal('fetch', fetchMock);
     const raw = twoLinePurchase();
     const txn = mapPurchase(raw, new Set(['4']));
@@ -215,7 +222,9 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       ]),
     ).resolves.toEqual({ ok: true, newSyncToken: '4' });
 
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase?minorversion=75');
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(
+      /\/purchase\?requestid=[^&]+&minorversion=75$/,
+    );
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as RawPurchase;
     expect(body).toMatchObject({
@@ -224,12 +233,13 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       EntityRef: raw.EntityRef,
       SyncToken: txn.syncToken,
     });
-    expect(body.Line?.[0]).toEqual(raw.Line?.[1]);
-    expect(body.Line?.[1]).toMatchObject({
+    expect(body.Line?.[0]).toMatchObject({
+      Id: raw.Line?.[0]?.Id,
       Amount: 100,
       Description: 'client dinner',
       AccountBasedExpenseLineDetail: { AccountRef: { value: '17' } },
     });
+    expect(body.Line?.[1]).toEqual(raw.Line?.[1]);
     expect(JSON.stringify(body)).not.toMatch(/TaxCodeRef|TaxAmount|TaxInclusiveAmt/);
   });
 
@@ -408,6 +418,489 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+});
+
+const LINE_WRITE_HOLDING = 'ACCOUNT_HOLDING_GENERIC';
+const LINE_WRITE_TARGET = 'ACCOUNT_TARGET_GENERIC';
+
+function lineWriteFixture(qboType: 'Purchase' | 'Deposit' | 'JournalEntry') {
+  if (qboType === 'Purchase') {
+    const raw: RawPurchase = {
+      Id: 'PURCHASE_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 15,
+      PrivateNote: 'generic private note',
+      AccountRef: { value: 'ACCOUNT_PAYMENT_GENERIC', name: 'Generic payment' },
+      UnknownDocumentField: { preserve: true },
+      Line: [
+        {
+          Id: 'LINE_HOLDING_GENERIC',
+          Amount: 10,
+          Description: 'generic holding memo',
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: LINE_WRITE_HOLDING, name: 'Generic holding' },
+          },
+        },
+        {
+          Id: 'LINE_UNTOUCHED_GENERIC',
+          Amount: 5,
+          Description: 'generic untouched memo',
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: {
+              value: 'ACCOUNT_UNTOUCHED_GENERIC',
+              name: 'Generic untouched',
+            },
+          },
+          UnknownLineField: { preserve: true },
+        },
+      ],
+    };
+    return {
+      raw,
+      txn: mapPurchase(raw, new Set([LINE_WRITE_HOLDING])),
+      responseKey: 'Purchase' as const,
+      path: 'purchase',
+      untouched: raw.Line![1],
+    };
+  }
+  if (qboType === 'Deposit') {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 15,
+      PrivateNote: 'generic private note',
+      DepositToAccountRef: {
+        value: 'ACCOUNT_PAYMENT_GENERIC',
+        name: 'Generic payment',
+      },
+      Line: [
+        {
+          Id: 'LINE_HOLDING_GENERIC',
+          Amount: 10,
+          Description: 'generic holding memo',
+          DetailType: 'DepositLineDetail',
+          DepositLineDetail: {
+            AccountRef: { value: LINE_WRITE_HOLDING, name: 'Generic holding' },
+            Entity: { value: 'ENTITY_GENERIC', name: 'Generic entity' },
+          },
+        },
+        {
+          Id: 'LINE_UNTOUCHED_GENERIC',
+          Amount: 5,
+          Description: 'generic untouched memo',
+          DetailType: 'DepositLineDetail',
+          DepositLineDetail: {
+            AccountRef: {
+              value: 'ACCOUNT_UNTOUCHED_GENERIC',
+              name: 'Generic untouched',
+            },
+          },
+        },
+      ],
+    };
+    return {
+      raw,
+      txn: mapDeposit(raw, new Set([LINE_WRITE_HOLDING])),
+      responseKey: 'Deposit' as const,
+      path: 'deposit',
+      untouched: raw.Line![1],
+    };
+  }
+  const raw: RawJournalEntry = {
+    Id: 'JOURNAL_GENERIC',
+    SyncToken: '7',
+    TxnDate: '2026-07-01',
+    PrivateNote: 'generic private note',
+    Line: [
+      {
+        Id: 'LINE_HOLDING_GENERIC',
+        Amount: 10,
+        Description: 'generic holding memo',
+        DetailType: 'JournalEntryLineDetail',
+        JournalEntryLineDetail: {
+          PostingType: 'Debit',
+          AccountRef: { value: LINE_WRITE_HOLDING, name: 'Generic holding' },
+        },
+      },
+      {
+        Id: 'LINE_UNTOUCHED_GENERIC',
+        Amount: 10,
+        Description: 'generic funding memo',
+        DetailType: 'JournalEntryLineDetail',
+        JournalEntryLineDetail: {
+          PostingType: 'Credit',
+          AccountRef: {
+            value: 'ACCOUNT_PAYMENT_GENERIC',
+            name: 'Generic payment',
+          },
+        },
+      },
+    ],
+  };
+  return {
+    raw,
+    txn: mapJournalEntry(raw, new Set([LINE_WRITE_HOLDING])),
+    responseKey: 'JournalEntry' as const,
+    path: 'journalentry',
+    untouched: raw.Line![1],
+  };
+}
+
+function providerResponseBody(
+  prepared: QboPreparedLineWrite,
+  syncToken = '8',
+): Record<string, unknown> {
+  const body = structuredClone(prepared.body);
+  body.SyncToken = syncToken;
+  body.MetaData = { LastUpdatedTime: '2026-07-29T00:00:00Z' };
+  body.domain = 'QBO';
+  body.sparse = false;
+  body.Line = (body.Line as Record<string, unknown>[]).map((line, index) => ({
+    ...line,
+    Id: `SERVER_ASSIGNED_${index}`,
+  }));
+  return body;
+}
+
+function jsonbStyleRoundTrip<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    return value.map(jsonbStyleRoundTrip) as T;
+  }
+  const reordered = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.keys(value).sort(
+    (left, right) => left.length - right.length || left.localeCompare(right),
+  )) {
+    Object.defineProperty(reordered, key, {
+      value: jsonbStyleRoundTrip((value as Record<string, unknown>)[key]),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return reordered as T;
+}
+
+function deterministicJsonFixture(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(deterministicJsonFixture).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${deterministicJsonFixture(record[key])}`)
+    .join(',')}}`;
+}
+
+describe('RealQboClient prepared transfer line writes', () => {
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
+    'fetches a hash-bound %s line-write snapshot',
+    async (qboType) => {
+      const fixture = lineWriteFixture(qboType);
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        [fixture.responseKey]: fixture.raw,
+      }))));
+
+      await expect(
+        realClient(undefined, [LINE_WRITE_HOLDING])
+          .client.fetchLineWriteSnapshot(qboType, fixture.txn.qboId),
+      ).resolves.toEqual({
+        qboType,
+        qboId: fixture.txn.qboId,
+        syncToken: '7',
+        contentHash: hashLineWriteContent(fixture.raw),
+      });
+    },
+  );
+
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
+    'prepares a complete %s write without sending',
+    async (qboType) => {
+      const sentRequests: unknown[] = [];
+      vi.stubGlobal('fetch', vi.fn((...args: unknown[]) => {
+        sentRequests.push(args);
+        throw new Error('preparation must not send');
+      }));
+      const fixture = lineWriteFixture(qboType);
+
+      const prepared = await realClient(undefined, [LINE_WRITE_HOLDING])
+        .client.prepareLineRecategorization(
+          fixture.txn,
+          [{
+            amount: fixture.txn.amount,
+            accountQboId: LINE_WRITE_TARGET,
+            memo: 'generic target memo',
+          }],
+          'request-1',
+        );
+
+      expect(prepared.before).toMatchObject({
+        qboType,
+        qboId: fixture.txn.qboId,
+        syncToken: '7',
+      });
+      expect(prepared.before.contentHash).not.toBe(prepared.expected.contentHash);
+      expect(prepared.body).toMatchObject({
+        Id: fixture.txn.qboId,
+        SyncToken: '7',
+        PrivateNote: 'generic private note',
+      });
+      expect((prepared.body.Line as unknown[])[1]).toEqual(fixture.untouched);
+      expect((prepared.body.Line as Record<string, unknown>[])[0]).toMatchObject({
+        Id: 'LINE_HOLDING_GENERIC',
+        Description: 'generic target memo',
+      });
+      expect(prepared.body).toEqual(
+        JSON.parse(JSON.stringify(prepared.body)) as Record<string, unknown>,
+      );
+      expect(sentRequests).toHaveLength(0);
+    },
+  );
+
+  it.each(['Purchase', 'Deposit', 'JournalEntry'] as const)(
+    'sends and verifies the exact prepared %s response with Intuit requestid',
+    async (qboType) => {
+      const fixture = lineWriteFixture(qboType);
+      const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+      const prepared = await client.prepareLineRecategorization(
+        fixture.txn,
+        [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+        'request-1',
+      );
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        [fixture.responseKey]: providerResponseBody(prepared),
+      })));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await expect(client.sendPreparedLineWrite(prepared)).resolves.toEqual({
+        ok: true,
+        newSyncToken: '8',
+        snapshot: {
+          ...prepared.expected,
+          syncToken: '8',
+        },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+        `/${fixture.path}?requestid=request-1&minorversion=75`,
+      );
+      expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+        method: 'POST',
+        body: deterministicJsonFixture(prepared.body),
+      });
+    },
+  );
+
+  it('runs the transfer authority guard after token refresh and before provider POST', async () => {
+    const fixture = lineWriteFixture('Purchase');
+    const events: string[] = [];
+    const client = new RealQboClient({
+      realmId: 'realm/1',
+      environment: 'sandbox',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      tokens: {
+        accessToken: 'expired-access-token',
+        refreshToken: 'refresh-token',
+        expiresAt: 0,
+      },
+      holdingAccountQboIds: [LINE_WRITE_HOLDING],
+      onTokensRefreshed: async () => {
+        events.push('tokens-persisted');
+      },
+    });
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => {
+        events.push('token-refresh');
+        return new Response(JSON.stringify({
+          access_token: 'fresh-access-token',
+          refresh_token: 'fresh-refresh-token',
+          expires_in: 3600,
+        }));
+      })
+      .mockImplementationOnce(async () => {
+        events.push('provider-post');
+        return new Response(JSON.stringify({
+          Purchase: providerResponseBody(prepared),
+        }));
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const guard = vi.fn(async () => {
+      events.push('authority-guard');
+      throw new Error('AUTHORITY_LOST_SENTINEL');
+    });
+
+    await expect(
+      client.sendPreparedLineWrite(prepared, guard),
+    ).rejects.toThrow('AUTHORITY_LOST_SENTINEL');
+    expect(events).toEqual([
+      'token-refresh',
+      'tokens-persisted',
+      'authority-guard',
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('captures the hash-bound body before the first asynchronous send boundary', async () => {
+    const fixture = lineWriteFixture('Purchase');
+    const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    const originalBodyText = deterministicJsonFixture(prepared.body);
+    const fetchMock = vi.fn().mockImplementation(
+      async (_url: unknown, init: RequestInit | undefined) => {
+        const sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({
+          Purchase: {
+            ...sentBody,
+            SyncToken: '8',
+            Line: (sentBody.Line as Record<string, unknown>[]).map(
+              (line, index) => ({ ...line, Id: `SERVER_ASSIGNED_${index}` }),
+            ),
+          },
+        }));
+      },
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = client.sendPreparedLineWrite(prepared);
+    prepared.body.PrivateNote = 'mutation after send call';
+
+    await expect(result).resolves.toMatchObject({ newSyncToken: '8' });
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(originalBodyText);
+  });
+
+  it('sends identical deterministic bytes before and after a JSONB-style prepared-payload round trip', async () => {
+    const fixture = lineWriteFixture('Purchase');
+    const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    const reloaded = jsonbStyleRoundTrip(prepared);
+    const sentBodies: string[] = [];
+    const fetchMock = vi.fn().mockImplementation(
+      async (_url: unknown, init: RequestInit | undefined) => {
+        const bodyText = String(init?.body);
+        sentBodies.push(bodyText);
+        const sentBody = JSON.parse(bodyText) as Record<string, unknown>;
+        return new Response(JSON.stringify({
+          Purchase: {
+            ...sentBody,
+            SyncToken: '8',
+            Line: (sentBody.Line as Record<string, unknown>[]).map(
+              (line, index) => ({ ...line, Id: `SERVER_ASSIGNED_${index}` }),
+            ),
+          },
+        }));
+      },
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(JSON.stringify(reloaded.body)).not.toBe(JSON.stringify(prepared.body));
+    expect(reloaded.requestHash).toBe(prepared.requestHash);
+    await expect(client.sendPreparedLineWrite(prepared)).resolves.toMatchObject({
+      newSyncToken: '8',
+    });
+    await expect(client.sendPreparedLineWrite(reloaded)).resolves.toMatchObject({
+      newSyncToken: '8',
+    });
+    expect(sentBodies).toEqual([
+      deterministicJsonFixture(prepared.body),
+      deterministicJsonFixture(prepared.body),
+    ]);
+  });
+
+  it.each([
+    ['changed untouched line', (response: Record<string, unknown>) => {
+      const lines = response.Line as Record<string, unknown>[];
+      lines[0] = { ...lines[0], Description: 'provider changed untouched memo' };
+    }],
+    ['wrong target amount', (response: Record<string, unknown>) => {
+      const lines = response.Line as Record<string, unknown>[];
+      lines[1] = { ...lines[1], Amount: 9 };
+    }],
+    ['wrong target account', (response: Record<string, unknown>) => {
+      const lines = response.Line as Record<string, unknown>[];
+      const line = lines[1]!;
+      lines[1] = {
+        ...line,
+        AccountBasedExpenseLineDetail: {
+          ...(line.AccountBasedExpenseLineDetail as Record<string, unknown>),
+          AccountRef: { value: 'ACCOUNT_WRONG_GENERIC' },
+        },
+      };
+    }],
+  ])('rejects a Purchase response with %s', async (_name, mutate) => {
+    const fixture = lineWriteFixture('Purchase');
+    const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    const response = providerResponseBody(prepared);
+    mutate(response);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Purchase: response,
+    }))));
+
+    await expect(client.sendPreparedLineWrite(prepared)).rejects.toThrow(
+      /content/i,
+    );
+  });
+
+  it('rejects an unchanged response SyncToken', async () => {
+    const fixture = lineWriteFixture('Deposit');
+    const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Deposit: providerResponseBody(prepared, prepared.before.syncToken),
+    }))));
+
+    await expect(client.sendPreparedLineWrite(prepared)).rejects.toThrow(
+      /old SyncToken/i,
+    );
+  });
+
+  it.each([{}, null])(
+    'rejects an omitted prepared JournalEntry response',
+    async (responseBody) => {
+    const fixture = lineWriteFixture('JournalEntry');
+    const client = realClient(undefined, [LINE_WRITE_HOLDING]).client;
+    const prepared = await client.prepareLineRecategorization(
+      fixture.txn,
+      [{ amount: fixture.txn.amount, accountQboId: LINE_WRITE_TARGET }],
+      'request-1',
+    );
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(responseBody)),
+    ));
+
+    await expect(client.sendPreparedLineWrite(prepared)).rejects.toThrow(
+      /response omitted/i,
+    );
+    },
+  );
 });
 
 const HOLDING = new Set(['4']);

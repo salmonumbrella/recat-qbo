@@ -176,6 +176,83 @@ export interface QboPreparedWrite {
   expected: QboPurchaseExpectedState;
 }
 
+export interface QboLineWriteSnapshot {
+  qboType: QboTxn['qboType'];
+  qboId: string;
+  syncToken: string;
+  contentHash: string;
+}
+
+export interface QboPreparedLineWrite {
+  operation: 'transfer';
+  qboType: QboTxn['qboType'];
+  qboId: string;
+  requestId: string;
+  requestHash: string;
+  body: Record<string, unknown>;
+  before: QboLineWriteSnapshot;
+  expected: Omit<QboLineWriteSnapshot, 'syncToken'>;
+}
+
+export interface QboLineWriteSplit {
+  amount: number;
+  accountQboId: string;
+  memo?: string;
+}
+
+export interface RawDepositLine {
+  Id?: string;
+  Amount?: number;
+  Description?: string;
+  DetailType?: string;
+  DepositLineDetail?: {
+    AccountRef?: QboRef;
+    Entity?: QboRef;
+    PaymentMethodRef?: QboRef;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+/** Complete QBO Deposit update shape. Unknown fields are retained verbatim. */
+export interface RawDeposit {
+  Id: string;
+  SyncToken: string;
+  TxnDate?: string;
+  TotalAmt?: number;
+  DocNumber?: string;
+  PrivateNote?: string;
+  DepositToAccountRef?: QboRef;
+  Line?: RawDepositLine[];
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface RawJournalEntryLine {
+  Id?: string;
+  Amount?: number;
+  Description?: string;
+  DetailType?: string;
+  JournalEntryLineDetail?: {
+    PostingType?: 'Debit' | 'Credit';
+    AccountRef?: QboRef;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+/** Complete QBO JournalEntry update shape. Unknown fields are retained verbatim. */
+export interface RawJournalEntry {
+  Id: string;
+  SyncToken: string;
+  TxnDate?: string;
+  DocNumber?: string;
+  PrivateNote?: string;
+  Line?: RawJournalEntryLine[];
+  status?: string;
+  [key: string]: unknown;
+}
+
 /** One normalized row of a QBO-computed financial statement (values in dollars). */
 export interface QboStatementRow {
   label: string;
@@ -226,6 +303,10 @@ export interface QboWriteResult {
   newSyncToken: string;
 }
 
+export interface QboLineWriteResult extends QboWriteResult {
+  snapshot: QboLineWriteSnapshot;
+}
+
 export class QboSyncTokenConflict extends Error {
   code = 'SYNC_TOKEN_CONFLICT' as const;
   constructor(message = 'SyncToken conflict — this transaction was edited in QuickBooks after our last sync.') {
@@ -272,6 +353,10 @@ export interface QboClient {
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
   fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null>;
+  fetchLineWriteSnapshot(
+    qboType: QboTxn['qboType'],
+    qboId: string,
+  ): Promise<QboLineWriteSnapshot | null>;
 
   preparePurchaseRecategorization(
     txn: QboTxn,
@@ -281,6 +366,17 @@ export interface QboClient {
   ): Promise<QboPreparedWrite>;
 
   sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult>;
+
+  prepareLineRecategorization(
+    txn: QboTxn,
+    splits: { amount: number; accountQboId: string; memo?: string }[],
+    requestId: string,
+  ): Promise<QboPreparedLineWrite>;
+
+  sendPreparedLineWrite(
+    prepared: QboPreparedLineWrite,
+    beforeSend?: () => Promise<void>,
+  ): Promise<QboLineWriteResult>;
 
   preparePurchaseRestore(
     txn: QboTxn,

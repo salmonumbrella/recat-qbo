@@ -394,6 +394,37 @@ model QboMutationAttempt {
   @@index([transactionId, status])
 }
 
+/// Immutable coordinator for the two durable attempts that make up a transfer.
+/// Deliberate scalar identities retain recovery evidence without cascading FKs.
+model QboTransferOperation {
+  id                       String   @id @default(uuid())
+  actorId                  String
+  companyId                String
+  firstTransactionId       String
+  secondTransactionId      String
+  firstExpectedRevision    Int
+  secondExpectedRevision   Int
+  firstQboType             String   @db.VarChar(32)
+  firstQboId               String   @db.VarChar(128)
+  firstQboSyncToken        String   @db.VarChar(128)
+  firstTargetAccountQboId  String   @db.VarChar(128)
+  firstAttemptRequestId    String   @db.VarChar(128)
+  secondQboType            String   @db.VarChar(32)
+  secondQboId              String   @db.VarChar(128)
+  secondQboSyncToken       String   @db.VarChar(128)
+  secondTargetAccountQboId String   @db.VarChar(128)
+  secondAttemptRequestId   String   @db.VarChar(128)
+  idempotencyHash          String   @db.Char(64)
+  inputHash                String   @db.Char(64)
+  preparedHash             String   @db.Char(64)
+  expiresAt                DateTime
+  retryOfId                String?  @unique
+  createdAt                DateTime @default(now())
+
+  @@unique([actorId, companyId, firstTransactionId, secondTransactionId, idempotencyHash])
+  @@index([companyId, firstTransactionId, secondTransactionId])
+}
+
 /// Immutable MCP preparation envelope. Attribution and target identifiers are
 /// deliberate scalars so account or token deletion cannot erase audit history.
 /// QBO write authority remains exclusively in QboMutationAttempt.

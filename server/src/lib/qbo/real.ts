@@ -13,6 +13,7 @@
 // token immediately via onTokensRefreshed (before any further API call), and on a
 // 401 we refresh once and retry the request.
 
+import { randomUUID } from 'node:crypto';
 import {
   QboAuthError,
   QboRequestTimeout,
@@ -22,12 +23,20 @@ import {
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
+  type QboLineWriteResult,
+  type QboLineWriteSnapshot,
+  type QboLineWriteSplit,
+  type QboPreparedLineWrite,
   type QboPreparedWrite,
   type QboStatement,
   type QboStatementRow,
   type QboPurchaseSnapshot,
   type RawPurchase,
   type RawPurchaseLine,
+  type RawDeposit,
+  type RawDepositLine,
+  type RawJournalEntry,
+  type RawJournalEntryLine,
   type QboTaxCodeInfo,
   type QboTaxProfile,
   type QboTaxRateInfo,
@@ -44,8 +53,31 @@ import {
   preparePurchaseRecategorization as preparePurchaseRecategorizationBody,
   preparePurchaseRestore as preparePurchaseRestoreBody,
 } from './purchaseTax.js';
+import {
+  buildPreparedLineWrite,
+  hashLineWriteContent,
+  rebuildDepositLines,
+  rebuildJournalEntryLines,
+  rebuildPurchaseLines,
+  serializeLineWriteRequest,
+  validatePreparedLineWrite,
+  verifyLineWriteResult,
+} from './lineWrite.js';
 
-export type { RawPurchase, RawPurchaseLine } from './types.js';
+export {
+  rebuildDepositLines,
+  rebuildJournalEntryLines,
+  rebuildPurchaseLines,
+} from './lineWrite.js';
+export type {
+  RawDeposit,
+  RawDepositLine,
+  RawJournalEntry,
+  RawJournalEntryLine,
+  RawPurchase,
+  RawPurchaseLine,
+} from './types.js';
+export type QboWriteLine = QboLineWriteSplit;
 
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
@@ -116,44 +148,6 @@ export interface RawTaxCode {
     TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
   };
   MetaData?: RawMetaData;
-}
-
-export interface RawDepositLine {
-  Id?: string;
-  Amount?: number;
-  Description?: string;
-  DetailType?: string;
-  DepositLineDetail?: { AccountRef?: QboRef; Entity?: QboRef; PaymentMethodRef?: QboRef };
-}
-
-export interface RawDeposit {
-  Id: string;
-  SyncToken: string;
-  TxnDate?: string;
-  TotalAmt?: number;
-  DocNumber?: string;
-  PrivateNote?: string;
-  DepositToAccountRef?: QboRef;
-  Line?: RawDepositLine[];
-  status?: string;
-}
-
-export interface RawJournalEntryLine {
-  Id?: string;
-  Amount?: number;
-  Description?: string;
-  DetailType?: string;
-  JournalEntryLineDetail?: { PostingType?: 'Debit' | 'Credit'; AccountRef?: QboRef };
-}
-
-export interface RawJournalEntry {
-  Id: string;
-  SyncToken: string;
-  TxnDate?: string;
-  DocNumber?: string;
-  PrivateNote?: string;
-  Line?: RawJournalEntryLine[];
-  status?: string;
 }
 
 interface QboFaultBody {
@@ -663,89 +657,6 @@ export function mapJournalEntry(raw: RawJournalEntry, holdingIds: ReadonlySet<st
   };
 }
 
-// ---------------------------------------------------------------------------
-// Line rebuilding (pure, unit-tested): replace ONLY the lines posting to
-// `replaceIds`, preserving every other line verbatim. This is what keeps a
-// multi-line entity's already-categorized lines safe across a write.
-// ---------------------------------------------------------------------------
-
-export interface QboWriteLine {
-  amount: number;
-  accountQboId: string;
-  memo?: string;
-}
-
-export function rebuildPurchaseLines(
-  raw: RawPurchase,
-  replaceIds: ReadonlySet<string>,
-  newLines: QboWriteLine[],
-): RawPurchaseLine[] {
-  const keep = (raw.Line ?? []).filter((l) => {
-    const id = l.AccountBasedExpenseLineDetail?.AccountRef?.value;
-    return id === undefined || !replaceIds.has(id);
-  });
-  return [
-    ...keep,
-    ...newLines.map(
-      (s): RawPurchaseLine => ({
-        Amount: round2(Math.abs(s.amount)),
-        DetailType: 'AccountBasedExpenseLineDetail',
-        Description: s.memo,
-        AccountBasedExpenseLineDetail: { AccountRef: { value: s.accountQboId } },
-      }),
-    ),
-  ];
-}
-
-export function rebuildDepositLines(
-  raw: RawDeposit,
-  replaceIds: ReadonlySet<string>,
-  newLines: QboWriteLine[],
-): RawDepositLine[] {
-  const isReplaced = (l: RawDepositLine): boolean => {
-    const id = l.DepositLineDetail?.AccountRef?.value;
-    return id !== undefined && replaceIds.has(id);
-  };
-  const keep = (raw.Line ?? []).filter((l) => !isReplaced(l));
-  // Preserve the payer Entity from the first replaced line so the deposit
-  // keeps its "received from" attribution after the category swap.
-  const entity = (raw.Line ?? []).find(isReplaced)?.DepositLineDetail?.Entity;
-  return [
-    ...keep,
-    ...newLines.map(
-      (s): RawDepositLine => ({
-        Amount: round2(Math.abs(s.amount)),
-        DetailType: 'DepositLineDetail',
-        Description: s.memo,
-        DepositLineDetail: { AccountRef: { value: s.accountQboId }, ...(entity ? { Entity: entity } : {}) },
-      }),
-    ),
-  ];
-}
-
-export function rebuildJournalEntryLines(
-  raw: RawJournalEntry,
-  replaceIds: ReadonlySet<string>,
-  newLines: QboWriteLine[],
-): RawJournalEntryLine[] {
-  const isReplaced = (l: RawJournalEntryLine): boolean => {
-    const detail = l.JournalEntryLineDetail;
-    return detail?.PostingType === 'Debit' && detail.AccountRef?.value !== undefined && replaceIds.has(detail.AccountRef.value);
-  };
-  const keep = (raw.Line ?? []).filter((l) => !isReplaced(l));
-  return [
-    ...keep,
-    ...newLines.map(
-      (s): RawJournalEntryLine => ({
-        Amount: round2(Math.abs(s.amount)),
-        DetailType: 'JournalEntryLineDetail',
-        Description: s.memo,
-        JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: s.accountQboId } },
-      }),
-    ),
-  ];
-}
-
 /** Sum (positive) of the raw category-detail lines posting to `accountIds`. */
 export function sumLinesPostingTo(txn: QboTxn, accountIds: ReadonlySet<string>): number {
   if (txn.qboType === 'Purchase') {
@@ -958,8 +869,15 @@ export class RealQboClient implements QboClient {
    * Prepared mutations are already the durable retry unit. Send their exact
    * body once and surface an ambiguous timeout to the lifecycle caller.
    */
-  private async requestPreparedWrite(prepared: QboPreparedWrite): Promise<{ Purchase?: RawPurchase }> {
+  private async requestPreparedBody(
+    path: string,
+    requestId: string,
+    body: Record<string, unknown> | string,
+    beforeSend?: () => Promise<void>,
+  ): Promise<Record<string, unknown>> {
+    const bodyText = typeof body === 'string' ? body : JSON.stringify(body);
     const accessToken = await this.ensureFreshToken();
+    await beforeSend?.();
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
@@ -967,7 +885,7 @@ export class RealQboClient implements QboClient {
     );
     try {
       const res = await fetch(
-        `${this.base}/purchase?requestid=${encodeURIComponent(prepared.requestId)}&minorversion=${MINOR_VERSION}`,
+        `${this.base}${path}?requestid=${encodeURIComponent(requestId)}&minorversion=${MINOR_VERSION}`,
         {
           method: 'POST',
           headers: {
@@ -975,13 +893,18 @@ export class RealQboClient implements QboClient {
             Accept: 'application/json',
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(prepared.body),
+          body: bodyText,
           signal: controller.signal,
         },
       );
       const text = await res.text();
       if (!res.ok) throw this.toError(res.status, text);
-      return (text ? JSON.parse(text) : {}) as { Purchase?: RawPurchase };
+      const parsed: unknown = text ? JSON.parse(text) : {};
+      return typeof parsed === 'object' &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
     } catch (error) {
       const cause = error instanceof Error
         ? (error as Error & { cause?: unknown }).cause
@@ -1005,6 +928,14 @@ export class RealQboClient implements QboClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async requestPreparedWrite(prepared: QboPreparedWrite): Promise<{ Purchase?: RawPurchase }> {
+    return this.requestPreparedBody(
+      '/purchase',
+      prepared.requestId,
+      prepared.body,
+    ) as Promise<{ Purchase?: RawPurchase }>;
   }
 
   private toError(status: number, bodyText: string): Error {
@@ -1095,6 +1026,20 @@ export class RealQboClient implements QboClient {
     }
   }
 
+  async fetchLineWriteSnapshot(
+    qboType: QboTxn['qboType'],
+    qboId: string,
+  ): Promise<QboLineWriteSnapshot | null> {
+    const txn = await this.fetchTxn(qboType, qboId);
+    if (!txn) return null;
+    return {
+      qboType,
+      qboId: txn.qboId,
+      syncToken: txn.syncToken,
+      contentHash: hashLineWriteContent(txn.raw),
+    };
+  }
+
   async preparePurchaseRecategorization(
     txn: QboTxn,
     staged: StagedCategorization,
@@ -1125,6 +1070,56 @@ export class RealQboClient implements QboClient {
       ok: true,
       newSyncToken: response.Purchase.SyncToken,
     };
+  }
+
+  async prepareLineRecategorization(
+    txn: QboTxn,
+    splits: { amount: number; accountQboId: string; memo?: string }[],
+    requestId: string,
+  ): Promise<QboPreparedLineWrite> {
+    return buildPreparedLineWrite({
+      txn,
+      splits,
+      requestId,
+      holdingAccountQboIds: [...this.holdingIds],
+    });
+  }
+
+  async sendPreparedLineWrite(
+    preparedValue: QboPreparedLineWrite,
+    beforeSend?: () => Promise<void>,
+  ): Promise<QboLineWriteResult> {
+    const prepared = structuredClone(validatePreparedLineWrite(preparedValue));
+    const bodyText = serializeLineWriteRequest(prepared.body);
+    const response = await this.requestPreparedBody(
+      `/${entityPath(prepared.qboType)}`,
+      prepared.requestId,
+      bodyText,
+      beforeSend,
+    );
+    const raw = response[prepared.qboType];
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error(
+        `QuickBooks prepared ${prepared.qboType} response omitted the updated entity.`,
+      );
+    }
+    const record = raw as Record<string, unknown>;
+    if (
+      typeof record.Id !== 'string' ||
+      record.Id.trim() === '' ||
+      typeof record.SyncToken !== 'string' ||
+      record.SyncToken.trim() === ''
+    ) {
+      throw new Error(
+        `QuickBooks prepared ${prepared.qboType} response omitted its identity metadata.`,
+      );
+    }
+    return verifyLineWriteResult(prepared, {
+      qboType: prepared.qboType,
+      qboId: record.Id,
+      syncToken: record.SyncToken,
+      contentHash: hashLineWriteContent(record),
+    });
   }
 
   async preparePurchaseRestore(
@@ -1218,7 +1213,13 @@ export class RealQboClient implements QboClient {
     // Split amounts arrive signed (like txn.amount, the holding-line sum) and
     // must sum to it, so the entity's total never changes; QBO line amounts are
     // always positive.
-    return this.replaceLines(txn, this.holdingIds, splits);
+    const prepared = await this.prepareLineRecategorization(
+      txn,
+      splits,
+      randomUUID(),
+    );
+    const result = await this.sendPreparedLineWrite(prepared);
+    return { ok: true, newSyncToken: result.newSyncToken };
   }
 
   async moveToAccount(txn: QboTxn, accountQboId: string, fromAccountQboIds: string[]): Promise<QboWriteResult> {

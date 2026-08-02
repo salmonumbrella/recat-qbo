@@ -421,6 +421,75 @@ function undoFixture(status: string | null = null) {
 }
 
 describe('MCP categorization operation execution', () => {
+  it('routes transfer status and retry through the shared paired-operation adapter', async () => {
+    const f = fixture();
+    f.operations[0] = operation({
+      kind: 'transfer',
+      toolName: 'prepare_transfer',
+    });
+    const transferDto = {
+      operationId: 'operation-1',
+      kind: 'transfer' as const,
+      expiresAt: '2026-07-29T12:15:00.000Z',
+      state: 'prepared' as const,
+      phase: 'awaiting_commit' as const,
+      result: {
+        complete: false,
+        firstLeg: { outcome: 'IN_PROGRESS' as const },
+        secondLeg: { outcome: 'IN_PROGRESS' as const },
+      },
+      error: null,
+      actions: {
+        canCommit: true,
+        canRetry: false,
+        requiresReconciliation: false,
+      },
+    };
+    const getTransferOperation = vi.fn(async () => transferDto);
+    const retryTransferOperation = vi.fn(async () => ({
+      ...transferDto,
+      state: 'committed' as const,
+      phase: 'verified' as const,
+      result: {
+        complete: true,
+        firstLeg: { outcome: 'VERIFIED' as const },
+        secondLeg: { outcome: 'VERIFIED' as const },
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: false,
+      },
+    }));
+    f.deps.getTransferOperation = getTransferOperation;
+    f.deps.retryTransferOperation = retryTransferOperation;
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      f.deps,
+    )).resolves.toEqual(transferDto);
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      f.deps,
+    )).resolves.toMatchObject({
+      kind: 'transfer',
+      state: 'committed',
+      result: { complete: true },
+    });
+    expect(getTransferOperation).toHaveBeenCalledWith(
+      principal,
+      'operation-1',
+      expect.objectContaining({ store: f.deps.store }),
+    );
+    expect(retryTransferOperation).toHaveBeenCalledWith(
+      principal,
+      'operation-1',
+      expect.objectContaining({ store: f.deps.store }),
+    );
+  });
+
   it('returns a DB-only prepared projection without private payload or QBO fields', async () => {
     const { deps, commit, reconcile } = fixture();
     const result = await getMcpOperation(principal, { operationId: 'operation-1' }, deps);
