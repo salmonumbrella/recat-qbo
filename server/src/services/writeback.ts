@@ -11,7 +11,7 @@
 // Dependencies on other agents' modules (audit, qbo factory) are imported
 // lazily and injectable, so unit tests can exercise this file with fakes.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { PrismaClient, Prisma } from '@prisma/client';
 import type { AuditAction, SplitDto, StagedCategorization, TxnStatus } from '@recat/shared';
 import {
@@ -667,7 +667,7 @@ type AttemptStatus =
   | 'UNCHANGED'
   | 'DRY_RUN';
 
-interface DurableAttempt {
+export interface DurableAttempt {
   id: string;
   transactionId: string;
   requestId: string;
@@ -715,6 +715,7 @@ interface DurableTransaction {
     taxCode: string | null;
     taxCodeQboId: string | null;
     memo: string | null;
+    tags?: { tagId: string }[];
   }[];
   txnTags: { tagId: string }[];
 }
@@ -740,7 +741,10 @@ export interface DurableWritebackDb {
       where: { id: string };
       include: {
         company: true;
-        splitLines: { orderBy: { idx: 'asc' } };
+        splitLines: {
+          orderBy: { idx: 'asc' };
+          include?: { tags: true };
+        };
         txnTags: true;
       };
     }): Promise<DurableTransaction | null>;
@@ -799,7 +803,7 @@ export interface DurableWritebackDb {
   };
   qboTaxRate: {
     findMany(args: {
-      where: { companyId: string };
+      where: { companyId: string; active: true };
     }): Promise<DurableTaxRate[]>;
   };
   $transaction<T>(callback: (tx: DurableWritebackDb) => Promise<T>): Promise<T>;
@@ -809,7 +813,11 @@ export interface DurableWritebackDeps {
   db: DurableWritebackDb;
   getClient: (companyId: string) => Promise<QboClient>;
   audit: AuditFn;
-  authorize: (actorId: string | null, companyId: string) => Promise<boolean>;
+  authorize: (
+    actorId: string | null,
+    companyId: string,
+    authorization: DurableMutationAuthorization,
+  ) => Promise<boolean>;
   envDryRun: boolean;
   lease: <T>(
     key: EntityLeaseKey,
@@ -821,17 +829,34 @@ export interface DurableWritebackDeps {
   now: () => Date;
 }
 
+export type DurableMutationAuthorization =
+  | { kind: 'user' }
+  | { kind: 'mcp'; tokenId: string; tokenPrefix: string };
+
+export interface ExpectedQboBinding {
+  qboType: string;
+  qboId: string;
+  qboSyncToken: string;
+}
+
 export interface CommitStagedCategorizationInput {
   transactionId: string;
   companyId: string;
   expectedRevision: number;
   requestId: string;
   actor: Actor;
+  expectedStageHash?: string;
+  expectedQboBinding?: ExpectedQboBinding;
+  authorization?: DurableMutationAuthorization;
 }
 
 export interface ReconcileMutationAttemptInput {
   requestId: string;
   actor: Actor;
+  authorization?: DurableMutationAuthorization;
+  expectedStageHash?: string;
+  expectedQboBinding?: ExpectedQboBinding;
+  auditAttribution?: McpMutationAuditAttribution;
 }
 
 export interface UndoCategorizationInput {
@@ -839,6 +864,56 @@ export interface UndoCategorizationInput {
   companyId: string;
   requestId: string;
   actor: Actor;
+  authorization?: DurableMutationAuthorization;
+  proof?: CategorizationUndoProof;
+  auditAttribution?: McpMutationAuditAttribution;
+}
+
+export interface CategorizationUndoProof {
+  sourceRequestId: string;
+  expectedRevision: number;
+  expectedQboBinding: ExpectedQboBinding;
+  sourcePreparedHash: string;
+  currentPostHash: string;
+  restoreHash: string;
+}
+
+export interface McpMutationAuditAttribution {
+  sourceOperationId: string;
+  operationId: string;
+  tokenPrefix: string;
+}
+
+export interface PrepareCategorizationUndoInput {
+  transactionId: string;
+  companyId: string;
+  sourceRequestId: string;
+  expectedRevision: number;
+  expectedSourceSyncToken: string;
+  expectedQboBinding: Pick<ExpectedQboBinding, 'qboType' | 'qboId'>;
+  actor: Actor;
+  authorization: DurableMutationAuthorization;
+}
+
+export interface PreparedCategorizationUndo {
+  transactionId: string;
+  companyId: string;
+  revision: number;
+  qboType: 'Purchase';
+  qboId: string;
+  qboSyncToken: string;
+  sourcePreparedHash: string;
+  currentPostHash: string;
+  restoreHash: string;
+  preview: {
+    action: 'restore_purchase_categorization';
+    resultingStatus: 'REVERTED';
+    direction: 'purchase' | 'refund';
+    totalCents: number;
+    totalTaxCents: number | null;
+    lineCount: number;
+    restorationDigest: string;
+  };
 }
 
 export type DurableMutationOutcome =
@@ -883,8 +958,21 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
     db: prisma as unknown as DurableWritebackDb,
     getClient: (companyId) => qboFactory.forCompany(companyId),
     audit: writeAudit,
-    authorize: async (actorId, companyId) => {
+    authorize: async (actorId, companyId, authorization) => {
       if (actorId === null) return false;
+      if (authorization.kind === 'mcp') {
+        const token = await prisma.mcpToken.findFirst({
+          where: {
+            id: authorization.tokenId,
+            userId: actorId,
+            prefix: authorization.tokenPrefix,
+            revokedAt: null,
+            expiresAt: { gt: new Date() },
+          },
+          select: { id: true },
+        });
+        if (token === null) return false;
+      }
       const user = await prisma.user.findUnique({
         where: { id: actorId },
         select: { isInstanceAdmin: true },
@@ -962,17 +1050,20 @@ async function loadAuthorizedStage(
   actorId: string | null,
   d: DurableWritebackDeps,
   allowedStatuses: string[],
+  authorization: DurableMutationAuthorization = { kind: 'user' },
+  expectedStageHash?: string,
+  expectedQboBinding?: ExpectedQboBinding,
 ): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
   const [txn, authorized] = await Promise.all([
     d.db.transaction.findUnique({
       where: { id: transactionId },
       include: {
         company: true,
-        splitLines: { orderBy: { idx: 'asc' } },
+        splitLines: { orderBy: { idx: 'asc' }, include: { tags: true } },
         txnTags: true,
       },
     }),
-    d.authorize(actorId, companyId),
+    d.authorize(actorId, companyId, authorization),
   ]);
   if (!authorized) lifecycleError('FORBIDDEN', 'You do not have permission to write this transaction.');
   if (!txn || txn.companyId !== companyId) {
@@ -983,6 +1074,16 @@ async function loadAuthorizedStage(
   }
   if (txn.revision !== expectedRevision) {
     lifecycleError('STALE_REVISION', 'The staged transaction changed. Reload before writing.');
+  }
+  if (
+    expectedQboBinding !== undefined
+    && (
+      txn.qboType !== expectedQboBinding.qboType
+      || txn.qboId !== expectedQboBinding.qboId
+      || txn.qboSyncToken !== expectedQboBinding.qboSyncToken
+    )
+  ) {
+    lifecycleError('STALE_QBO_BINDING', 'The QuickBooks transaction binding changed.');
   }
   if (!allowedStatuses.includes(txn.status)) {
     lifecycleError('INVALID_STATUS', `Transaction cannot be written from status ${txn.status}.`);
@@ -1044,7 +1145,7 @@ async function loadAuthorizedStage(
       d.db.qboTaxCode.findMany({
         where: { companyId, qboId: { in: taxCodeIds } },
       }),
-      d.db.qboTaxRate.findMany({ where: { companyId } }),
+      d.db.qboTaxRate.findMany({ where: { companyId, active: true } }),
     ]);
     if (
       taxCodes.length !== taxCodeIds.length ||
@@ -1103,9 +1204,7 @@ async function loadAuthorizedStage(
   if (totals.totalCents !== exactMoneyCents(txn.amount)) {
     lifecycleError('STALE_REVISION', 'The staged Purchase total no longer matches the transaction.');
   }
-  return {
-    txn,
-    staged: {
+  const staged: StagedCategorization = {
       transactionId: txn.id,
       revision: txn.revision,
       taxCalculation,
@@ -1116,10 +1215,17 @@ async function loadAuthorizedStage(
         categoryQboId: line.categoryQboId!,
         taxCodeQboId: line.taxCodeQboId,
         memo: line.memo,
+        tagIds: (line.tags?.map((tag) => tag.tagId) ?? []).sort(),
       })),
-      tagIds: txn.txnTags.map((tag) => tag.tagId),
-    },
+      tagIds: txn.txnTags.map((tag) => tag.tagId).sort(),
   };
+  if (
+    expectedStageHash !== undefined
+    && hashStagedCategorization(staged) !== expectedStageHash
+  ) {
+    lifecycleError('STALE_STAGE', 'The staged categorization no longer matches this operation.');
+  }
+  return { txn, staged };
 }
 
 function isRuntimeRecord(value: unknown): value is Record<string, unknown> {
@@ -1293,6 +1399,7 @@ function preparedForAttempt(attempt: DurableAttempt): QboPreparedWrite {
     prepared.operation !== attempt.operation ||
     prepared.requestId !== attempt.requestId ||
     prepared.requestHash !== attempt.requestHash ||
+    hashPreparedWriteBody(prepared.body) !== attempt.requestHash ||
     prepared.body.SyncToken !== attempt.expectedSyncToken
   ) {
     lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation attempt identity is inconsistent.');
@@ -1302,14 +1409,91 @@ function preparedForAttempt(attempt: DurableAttempt): QboPreparedWrite {
 
 function validateAttemptPersistence(attempt: DurableAttempt): QboPreparedWrite {
   const prepared = preparedForAttempt(attempt);
-  persistedSnapshot(attempt.beforeSnapshot);
-  if (attempt.responseSnapshot !== null) persistedSnapshot(attempt.responseSnapshot);
+  const before = persistedSnapshot(attempt.beforeSnapshot);
+  if (
+    (prepared.operation === 'recategorize' && !snapshotEquals(before, prepared.before))
+    || (
+      prepared.operation === 'restore'
+      && (
+        before.qboId !== prepared.qboId
+        || before.syncToken !== prepared.body.SyncToken
+      )
+    )
+  ) {
+    lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation attempt before-image is inconsistent.');
+  }
+  if (attempt.responseSnapshot !== null) {
+    const response = persistedSnapshot(attempt.responseSnapshot);
+    if (response.qboId !== prepared.qboId) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Stored mutation attempt response identity is inconsistent.');
+    }
+  }
+  if (attempt.status === 'VERIFIED') {
+    const response = persistedSnapshot(attempt.responseSnapshot);
+    const verification = isRuntimeRecord(attempt.verification)
+      ? attempt.verification
+      : lifecycleError('ATTEMPT_CORRUPT', 'Verified mutation evidence is incomplete.');
+    const expectedStatus = prepared.operation === 'restore' ? 'REVERTED' : 'POSTED';
+    if (
+      verification.outcome !== 'VERIFIED'
+      || verification.status !== expectedStatus
+      || typeof verification.newSyncToken !== 'string'
+      || verification.newSyncToken !== response.syncToken
+      || !verifyPurchaseResult(prepared.expected, response).ok
+    ) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Verified mutation evidence is inconsistent.');
+    }
+  }
+  if (attempt.status === 'UNCHANGED') {
+    const response = persistedSnapshot(attempt.responseSnapshot);
+    const verification = isRuntimeRecord(attempt.verification)
+      ? attempt.verification
+      : lifecycleError('ATTEMPT_CORRUPT', 'Unchanged mutation evidence is incomplete.');
+    const expectedStatus = prepared.operation === 'restore' ? 'POSTED' : 'PENDING';
+    if (
+      verification.outcome !== 'UNCHANGED'
+      || verification.status !== expectedStatus
+      || !snapshotEquals(response, before)
+    ) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Unchanged mutation evidence is inconsistent.');
+    }
+  }
   return prepared;
+}
+
+export interface DurableAttemptPersistenceProof {
+  operation: string;
+  qboType: string;
+  qboId: string;
+  requestId: string;
+  requestHash: string;
+  expectedSyncToken: string;
+  preparedBindingHash?: string;
+  beforeSnapshotHash?: string;
+}
+
+export function validateDurableAttemptPersistence(
+  attempt: DurableAttempt,
+): DurableAttemptPersistenceProof {
+  const prepared = validateAttemptPersistence(attempt);
+  return {
+    operation: prepared.operation,
+    qboType: prepared.qboType,
+    qboId: prepared.qboId,
+    requestId: prepared.requestId,
+    requestHash: prepared.requestHash,
+    expectedSyncToken: prepared.body.SyncToken,
+    preparedBindingHash: hashPreparedWriteBinding(prepared),
+    beforeSnapshotHash: hashPurchaseSnapshot(
+      persistedSnapshot(attempt.beforeSnapshot),
+    ),
+  };
 }
 
 function mutationMetadata(
   prepared: Pick<QboPreparedWrite, 'requestId' | 'operation' | 'qboType' | 'qboId' | 'expected'>,
   outcome: MutationAuditInput['outcome'],
+  mcp?: McpMutationAuditAttribution,
 ): MutationAuditInput {
   return {
     requestId: prepared.requestId,
@@ -1325,6 +1509,7 @@ function mutationMetadata(
         prepared.expected.targetLines.map((line) => line.taxCodeQboId),
       ),
     },
+    ...(mcp === undefined ? {} : { mcp }),
   };
 }
 
@@ -1514,6 +1699,7 @@ async function markUncertain(
   txn: DurableTransaction,
   actor: Actor,
   prepared: QboPreparedWrite,
+  auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
   const safeUncertainResult = (): DurableMutationResult =>
     recordedAttemptResult({ ...attempt, status: 'UNCERTAIN' }, 'ERROR');
@@ -1546,7 +1732,7 @@ async function markUncertain(
         txn,
         actor,
         'error',
-        mutationMetadata(prepared, 'UNCERTAIN'),
+        mutationMetadata(prepared, 'UNCERTAIN', auditAttribution),
       );
     });
   } catch {
@@ -1572,7 +1758,7 @@ async function markUncertain(
             txn,
             actor,
             'error',
-            mutationMetadata(prepared, 'UNCERTAIN'),
+            mutationMetadata(prepared, 'UNCERTAIN', auditAttribution),
           ),
         ]);
       }
@@ -1616,6 +1802,7 @@ async function finalizeVerified(
   response: QboPurchaseSnapshot,
   newSyncToken: string,
   status: 'POSTED' | 'REVERTED',
+  auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
   let transitioned = false;
   await d.db.$transaction(async (tx) => {
@@ -1652,7 +1839,7 @@ async function finalizeVerified(
       txn,
       actor,
       status === 'POSTED' ? 'posted' : 'reverted',
-      mutationMetadata(prepared, 'VERIFIED'),
+      mutationMetadata(prepared, 'VERIFIED', auditAttribution),
     );
   });
   if (!transitioned) {
@@ -1756,8 +1943,8 @@ function allowedStatusesForAttempt(attempt: DurableAttempt): string[] {
     return [attempt.operation === 'restore' ? 'POSTED' : 'PENDING'];
   }
   return attempt.operation === 'restore'
-    ? ['POSTED', 'ERROR']
-    : ['PENDING', 'POSTING', 'ERROR'];
+    ? ['POSTED', 'ERROR', 'SUPERSEDED']
+    : ['PENDING', 'POSTING', 'ERROR', 'SUPERSEDED'];
 }
 
 async function loadAuthorizedAttempt(
@@ -1765,6 +1952,9 @@ async function loadAuthorizedAttempt(
   attempt: DurableAttempt,
   companyId: string,
   actorId: string | null,
+  authorization: DurableMutationAuthorization = { kind: 'user' },
+  expectedStageHash?: string,
+  expectedQboBinding?: ExpectedQboBinding,
 ): Promise<{ txn: DurableTransaction; staged: StagedCategorization }> {
   return loadAuthorizedStage(
     attempt.transactionId,
@@ -1773,6 +1963,9 @@ async function loadAuthorizedAttempt(
     actorId,
     d,
     allowedStatusesForAttempt(attempt),
+    authorization,
+    expectedStageHash,
+    expectedQboBinding,
   );
 }
 
@@ -1781,10 +1974,11 @@ async function loadAuthorizedRecordedAttempt(
   attempt: DurableAttempt,
   companyId: string,
   actorId: string | null,
+  authorization: DurableMutationAuthorization = { kind: 'user' },
 ): Promise<DurableTransaction> {
   const [txn, authorized] = await Promise.all([
     preliminaryTransaction(d, attempt.transactionId),
-    d.authorize(actorId, companyId),
+    d.authorize(actorId, companyId, authorization),
   ]);
   if (!authorized) {
     lifecycleError('FORBIDDEN', 'You do not have permission to write this transaction.');
@@ -1802,6 +1996,9 @@ async function enterCommitting(
   actor: Actor,
   owner: string,
   allowedStatuses: string[],
+  authorization: DurableMutationAuthorization = { kind: 'user' },
+  expectedStageHash?: string,
+  expectedQboBinding?: ExpectedQboBinding,
   finalQboProof?: () => Promise<void>,
 ): Promise<
   | { won: true; attempt: DurableAttempt }
@@ -1819,6 +2016,9 @@ async function enterCommitting(
       actor.id,
       d,
       allowedStatuses,
+      authorization,
+      expectedStageHash,
+      expectedQboBinding,
     );
     if (finalQboProof) await finalQboProof();
   } catch (error) {
@@ -1866,6 +2066,7 @@ async function sendAndVerifyPrepared(
   actor: Actor,
   prepared: QboPreparedWrite,
   status: 'POSTED' | 'REVERTED',
+  auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
   // Possible-write boundary: COMMITTING is durable before this function runs.
   try {
@@ -1883,9 +2084,17 @@ async function sendAndVerifyPrepared(
       response,
       response.syncToken,
       status,
+      auditAttribution,
     );
   } catch {
-    return markUncertain(d, attempt, txn, actor, prepared);
+    return markUncertain(
+      d,
+      attempt,
+      txn,
+      actor,
+      prepared,
+      auditAttribution,
+    );
   }
 }
 
@@ -1960,6 +2169,7 @@ export async function commitStagedCategorization(
   deps?: DurableWritebackDeps,
 ): Promise<DurableMutationResult> {
   const d = deps ?? (await defaultDurableDeps());
+  const authorization = input.authorization ?? { kind: 'user' };
   const invocationOwner = d.invocationId();
   const preliminary = await preliminaryTransaction(d, input.transactionId);
   if (preliminary.companyId !== input.companyId) {
@@ -1979,6 +2189,7 @@ export async function commitStagedCategorization(
           existing,
           input.companyId,
           input.actor.id,
+          authorization,
         );
         return recordedAttemptResult(existing, txn.status);
       }
@@ -1987,6 +2198,9 @@ export async function commitStagedCategorization(
         existing,
         input.companyId,
         input.actor.id,
+        authorization,
+        input.expectedStageHash,
+        input.expectedQboBinding,
       );
 
       const prepared = preparedForAttempt(existing);
@@ -1999,6 +2213,9 @@ export async function commitStagedCategorization(
         input.actor,
         invocationOwner,
         ['PENDING'],
+        authorization,
+        input.expectedStageHash,
+        input.expectedQboBinding,
         async () => {
           const [freshTxn, current] = await Promise.all([
             client.fetchTxn('Purchase', txn.qboId),
@@ -2022,6 +2239,9 @@ export async function commitStagedCategorization(
           entered.attempt,
           input.companyId,
           input.actor.id,
+          authorization,
+          input.expectedStageHash,
+          input.expectedQboBinding,
         );
         return recordedAttemptResult(entered.attempt, latestTxn.status);
       }
@@ -2043,6 +2263,9 @@ export async function commitStagedCategorization(
       input.actor.id,
       d,
       ['PENDING'],
+      authorization,
+      input.expectedStageHash,
+      input.expectedQboBinding,
     );
     if (txn.company.dryRun || d.envDryRun) {
       return recordDryRun(input, txn, staged, d);
@@ -2083,6 +2306,9 @@ export async function commitStagedCategorization(
         persisted.attempt,
         input.companyId,
         input.actor.id,
+        authorization,
+        input.expectedStageHash,
+        input.expectedQboBinding,
       );
       return recordedAttemptResult(persisted.attempt, racedTxn.status);
     }
@@ -2093,6 +2319,9 @@ export async function commitStagedCategorization(
       input.actor,
       invocationOwner,
       ['PENDING'],
+      authorization,
+      input.expectedStageHash,
+      input.expectedQboBinding,
     );
     if (!entered.won) {
       const { txn: latestTxn } = await loadAuthorizedAttempt(
@@ -2100,6 +2329,9 @@ export async function commitStagedCategorization(
         entered.attempt,
         input.companyId,
         input.actor.id,
+        authorization,
+        input.expectedStageHash,
+        input.expectedQboBinding,
       );
       return recordedAttemptResult(entered.attempt, latestTxn.status);
     }
@@ -2120,9 +2352,39 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(',')}}`;
+}
+
+export function hashPreparedWriteBody(body: QboPreparedWrite['body']): string {
+  return createHash('sha256').update(canonicalJson(body)).digest('hex');
+}
+
+export function hashPreparedWriteBinding(prepared: QboPreparedWrite): string {
+  const { requestId: _throwawayRequestId, ...binding } = prepared;
+  return createHash('sha256').update(canonicalJson(binding)).digest('hex');
+}
+
+function hashPurchaseSnapshot(snapshot: QboPurchaseSnapshot): string {
+  return createHash('sha256').update(canonicalJson(snapshot)).digest('hex');
+}
+
+export function hashStagedCategorization(staged: StagedCategorization): string {
+  const normalized: StagedCategorization = {
+    ...staged,
+    lines: [...staged.lines]
+      .sort((left, right) => left.idx - right.idx)
+      .map((line) => ({
+        ...line,
+        ...(line.tagIds === undefined
+          ? {}
+          : { tagIds: [...line.tagIds].sort() }),
+      })),
+    tagIds: [...staged.tagIds].sort(),
+  };
+  return createHash('sha256').update(canonicalJson(normalized)).digest('hex');
 }
 
 function snapshotEquals(left: QboPurchaseSnapshot, right: QboPurchaseSnapshot): boolean {
@@ -2136,6 +2398,7 @@ async function finalizeUnchanged(
   actor: Actor,
   prepared: QboPreparedWrite,
   actual: QboPurchaseSnapshot,
+  auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
   const unchangedStatus = prepared.operation === 'restore' ? 'POSTED' : 'PENDING';
   let transitioned = false;
@@ -2166,7 +2429,7 @@ async function finalizeUnchanged(
       txn,
       actor,
       'error',
-      mutationMetadata(prepared, 'UNCHANGED'),
+      mutationMetadata(prepared, 'UNCHANGED', auditAttribution),
     );
   });
   if (!transitioned) {
@@ -2190,6 +2453,7 @@ export async function reconcileMutationAttempt(
   deps?: DurableWritebackDeps,
 ): Promise<DurableMutationResult> {
   const d = deps ?? (await defaultDurableDeps());
+  const authorization = input.authorization ?? { kind: 'user' };
   const invocationOwner = d.invocationId();
   const preliminaryAttempt = await d.db.qboMutationAttempt.findUnique({
     where: { requestId: input.requestId },
@@ -2209,6 +2473,9 @@ export async function reconcileMutationAttempt(
         attempt,
         preliminary.companyId,
         input.actor.id,
+        authorization,
+        input.expectedStageHash,
+        input.expectedQboBinding,
       );
       return recordedAttemptResult(attempt, txn.status);
     }
@@ -2218,7 +2485,13 @@ export async function reconcileMutationAttempt(
       attempt.status !== 'UNCERTAIN' &&
       attempt.status !== 'COMMITTING'
     ) {
-      await loadAuthorizedAttempt(d, attempt, preliminary.companyId, input.actor.id);
+      await loadAuthorizedAttempt(
+        d,
+        attempt,
+        preliminary.companyId,
+        input.actor.id,
+        authorization,
+      );
       lifecycleError('RECONCILE_NOT_ALLOWED', 'Only uncertain writes can be reconciled.');
     }
     const prepared = validateAttemptPersistence(attempt);
@@ -2227,16 +2500,35 @@ export async function reconcileMutationAttempt(
       attempt,
       preliminary.companyId,
       input.actor.id,
+      authorization,
+      input.expectedStageHash,
+      input.expectedQboBinding,
     );
     if (attempt.status === 'VERIFIED' || attempt.status === 'UNCHANGED') {
       return recordedAttemptResult(attempt, txn.status);
     }
     const before = persistedSnapshot(attempt.beforeSnapshot);
     await d.renewLease(leaseKey(txn), invocationOwner);
+    await loadAuthorizedAttempt(
+      d,
+      attempt,
+      preliminary.companyId,
+      input.actor.id,
+      authorization,
+      input.expectedStageHash,
+      input.expectedQboBinding,
+    );
     const client = await d.getClient(txn.companyId);
     const actual = await client.fetchPurchaseSnapshot(txn.qboId);
     if (!actual) {
-      return markUncertain(d, attempt, txn, input.actor, prepared);
+      return markUncertain(
+        d,
+        attempt,
+        txn,
+        input.actor,
+        prepared,
+        input.auditAttribution,
+      );
     }
 
     const expectedVerification = verifyPurchaseResult(prepared.expected, actual);
@@ -2250,12 +2542,174 @@ export async function reconcileMutationAttempt(
         actual,
         actual.syncToken,
         prepared.operation === 'restore' ? 'REVERTED' : 'POSTED',
+        input.auditAttribution,
       );
     }
     if (snapshotEquals(actual, before)) {
-      return finalizeUnchanged(d, attempt, txn, input.actor, prepared, actual);
+      return finalizeUnchanged(
+        d,
+        attempt,
+        txn,
+        input.actor,
+        prepared,
+        actual,
+        input.auditAttribution,
+      );
     }
-    return markUncertain(d, attempt, txn, input.actor, prepared);
+    return markUncertain(
+      d,
+      attempt,
+      txn,
+      input.actor,
+      prepared,
+      input.auditAttribution,
+    );
+  });
+}
+
+export async function prepareCategorizationUndo(
+  input: PrepareCategorizationUndoInput,
+  deps?: DurableWritebackDeps,
+): Promise<PreparedCategorizationUndo> {
+  const d = deps ?? (await defaultDurableDeps());
+  const invocationOwner = d.invocationId();
+  const preliminary = await preliminaryTransaction(d, input.transactionId);
+  if (preliminary.companyId !== input.companyId) {
+    lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
+  }
+  return d.lease(leaseKey(preliminary), invocationOwner, async () => {
+    const source = await d.db.qboMutationAttempt.findUnique({
+      where: { requestId: input.sourceRequestId },
+    });
+    if (
+      source === null
+      || source.transactionId !== input.transactionId
+      || source.operation !== 'recategorize'
+      || source.status !== 'VERIFIED'
+      || source.expectedRevision !== input.expectedRevision
+      || source.expectedSyncToken !== input.expectedSourceSyncToken
+    ) {
+      lifecycleError('VERIFIED_POST_REQUIRED', 'Undo requires the exact verified MCP categorization write.');
+    }
+    const sourcePrepared = validateAttemptPersistence(source);
+    if (
+      sourcePrepared.qboType !== input.expectedQboBinding.qboType
+      || sourcePrepared.qboId !== input.expectedQboBinding.qboId
+      || sourcePrepared.body.SyncToken !== input.expectedSourceSyncToken
+    ) {
+      lifecycleError('VERIFIED_POST_REQUIRED', 'The verified source write does not match this operation.');
+    }
+
+    const { txn: initialTxn } = await loadAuthorizedStage(
+      input.transactionId,
+      input.companyId,
+      input.expectedRevision,
+      input.actor.id,
+      d,
+      ['POSTED'],
+      input.authorization,
+    );
+    if (
+      initialTxn.qboType !== input.expectedQboBinding.qboType
+      || initialTxn.qboId !== input.expectedQboBinding.qboId
+    ) {
+      lifecycleError('STALE_QBO_BINDING', 'The QuickBooks transaction binding changed.');
+    }
+
+    await d.renewLease(leaseKey(initialTxn), invocationOwner);
+    const finalSource = await d.db.qboMutationAttempt.findUnique({
+      where: { requestId: input.sourceRequestId },
+    });
+    if (
+      finalSource === null
+      || finalSource.transactionId !== input.transactionId
+      || finalSource.operation !== 'recategorize'
+      || finalSource.status !== 'VERIFIED'
+      || finalSource.expectedRevision !== input.expectedRevision
+      || finalSource.expectedSyncToken !== input.expectedSourceSyncToken
+    ) {
+      lifecycleError('VERIFIED_POST_REQUIRED', 'Undo requires the exact verified MCP categorization write.');
+    }
+    const finalSourcePrepared = validateAttemptPersistence(finalSource);
+    if (
+      hashPreparedWriteBinding(finalSourcePrepared)
+        !== hashPreparedWriteBinding(sourcePrepared)
+      || finalSourcePrepared.qboType !== input.expectedQboBinding.qboType
+      || finalSourcePrepared.qboId !== input.expectedQboBinding.qboId
+      || finalSourcePrepared.body.SyncToken !== input.expectedSourceSyncToken
+    ) {
+      lifecycleError('VERIFIED_POST_REQUIRED', 'The verified source write changed while preparing undo.');
+    }
+    const { txn } = await loadAuthorizedStage(
+      input.transactionId,
+      input.companyId,
+      input.expectedRevision,
+      input.actor.id,
+      d,
+      ['POSTED'],
+      input.authorization,
+    );
+    if (
+      txn.qboType !== input.expectedQboBinding.qboType
+      || txn.qboId !== input.expectedQboBinding.qboId
+    ) {
+      lifecycleError('STALE_QBO_BINDING', 'The QuickBooks transaction binding changed.');
+    }
+    const client = await d.getClient(input.companyId);
+    const [freshTxn, current] = await Promise.all([
+      client.fetchTxn('Purchase', txn.qboId),
+      client.fetchPurchaseSnapshot(txn.qboId),
+    ]);
+    if (
+      freshTxn === null
+      || current === null
+      || freshTxn.qboId !== txn.qboId
+      || current.qboId !== txn.qboId
+      || freshTxn.syncToken !== current.syncToken
+      || current.syncToken !== txn.qboSyncToken
+    ) {
+      lifecycleError('QBO_STATE_DRIFT', 'Purchase changed after the verified categorization.');
+    }
+    const currentVerification = verifyPurchaseResult(sourcePrepared.expected, current);
+    if (!currentVerification.ok) {
+      lifecycleError('QBO_STATE_DRIFT', currentVerification.message);
+    }
+
+    const restore = persistedPrepared(await client.preparePurchaseRestore(
+      freshTxn,
+      sourcePrepared,
+      input.sourceRequestId,
+    ));
+    if (
+      restore.operation !== 'restore'
+      || restore.qboType !== 'Purchase'
+      || restore.qboId !== txn.qboId
+      || restore.body.SyncToken !== current.syncToken
+      || restore.requestHash !== hashPreparedWriteBody(restore.body)
+    ) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Prepared restore identity is inconsistent.');
+    }
+    const restoreHash = hashPreparedWriteBinding(restore);
+    return {
+      transactionId: txn.id,
+      companyId: txn.companyId,
+      revision: txn.revision,
+      qboType: 'Purchase',
+      qboId: txn.qboId,
+      qboSyncToken: current.syncToken,
+      sourcePreparedHash: hashPreparedWriteBinding(sourcePrepared),
+      currentPostHash: hashPurchaseSnapshot(current),
+      restoreHash,
+      preview: {
+        action: 'restore_purchase_categorization',
+        resultingStatus: 'REVERTED',
+        direction: restore.expected.direction,
+        totalCents: restore.expected.totalCents,
+        totalTaxCents: restore.expected.totalTaxCents,
+        lineCount: restore.expected.targetLines.length,
+        restorationDigest: restoreHash,
+      },
+    };
   });
 }
 
@@ -2264,24 +2718,98 @@ export async function undoCategorization(
   deps?: DurableWritebackDeps,
 ): Promise<DurableMutationResult> {
   const d = deps ?? (await defaultDurableDeps());
+  const authorization = input.authorization ?? { kind: 'user' };
+  if (authorization.kind === 'mcp' && input.proof === undefined) {
+    lifecycleError('UNDO_PROOF_REQUIRED', 'MCP undo requires an exact preparation proof.');
+  }
   const invocationOwner = d.invocationId();
   const preliminary = await preliminaryTransaction(d, input.transactionId);
   if (preliminary.companyId !== input.companyId) {
     lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
   }
   return d.lease(leaseKey(preliminary), invocationOwner, async () => {
-    const original = await d.db.qboMutationAttempt.findFirst({
-      where: {
-        transactionId: input.transactionId,
-        operation: 'recategorize',
-        status: 'VERIFIED',
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-    if (!original) {
-      lifecycleError('VERIFIED_POST_REQUIRED', 'Undo requires a verified prepared write.');
-    }
-    const originalPrepared = validateAttemptPersistence(original);
+    const loadVerifiedSource = async (): Promise<{
+      attempt: DurableAttempt;
+      prepared: QboPreparedWrite;
+    }> => {
+      const source = input.proof === undefined
+        ? await d.db.qboMutationAttempt.findFirst({
+            where: {
+              transactionId: input.transactionId,
+              operation: 'recategorize',
+              status: 'VERIFIED',
+            },
+            orderBy: { createdAt: 'desc' },
+          })
+        : await d.db.qboMutationAttempt.findUnique({
+            where: { requestId: input.proof.sourceRequestId },
+          });
+      if (
+        source === null
+        || source.transactionId !== input.transactionId
+        || source.operation !== 'recategorize'
+        || source.status !== 'VERIFIED'
+      ) {
+        lifecycleError('VERIFIED_POST_REQUIRED', 'Undo requires a verified prepared write.');
+      }
+      const prepared = validateAttemptPersistence(source);
+      if (
+        input.proof !== undefined
+        && (
+          source.requestId !== input.proof.sourceRequestId
+          || source.expectedRevision !== input.proof.expectedRevision
+          || prepared.qboType !== input.proof.expectedQboBinding.qboType
+          || prepared.qboId !== input.proof.expectedQboBinding.qboId
+          || hashPreparedWriteBinding(prepared) !== input.proof.sourcePreparedHash
+        )
+      ) {
+        lifecycleError('UNDO_PROOF_MISMATCH', 'The verified source no longer matches the prepared undo.');
+      }
+      return { attempt: source, prepared };
+    };
+    const assertCurrentProof = (
+      txn: DurableTransaction,
+      current: QboPurchaseSnapshot,
+    ): void => {
+      if (
+        input.proof !== undefined
+        && (
+          txn.qboType !== input.proof.expectedQboBinding.qboType
+          || txn.qboId !== input.proof.expectedQboBinding.qboId
+          || txn.qboSyncToken !== input.proof.expectedQboBinding.qboSyncToken
+          || current.syncToken !== input.proof.expectedQboBinding.qboSyncToken
+          || hashPurchaseSnapshot(current) !== input.proof.currentPostHash
+        )
+      ) {
+        lifecycleError('UNDO_PROOF_MISMATCH', 'The current Purchase no longer matches the prepared undo.');
+      }
+    };
+    const assertRestoreProof = (restore: QboPreparedWrite): void => {
+      if (
+        input.proof !== undefined
+        && hashPreparedWriteBinding(restore) !== input.proof.restoreHash
+      ) {
+        lifecycleError('UNDO_PROOF_MISMATCH', 'The prepared restore no longer matches the prepared undo.');
+      }
+    };
+    const persistedRestoreForProof = (
+      attempt: DurableAttempt,
+    ): QboPreparedWrite => {
+      const restore = validateAttemptPersistence(attempt);
+      assertRestoreProof(restore);
+      if (
+        input.proof !== undefined
+        && hashPurchaseSnapshot(persistedSnapshot(attempt.beforeSnapshot))
+          !== input.proof.currentPostHash
+      ) {
+        lifecycleError('UNDO_PROOF_MISMATCH', 'The stored current Purchase no longer matches the prepared undo.');
+      }
+      return restore;
+    };
+
+    const source = await loadVerifiedSource();
+    const original = source.attempt;
+    const originalPrepared = source.prepared;
     const intent: RequestIntent = {
       transactionId: input.transactionId,
       operation: 'restore',
@@ -2289,12 +2817,14 @@ export async function undoCategorization(
     };
     const sameRequest = await findRequestOrConflict(d, input.requestId, intent);
     if (sameRequest) {
+      const restore = persistedRestoreForProof(sameRequest);
       if (sameRequest.status !== 'PREPARED') {
         const txn = await loadAuthorizedRecordedAttempt(
           d,
           sameRequest,
           input.companyId,
           input.actor.id,
+          authorization,
         );
         return recordedAttemptResult(sameRequest, txn.status);
       }
@@ -2303,8 +2833,10 @@ export async function undoCategorization(
         sameRequest,
         input.companyId,
         input.actor.id,
+        authorization,
+        undefined,
+        input.proof?.expectedQboBinding,
       );
-      const restore = preparedForAttempt(sameRequest);
       const client = await d.getClient(input.companyId);
       const entered = await enterCommitting(
         d,
@@ -2313,7 +2845,17 @@ export async function undoCategorization(
         input.actor,
         invocationOwner,
         ['POSTED'],
+        authorization,
+        undefined,
+        input.proof?.expectedQboBinding,
         async () => {
+          const finalSource = await loadVerifiedSource();
+          if (
+            hashPreparedWriteBinding(finalSource.prepared)
+              !== hashPreparedWriteBinding(originalPrepared)
+          ) {
+            lifecycleError('UNDO_PROOF_MISMATCH', 'The verified source changed before restore send.');
+          }
           const [freshTxn, current] = await Promise.all([
             client.fetchTxn('Purchase', txn.qboId),
             client.fetchPurchaseSnapshot(txn.qboId),
@@ -2331,6 +2873,7 @@ export async function undoCategorization(
           ) {
             lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared restore could resume.');
           }
+          assertCurrentProof(txn, current);
         },
       );
       if (!entered.won) {
@@ -2339,6 +2882,9 @@ export async function undoCategorization(
           entered.attempt,
           input.companyId,
           input.actor.id,
+          authorization,
+          undefined,
+          input.proof?.expectedQboBinding,
         );
         return recordedAttemptResult(entered.attempt, latestTxn.status);
       }
@@ -2350,6 +2896,7 @@ export async function undoCategorization(
         input.actor,
         restore,
         'REVERTED',
+        input.auditAttribution,
       );
     }
 
@@ -2360,6 +2907,9 @@ export async function undoCategorization(
       input.actor.id,
       d,
       ['POSTED'],
+      authorization,
+      undefined,
+      input.proof?.expectedQboBinding,
     );
     await d.renewLease(leaseKey(txn), invocationOwner);
     const client = await d.getClient(input.companyId);
@@ -2383,12 +2933,14 @@ export async function undoCategorization(
     if (!currentVerification.ok) {
       lifecycleError('QBO_STATE_DRIFT', currentVerification.message);
     }
+    assertCurrentProof(txn, current);
 
     const restore = await client.preparePurchaseRestore(
       freshTxn,
       originalPrepared,
       input.requestId,
     );
+    assertRestoreProof(restore);
     const persisted = await persistPrepared(
       d,
       txn.id,
@@ -2397,11 +2949,15 @@ export async function undoCategorization(
       current,
     );
     if (!persisted.created) {
+      persistedRestoreForProof(persisted.attempt);
       const { txn: racedTxn } = await loadAuthorizedAttempt(
         d,
         persisted.attempt,
         input.companyId,
         input.actor.id,
+        authorization,
+        undefined,
+        input.proof?.expectedQboBinding,
       );
       return recordedAttemptResult(persisted.attempt, racedTxn.status);
     }
@@ -2412,7 +2968,17 @@ export async function undoCategorization(
       input.actor,
       invocationOwner,
       ['POSTED'],
+      authorization,
+      undefined,
+      input.proof?.expectedQboBinding,
       async () => {
+        const finalSource = await loadVerifiedSource();
+        if (
+          hashPreparedWriteBinding(finalSource.prepared)
+            !== hashPreparedWriteBinding(originalPrepared)
+        ) {
+          lifecycleError('UNDO_PROOF_MISMATCH', 'The verified source changed before restore send.');
+        }
         const [lastTxn, lastSnapshot] = await Promise.all([
           client.fetchTxn('Purchase', txn.qboId),
           client.fetchPurchaseSnapshot(txn.qboId),
@@ -2430,14 +2996,19 @@ export async function undoCategorization(
         ) {
           lifecycleError('QBO_STATE_DRIFT', 'Purchase changed before the prepared restore send.');
         }
+        assertCurrentProof(txn, lastSnapshot);
       },
     );
     if (!entered.won) {
+      persistedRestoreForProof(entered.attempt);
       const { txn: latestTxn } = await loadAuthorizedAttempt(
         d,
         entered.attempt,
         input.companyId,
         input.actor.id,
+        authorization,
+        undefined,
+        input.proof?.expectedQboBinding,
       );
       return recordedAttemptResult(entered.attempt, latestTxn.status);
     }
@@ -2449,6 +3020,7 @@ export async function undoCategorization(
       input.actor,
       restore,
       'REVERTED',
+      input.auditAttribution,
     );
   });
 }

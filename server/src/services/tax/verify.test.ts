@@ -54,6 +54,58 @@ describe('verifyPurchaseResult', () => {
     expect(verifyPurchaseResult(expected, actual)).toEqual({ ok: true });
   });
 
+  it('accepts omitted redundant tax fields when the inclusive amount proves the exact tax', () => {
+    const expectedTarget = {
+      ...targetLine,
+      amountCents: -10_00,
+      taxAmountCents: -50,
+      taxInclusiveCents: -10_50,
+    };
+    const expectedWithDerivedTax = {
+      ...expected,
+      targetLines: [expectedTarget],
+    };
+    const qboReadback = {
+      ...actual,
+      totalTaxCents: null,
+      lines: [{
+        ...expectedTarget,
+        id: 'new-target',
+        taxAmountCents: null,
+      }, untouchedLine],
+    };
+
+    expect(verifyPurchaseResult(expectedWithDerivedTax, qboReadback)).toEqual({ ok: true });
+  });
+
+  it('rejects omitted tax fields when the inclusive amount does not prove the expected tax', () => {
+    const expectedTarget = {
+      ...targetLine,
+      amountCents: -10_00,
+      taxAmountCents: -50,
+      taxInclusiveCents: -10_50,
+    };
+    const expectedWithDerivedTax = {
+      ...expected,
+      targetLines: [expectedTarget],
+    };
+    const qboReadback = {
+      ...actual,
+      totalTaxCents: null,
+      lines: [{
+        ...expectedTarget,
+        id: 'new-target',
+        taxAmountCents: null,
+        taxInclusiveCents: -10_49,
+      }, untouchedLine],
+    };
+
+    expect(verifyPurchaseResult(expectedWithDerivedTax, qboReadback)).toMatchObject({
+      ok: false,
+      code: 'QBO_STATE_DRIFT',
+    });
+  });
+
   it.each([
     ['Purchase ID', { qboId: 'purchase-2' }],
     ['total', { totalCents: -10_49 }],

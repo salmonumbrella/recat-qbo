@@ -394,6 +394,39 @@ model QboMutationAttempt {
   @@index([transactionId, status])
 }
 
+/// Immutable MCP preparation envelope. Attribution and target identifiers are
+/// deliberate scalars so account or token deletion cannot erase audit history.
+/// QBO write authority remains exclusively in QboMutationAttempt.
+model McpOperation {
+  id                String   @id @default(uuid())
+  tokenId           String
+  tokenPrefix       String   @db.VarChar(12)
+  userId            String
+  companyId         String
+  transactionId     String
+  toolName          String   @db.VarChar(64)
+  kind              String   @db.VarChar(32)
+  idempotencyKey    String?  @db.VarChar(128)
+  inputHash         String   @db.Char(64)
+  payload           Json
+  payloadHash       String   @db.Char(64)
+  sourceRevision    Int
+  preparedRevision  Int
+  qboType           String   @db.VarChar(32)
+  qboId             String   @db.VarChar(128)
+  qboSyncToken      String   @db.VarChar(128)
+  expiresAt         DateTime
+  retryOfId         String?  @unique
+  cancelledAt       DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([tokenId, createdAt])
+  @@index([userId, createdAt])
+  @@index([companyId, transactionId])
+  @@unique([tokenId, toolName, transactionId, idempotencyKey])
+}
+
 model AppConfig {
   key       String   @id
   value     String // encrypted where sensitive

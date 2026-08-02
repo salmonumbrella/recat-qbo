@@ -43,6 +43,11 @@ import {
   toBoundedJsonSchema,
 } from './schemaBounds.js';
 import { extractMcpTraceContext, type McpTraceContext } from './trace.js';
+import {
+  mcpMutationOperations,
+  mutationToolDefinitions,
+  type McpMutationOperations,
+} from './mutationTools.js';
 
 export const READ_TOOL_NAMES = [
   'get_identity',
@@ -110,6 +115,7 @@ export interface RecatMcpContext {
   principal: McpPrincipal;
   era: 'legacy' | 'modern';
   reads?: CompanyReadOperations;
+  mutations?: McpMutationOperations;
   requestId?: string;
   traceId?: string;
   traceContext?: McpTraceContext;
@@ -387,6 +393,7 @@ function inputWithoutCompany<T extends { companyId: string }>(
 
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
+  const mutations = context.mutations ?? mcpMutationOperations;
   const requestId = context.requestId ?? randomUUID();
   const traceContext = context.traceContext ?? (
     context.traceId === undefined
@@ -409,11 +416,12 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   );
 
   const register = <T extends z.ZodObject>(
-    name: typeof READ_TOOL_NAMES[number],
+    name: string,
     description: string,
     inputSchema: T,
     outputSchema: z.ZodObject,
     operation: (input: z.output<T>) => Promise<unknown>,
+    toolAnnotations: ToolAnnotations = annotations,
   ): void => {
     const callback = async (input: z.output<T>, sdkContext: ServerContext) => {
       try {
@@ -450,7 +458,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
       description,
       inputSchema,
       outputSchema,
-      annotations,
+      annotations: toolAnnotations,
     }, callback as never);
   };
 
@@ -498,6 +506,17 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     (input) => reads.listRules(context.principal.userId, input.companyId, inputWithoutCompany(input)));
   register('list_transfer_candidates', 'List bounded transfer candidate pairs.', companyPageInput, transferCandidateListOutput,
     (input) => reads.listTransferCandidates(context.principal.userId, input.companyId, inputWithoutCompany(input)));
+
+  for (const definition of mutationToolDefinitions) {
+    register(
+      definition.name,
+      definition.description,
+      definition.inputSchema,
+      definition.outputSchema,
+      (input) => definition.invoke(mutations, context.principal, input),
+      definition.annotations,
+    );
+  }
 
   return server;
 }

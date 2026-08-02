@@ -508,6 +508,34 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
     if (cents === 0) return 0;
     return direction === 'refund' ? Math.abs(cents) : -Math.abs(cents);
   };
+  const lines = (raw.Line ?? []).map((line) => {
+    const detail = line.AccountBasedExpenseLineDetail;
+    const amountCents = signedCents(line.Amount ?? 0);
+    const taxInclusiveCents = detail?.TaxInclusiveAmt === undefined
+      ? null
+      : signedCents(detail.TaxInclusiveAmt);
+    const taxAmountCents = detail?.TaxAmount === undefined
+      ? raw.GlobalTaxCalculation === 'TaxInclusive' && taxInclusiveCents !== null
+        ? taxInclusiveCents - amountCents
+        : null
+      : signedCents(detail.TaxAmount);
+    return {
+      id: line.Id ?? null,
+      amountCents,
+      description: line.Description ?? null,
+      accountQboId: detail?.AccountRef?.value ?? null,
+      customerQboId: detail?.CustomerRef?.value ?? null,
+      classQboId: detail?.ClassRef?.value ?? null,
+      taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
+      taxAmountCents,
+      taxInclusiveCents,
+    };
+  });
+  const derivedTotalTaxCents = lines.reduce<number | null>((sum, line) => {
+    if (sum === null) return null;
+    if (line.taxAmountCents !== null) return sum + line.taxAmountCents;
+    return line.taxCodeQboId === null ? sum : null;
+  }, 0);
   return {
     qboId: raw.Id,
     syncToken: raw.SyncToken,
@@ -516,24 +544,12 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
     date: raw.TxnDate ?? '',
     direction,
     globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
-    totalTaxCents: raw.TxnTaxDetail?.TotalTax === undefined ? null : signedCents(raw.TxnTaxDetail.TotalTax),
-    lines: (raw.Line ?? []).map((line) => ({
-      id: line.Id ?? null,
-      amountCents: signedCents(line.Amount ?? 0),
-      description: line.Description ?? null,
-      accountQboId: line.AccountBasedExpenseLineDetail?.AccountRef?.value ?? null,
-      customerQboId: line.AccountBasedExpenseLineDetail?.CustomerRef?.value ?? null,
-      classQboId: line.AccountBasedExpenseLineDetail?.ClassRef?.value ?? null,
-      taxCodeQboId: line.AccountBasedExpenseLineDetail?.TaxCodeRef?.value ?? null,
-      taxAmountCents:
-        line.AccountBasedExpenseLineDetail?.TaxAmount === undefined
-          ? null
-          : signedCents(line.AccountBasedExpenseLineDetail.TaxAmount),
-      taxInclusiveCents:
-        line.AccountBasedExpenseLineDetail?.TaxInclusiveAmt === undefined
-          ? null
-          : signedCents(line.AccountBasedExpenseLineDetail.TaxInclusiveAmt),
-    })),
+    totalTaxCents: raw.TxnTaxDetail?.TotalTax === undefined
+      ? raw.GlobalTaxCalculation !== undefined
+        ? derivedTotalTaxCents
+        : null
+      : signedCents(raw.TxnTaxDetail.TotalTax),
+    lines,
   };
 }
 

@@ -38,9 +38,39 @@ function targetLineHash(line: PurchaseLine): string {
     line.customerQboId,
     line.classQboId,
     line.taxCodeQboId,
-    line.taxAmountCents,
+    effectiveLineTaxCents(line),
     line.taxInclusiveCents,
   ]);
+}
+
+function effectiveLineTaxCents(line: PurchaseLine): number | null {
+  if (line.taxAmountCents !== null) return line.taxAmountCents;
+  if (line.taxInclusiveCents === null) return null;
+  return line.taxInclusiveCents - line.amountCents;
+}
+
+function omittedInclusiveTotalTaxMatches(
+  expectedTotalTaxCents: number | null,
+  actual: QboPurchaseSnapshot,
+): boolean {
+  if (actual.totalTaxCents === expectedTotalTaxCents) return true;
+  if (
+    actual.totalTaxCents !== null
+    || expectedTotalTaxCents === null
+    || actual.globalTaxCalculation !== 'TaxInclusive'
+  ) {
+    return false;
+  }
+  let derivedTotalTaxCents = 0;
+  for (const line of actual.lines) {
+    const lineTaxCents = effectiveLineTaxCents(line);
+    if (lineTaxCents === null) {
+      if (line.taxCodeQboId !== null) return false;
+      continue;
+    }
+    derivedTotalTaxCents += lineTaxCents;
+  }
+  return derivedTotalTaxCents === expectedTotalTaxCents;
 }
 
 function drift(message: string): PurchaseVerification {
@@ -57,7 +87,9 @@ export function verifyPurchaseResult(
   if (actual.date !== expected.date) return drift('Purchase date changed.');
   if (actual.direction !== expected.direction) return drift('Purchase direction changed.');
   if (actual.globalTaxCalculation !== expected.globalTaxCalculation) return drift('Purchase global tax mode changed.');
-  if (actual.totalTaxCents !== expected.totalTaxCents) return drift('Purchase total tax changed.');
+  if (!omittedInclusiveTotalTaxMatches(expected.totalTaxCents, actual)) {
+    return drift('Purchase total tax changed.');
+  }
 
   const remainingLines = [...actual.lines];
   for (const targetLine of expected.targetLines) {

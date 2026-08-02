@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CategorizationError,
   stageCategorization,
+  stageCategorizationWithWorkflow,
   type CategorizationDb,
   type CategorizationDeps,
 } from './categorization.js';
@@ -207,7 +208,9 @@ class FakeCategorizationDb implements CategorizationDb {
         (row) => row.companyId === where.companyId && matchesScalar(row.qboId, where.qboId),
       );
     this.qboTaxRate.findMany = async ({ where }) =>
-      this.state.taxRates.filter((row) => row.companyId === where.companyId);
+      this.state.taxRates.filter(
+        (row) => row.companyId === where.companyId && row.active === where.active,
+      );
     this.qboMutationAttempt.findFirst = async ({ where }) => {
       const attempt = this.state.attempts.find(
         (row) =>
@@ -515,6 +518,67 @@ describe('stageCategorization', () => {
     expect(afterRevisionCas).toHaveBeenCalledOnce();
   });
 
+  it('lets a fenced workflow return before mutable validation or revision CAS', async () => {
+    const before = structuredClone(db.state);
+    const events: string[] = [];
+
+    const result = await stageCategorizationWithWorkflow(
+      input(),
+      {
+        beforeValidation: async (transaction, normalizedInput) => {
+          expect(transaction).toBe(db);
+          expect(normalizedInput).toEqual(input());
+          events.push('before-validation');
+          return { kind: 'return', value: 'exact-replay' };
+        },
+        afterStage: async () => {
+          throw new Error('afterStage must not run for a replay');
+        },
+      },
+      testDeps(db, {
+        fence: async () => {
+          events.push('fence');
+        },
+      } as Partial<CategorizationDeps>),
+    );
+
+    expect(result).toBe('exact-replay');
+    expect(events).toEqual(['fence', 'before-validation']);
+    expect(db.lastUpdateMany).toBeNull();
+    expect(db.state).toEqual(before);
+  });
+
+  it('passes the normalized staging receipt inside the transaction and rolls back on receipt failure', async () => {
+    const before = structuredClone(db.state);
+    const receiptError = new Error('receipt persistence failed');
+
+    await expect(stageCategorizationWithWorkflow(
+      input(),
+      {
+        beforeValidation: async () => ({ kind: 'continue' }),
+        afterStage: async (transaction, receipt) => {
+          expect(transaction).toBe(db);
+          expect(receipt).toMatchObject({
+            normalizedProposal: standardProposal,
+            sourceRevision: 0,
+            preparedRevision: 1,
+            qboType: 'Purchase',
+            qboId: 'QBO_PURCHASE_30',
+            qboSyncToken: '7',
+            staged: {
+              transactionId: TRANSACTION_ID,
+              revision: 1,
+            },
+          });
+          throw receiptError;
+        },
+      },
+      testDeps(db),
+    )).rejects.toBe(receiptError);
+
+    expect(db.state).toEqual(before);
+  });
+
   it.each([
     ['revision', () => { db.state.transactions[0]!.revision = 1; }, 'STALE_REVISION'],
     ['status', () => { db.state.transactions[0]!.status = 'ERROR'; }, 'STALE_REVISION'],
@@ -603,6 +667,33 @@ describe('stageCategorization', () => {
       { splitLineId: db.state.splits[0]!.id, tagId: LINE_TAG_ID },
     ]);
     expect(getClient).not.toHaveBeenCalled();
+  });
+
+  it('loads only active tax rates so inactive nullable legacy rows are never decoded', async () => {
+    const findMany = vi.fn(async (
+      args: { where: { companyId: string; active?: boolean } },
+    ) => {
+      if (args.where.active !== true) {
+        throw Object.assign(
+          new Error('inactive legacy rate contains a nullable value'),
+          { code: 'P2032' },
+        );
+      }
+      return db.state.taxRates.filter(
+        (row) => row.companyId === args.where.companyId && row.active,
+      );
+    });
+    db.qboTaxRate.findMany =
+      findMany as unknown as CategorizationDb['qboTaxRate']['findMany'];
+
+    await expect(stageCategorization(input(), testDeps(db))).resolves.toMatchObject({
+      transactionId: TRANSACTION_ID,
+      revision: 1,
+    });
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { companyId: COMPANY_ID, active: true },
+    });
   });
 
   it('persists owned line tags in request order without confusing shared references for missing tags', async () => {

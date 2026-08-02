@@ -143,7 +143,9 @@ export interface CategorizationDb {
     }): Promise<TaxCodeRow[]>;
   };
   qboTaxRate: {
-    findMany(args: { where: { companyId: string } }): Promise<TaxRateRow[]>;
+    findMany(args: {
+      where: { companyId: string; active: true };
+    }): Promise<TaxRateRow[]>;
   };
   splitLine: {
     deleteMany(args: { where: { txnId: string } }): Promise<{ count: number }>;
@@ -194,6 +196,31 @@ export interface CategorizationDeps {
   invocationId(): string;
   /** Deterministic concurrency seam used only by the opt-in PostgreSQL race suite. */
   afterRevisionCas?(): Promise<void>;
+}
+
+export interface CategorizationStageReceipt {
+  normalizedProposal: CategorizationProposal;
+  sourceRevision: number;
+  preparedRevision: number;
+  qboType: string;
+  qboId: string;
+  qboSyncToken: string;
+  staged: StagedCategorization;
+}
+
+export type CategorizationWorkflowDecision<T> =
+  | { kind: 'continue' }
+  | { kind: 'return'; value: T };
+
+export interface CategorizationStagingWorkflow<T> {
+  beforeValidation(
+    tx: CategorizationDb,
+    normalizedInput: StageCategorizationInput,
+  ): Promise<CategorizationWorkflowDecision<T>>;
+  afterStage(
+    tx: CategorizationDb,
+    receipt: CategorizationStageReceipt,
+  ): Promise<T>;
 }
 
 export class CategorizationError extends Error {
@@ -410,7 +437,9 @@ async function validateStage(
       db.qboTaxCode.findMany({
         where: { companyId: input.companyId, qboId: { in: taxCodeIds } },
       }),
-      db.qboTaxRate.findMany({ where: { companyId: input.companyId } }),
+      db.qboTaxRate.findMany({
+        where: { companyId: input.companyId, active: true },
+      }),
     ]);
     if (!company) {
       throw new CategorizationError('TRANSACTION_NOT_FOUND', 'Transaction company was not found.');
@@ -520,10 +549,11 @@ async function defaultCategorizationDeps(): Promise<CategorizationDeps> {
   };
 }
 
-export async function stageCategorization(
+export async function stageCategorizationWithWorkflow<T>(
   input: StageCategorizationInput,
+  workflow: CategorizationStagingWorkflow<T>,
   deps?: CategorizationDeps,
-): Promise<StagedCategorization> {
+): Promise<T> {
   const {
     db,
     lease,
@@ -557,6 +587,8 @@ export async function stageCategorization(
     // holds the lease-row lock through commit, preventing expiry takeover from
     // crossing the local mutation boundary.
     await fence(key, owner, tx);
+    const decision = await workflow.beforeValidation(tx, parsed.data);
+    if (decision.kind === 'return') return decision.value;
 
     // Reload every mutable fact after both the outer lease and transaction
     // fence are held, so validation and replacement share one snapshot/commit.
@@ -681,7 +713,7 @@ export async function stageCategorization(
       },
     });
 
-    return {
+    const staged: StagedCategorization = {
       transactionId: reloaded.id,
       revision: reloaded.revision,
       taxCalculation: proposal.taxCalculation,
@@ -698,5 +730,24 @@ export async function stageCategorization(
       })),
       tagIds,
     };
+    return workflow.afterStage(tx, {
+      normalizedProposal: proposal,
+      sourceRevision: validated.input.expectedRevision,
+      preparedRevision: reloaded.revision,
+      qboType: validated.transaction.qboType,
+      qboId: validated.transaction.qboId,
+      qboSyncToken: validated.transaction.qboSyncToken,
+      staged,
+    });
   }));
+}
+
+export async function stageCategorization(
+  input: StageCategorizationInput,
+  deps?: CategorizationDeps,
+): Promise<StagedCategorization> {
+  return stageCategorizationWithWorkflow(input, {
+    beforeValidation: async () => ({ kind: 'continue' }),
+    afterStage: async (_tx, receipt) => receipt.staged,
+  }, deps);
 }

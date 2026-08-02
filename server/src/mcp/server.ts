@@ -18,6 +18,10 @@ import {
   type CompanyReadOperations,
   type RecatMcpContext,
 } from './readTools.js';
+import {
+  mcpMutationOperations,
+  type McpMutationOperations,
+} from './mutationTools.js';
 import { extractMcpTraceContext } from './trace.js';
 import {
   isSafeToolFailure,
@@ -389,6 +393,7 @@ export function contextFrom(
   era: McpRequestContext['era'],
   reads: CompanyReadOperations = companyReads,
   requestInfo?: Request,
+  mutations: McpMutationOperations = mcpMutationOperations,
 ): RecatMcpContext {
   const trace = extractMcpTraceContext({
     traceparent: requestInfo?.headers.get('traceparent') ?? undefined,
@@ -399,6 +404,7 @@ export function contextFrom(
     principal: principalFrom(authInfo),
     era,
     reads,
+    mutations,
     requestId:
       requestInfo?.headers.get(INTERNAL_REQUEST_ID_HEADER) ?? randomUUID(),
     traceId: trace.traceId,
@@ -408,10 +414,13 @@ export function contextFrom(
 
 export function createRecatMcpHandler(
   reads: CompanyReadOperations = companyReads,
+  mutations: McpMutationOperations = mcpMutationOperations,
 ): McpHttpHandler {
   const sdkHandler = createMcpHandler(
     ({ authInfo, era, requestInfo }) =>
-      createRecatMcpServer(contextFrom(authInfo, era, reads, requestInfo)),
+      createRecatMcpServer(
+        contextFrom(authInfo, era, reads, requestInfo, mutations),
+      ),
     { legacy: 'stateless' },
   );
   return {

@@ -1,5 +1,11 @@
 import type { CallToolResult, JSONObject } from '@modelcontextprotocol/server';
 import { HttpError } from '../lib/http.js';
+import { CategorizationError } from '../services/categorization.js';
+import { McpCategorizationError } from '../services/mcp/categorization.js';
+import { McpOperationError } from '../services/mcp/operations.js';
+import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
+import { McpUndoError } from '../services/mcp/undo.js';
+import { WritebackLifecycleError } from '../services/writeback.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -30,8 +36,99 @@ export function toolSuccess<T extends JSONObject>(value: T): CallToolResult {
   };
 }
 
+const CATEGORIZATION_INVALID_CODES = new Set([
+  'INVALID_ACCOUNT',
+  'INVALID_INPUT',
+  'INVALID_TAG',
+  'INVALID_TRANSACTION_AMOUNT',
+  'STALE_REVISION',
+  'TAX_NOT_READY',
+  'TAX_REQUIRES_PURCHASE',
+  'UNBALANCED_TOTAL',
+]);
+const WRITEBACK_INVALID_CODES = new Set([
+  'INVALID_ACCOUNT',
+  'INVALID_STAGE',
+  'INVALID_STATUS',
+  'INVALID_TRANSACTION_AMOUNT',
+  'QBO_PURCHASE_UNSUPPORTED',
+  'QBO_STATE_DRIFT',
+  'RECONCILE_NOT_ALLOWED',
+  'STALE_QBO_BINDING',
+  'STALE_REVISION',
+  'STALE_STAGE',
+  'TAX_CODE_UNAVAILABLE',
+  'TAX_NOT_READY',
+  'UNDO_PROOF_MISMATCH',
+  'UNDO_PROOF_REQUIRED',
+  'VERIFIED_POST_REQUIRED',
+]);
+
+function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof McpCategorizationError) {
+    switch (error.code) {
+      case 'MCP_UNAUTHORIZED':
+      case 'MCP_FORBIDDEN':
+        return 'FORBIDDEN';
+      case 'COMPANY_DISCONNECTED':
+        return 'QBO_DISCONNECTED';
+      default:
+        return 'COMPANY_UNAVAILABLE';
+    }
+  }
+  if (error instanceof McpOperationError) {
+    switch (error.code) {
+      case 'OPERATION_NOT_FOUND':
+        return 'NOT_FOUND';
+      case 'OPERATION_INVALID_INPUT':
+      case 'IDEMPOTENCY_CONFLICT':
+        return 'INVALID_INPUT';
+      default:
+        return 'COMPANY_UNAVAILABLE';
+    }
+  }
+  if (error instanceof McpOperationExecutionError) {
+    switch (error.code) {
+      case 'OPERATION_NOT_FOUND':
+        return 'NOT_FOUND';
+      case 'OPERATION_EXPIRED':
+      case 'OPERATION_CANCELLED':
+      case 'IDEMPOTENCY_CONFLICT':
+      case 'RETRY_NOT_ALLOWED':
+        return 'INVALID_INPUT';
+      default:
+        return 'COMPANY_UNAVAILABLE';
+    }
+  }
+  if (error instanceof McpUndoError) {
+    return error.code === 'UNDO_NOT_ALLOWED'
+      ? 'INVALID_INPUT'
+      : 'COMPANY_UNAVAILABLE';
+  }
+  if (error instanceof CategorizationError) {
+    if (error.code === 'TRANSACTION_NOT_FOUND') return 'NOT_FOUND';
+    if (CATEGORIZATION_INVALID_CODES.has(error.code)) return 'INVALID_INPUT';
+    return 'COMPANY_UNAVAILABLE';
+  }
+  if (error instanceof WritebackLifecycleError) {
+    if (error.code === 'FORBIDDEN') return 'FORBIDDEN';
+    if (
+      error.code === 'TRANSACTION_NOT_FOUND'
+      || error.code === 'ATTEMPT_NOT_FOUND'
+    ) {
+      return 'NOT_FOUND';
+    }
+    if (error.code === 'COMPANY_DISCONNECTED') return 'QBO_DISCONNECTED';
+    if (WRITEBACK_INVALID_CODES.has(error.code)) return 'INVALID_INPUT';
+    return 'COMPANY_UNAVAILABLE';
+  }
+  return null;
+}
+
 function safeCode(error: unknown): SafeToolErrorCode {
   if (error instanceof McpSchemaBoundsError) return 'INVALID_INPUT';
+  const mutationCode = safeMutationCode(error);
+  if (mutationCode !== null) return mutationCode;
   if (!(error instanceof HttpError)) return 'COMPANY_UNAVAILABLE';
   if (error.code === 'COMPANY_UNAVAILABLE') return 'COMPANY_UNAVAILABLE';
   if (error.code === 'QBO_DISCONNECTED') return 'QBO_DISCONNECTED';

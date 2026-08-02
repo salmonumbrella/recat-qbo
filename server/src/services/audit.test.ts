@@ -172,4 +172,58 @@ describe('writeAudit mutation metadata', () => {
     expect(payload.references.accountQboIds.every((reference) => reference.length <= 128)).toBe(true);
     expect(payload.references.taxCodeQboIds.every((reference) => reference.length <= 128)).toBe(true);
   });
+
+  it('stores only bounded MCP operation attribution and excludes raw proof or prepared data', async () => {
+    const create = vi.fn(async () => undefined);
+    await writeAudit(
+      { auditEntry: { create } } as never,
+      {
+        companyId: 'company-generic',
+        actorId: 'actor-generic',
+        actorLabel: 'Generic User (MCP rct_example1)',
+        txnId: 'transaction-generic',
+        payee: 'Generic Supplier',
+        amount: -10.5,
+        action: 'reverted',
+        before: 'Prepared purchase',
+        after: 'QuickBooks Purchase',
+        mutation: {
+          requestId: 'undo-operation',
+          outcome: 'VERIFIED',
+          references: {
+            operation: 'restore',
+            qboType: 'Purchase',
+            qboId: 'purchase-generic',
+            accountQboIds: [],
+            taxCodeQboIds: [],
+          },
+          mcp: {
+            sourceOperationId: `source-${'s'.repeat(200)}`,
+            operationId: `undo-${'o'.repeat(200)}`,
+            tokenPrefix: `rct_${'p'.repeat(30)}`,
+            sourcePreparedHash: 'must-not-survive',
+            currentPostHash: 'must-not-survive',
+            restoreHash: 'must-not-survive',
+            body: { secret: 'must-not-survive' },
+          } as never,
+        },
+      },
+    );
+
+    const payload = create.mock.calls[0]?.[0].data.payload as {
+      mcp: {
+        sourceOperationId: string;
+        operationId: string;
+        tokenPrefix: string;
+      };
+    };
+    expect(payload.mcp).toEqual({
+      sourceOperationId: `source-${'s'.repeat(121)}`,
+      operationId: `undo-${'o'.repeat(123)}`,
+      tokenPrefix: 'rct_pppppppp',
+    });
+    expect(JSON.stringify(payload)).not.toMatch(
+      /sourcePreparedHash|currentPostHash|restoreHash|must-not-survive|secret|body/,
+    );
+  });
 });

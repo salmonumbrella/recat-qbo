@@ -508,19 +508,37 @@ function purchaseSign(raw: RawPurchase): 1 | -1 {
   return raw.Credit === true ? 1 : -1;
 }
 
-function snapshotLine(raw: RawPurchaseLine, sign: 1 | -1): QboPurchaseSnapshot['lines'][number] {
+function directionalCents(value: number, sign: 1 | -1): number {
+  const cents = exactCents(value);
+  if (cents === 0) return 0;
+  return sign === 1 ? Math.abs(cents) : -Math.abs(cents);
+}
+
+function snapshotLine(
+  raw: RawPurchaseLine,
+  sign: 1 | -1,
+  taxCalculation: string | undefined,
+): QboPurchaseSnapshot['lines'][number] {
   const detail = raw.AccountBasedExpenseLineDetail;
+  const amountCents = directionalCents(raw.Amount ?? 0, sign);
+  const taxInclusiveCents = detail?.TaxInclusiveAmt === undefined
+    ? null
+    : directionalCents(detail.TaxInclusiveAmt, sign);
+  const taxAmountCents = detail?.TaxAmount === undefined
+    ? taxCalculation === 'TaxInclusive' && taxInclusiveCents !== null
+      ? taxInclusiveCents - amountCents
+      : null
+    : directionalCents(detail.TaxAmount, sign);
   return {
     id: raw.Id ?? null,
-    amountCents: sign * exactCents(raw.Amount ?? 0),
+    amountCents,
     description: raw.Description ?? null,
     accountQboId: detail?.AccountRef?.value ?? null,
     customerQboId: detail?.CustomerRef?.value ?? null,
     classQboId: detail?.ClassRef?.value ?? null,
     taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
-    taxAmountCents: detail?.TaxAmount === undefined ? null : sign * exactCents(detail.TaxAmount),
-    taxInclusiveCents:
-      detail?.TaxInclusiveAmt === undefined ? null : sign * exactCents(detail.TaxInclusiveAmt),
+    taxAmountCents,
+    taxInclusiveCents,
   };
 }
 
@@ -546,7 +564,16 @@ function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
   const accountQboId = requiredIdentity(raw.AccountRef?.value, 'payment account reference');
   const provableLineTaxCents = raw.Line.map((line): number | null => {
     const detail = line.AccountBasedExpenseLineDetail;
-    if (detail?.TaxAmount !== undefined) return exactCents(detail.TaxAmount);
+    if (detail?.TaxAmount !== undefined) {
+      return directionalCents(detail.TaxAmount, sign);
+    }
+    if (
+      raw.GlobalTaxCalculation === 'TaxInclusive'
+      && detail?.TaxInclusiveAmt !== undefined
+    ) {
+      return directionalCents(detail.TaxInclusiveAmt, sign)
+        - directionalCents(line.Amount ?? 0, sign);
+    }
     return detail?.TaxCodeRef?.value === undefined ? 0 : null;
   });
   const derivedTotalTaxCents =
@@ -557,7 +584,7 @@ function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
   return {
     qboId: raw.Id,
     syncToken: raw.SyncToken,
-    totalCents: sign * exactCents(raw.TotalAmt),
+    totalCents: directionalCents(raw.TotalAmt, sign),
     accountQboId,
     date: raw.TxnDate,
     direction: sign === 1 ? 'refund' : 'purchase',
@@ -566,9 +593,9 @@ function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
       raw.TxnTaxDetail?.TotalTax === undefined
         ? derivedTotalTaxCents === null
           ? null
-          : sign * derivedTotalTaxCents
-        : sign * exactCents(raw.TxnTaxDetail.TotalTax),
-    lines: raw.Line.map((line) => snapshotLine(line, sign)),
+          : derivedTotalTaxCents
+        : directionalCents(raw.TxnTaxDetail.TotalTax, sign),
+    lines: raw.Line.map((line) => snapshotLine(line, sign, raw.GlobalTaxCalculation)),
   };
 }
 

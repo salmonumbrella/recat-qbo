@@ -12,7 +12,11 @@ import {
 import {
   bulkPost,
   commitStagedCategorization,
+  hashPreparedWriteBinding,
+  hashStagedCategorization,
+  hashPreparedWriteBody,
   postTransaction,
+  prepareCategorizationUndo,
   reconcileMutationAttempt,
   retryError,
   splitLineDtos,
@@ -84,6 +88,36 @@ describe('splitLineDtos', () => {
       memo: 'Generic line memo',
       tagIds: ['00000000-0000-4000-8000-000000000001'],
     }]);
+  });
+});
+
+describe('hashStagedCategorization', () => {
+  it('is stable across unordered relation results for transaction and line tags', () => {
+    const staged: StagedCategorization = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -100, taxCents: 0, totalCents: -100 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -100,
+        taxCents: 0,
+        totalCents: -100,
+        categoryQboId: 'category',
+        taxCodeQboId: null,
+        memo: null,
+        tagIds: ['tag-b', 'tag-a'],
+      }],
+      tagIds: ['tag-d', 'tag-c'],
+    };
+    expect(hashStagedCategorization(staged)).toBe(hashStagedCategorization({
+      ...staged,
+      lines: [{
+        ...staged.lines[0]!,
+        tagIds: ['tag-a', 'tag-b'],
+      }],
+      tagIds: ['tag-c', 'tag-d'],
+    }));
   });
 });
 
@@ -629,13 +663,7 @@ const stagedPurchase: StagedCategorization = {
 };
 
 function preparedWrite(requestId = 'request-generic'): QboPreparedWrite {
-  return {
-    operation: 'recategorize',
-    qboType: 'Purchase',
-    qboId: 'purchase-generic',
-    requestId,
-    requestHash: `hash-${requestId}`,
-    body: {
+  const body: QboPreparedWrite['body'] = {
       Id: 'purchase-generic',
       SyncToken: '7',
       TxnDate: '2026-07-28',
@@ -653,7 +681,14 @@ function preparedWrite(requestId = 'request-generic'): QboPreparedWrite {
           TaxInclusiveAmt: 10.5,
         },
       }],
-    },
+    };
+  return {
+    operation: 'recategorize',
+    qboType: 'Purchase',
+    qboId: 'purchase-generic',
+    requestId,
+    requestHash: hashPreparedWriteBody(body),
+    body,
     before: structuredClone(beforePurchase),
     expected: structuredClone(expectedPurchase),
   };
@@ -928,19 +963,24 @@ function durableDeps(
     _txn: QboTxn,
     original: QboPreparedWrite,
     requestId: string,
-  ): Promise<QboPreparedWrite> => ({
-    ...preparedWrite(requestId),
-    operation: 'restore',
-    body: { ...preparedWrite(requestId).body, SyncToken: '8' },
-    before: original.before,
-    expected: {
-      ...original.expected,
-      globalTaxCalculation: original.before.globalTaxCalculation,
-      totalTaxCents: original.before.totalTaxCents,
-      targetLines: original.before.lines,
-      untouchedLineHashes: [],
-    },
-  }));
+  ): Promise<QboPreparedWrite> => {
+    const base = preparedWrite(requestId);
+    const body = { ...base.body, SyncToken: '8' };
+    return {
+      ...base,
+      operation: 'restore',
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before: original.before,
+      expected: {
+        ...original.expected,
+        globalTaxCalculation: original.before.globalTaxCalculation,
+        totalTaxCents: original.before.totalTaxCents,
+        targetLines: original.before.lines,
+        untouchedLineHashes: [],
+      },
+    };
+  });
   const sendPreparedWrite = vi.fn(async (prepared: QboPreparedWrite) => ({
     ok: true as const,
     newSyncToken: prepared.operation === 'restore' ? '9' : '8',
@@ -1012,11 +1052,13 @@ function seedAttempt(
 ): DurableAttemptRow {
   const now = new Date('2026-07-28T12:00:00.000Z');
   const recategorization = preparedWrite(requestId);
+  const restoreBody = { ...recategorization.body, SyncToken: '8' };
   const persisted = operation === 'restore'
     ? {
         ...recategorization,
         operation: 'restore' as const,
-        body: { ...recategorization.body, SyncToken: '8' },
+        requestHash: hashPreparedWriteBody(restoreBody),
+        body: restoreBody,
         expected: {
           ...recategorization.expected,
           globalTaxCalculation: recategorization.before.globalTaxCalculation,
@@ -1043,7 +1085,11 @@ function seedAttempt(
         : null,
     verification:
       status === 'VERIFIED'
-        ? { outcome: 'VERIFIED', status: operation === 'restore' ? 'REVERTED' : 'POSTED', newSyncToken: '8' }
+        ? {
+            outcome: 'VERIFIED',
+            status: operation === 'restore' ? 'REVERTED' : 'POSTED',
+            newSyncToken: operation === 'restore' ? '9' : '8',
+          }
         : null,
     errorCode: null,
     errorMessage: null,
@@ -1083,6 +1129,98 @@ function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number)
 }
 
 describe('commitStagedCategorization durable lifecycle', () => {
+  it('loads only active tax rates so inactive legacy null rows cannot break a live commit', async () => {
+    const fixture = durableDeps();
+    fixture.db.qboTaxRate.findMany.mockImplementation(async (args) => {
+      if (args?.where?.active !== true) {
+        const error = new Error('legacy nullable tax rate');
+        Object.assign(error, { code: 'P2032' });
+        throw error;
+      }
+      return [{
+        qboId: 'rate-generic',
+        name: 'Generic rate',
+        active: true,
+        rateValue: 5,
+      }];
+    });
+
+    const result = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(result).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.db.qboTaxRate.findMany).toHaveBeenCalledWith({
+      where: { companyId: DURABLE_COMPANY_ID, active: true },
+    });
+  });
+
+  it('rejects a mismatched expected stage hash before QBO access on a fresh commit', async () => {
+    const fixture = durableDeps();
+
+    await expect(
+      commitStagedCategorization({
+        ...commitInput(),
+        expectedStageHash: 'not-the-current-stage-hash',
+        authorization: {
+          kind: 'mcp',
+          tokenId: 'token-generic',
+          tokenPrefix: 'mcp_generic',
+        },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'STALE_STAGE' });
+
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRecategorization).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a mismatched expected stage hash before QBO access on PREPARED resume', async () => {
+    const fixture = durableDeps();
+    seedAttempt(fixture.db, 'PREPARED', 'request-generic');
+
+    await expect(
+      commitStagedCategorization({
+        ...commitInput(),
+        expectedStageHash: 'not-the-current-stage-hash',
+        authorization: {
+          kind: 'mcp',
+          tokenId: 'token-generic',
+          tokenPrefix: 'mcp_generic',
+        },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'STALE_STAGE' });
+
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('threads MCP authorization through the initial and final pre-send checks', async () => {
+    const fixture = durableDeps();
+    const authorization = {
+      kind: 'mcp' as const,
+      tokenId: 'token-generic',
+      tokenPrefix: 'mcp_generic',
+    };
+
+    await commitStagedCategorization({
+      ...commitInput(),
+      authorization,
+    }, fixture.deps);
+
+    expect(fixture.authorize).toHaveBeenCalledTimes(2);
+    expect(fixture.authorize).toHaveBeenNthCalledWith(
+      1,
+      DURABLE_ACTOR_ID,
+      DURABLE_COMPANY_ID,
+      authorization,
+    );
+    expect(fixture.authorize).toHaveBeenNthCalledWith(
+      2,
+      DURABLE_ACTOR_ID,
+      DURABLE_COMPANY_ID,
+      authorization,
+    );
+  });
+
   it('renews the entity lease before preparation and again immediately before send', async () => {
     const fixture = durableDeps();
 
@@ -1127,6 +1265,73 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['QBO type', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboType = 'Bill';
+    }],
+    ['QBO id', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboId = 'different-purchase';
+    }],
+    ['QBO SyncToken', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboSyncToken = 'different-sync';
+    }],
+  ] as const)(
+    'rejects same-revision %s tampering before QBO client construction',
+    async (_label, tamper) => {
+      const fixture = durableDeps();
+      tamper(fixture);
+
+      await expect(
+        commitStagedCategorization({
+          ...commitInput(),
+          expectedQboBinding: {
+            qboType: 'Purchase',
+            qboId: 'purchase-generic',
+            qboSyncToken: '7',
+          },
+        }, fixture.deps),
+      ).rejects.toMatchObject({ code: 'STALE_QBO_BINDING' });
+
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['QBO type', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboType = 'Bill';
+    }],
+    ['QBO id', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboId = 'different-purchase';
+    }],
+    ['QBO SyncToken', (fixture: ReturnType<typeof durableDeps>) => {
+      fixture.db.transactionRow.qboSyncToken = 'different-sync';
+    }],
+  ] as const)(
+    'rejects same-revision %s tampering at the final gate before send',
+    async (_label, tamper) => {
+      const fixture = durableDeps();
+      fixture.renewLease.mockImplementationOnce(async () => undefined)
+        .mockImplementationOnce(async () => {
+          tamper(fixture);
+        });
+
+      await expect(
+        commitStagedCategorization({
+          ...commitInput(),
+          expectedQboBinding: {
+            qboType: 'Purchase',
+            qboId: 'purchase-generic',
+            qboSyncToken: '7',
+          },
+        }, fixture.deps),
+      ).rejects.toMatchObject({ code: 'STALE_QBO_BINDING' });
+
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.attempts[0]?.status).toBe('RETRYABLE');
+    },
+  );
+
   it('persists the exact prepared request before one send and returns the recorded result idempotently', async () => {
     const fixture = durableDeps();
     fixture.sendPreparedWrite.mockImplementationOnce(async (prepared) => {
@@ -1135,7 +1340,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
         status: 'COMMITTING',
         expectedRevision: 1,
         expectedSyncToken: '7',
-        requestHash: 'hash-request-generic',
+        requestHash: prepared.requestHash,
         beforeSnapshot: beforePurchase,
         requestPayload: prepared,
       });
@@ -1186,6 +1391,50 @@ describe('commitStagedCategorization durable lifecycle', () => {
     const attempt = seedAttempt(fixture.db, 'VERIFIED', 'request-generic');
     fixture.db.transactionRow.status = 'POSTED';
     attempt.beforeSnapshot = { ...structuredClone(beforePurchase), lines: [{}] };
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing response', null],
+    ['wrong response SyncToken', { ...structuredClone(verifiedPurchase), syncToken: '999' }],
+    ['unverified response contents', { ...structuredClone(verifiedPurchase), totalCents: -999 }],
+  ])('rejects VERIFIED terminal evidence with %s', async (_label, responseSnapshot) => {
+    const fixture = durableDeps();
+    const attempt = seedAttempt(fixture.db, 'VERIFIED', 'request-generic');
+    fixture.db.transactionRow.status = 'POSTED';
+    attempt.responseSnapshot = responseSnapshot;
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a valid-looking prepared body whose persisted request hash was not recomputed', async () => {
+    const fixture = durableDeps();
+    const attempt = seedAttempt(fixture.db, 'PREPARED', 'request-generic');
+    const payload = structuredClone(attempt.requestPayload) as QboPreparedWrite;
+    payload.body.Line[0]!.Description = 'coordinated payload change';
+    attempt.requestPayload = payload;
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects UNCHANGED evidence unless its response exactly equals the before-image', async () => {
+    const fixture = durableDeps();
+    const attempt = seedAttempt(fixture.db, 'VERIFIED', 'request-generic');
+    fixture.db.transactionRow.status = 'PENDING';
+    attempt.status = 'UNCHANGED';
+    attempt.responseSnapshot = { ...structuredClone(beforePurchase), totalCents: -999 };
+    attempt.verification = { outcome: 'UNCHANGED', status: 'PENDING' };
 
     await expect(
       commitStagedCategorization(commitInput(), fixture.deps),
@@ -1647,6 +1896,32 @@ describe('legacy retryError with durable attempts', () => {
 });
 
 describe('reconcileMutationAttempt', () => {
+  it('rechecks the exact MCP authorization after lease renewal and before QBO readback', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.status = 'ERROR';
+    seedAttempt(fixture.db, 'UNCERTAIN');
+    fixture.authorize.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const authorization = {
+      kind: 'mcp' as const,
+      tokenId: 'token-generic',
+      tokenPrefix: 'mcp_generic',
+    };
+
+    await expect(reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      authorization,
+    }, fixture.deps)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    expect(fixture.authorize).toHaveBeenNthCalledWith(
+      2,
+      DURABLE_ACTOR_ID,
+      DURABLE_COMPANY_ID,
+      authorization,
+    );
+    expect(fixture.getClient).not.toHaveBeenCalled();
+  });
+
   it('returns the recorded DRY_RUN outcome without validating it as a prepared QBO payload', async () => {
     const fixture = durableDeps();
     fixture.db.transactionRow.company.dryRun = true;
@@ -1684,6 +1959,24 @@ describe('reconcileMutationAttempt', () => {
     expect(restarted.preparePurchaseRecategorization).not.toHaveBeenCalled();
     expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
     expect(db.transactionRow.status).toBe(status);
+  });
+
+  it('reconciles an uncertain write after sync supersedes the moved-out queue row', async () => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = 'SUPERSEDED';
+    seedAttempt(db, 'UNCERTAIN');
+    const restarted = durableDeps(db);
+    restarted.fetchPurchaseSnapshot.mockReset()
+      .mockResolvedValue(structuredClone(verifiedPurchase));
+
+    const result = await reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, restarted.deps);
+
+    expect(result).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(db.transactionRow.status).toBe('POSTED');
+    expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
   it('keeps a posted transaction POSTED when an uncertain restore proves unchanged after restart', async () => {
@@ -1746,6 +2039,181 @@ describe('reconcileMutationAttempt', () => {
   });
 });
 
+describe('prepareCategorizationUndo', () => {
+  function postedFixture() {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.status = 'POSTED';
+    fixture.db.transactionRow.qboSyncToken = '8';
+    fixture.db.transactionRow.postedAt = new Date('2026-07-28T12:00:00.000Z');
+    const source = seedAttempt(fixture.db, 'VERIFIED', 'source-operation');
+    fixture.fetchPurchaseSnapshot.mockReset()
+      .mockResolvedValue(structuredClone(verifiedPurchase));
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(currentQboTxn('8'));
+    return { ...fixture, source };
+  }
+
+  function input(sourceRequestId = 'source-operation') {
+    return {
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      sourceRequestId,
+      expectedRevision: 1,
+      expectedSourceSyncToken: '7',
+      expectedQboBinding: {
+        qboType: 'Purchase',
+        qboId: 'purchase-generic',
+      },
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp' as const,
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+    };
+  }
+
+  it('authoritatively prepares a proof-bound redacted restore under lease with zero attempt and zero send', async () => {
+    const fixture = postedFixture();
+    const attemptCount = fixture.db.attempts.length;
+
+    const result = await prepareCategorizationUndo(input(), fixture.deps);
+
+    expect(result).toMatchObject({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      revision: 1,
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      qboSyncToken: '8',
+      preview: {
+        action: 'restore_purchase_categorization',
+        resultingStatus: 'REVERTED',
+        direction: 'purchase',
+        totalCents: -1050,
+        totalTaxCents: 0,
+        lineCount: 1,
+      },
+    });
+    expect(result.sourcePreparedHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.currentPostHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.restoreHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.preview.restorationDigest).toBe(result.restoreHash);
+    expect(fixture.authorize).toHaveBeenCalledWith(
+      DURABLE_ACTOR_ID,
+      DURABLE_COMPANY_ID,
+      input().authorization,
+    );
+    expect(fixture.leaseOwners).toHaveLength(1);
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+    expect(fixture.db.qboMutationAttempt.create).not.toHaveBeenCalled();
+    expect(fixture.db.attempts).toHaveLength(attemptCount);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.audit).not.toHaveBeenCalled();
+  });
+
+  it('hashes the complete source and restore bindings while excluding only the throwaway request ID', async () => {
+    expect(hashPreparedWriteBinding(preparedWrite('request-a')))
+      .toBe(hashPreparedWriteBinding(preparedWrite('request-b')));
+    const changedExpected = preparedWrite('request-a');
+    changedExpected.expected = {
+      ...changedExpected.expected,
+      totalTaxCents: -51,
+    };
+    expect(hashPreparedWriteBinding(changedExpected))
+      .not.toBe(hashPreparedWriteBinding(preparedWrite('request-a')));
+
+    const fixture = postedFixture();
+    const first = await prepareCategorizationUndo(input(), fixture.deps);
+    const second = await prepareCategorizationUndo(input(), fixture.deps);
+    expect(first.sourcePreparedHash).toBe(second.sourcePreparedHash);
+    expect(first.currentPostHash).toBe(second.currentPostHash);
+    expect(first.restoreHash).toBe(second.restoreHash);
+  });
+
+  it.each([
+    ['DRY_RUN', 'recategorize'],
+    ['UNCERTAIN', 'recategorize'],
+    ['VERIFIED', 'restore'],
+  ])('rejects an exact non-eligible source attempt: %s %s', async (status, operation) => {
+    const fixture = postedFixture();
+    fixture.source.status = status;
+    fixture.source.operation = operation;
+
+    await expect(
+      prepareCategorizationUndo(input(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'VERIFIED_POST_REQUIRED' });
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.db.qboMutationAttempt.create).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('selects the source by exact request ID instead of a newer UI or transfer attempt', async () => {
+    const fixture = postedFixture();
+    seedAttempt(fixture.db, 'VERIFIED', 'newer-ui-attempt');
+
+    await prepareCategorizationUndo(input('source-operation'), fixture.deps);
+
+    expect(fixture.db.qboMutationAttempt.findUnique)
+      .toHaveBeenCalledWith({ where: { requestId: 'source-operation' } });
+    expect(fixture.preparePurchaseRestore.mock.calls[0]?.[1].requestId)
+      .toBe('source-operation');
+  });
+
+  it('rejects a source attempt outside the source MCP operation sync-token binding before QBO access', async () => {
+    const fixture = postedFixture();
+
+    await expect(
+      prepareCategorizationUndo({
+        ...input(),
+        expectedSourceSyncToken: 'different-source-sync',
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'VERIFIED_POST_REQUIRED' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+  });
+
+  it('rechecks current MCP authorization after lease renewal before QBO access', async () => {
+    const fixture = postedFixture();
+    fixture.authorize
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+
+    await expect(
+      prepareCategorizationUndo(input(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(fixture.authorize).toHaveBeenCalledTimes(2);
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the source MCP operation sync-token binding after lease renewal before QBO access', async () => {
+    const fixture = postedFixture();
+    fixture.renewLease.mockImplementationOnce(async () => {
+      fixture.source.expectedSyncToken = 'different-source-sync';
+    });
+
+    await expect(
+      prepareCategorizationUndo(input(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'VERIFIED_POST_REQUIRED' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the exact verified source after lease renewal before QBO access', async () => {
+    const fixture = postedFixture();
+    fixture.renewLease.mockImplementationOnce(async () => {
+      fixture.source.status = 'UNCERTAIN';
+    });
+
+    await expect(
+      prepareCategorizationUndo(input(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'VERIFIED_POST_REQUIRED' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+  });
+});
+
 describe('undoCategorization', () => {
   function postedFixture() {
     const fixture = durableDeps();
@@ -1757,6 +2225,210 @@ describe('undoCategorization', () => {
     (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue(currentQboTxn('8'));
     return fixture;
   }
+
+  async function prepareMcpProof(
+    fixture: ReturnType<typeof postedFixture>,
+  ) {
+    const prepared = await prepareCategorizationUndo({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      sourceRequestId: 'request-existing',
+      expectedRevision: 1,
+      expectedSourceSyncToken: '7',
+      expectedQboBinding: {
+        qboType: 'Purchase',
+        qboId: 'purchase-generic',
+      },
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp',
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+    }, fixture.deps);
+    return {
+      sourceRequestId: 'request-existing',
+      expectedRevision: 1,
+      expectedQboBinding: {
+        qboType: 'Purchase',
+        qboId: 'purchase-generic',
+        qboSyncToken: prepared.qboSyncToken,
+      },
+      sourcePreparedHash: prepared.sourcePreparedHash,
+      currentPostHash: prepared.currentPostHash,
+      restoreHash: prepared.restoreHash,
+    };
+  }
+
+  function resetForVerifiedRestore(
+    fixture: ReturnType<typeof postedFixture>,
+  ): void {
+    fixture.authorize.mockClear();
+    fixture.getClient.mockClear();
+    fixture.preparePurchaseRestore.mockClear();
+    fixture.sendPreparedWrite.mockClear();
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce({
+        ...structuredClone(beforePurchase),
+        syncToken: '9',
+      });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>)
+      .mockReset()
+      .mockResolvedValue(currentQboTxn('8'));
+  }
+
+  it('uses the undo operation ID for one real proof-bound MCP restore even when dry-run is enabled', async () => {
+    const fixture = postedFixture();
+    const proof = await prepareMcpProof(fixture);
+    resetForVerifiedRestore(fixture);
+    fixture.db.transactionRow.company.dryRun = true;
+    fixture.deps.envDryRun = true;
+
+    const result = await undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'undo-operation',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp',
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+      proof,
+      auditAttribution: {
+        sourceOperationId: 'request-existing',
+        operationId: 'undo-operation',
+        tokenPrefix: 'rct_example1',
+      },
+    }, fixture.deps);
+
+    expect(result).toMatchObject({
+      requestId: 'undo-operation',
+      outcome: 'VERIFIED',
+      status: 'REVERTED',
+    });
+    expect(fixture.db.qboMutationAttempt.findUnique)
+      .toHaveBeenCalledWith({ where: { requestId: 'request-existing' } });
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+    expect(fixture.preparePurchaseRestore.mock.calls[0]?.[2]).toBe('undo-operation');
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      requestId: 'undo-operation',
+      operation: 'restore',
+      status: 'VERIFIED',
+    });
+    expect(fixture.authorize).toHaveBeenCalledTimes(2);
+    expect(fixture.audit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        actorId: DURABLE_ACTOR_ID,
+        actorLabel: 'Generic User (MCP rct_example1)',
+        mutation: expect.objectContaining({
+          mcp: {
+            sourceOperationId: 'request-existing',
+            operationId: 'undo-operation',
+            tokenPrefix: 'rct_example1',
+          },
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    'sourcePreparedHash',
+    'currentPostHash',
+    'restoreHash',
+  ] as const)('rejects a changed %s without a QBO send', async (field) => {
+    const fixture = postedFixture();
+    const proof = await prepareMcpProof(fixture);
+    resetForVerifiedRestore(fixture);
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: `undo-tampered-${field}`,
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp',
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+      proof: { ...proof, [field]: 'f'.repeat(64) },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'UNDO_PROOF_MISMATCH' });
+
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.attempts).toHaveLength(1);
+  });
+
+  it('rechecks MCP authorization after preparing the durable restore and before send', async () => {
+    const fixture = postedFixture();
+    const proof = await prepareMcpProof(fixture);
+    resetForVerifiedRestore(fixture);
+    fixture.authorize
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'undo-revoked',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp',
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+      proof,
+    }, fixture.deps)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    expect(fixture.authorize).toHaveBeenCalledTimes(2);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      requestId: 'undo-revoked',
+      operation: 'restore',
+      status: 'RETRYABLE',
+    });
+  });
+
+  it('validates terminal replay restore and current-post evidence against the immutable proof', async () => {
+    const fixture = postedFixture();
+    const proof = await prepareMcpProof(fixture);
+    resetForVerifiedRestore(fixture);
+    const input = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'undo-terminal-proof',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User (MCP rct_example1)' },
+      authorization: {
+        kind: 'mcp' as const,
+        tokenId: 'token-generic',
+        tokenPrefix: 'rct_example1',
+      },
+      proof,
+    };
+    await undoCategorization(input, fixture.deps);
+    fixture.sendPreparedWrite.mockClear();
+
+    await expect(undoCategorization({
+      ...input,
+      proof: { ...proof, restoreHash: 'f'.repeat(64) },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'UNDO_PROOF_MISMATCH' });
+
+    const attempt = fixture.db.attempts.find(
+      (candidate) => candidate.requestId === input.requestId,
+    )!;
+    attempt.beforeSnapshot = {
+      ...structuredClone(verifiedPurchase),
+      totalCents: -999,
+    };
+    await expect(
+      undoCategorization(input, fixture.deps),
+    ).rejects.toMatchObject({ code: 'UNDO_PROOF_MISMATCH' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
 
   it('rejects current SyncToken or snapshot drift before preparing a restore', async () => {
     const fixture = postedFixture();
