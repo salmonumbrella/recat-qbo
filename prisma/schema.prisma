@@ -433,6 +433,7 @@ model ReceiptDocument {
   retainLocally              Boolean                    @default(true)
   userNotes                  String?                    @db.Text
   manuallyEdited             Boolean                    @default(false)
+  currentMetadata            Json                       @default("{}")
   lastExportedAt             DateTime?
   createdByUserId            String?
   createdByUser              User?                      @relation("ReceiptCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
@@ -23,6 +24,7 @@ import {
 } from '../services/attachments/types.js';
 import { EntityLeaseError } from '../services/entityLease.js';
 import { createReceipts } from '../services/receipts/intake.js';
+import { exportReceipts } from '../services/receipts/export.js';
 import {
   attachMatchedReceipt,
   confirmReceiptMatch,
@@ -30,13 +32,20 @@ import {
   undoAttachedReceipt,
 } from '../services/receipts/matching.js';
 import {
+  batchReceiptState,
+  getReceiptDuplicateGroups,
   getReceiptDetail,
   listReceipts,
+  receiptStats,
   setReceiptDeleted,
+  updateReceipt,
   type ReceiptQuery,
 } from '../services/receipts/query.js';
 import { ReceiptError } from '../services/receipts/types.js';
-import { reprocessReceipt } from '../services/receipts/worker.js';
+import {
+  batchReprocessReceipts,
+  reprocessReceipt,
+} from '../services/receipts/worker.js';
 
 const receiptStatuses = [
   'RECEIVED',
@@ -75,8 +84,8 @@ function optionalBoolean(value: unknown): unknown {
 }
 
 const receiptListQuerySchema = z.object({
-  statuses: commaSeparatedArray(receiptStatuses),
-  documentTypes: z.preprocess((value) => {
+  status: commaSeparatedArray(receiptStatuses),
+  documentType: z.preprocess((value) => {
     const source = Array.isArray(value) ? value : [value];
     return source.flatMap((item) =>
       typeof item === 'string' && item !== ''
@@ -85,7 +94,7 @@ const receiptListQuerySchema = z.object({
   }, z.array(z.string().trim().min(1).max(80)).max(5).default([])),
   dateFrom: z.coerce.date().optional(),
   dateTo: z.coerce.date().optional(),
-  sourceKinds: commaSeparatedArray(receiptSourceKinds),
+  sourceKind: commaSeparatedArray(receiptSourceKinds),
   missingInfo: z.preprocess(optionalBoolean, z.boolean().default(false)),
   duplicate: z.preprocess(optionalBoolean, z.boolean().default(false)),
   matched: z.preprocess(optionalBoolean, z.boolean().optional()),
@@ -126,15 +135,78 @@ const receiptConfirmMatchSchema = z.object({
   expectedTransactionRevision: z.number().int().min(0).max(2_147_483_647),
 }).strict();
 const receiptAttachmentMutationSchema = receiptConfirmMatchSchema;
+const receiptStatsQuerySchema = z.object({
+  dateFrom: z.coerce.date().optional(),
+  dateTo: z.coerce.date().optional(),
+}).strict();
+const decimalString = z.string().regex(/^-?\d{1,14}(?:\.\d{1,4})?$/u);
+const nullableTrimmed = (max: number) =>
+  z.string().trim().max(max).nullable().optional();
+const editableReceiptPatchSchema = z.object({
+  receiptDate: z.string().date().nullable().optional(),
+  documentTitle: nullableTrimmed(500),
+  vendorName: nullableTrimmed(500),
+  vendorTaxId: nullableTrimmed(200),
+  vendorReceiptId: nullableTrimmed(200),
+  clientName: nullableTrimmed(500),
+  clientTaxId: nullableTrimmed(200),
+  description: nullableTrimmed(10_000),
+  subtotal: decimalString.nullable().optional(),
+  taxAmount: decimalString.nullable().optional(),
+  totalAmount: decimalString.nullable().optional(),
+  currency: z.string().regex(/^[A-Z]{3}$/u).nullable().optional(),
+  paymentMethod: nullableTrimmed(80),
+  paymentIdentifier: nullableTrimmed(200),
+  language: nullableTrimmed(16),
+  documentType: nullableTrimmed(80),
+  category: nullableTrimmed(500),
+  userNotes: z.string().max(20_000).nullable().optional(),
+  lineItems: z.array(z.object({
+    description: z.string().trim().min(1).max(2_000),
+    quantity: decimalString.nullable(),
+    unitPrice: decimalString.nullable(),
+  }).strict()).max(1_000).optional(),
+  taxComponents: z.array(z.object({
+    label: z.string().trim().min(1).max(200),
+    rate: decimalString.nullable(),
+    amount: decimalString.nullable(),
+    confidence: z.number().min(0).max(1).nullable(),
+  }).strict()).max(20).optional(),
+  additionalFields: z.array(z.object({
+    key: z.string().trim().min(1).max(200),
+    value: z.string().max(2_000),
+  }).strict()).max(200).optional(),
+  approved: z.boolean().optional(),
+}).strict().refine((patch) => Object.keys(patch).length > 0);
+const patchReceiptBodySchema = z.object({
+  expectedRevision: z.number().int().min(0).max(2_147_483_646),
+  patch: editableReceiptPatchSchema,
+}).strict();
+const receiptBatchItemSchema = z.object({
+  id: z.string().uuid(),
+  expectedRevision: z.number().int().min(0).max(2_147_483_646),
+}).strict();
+const receiptBatchSchema = z.object({
+  receipts: z.array(receiptBatchItemSchema).min(1).max(100),
+  idempotencyKey: z.string().trim().min(1).max(128).optional(),
+}).strict();
+const receiptExportSchema = z.union([
+  z.object({
+    documentIds: z.array(z.string().uuid()).min(1).max(500),
+  }).strict(),
+  z.object({
+    filters: receiptListQuerySchema,
+  }).strict(),
+]);
 
 export function parseReceiptListQuery(input: unknown): ReceiptQuery {
   const parsed = validate(receiptListQuerySchema)(input);
   return {
-    statuses: parsed.statuses as ReceiptDocumentStatus[],
-    documentTypes: parsed.documentTypes,
+    statuses: parsed.status as ReceiptDocumentStatus[],
+    documentTypes: parsed.documentType,
     dateFrom: parsed.dateFrom ?? null,
     dateTo: parsed.dateTo ?? null,
-    sourceKinds: parsed.sourceKinds as ReceiptSourceKind[],
+    sourceKinds: parsed.sourceKind as ReceiptSourceKind[],
     missingInfo: parsed.missingInfo,
     duplicate: parsed.duplicate,
     matched: parsed.matched ?? null,
@@ -202,12 +274,13 @@ const hideUnscopedCompany: RequestHandler = (req, _res, next) => {
 async function streamBody(
   body: AsyncIterable<Uint8Array>,
   res: Response,
+  end = true,
 ): Promise<void> {
   for await (const chunk of body) {
     if (res.destroyed) return;
     if (!res.write(chunk)) await once(res, 'drain');
   }
-  res.end();
+  if (end) res.end();
 }
 
 async function tryOpenBlob(
@@ -345,6 +418,157 @@ receiptsRouter.get(
 );
 
 receiptsRouter.get(
+  '/stats',
+  requireRole('viewer'),
+  asyncHandler(async (req, res) => {
+    const range = validate(receiptStatsQuerySchema)(req.query);
+    res.json(await receiptCall(() => receiptStats(req.company!.id, {
+      dateFrom: range.dateFrom ?? null,
+      dateTo: range.dateTo ?? null,
+    })));
+  }),
+);
+
+receiptsRouter.get(
+  '/duplicates',
+  requireRole('viewer'),
+  asyncHandler(async (req, res) => {
+    res.json(await receiptCall(() =>
+      getReceiptDuplicateGroups(req.company!.id)));
+  }),
+);
+
+receiptsRouter.post(
+  '/batch/approve',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptBatchSchema)(req.body);
+    res.json(await receiptCall(() => batchReceiptState({
+      companyId: req.company!.id,
+      actorUserId: req.user!.id,
+      action: 'approve',
+      receipts: body.receipts,
+    })));
+  }),
+);
+
+receiptsRouter.post(
+  '/batch/delete',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptBatchSchema)(req.body);
+    res.json(await receiptCall(() => batchReceiptState({
+      companyId: req.company!.id,
+      actorUserId: req.user!.id,
+      action: 'delete',
+      receipts: body.receipts,
+    })));
+  }),
+);
+
+receiptsRouter.post(
+  '/batch/reprocess',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptBatchSchema)(req.body);
+    if (!body.idempotencyKey) {
+      throw new HttpError(
+        400,
+        'Batch reprocess requires an idempotency key.',
+        'RECEIPT_INVALID_INPUT',
+      );
+    }
+    await receiptCall(() => batchReprocessReceipts(
+      req.company!.id,
+      req.user!.id,
+      body.receipts.map((receipt) => ({
+        ...receipt,
+        idempotencyKey: createHash('sha256')
+          .update(`${body.idempotencyKey}:${receipt.id}`, 'utf8')
+          .digest('hex'),
+      })),
+    ));
+    res.status(202).json({ updated: body.receipts.length });
+  }),
+);
+
+receiptsRouter.post(
+  '/export',
+  requireRole('viewer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptExportSchema)(req.body);
+    let documentIds: string[];
+    if ('documentIds' in body) {
+      documentIds = body.documentIds;
+    } else {
+      const baseQuery = parseReceiptListQuery(body.filters);
+      documentIds = [];
+      let page = 1;
+      while (documentIds.length < 500) {
+        const result = await receiptCall(() => listReceipts(
+          req.company!.id,
+          { ...baseQuery, page, pageSize: 100 },
+        ));
+        if (result.total > 500) {
+          throw new HttpError(
+            400,
+            'Receipt export cannot contain more than 500 receipts.',
+            'RECEIPT_INVALID_INPUT',
+          );
+        }
+        documentIds.push(...result.receipts.map((receipt) => receipt.id));
+        if (documentIds.length >= result.total) break;
+        page += 1;
+      }
+      if (documentIds.length < 1 || documentIds.length > 500) {
+        throw new HttpError(
+          400,
+          'Receipt export must contain between 1 and 500 receipts.',
+          'RECEIPT_INVALID_INPUT',
+        );
+      }
+    }
+    const exported = await receiptCall(() => exportReceipts({
+      companyId: req.company!.id,
+      actorUserId: req.user!.id,
+      documentIds,
+    }, {
+      openQboFile: async (companyId, attachment) => {
+        const qbo = await qboFactory.forCompany(companyId);
+        try {
+          const download = await qbo.openAttachmentDownload(
+            attachment.qboAttachableId!,
+          );
+          return {
+            blobId: `qbo:${attachment.qboAttachableId}`,
+            sizeBytes: download.sizeBytes ?? Number(attachment.sizeBytes),
+            contentType: download.contentType,
+            chunks: () => download.body,
+          };
+        } catch (error) {
+          if (error instanceof QboAttachmentNotFoundError) {
+            throw new ReceiptError(
+              'RECEIPT_NOT_FOUND',
+              `Original file is unavailable for receipt ${attachment.id}.`,
+            );
+          }
+          throw error;
+        }
+      },
+    }));
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+      'Content-Disposition',
+      attachmentContentDisposition(exported.filename, 'attachment'),
+    );
+    res.setHeader('Cache-Control', 'private, no-store');
+    await streamBody(exported.stream, res, false);
+    await exported.completed;
+    res.end();
+  }),
+);
+
+receiptsRouter.get(
   '/:receiptId/file',
   requireRole('viewer'),
   asyncHandler(async (req, res) => {
@@ -354,6 +578,21 @@ receiptsRouter.get(
       'attachment',
       res,
     );
+  }),
+);
+
+receiptsRouter.patch(
+  '/:receiptId',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(patchReceiptBodySchema)(req.body);
+    res.json(await receiptCall(() => updateReceipt({
+      companyId: req.company!.id,
+      documentId: req.params.receiptId!,
+      actorUserId: req.user!.id,
+      expectedRevision: body.expectedRevision,
+      patch: body.patch,
+    })));
   }),
 );
 

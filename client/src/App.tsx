@@ -14,6 +14,9 @@ import Audit from './pages/Audit';
 import Tags from './pages/Tags';
 import Settings from './pages/Settings';
 import Connect from './pages/Connect';
+import ReceiptBrowser from './pages/receipts/ReceiptBrowser';
+import ReceiptDashboard from './pages/receipts/ReceiptDashboard';
+import ReceiptDetail from './pages/receipts/ReceiptDetail';
 
 /** Auth gate + app chrome. Keyed wrapper remounts every screen on company switch. */
 function AppLayout() {
@@ -89,6 +92,9 @@ export default function App() {
           />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/reports" element={<Reports />} />
+          <Route path="/receipts" element={<ReceiptBrowser />} />
+          <Route path="/receipts/dashboard" element={<ReceiptDashboard />} />
+          <Route path="/receipts/:receiptId" element={<ReceiptDetail />} />
           <Route
             path="/audit"
             element={

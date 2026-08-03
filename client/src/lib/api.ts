@@ -35,6 +35,20 @@ import type {
   QboConnectionTestDto,
   QboEnv,
   QboPreflightDto,
+  ConfirmReceiptMatchBody,
+  CreateReceiptsResult,
+  PatchReceiptBody,
+  ReceiptBatchBody,
+  ReceiptBatchResult,
+  ReceiptCompanySettingsDto,
+  ReceiptDetailDto,
+  ReceiptDuplicateGroupDto,
+  ReceiptExportBody,
+  ReceiptListParams,
+  ReceiptListResponse,
+  ReceiptSourceKind,
+  ReceiptStatsDto,
+  ReceiptStatsRange,
   Role,
   ReconcileCategorizationBody,
   RuleDto,
@@ -625,7 +639,207 @@ export const attachments = {
         scope,
         idempotencyKey: createCategorizationRequestId(),
       })}`,
+  ),
+};
+
+function receiptQuery(filters: ReceiptListParams): string {
+  return qs({
+    status: filters.statuses,
+    documentType: filters.documentTypes,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    sourceKind: filters.sourceKinds,
+    missingInfo: filters.missingInfo,
+    duplicate: filters.duplicate,
+    matched: filters.matched,
+    search: filters.search,
+    page: filters.page,
+    pageSize: filters.pageSize,
+    sortBy: filters.sortBy,
+    sortOrder: filters.sortOrder,
+  });
+}
+
+async function receiptExport(
+  companyId: string,
+  body: ReceiptExportBody,
+): Promise<Blob> {
+  const response = await fetch(
+    `/api/companies/${companyId}/receipts/export`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify('filters' in body && body.filters
+        ? {
+            filters: {
+              status: body.filters.statuses,
+              documentType: body.filters.documentTypes,
+              dateFrom: body.filters.dateFrom,
+              dateTo: body.filters.dateTo,
+              sourceKind: body.filters.sourceKinds,
+              missingInfo: body.filters.missingInfo,
+              duplicate: body.filters.duplicate,
+              matched: body.filters.matched,
+              search: body.filters.search,
+              page: body.filters.page,
+              pageSize: body.filters.pageSize,
+              sortBy: body.filters.sortBy,
+              sortOrder: body.filters.sortOrder,
+            },
+          }
+        : body),
+    },
+  );
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      response.statusText || `Request failed (${response.status})`,
+    );
+  }
+  return response.blob();
+}
+
+const receiptBase = (companyId: string) =>
+  `/api/companies/${companyId}/receipts`;
+
+export const receipts = {
+  async upload(
+    companyId: string,
+    files: File[],
+    sourceKind: ReceiptSourceKind,
+  ): Promise<CreateReceiptsResult> {
+    const contentBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const grant = await attachments.createGrant(
+      companyId,
+      files.length,
+      contentBytes,
+    );
+    const uploadIds = await attachments.stage(grant, files);
+    return api.post<CreateReceiptsResult>(receiptBase(companyId), {
+      idempotencyKey: createCategorizationRequestId(),
+      files: uploadIds.map((uploadId) => ({ uploadId })),
+      sourceKind,
+    });
+  },
+  list: (companyId: string, filters: ReceiptListParams = {}) =>
+    api.get<ReceiptListResponse>(
+      `${receiptBase(companyId)}${receiptQuery(filters)}`,
     ),
+  detail: (companyId: string, receiptId: string) =>
+    api.get<ReceiptDetailDto>(`${receiptBase(companyId)}/${receiptId}`),
+  stats: (companyId: string, range: ReceiptStatsRange = {}) =>
+    api.get<ReceiptStatsDto>(
+      `${receiptBase(companyId)}/stats${qs({ ...range })}`,
+    ),
+  duplicates: (companyId: string) =>
+    api.get<ReceiptDuplicateGroupDto[]>(
+      `${receiptBase(companyId)}/duplicates`,
+    ),
+  patch: (
+    companyId: string,
+    receiptId: string,
+    body: PatchReceiptBody,
+  ) => api.patch<ReceiptDetailDto>(
+    `${receiptBase(companyId)}/${receiptId}`,
+    body,
+  ),
+  reprocess: (
+    companyId: string,
+    receiptId: string,
+    body: { expectedRevision: number; idempotencyKey: string },
+  ) => api.post<ReceiptDetailDto>(
+    `${receiptBase(companyId)}/${receiptId}/reprocess`,
+    body,
+  ),
+  rematch: (
+    companyId: string,
+    receiptId: string,
+    expectedReceiptRevision: number,
+  ) => api.post<ReceiptDetailDto>(
+    `${receiptBase(companyId)}/${receiptId}/rematch`,
+    { expectedReceiptRevision },
+  ),
+  confirmMatch: (
+    companyId: string,
+    receiptId: string,
+    transactionId: string,
+    body: ConfirmReceiptMatchBody,
+  ) => api.post<ReceiptDetailDto>(
+    `${receiptBase(companyId)}/${receiptId}`
+    + `/matches/${transactionId}/confirm`,
+    body,
+  ),
+  attach: (
+    companyId: string,
+    receiptId: string,
+    body: {
+      expectedReceiptRevision: number;
+      expectedTransactionRevision: number;
+    },
+  ) => api.post<AttachmentOperationDto>(
+    `${receiptBase(companyId)}/${receiptId}/attach`,
+    body,
+  ),
+  undo: (
+    companyId: string,
+    receiptId: string,
+    body: {
+      expectedReceiptRevision: number;
+      expectedTransactionRevision: number;
+    },
+  ) => api.post<AttachmentOperationDto>(
+    `${receiptBase(companyId)}/${receiptId}/undo`,
+    body,
+  ),
+  restore: (
+    companyId: string,
+    receiptId: string,
+    expectedRevision: number,
+  ) => api.post<ReceiptDetailDto>(
+    `${receiptBase(companyId)}/${receiptId}/restore`,
+    { expectedRevision },
+  ),
+  delete: (
+    companyId: string,
+    receiptId: string,
+    expectedRevision: number,
+  ) => api.del<void>(
+    `${receiptBase(companyId)}/${receiptId}${qs({ expectedRevision })}`,
+  ),
+  batchApprove: (companyId: string, body: ReceiptBatchBody) =>
+    api.post<ReceiptBatchResult>(
+      `${receiptBase(companyId)}/batch/approve`,
+      body,
+    ),
+  batchDelete: (companyId: string, body: ReceiptBatchBody) =>
+    api.post<ReceiptBatchResult>(
+      `${receiptBase(companyId)}/batch/delete`,
+      body,
+    ),
+  batchReprocess: (companyId: string, body: ReceiptBatchBody) =>
+    api.post<ReceiptBatchResult>(
+      `${receiptBase(companyId)}/batch/reprocess`,
+      body,
+    ),
+  export: receiptExport,
+  fileUrl: (companyId: string, receiptId: string) =>
+    `${receiptBase(companyId)}/${receiptId}/file`,
+  previewUrl: (companyId: string, receiptId: string) =>
+    `${receiptBase(companyId)}/${receiptId}/preview`,
+  settings: {
+    get: (companyId: string) =>
+      api.get<ReceiptCompanySettingsDto>(
+        `/api/companies/${companyId}/receipt-settings`,
+      ),
+    patch: (
+      companyId: string,
+      patch: Partial<Omit<ReceiptCompanySettingsDto, 'configVersion'>>,
+    ) => api.patch<ReceiptCompanySettingsDto>(
+      `/api/companies/${companyId}/receipt-settings`,
+      patch,
+    ),
+  },
 };
 
 export const tags = {

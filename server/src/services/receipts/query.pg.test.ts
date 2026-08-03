@@ -2,8 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
+  batchReceiptState,
+  getReceiptDuplicateGroups,
   getReceiptDetail,
   listReceipts,
+  receiptStats,
+  updateReceipt,
   type ReceiptQuery,
 } from './query.js';
 
@@ -30,6 +34,7 @@ const DEFAULT_QUERY: ReceiptQuery = {
 describePostgres('receipt library queries', () => {
   let db: PrismaClient;
   const companyIds = new Set<string>();
+  const userIds = new Set<string>();
 
   beforeAll(() => {
     db = new PrismaClient({
@@ -42,6 +47,11 @@ describePostgres('receipt library queries', () => {
     companyIds.clear();
     if (ids.length > 0) {
       await db.company.deleteMany({ where: { id: { in: ids } } });
+    }
+    const users = [...userIds];
+    userIds.clear();
+    if (users.length > 0) {
+      await db.user.deleteMany({ where: { id: { in: users } } });
     }
   });
 
@@ -261,5 +271,387 @@ describePostgres('receipt library queries', () => {
     expect(detail.attempts).toHaveLength(25);
     expect(detail.events).toHaveLength(100);
     expect(detail.attempts[0]?.generation).toBe(30);
+  });
+
+  it('projects revision-fenced edits without mutating extraction attempts', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-edit-${randomUUID()}`,
+        legalName: 'Synthetic Edit Company',
+        nickname: 'Edit',
+      },
+    });
+    companyIds.add(company.id);
+    const user = await db.user.create({
+      data: { email: `receipt-edit-${randomUUID()}@example.invalid` },
+    });
+    userIds.add(user.id);
+    const receipt = await createSearchableReceipt(
+      company.id,
+      '1'.repeat(64),
+      'Invented Original Vendor',
+    );
+
+    await expect(updateReceipt({
+      companyId: company.id,
+      documentId: receipt.id,
+      actorUserId: user.id,
+      expectedRevision: receipt.revision - 1,
+      patch: { vendorName: 'Invented Edited Vendor' },
+    }, { db })).rejects.toMatchObject({ code: 'RECEIPT_STALE' });
+
+    const updated = await updateReceipt({
+      companyId: company.id,
+      documentId: receipt.id,
+      actorUserId: user.id,
+      expectedRevision: receipt.revision,
+      patch: {
+        vendorName: 'Invented Edited Vendor',
+        vendorTaxId: 'synthetic-tax-id',
+        totalAmount: '14.25',
+        userNotes: 'Synthetic note',
+        approved: true,
+      },
+    }, { db });
+
+    expect(updated).toMatchObject({
+      revision: receipt.revision + 1,
+      approved: true,
+      userNotes: 'Synthetic note',
+      manuallyEdited: true,
+      currentExtraction: {
+        vendorName: 'Invented Edited Vendor',
+        vendorTaxId: 'synthetic-tax-id',
+        totalAmount: '14.25',
+      },
+    });
+    const attempt = await db.receiptExtractionAttempt.findFirstOrThrow({
+      where: { documentId: receipt.id },
+    });
+    expect(attempt.vendorName).toBe('Invented Original Vendor');
+    expect(attempt.totalAmount?.toString()).toBe('12.34');
+    const event = await db.receiptEvent.findFirstOrThrow({
+      where: { documentId: receipt.id, action: 'receipt_edited' },
+    });
+    expect(JSON.stringify(event)).not.toContain('synthetic-tax-id');
+    expect(event.after).toMatchObject({
+      changedFields: [
+        'approved',
+        'totalAmount',
+        'userNotes',
+        'vendorName',
+        'vendorTaxId',
+      ],
+    });
+    expect((await listReceipts(company.id, {
+      ...DEFAULT_QUERY,
+      search: 'Edited',
+    })).receipts.map((item) => item.id)).toEqual([receipt.id]);
+    expect((await listReceipts(company.id, {
+      ...DEFAULT_QUERY,
+      search: 'Original',
+    })).receipts).toHaveLength(0);
+  });
+
+  it('never projects or filters on a successful attempt from an old generation', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-current-generation-${randomUUID()}`,
+        legalName: 'Synthetic Current Generation Company',
+        nickname: 'Current generation',
+      },
+    });
+    companyIds.add(company.id);
+    const receipt = await createSearchableReceipt(
+      company.id,
+      '8'.repeat(64),
+      'Invented Old Generation Vendor',
+    );
+    await db.receiptDocument.update({
+      where: { id: receipt.id },
+      data: { generation: 2, status: 'QUEUED' },
+    });
+
+    const listed = await listReceipts(company.id, DEFAULT_QUERY, { db });
+    expect(listed.receipts[0]?.currentExtraction).toBeNull();
+    await expect(listReceipts(company.id, {
+      ...DEFAULT_QUERY,
+      search: 'Old Generation Vendor',
+    }, { db })).resolves.toMatchObject({ total: 0, receipts: [] });
+    await expect(getReceiptDetail(company.id, receipt.id, { db }))
+      .resolves.toMatchObject({ currentExtraction: null, candidates: [] });
+  });
+
+  it('invalidates a confirmed match when match-sensitive metadata changes', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-edit-match-${randomUUID()}`,
+        legalName: 'Synthetic Match Edit Company',
+        nickname: 'Match edit',
+      },
+    });
+    companyIds.add(company.id);
+    const user = await db.user.create({
+      data: { email: `receipt-edit-match-${randomUUID()}@example.invalid` },
+    });
+    userIds.add(user.id);
+    const receipt = await createSearchableReceipt(
+      company.id,
+      '7'.repeat(64),
+      'Invented Match Vendor',
+    );
+    const transaction = await db.transaction.create({
+      data: {
+        companyId: company.id,
+        qboId: `synthetic-${randomUUID()}`,
+        qboType: 'Purchase',
+        qboSyncToken: '0',
+        date: new Date('2026-07-30T00:00:00.000Z'),
+        payee: 'Invented Match Vendor',
+        amount: '-12.34',
+        bankAccount: 'Synthetic account',
+        revision: 4,
+      },
+    });
+    const attempt = await db.receiptExtractionAttempt.findFirstOrThrow({
+      where: { documentId: receipt.id },
+    });
+    await db.receiptMatchCandidate.create({
+      data: {
+        documentId: receipt.id,
+        extractionAttemptId: attempt.id,
+        transactionId: transaction.id,
+        transactionRevision: transaction.revision,
+        score: 92,
+        evidence: {},
+        rank: 1,
+        state: 'confirmed',
+      },
+    });
+    await db.receiptDocument.update({
+      where: { id: receipt.id },
+      data: {
+        status: 'MATCHED',
+        matchedTransactionId: transaction.id,
+        matchedTransactionRevision: transaction.revision,
+        approvedAt: new Date(),
+        approvedByUserId: user.id,
+      },
+    });
+
+    const updated = await updateReceipt({
+      companyId: company.id,
+      documentId: receipt.id,
+      actorUserId: user.id,
+      expectedRevision: receipt.revision,
+      patch: { totalAmount: '14.25' },
+    }, { db });
+
+    expect(updated).toMatchObject({
+      status: 'READY',
+      matchedTransactionId: null,
+      approved: false,
+    });
+    await expect(db.receiptMatchCandidate.findFirstOrThrow({
+      where: { documentId: receipt.id },
+    })).resolves.toMatchObject({ state: 'stale' });
+  });
+
+  it('rejects every edit while attachment work is in progress', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-edit-attaching-${randomUUID()}`,
+        legalName: 'Synthetic Attaching Edit Company',
+        nickname: 'Attaching edit',
+      },
+    });
+    companyIds.add(company.id);
+    const user = await db.user.create({
+      data: { email: `receipt-edit-attaching-${randomUUID()}@example.invalid` },
+    });
+    userIds.add(user.id);
+    const receipt = await createSearchableReceipt(
+      company.id,
+      '9'.repeat(64),
+      'Invented Attaching Vendor',
+    );
+    await db.receiptDocument.update({
+      where: { id: receipt.id },
+      data: { status: 'ATTACHING' },
+    });
+
+    await expect(updateReceipt({
+      companyId: company.id,
+      documentId: receipt.id,
+      actorUserId: user.id,
+      expectedRevision: receipt.revision,
+      patch: { userNotes: 'Synthetic note' },
+    }, { db })).rejects.toMatchObject({ code: 'RECEIPT_STALE' });
+    await expect(db.receiptDocument.findUniqueOrThrow({
+      where: { id: receipt.id },
+    })).resolves.toMatchObject({ revision: receipt.revision, status: 'ATTACHING' });
+  });
+
+  it('returns company-scoped dashboard totals and processing cost', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-stats-${randomUUID()}`,
+        legalName: 'Synthetic Stats Company',
+        nickname: 'Stats',
+      },
+    });
+    const other = await db.company.create({
+      data: {
+        realmId: `receipt-stats-other-${randomUUID()}`,
+        legalName: 'Synthetic Other Stats Company',
+        nickname: 'Other Stats',
+      },
+    });
+    companyIds.add(company.id);
+    companyIds.add(other.id);
+    const first = await createSearchableReceipt(
+      company.id,
+      '2'.repeat(64),
+      'Invented Stats Vendor',
+    );
+    await db.receiptExtractionAttempt.updateMany({
+      where: { documentId: first.id },
+      data: { taxAmount: '2.4000', costUsd: '0.01000000' },
+    });
+    const second = await createSearchableReceipt(
+      company.id,
+      '3'.repeat(64),
+      'Invented Queue Vendor',
+    );
+    await db.receiptDocument.update({
+      where: { id: second.id },
+      data: { status: 'QUEUED' },
+    });
+    await createSearchableReceipt(
+      other.id,
+      '4'.repeat(64),
+      'Invented Isolated Vendor',
+    );
+
+    const stats = await receiptStats(company.id, {
+      dateFrom: new Date('2000-01-01T00:00:00Z'),
+      dateTo: new Date('2100-01-01T00:00:00Z'),
+    }, { db });
+
+    expect(stats).toMatchObject({
+      received: 2,
+      needsReview: 0,
+      queued: 1,
+      processing: 0,
+      failed: 0,
+      totalByCurrency: [{ currency: 'USD', amount: '24.68' }],
+      totalByCategory: [{
+        category: 'Uncategorized',
+        currency: 'USD',
+        amount: '24.68',
+      }],
+      totalTaxByCurrency: [{ currency: 'USD', amount: '2.4' }],
+      processingCostUsd: '0.01',
+    });
+  });
+
+  it('groups duplicate document identities within one company', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-duplicates-${randomUUID()}`,
+        legalName: 'Synthetic Duplicate Company',
+        nickname: 'Duplicates',
+      },
+    });
+    companyIds.add(company.id);
+    const first = await createSearchableReceipt(
+      company.id,
+      '5'.repeat(64),
+      'Invented Duplicate Vendor',
+    );
+    const second = await createSearchableReceipt(
+      company.id,
+      '6'.repeat(64),
+      'Invented Duplicate Vendor',
+    );
+    await db.receiptExtractionAttempt.updateMany({
+      where: { documentId: { in: [first.id, second.id] } },
+      data: {
+        vendorReceiptId: 'synthetic-receipt-1',
+        receiptDate: new Date('2026-07-01T00:00:00Z'),
+      },
+    });
+
+    const groups = await getReceiptDuplicateGroups(company.id, { db });
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      reason: 'document_identity',
+      receipts: [
+        expect.objectContaining({ id: expect.any(String) }),
+        expect.objectContaining({ id: expect.any(String) }),
+      ],
+    });
+    expect(groups[0]?.receipts.map((item) => item.id).sort())
+      .toEqual([first.id, second.id].sort());
+  });
+
+  it('batch approves with one audit event per receipt and rejects stale input', async () => {
+    const company = await db.company.create({
+      data: {
+        realmId: `receipt-batch-${randomUUID()}`,
+        legalName: 'Synthetic Batch Company',
+        nickname: 'Batch',
+      },
+    });
+    companyIds.add(company.id);
+    const user = await db.user.create({
+      data: { email: `receipt-batch-${randomUUID()}@example.invalid` },
+    });
+    userIds.add(user.id);
+    const first = await createSearchableReceipt(
+      company.id,
+      '7'.repeat(64),
+      'Invented Batch One',
+    );
+    const second = await createSearchableReceipt(
+      company.id,
+      '8'.repeat(64),
+      'Invented Batch Two',
+    );
+
+    await expect(batchReceiptState({
+      companyId: company.id,
+      actorUserId: user.id,
+      action: 'approve',
+      receipts: [
+        { id: first.id, expectedRevision: first.revision },
+        { id: second.id, expectedRevision: second.revision + 1 },
+      ],
+    }, { db })).rejects.toMatchObject({ code: 'RECEIPT_STALE' });
+    expect(await db.receiptDocument.count({
+      where: { id: { in: [first.id, second.id] }, approvedAt: { not: null } },
+    })).toBe(0);
+
+    const result = await batchReceiptState({
+      companyId: company.id,
+      actorUserId: user.id,
+      action: 'approve',
+      receipts: [
+        { id: first.id, expectedRevision: first.revision },
+        { id: second.id, expectedRevision: second.revision },
+      ],
+    }, { db });
+
+    expect(result).toEqual({ updated: 2 });
+    expect(await db.receiptDocument.count({
+      where: { id: { in: [first.id, second.id] }, approvedAt: { not: null } },
+    })).toBe(2);
+    expect(await db.receiptEvent.count({
+      where: {
+        documentId: { in: [first.id, second.id] },
+        action: 'receipt_approved',
+      },
+    })).toBe(2);
   });
 });
