@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  QboAttachmentNotFoundError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
@@ -1230,7 +1231,7 @@ export class MockQboClient implements QboClient {
     const record = this.realm.attachments.find(
       (attachment) => attachment.id === id,
     );
-    if (!record) throw new Error(`Mock QBO: attachment ${id} not found`);
+    if (!record) throw new QboAttachmentNotFoundError();
     const content = Buffer.from(record.contentBase64, 'base64');
     return {
       contentType: record.contentType,

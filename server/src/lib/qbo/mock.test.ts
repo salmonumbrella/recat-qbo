@@ -15,6 +15,7 @@ import {
 } from './mock.js';
 import type { StagedCategorization } from '@recat/shared';
 import {
+  QboAttachmentNotFoundError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type RawPurchase,
@@ -220,6 +221,12 @@ describe('MockQboClient attachments', () => {
       requestId: 'request-4',
     });
     await expect(c.getAttachment('external-1')).resolves.toBeNull();
+  });
+
+  it('uses a typed error when attachment content is absent', async () => {
+    await expect(
+      client().openAttachmentDownload('missing-attachment'),
+    ).rejects.toBeInstanceOf(QboAttachmentNotFoundError);
   });
 });
 
