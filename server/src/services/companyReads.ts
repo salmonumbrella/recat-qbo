@@ -653,6 +653,12 @@ function tagDto(row: Row): TagDto {
 }
 
 function ruleDto(row: Row): RuleDto {
+  const candidateOrigin =
+    row.candidateOrigin &&
+    typeof row.candidateOrigin === 'object' &&
+    !Array.isArray(row.candidateOrigin)
+      ? row.candidateOrigin as Row
+      : null;
   return {
     id: String(row.id),
     companyId: String(row.companyId),
@@ -672,6 +678,18 @@ function ruleDto(row: Row): RuleDto {
     tagIds: Array.isArray(row.ruleTags) ? (row.ruleTags as Row[]).map((tag) => String(tag.tagId)) : [],
     autoPost: row.autoPost === true,
     createdAt: iso(row.createdAt),
+    reviewRequiredAt: row.reviewRequiredAt == null ? null : iso(row.reviewRequiredAt),
+    reviewReason: typeof row.reviewReason === 'string' ? row.reviewReason : null,
+    origin: candidateOrigin
+      ? {
+          candidateId: String(candidateOrigin.id),
+          evidenceCount: Number(
+            candidateOrigin.activationEvidenceCount ?? candidateOrigin.evidenceCount,
+          ),
+          schemaVersion: String(candidateOrigin.schemaVersion),
+          configVersion: String(candidateOrigin.configVersion),
+        }
+      : null,
   };
 }
 
@@ -1082,7 +1100,10 @@ export function createCompanyReadService(
       model: db.rule,
       where: {},
       orderField: 'priority',
-      include: { ruleTags: { select: { tagId: true } } },
+      include: {
+        ruleTags: { select: { tagId: true } },
+        candidateOrigin: true,
+      },
       map: ruleDto,
     });
     if (base.items.length === 0) return { items: [], nextCursor: base.nextCursor };

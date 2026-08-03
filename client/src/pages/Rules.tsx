@@ -4,9 +4,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
-import type { RuleDto, RuleTestResult } from '@recat/shared';
+import type { RuleCandidateDto, RuleDto, RuleTestResult } from '@recat/shared';
 import { isUsableTaxCodeDto } from '@recat/shared';
-import { rules as rulesApi } from '../lib/api';
+import { ruleCandidates as ruleCandidatesApi, rules as rulesApi } from '../lib/api';
 import type { RuleBody } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { useApp } from '../state/AppContext';
@@ -91,6 +91,14 @@ export default function Rules() {
   const { activeCompanyId, accounts, tags, taxReadiness, toast } = useApp();
 
   const [ruleList, setRuleList] = useState<RuleDto[]>([]);
+  const [candidateList, setCandidateList] = useState<RuleCandidateDto[]>([]);
+  const [candidateCursor, setCandidateCursor] = useState<string | null>(null);
+  const [candidateLoadingMore, setCandidateLoadingMore] = useState(false);
+  const [candidateBusy, setCandidateBusy] = useState<string | null>(null);
+  const activeCompanyIdRef = useRef(activeCompanyId);
+  const candidatePageRequest = useRef(0);
+  const candidateActionRequest = useRef(0);
+  activeCompanyIdRef.current = activeCompanyId;
   // Bumped per rule when a matchText PATCH fails, so the (uncontrolled) input
   // re-mounts and shows the server's value again.
   const [matchResets, setMatchResets] = useState<Record<string, number>>({});
@@ -131,15 +139,37 @@ export default function Rules() {
 
   // ---- load rules (server returns match order: priority asc — render as-is) ----
   useEffect(() => {
+    const companyId = activeCompanyId;
+    const candidateRequestId = ++candidatePageRequest.current;
+    candidateActionRequest.current += 1;
     setRuleList([]);
+    setCandidateList([]);
+    setCandidateCursor(null);
+    setCandidateLoadingMore(false);
+    setCandidateBusy(null);
     setTestRes(null);
-    if (!activeCompanyId) return;
+    if (!companyId) return;
     let cancelled = false;
     rulesApi
-      .list(activeCompanyId)
+      .list(companyId)
       .then((list) => {
         if (cancelled) return;
         setRuleList(list);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) toast(err.message);
+      });
+    ruleCandidatesApi
+      .list(companyId)
+      .then((page) => {
+        if (
+          !cancelled &&
+          candidatePageRequest.current === candidateRequestId &&
+          activeCompanyIdRef.current === companyId
+        ) {
+          setCandidateList(page.candidates);
+          setCandidateCursor(page.nextCursor);
+        }
       })
       .catch((err: Error) => {
         if (!cancelled) toast(err.message);
@@ -148,6 +178,98 @@ export default function Rules() {
       cancelled = true;
     };
   }, [activeCompanyId, toast]);
+
+  const loadMoreCandidates = useCallback(() => {
+    if (!activeCompanyId || !candidateCursor || candidateLoadingMore) return;
+    const companyId = activeCompanyId;
+    const requestId = ++candidatePageRequest.current;
+    setCandidateLoadingMore(true);
+    ruleCandidatesApi
+      .list(companyId, candidateCursor)
+      .then((page) => {
+        if (
+          candidatePageRequest.current !== requestId ||
+          activeCompanyIdRef.current !== companyId
+        ) return;
+        setCandidateList((current) => {
+          const existing = new Set(current.map((candidate) => candidate.id));
+          return [
+            ...current,
+            ...page.candidates.filter((candidate) => !existing.has(candidate.id)),
+          ];
+        });
+        setCandidateCursor(page.nextCursor);
+      })
+      .catch((err: Error) => {
+        if (
+          candidatePageRequest.current === requestId &&
+          activeCompanyIdRef.current === companyId
+        ) toast(err.message);
+      })
+      .finally(() => {
+        if (
+          candidatePageRequest.current === requestId &&
+          activeCompanyIdRef.current === companyId
+        ) setCandidateLoadingMore(false);
+      });
+  }, [activeCompanyId, candidateCursor, candidateLoadingMore, toast]);
+
+  const activateCandidate = useCallback(
+    (candidate: RuleCandidateDto) => {
+      if (!activeCompanyId || candidateBusy !== null) return;
+      const companyId = activeCompanyId;
+      const requestId = ++candidateActionRequest.current;
+      const requestIsCurrent = () =>
+        candidateActionRequest.current === requestId &&
+        activeCompanyIdRef.current === companyId;
+      setCandidateBusy(candidate.id);
+      ruleCandidatesApi
+        .activate(companyId, candidate.id)
+        .then(() => {
+          if (!requestIsCurrent()) return null;
+          setCandidateList((current) => current.filter((row) => row.id !== candidate.id));
+          return rulesApi.list(companyId);
+        })
+        .then((list) => {
+          if (!list || !requestIsCurrent()) return;
+          setRuleList(list);
+          toast('Rule activated — auto-post remains off');
+        })
+        .catch((err: Error) => {
+          if (requestIsCurrent()) toast(err.message);
+        })
+        .finally(() => {
+          if (requestIsCurrent()) setCandidateBusy(null);
+        });
+    },
+    [activeCompanyId, candidateBusy, toast],
+  );
+
+  const dismissCandidate = useCallback(
+    (candidate: RuleCandidateDto) => {
+      if (!activeCompanyId || candidateBusy !== null) return;
+      const companyId = activeCompanyId;
+      const requestId = ++candidateActionRequest.current;
+      const requestIsCurrent = () =>
+        candidateActionRequest.current === requestId &&
+        activeCompanyIdRef.current === companyId;
+      setCandidateBusy(candidate.id);
+      ruleCandidatesApi
+        .dismiss(companyId, candidate.id)
+        .then(() => {
+          if (!requestIsCurrent()) return;
+          setCandidateList((current) => current.filter((row) => row.id !== candidate.id));
+          toast('Rule candidate dismissed');
+        })
+        .catch((err: Error) => {
+          if (requestIsCurrent()) toast(err.message);
+        })
+        .finally(() => {
+          if (requestIsCurrent()) setCandidateBusy(null);
+        });
+    },
+    [activeCompanyId, candidateBusy, toast],
+  );
 
   // Close the tags dropdown on any outside click (prototype closes menus on root click).
   useEffect(() => {
@@ -384,6 +506,98 @@ export default function Rules() {
           <InfoDot tip={RULES_TIP} />
         </div>
       </div>
+      {(candidateList.length > 0 || candidateCursor !== null) && (
+        <section style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 650, marginBottom: 5 }}>
+            Learned rule candidates
+          </div>
+          <div style={{ color: 'var(--mut)', fontSize: 13.5, marginBottom: 10 }}>
+            Recat proposes these only after three current verified outcomes agree.
+            Review is required; activating creates a normal rule and never posts automatically.
+          </div>
+          <div className="card">
+            {candidateList.map((candidate) => {
+              const people = candidate.provenance.user;
+              const autopilot = candidate.provenance.autopilot;
+              const mcp = candidate.provenance.mcp;
+              const appliedTags = candidate.tagIds
+                .map((id) => tagById.get(id)?.name)
+                .filter((name): name is string => Boolean(name));
+              const provenance = [
+                `${people} reviewed by a person`,
+                `${autopilot} by autopilot`,
+                ...(mcp > 0 ? [`${mcp} through MCP`] : []),
+              ].join(' · ');
+              return (
+                <div
+                  key={candidate.id}
+                  style={{
+                    padding: '15px 18px',
+                    borderBottom: '1px solid var(--rowbd)',
+                    display: 'grid',
+                    gap: 8,
+                  }}
+                >
+                  <div style={{ display: 'flex', gap: 12, justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={{ fontWeight: 650 }}>{candidate.matchText}</div>
+                      <div style={{ color: 'var(--mut)', fontSize: 13.5, marginTop: 3 }}>
+                        {candidate.category ?? 'Unavailable category'}
+                        {candidate.taxCode ? ` · ${candidate.taxCode}` : ''}
+                        {appliedTags.length > 0 ? ` · ${appliedTags.join(', ')}` : ''}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <button
+                        className="btn-ghost"
+                        onClick={() => dismissCandidate(candidate)}
+                        disabled={candidateBusy !== null}
+                      >
+                        Dismiss
+                      </button>
+                      {candidate.canActivate && (
+                        <button
+                          className="rules-add-btn"
+                          onClick={() => activateCandidate(candidate)}
+                          disabled={candidateBusy !== null}
+                        >
+                          Activate rule
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ color: 'var(--fnt)', fontSize: 12.5 }}>
+                    {candidate.evidenceCount} verified outcomes · {provenance}
+                  </div>
+                  {candidate.conflictingEvidenceCount > 0 && (
+                    <div role="alert" style={{ color: 'var(--amT)', fontSize: 12.5 }}>
+                      {candidate.conflictingEvidenceCount} conflicting outcome
+                      {candidate.conflictingEvidenceCount === 1 ? '' : 's'} — activation is blocked.
+                    </div>
+                  )}
+                  {candidate.staleReasons.map((reason) => (
+                    <div key={reason} role="alert" style={{ color: 'var(--erT)', fontSize: 12.5 }}>
+                      {reason}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+            {candidateCursor && (
+              <div style={{ padding: '12px 18px', textAlign: 'center' }}>
+                <button
+                  className="btn-ghost"
+                  onClick={loadMoreCandidates}
+                  disabled={candidateLoadingMore}
+                  aria-label="Load more candidates"
+                >
+                  {candidateLoadingMore ? 'Loading…' : 'Load more candidates'}
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
       <div className="card">
         <div className="rules-head">
           <span></span>
@@ -562,6 +776,29 @@ export default function Rules() {
                 >
                   Tax reference unavailable: {rule.taxCode ?? rule.taxCodeQboId}. This rule will not
                   apply tax until the reference is valid again.
+                </span>
+              )}
+              {rule.origin && (
+                <span
+                  style={{
+                    gridColumn: '2 / -1',
+                    color: 'var(--mut)',
+                    fontSize: 12.5,
+                  }}
+                >
+                  Learned from {rule.origin.evidenceCount} verified outcomes · auto-post started off
+                </span>
+              )}
+              {rule.reviewRequiredAt && (
+                <span
+                  role="alert"
+                  style={{
+                    gridColumn: '2 / -1',
+                    color: 'var(--amT)',
+                    fontSize: 12.5,
+                  }}
+                >
+                  Review required: {rule.reviewReason ?? 'verified outcomes changed'}
                 </span>
               )}
             </div>

@@ -319,6 +319,14 @@ const ruleOutput = z.strictObject({
   tagIds: z.array(id).max(MAX_READ_LIMIT),
   autoPost: z.boolean(),
   createdAt: isoDate,
+  reviewRequiredAt: nullableIsoDate,
+  reviewReason: nullableText,
+  origin: z.strictObject({
+    candidateId: id,
+    evidenceCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    schemaVersion: text,
+    configVersion: text,
+  }).nullable(),
   valid: z.boolean(),
   invalidReasons: z.array(text).max(4),
 });

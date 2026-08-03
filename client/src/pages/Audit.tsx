@@ -9,6 +9,7 @@ import type { AuditAction, AuditEntryDto } from '@recat/shared';
 import { audit as auditApi } from '../lib/api';
 import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
+import { AutopilotQueueStatus } from './settings/AutopilotCard';
 
 // Grid `150px 110px 1fr 120px 1.4fr`; ≤640px rows switch to flex-wrap with
 // gap 3px 14px and the header hides (prototype auditDisp / auditGap / deskQ).
@@ -107,6 +108,13 @@ export default function Audit() {
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto', padding: '28px clamp(14px,3.5vw,32px) 80px' }}>
       <style>{AUDIT_CSS}</style>
+      {activeCompanyId && (
+        <AutopilotQueueStatus
+          key={`audit-autopilot-${activeCompanyId}`}
+          companyId={activeCompanyId}
+          surface="audit"
+        />
+      )}
       <div
         style={{
           display: 'flex',

@@ -6,6 +6,7 @@ import type { InstanceSettingsDto, SuggestionProvider, SuggestionSetting } from 
 import { env, redirectUri } from '../env.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { prisma } from '../lib/prisma.js';
+import { runSerializableTransaction } from '../lib/serializableTransaction.js';
 
 const SETTING_KEYS = [
   'intuitClientId',
@@ -37,6 +38,28 @@ const ENCRYPTED_KEYS: ReadonlySet<SettingKey> = new Set([
   'openrouterApiKey',
   'smtpPass',
 ]);
+
+const LIVE_AUTHORITY_SETTING_KEYS: ReadonlySet<SettingKey> = new Set([
+  'intuitClientId',
+  'intuitClientSecret',
+  'suggestionProvider',
+  'suggestionModel',
+  'agentDecisionModel',
+  'agentVerifierModel',
+  'aiEndpoint',
+  'aiApiKey',
+  'openrouterApiKey',
+  'openrouterReferer',
+  'openrouterTitle',
+]);
+
+export interface InstanceSettingsDb {
+  appConfig: {
+    findMany(args: {
+      where: { key: { in: readonly SettingKey[] } };
+    }): Promise<{ key: string; value: string; encrypted: boolean }[]>;
+  };
+}
 
 /** Plaintext settings — server-internal only, never serialized to a client. */
 export interface InstanceSettings {
@@ -83,8 +106,10 @@ export interface InstanceSettingsPatch {
   smtpFrom?: string;
 }
 
-async function readStored(): Promise<Partial<Record<SettingKey, string>>> {
-  const rows = await prisma.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
+async function readStored(
+  db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+): Promise<Partial<Record<SettingKey, string>>> {
+  const rows = await db.appConfig.findMany({ where: { key: { in: [...SETTING_KEYS] } } });
   const out: Partial<Record<SettingKey, string>> = {};
   for (const row of rows) {
     const key = row.key as SettingKey;
@@ -112,8 +137,10 @@ function normalizeSmtpPort(v: string | undefined): number {
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : 587;
 }
 
-export async function getInstanceSettings(): Promise<InstanceSettings> {
-  const stored = await readStored();
+export async function getInstanceSettings(
+  db: InstanceSettingsDb = prisma as unknown as InstanceSettingsDb,
+): Promise<InstanceSettings> {
+  const stored = await readStored(db);
   // SMTP is env-managed as a block: SMTP_HOST set → all five values come from
   // env (SMTP_PORT/SMTP_FROM carry zod defaults, so per-field precedence would
   // silently mix sources).
@@ -198,16 +225,33 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
 }
 
 export async function updateInstanceSettings(patch: InstanceSettingsPatch): Promise<void> {
-  for (const key of SETTING_KEYS) {
-    const rawValue = patch[key];
-    if (rawValue === undefined) continue;
-    const raw = String(rawValue); // smtpPort arrives as a number; AppConfig stores strings
-    const shouldEncrypt = ENCRYPTED_KEYS.has(key) && raw !== '';
-    const value = shouldEncrypt ? encrypt(raw) : raw;
-    await prisma.appConfig.upsert({
-      where: { key },
-      update: { value, encrypted: shouldEncrypt },
-      create: { key, value, encrypted: shouldEncrypt },
-    });
-  }
+  await runSerializableTransaction(prisma, async (transaction) => {
+    let invalidatesLiveAuthority = false;
+    for (const key of SETTING_KEYS) {
+      const rawValue = patch[key];
+      if (rawValue === undefined) continue;
+      const raw = String(rawValue); // smtpPort arrives as a number; AppConfig stores strings
+      const shouldEncrypt = ENCRYPTED_KEYS.has(key) && raw !== '';
+      const value = shouldEncrypt ? encrypt(raw) : raw;
+      await transaction.appConfig.upsert({
+        where: { key },
+        update: { value, encrypted: shouldEncrypt },
+        create: { key, value, encrypted: shouldEncrypt },
+      });
+      invalidatesLiveAuthority ||= LIVE_AUTHORITY_SETTING_KEYS.has(key);
+    }
+    if (invalidatesLiveAuthority) {
+      await transaction.agentCompanyConfig.updateMany({
+        where: { liveRequested: true },
+        data: {
+          liveAcceptedPolicyVersion: null,
+          liveAcceptedConfigVersion: null,
+          liveAcceptedProviderBinding: null,
+          livePausedAt: new Date(),
+          livePauseCode: 'LIVE_POLICY_NOT_ACCEPTED',
+          livePauseMessage: 'Live mode is paused: The current live policy must be accepted.',
+        },
+      });
+    }
+  });
 }

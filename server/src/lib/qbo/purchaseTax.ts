@@ -613,17 +613,52 @@ function canonicalSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): stri
   ]);
 }
 
-function targetSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
-  return JSON.stringify([
-    line.amountCents,
-    line.description,
-    line.accountQboId,
-    line.customerQboId,
-    line.classQboId,
-    line.taxCodeQboId,
-    line.taxAmountCents,
-    line.taxInclusiveCents,
-  ]);
+function zeroOrUnspecifiedTax(value: number | null): boolean {
+  return value === 0 || value === null;
+}
+
+export function purchaseTotalTaxMatches(
+  globalTaxCalculation: string | null,
+  expected: number | null,
+  actual: number | null,
+): boolean {
+  return expected === actual
+    || (
+      globalTaxCalculation === 'NotApplicable'
+      && zeroOrUnspecifiedTax(expected)
+      && zeroOrUnspecifiedTax(actual)
+    );
+}
+
+export function purchaseTargetLineMatches(
+  globalTaxCalculation: string | null,
+  expectedTotalTaxCents: number | null,
+  actualTotalTaxCents: number | null,
+  expected: QboPurchaseSnapshot['lines'][number],
+  actual: QboPurchaseSnapshot['lines'][number],
+): boolean {
+  const providerDefaultNonTaxCode =
+    globalTaxCalculation === 'NotApplicable'
+    && zeroOrUnspecifiedTax(expectedTotalTaxCents)
+    && zeroOrUnspecifiedTax(actualTotalTaxCents)
+    && expected.taxCodeQboId === null
+    && typeof actual.taxCodeQboId === 'string'
+    && actual.taxCodeQboId.trim() !== ''
+    && expected.taxAmountCents === null
+    && actual.taxAmountCents === null
+    && expected.taxInclusiveCents === null
+    && actual.taxInclusiveCents === null;
+  return expected.amountCents === actual.amountCents
+    && expected.description === actual.description
+    && expected.accountQboId === actual.accountQboId
+    && expected.customerQboId === actual.customerQboId
+    && expected.classQboId === actual.classQboId
+    && (
+      expected.taxCodeQboId === actual.taxCodeQboId
+      || providerDefaultNonTaxCode
+    )
+    && expected.taxAmountCents === actual.taxAmountCents
+    && expected.taxInclusiveCents === actual.taxInclusiveCents;
 }
 
 function assertSnapshotEqualsBefore(actual: QboPurchaseSnapshot, before: QboPurchaseSnapshot): void {
@@ -877,7 +912,11 @@ function assertExpectedCurrent(
     actual.date !== expected.date ||
     actual.direction !== expected.direction ||
     actual.globalTaxCalculation !== expected.globalTaxCalculation ||
-    actual.totalTaxCents !== expected.totalTaxCents
+    !purchaseTotalTaxMatches(
+      expected.globalTaxCalculation,
+      expected.totalTaxCents,
+      actual.totalTaxCents,
+    )
   ) {
     return preparationError('QBO_STATE_DRIFT', 'Purchase fields drifted before restore preparation.');
   }
@@ -893,7 +932,14 @@ function assertExpectedCurrent(
   }
   const targetIndexes: number[] = [];
   for (const target of expected.targetLines) {
-    const index = remaining.findIndex(({ line }) => targetSnapshotLine(line) === targetSnapshotLine(target));
+    const index = remaining.findIndex(({ line }) =>
+      purchaseTargetLineMatches(
+        expected.globalTaxCalculation,
+        expected.totalTaxCents,
+        actual.totalTaxCents,
+        target,
+        line,
+      ));
     if (index === -1) {
       return preparationError('QBO_STATE_DRIFT', 'Prepared Purchase target line drifted before restore.');
     }

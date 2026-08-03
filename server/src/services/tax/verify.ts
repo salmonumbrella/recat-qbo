@@ -1,4 +1,8 @@
 import type { QboPurchaseSnapshot } from '../../lib/qbo/types.js';
+import {
+  purchaseTargetLineMatches,
+  purchaseTotalTaxMatches,
+} from '../../lib/qbo/purchaseTax.js';
 
 type PurchaseLine = QboPurchaseSnapshot['lines'][number];
 
@@ -72,7 +76,6 @@ function omittedInclusiveTotalTaxMatches(
   }
   return derivedTotalTaxCents === expectedTotalTaxCents;
 }
-
 function drift(message: string): PurchaseVerification {
   return { ok: false, code: 'QBO_STATE_DRIFT', message };
 }
@@ -87,13 +90,27 @@ export function verifyPurchaseResult(
   if (actual.date !== expected.date) return drift('Purchase date changed.');
   if (actual.direction !== expected.direction) return drift('Purchase direction changed.');
   if (actual.globalTaxCalculation !== expected.globalTaxCalculation) return drift('Purchase global tax mode changed.');
-  if (!omittedInclusiveTotalTaxMatches(expected.totalTaxCents, actual)) {
+  if (
+    !purchaseTotalTaxMatches(
+      expected.globalTaxCalculation,
+      expected.totalTaxCents,
+      actual.totalTaxCents,
+    )
+    && !omittedInclusiveTotalTaxMatches(expected.totalTaxCents, actual)
+  ) {
     return drift('Purchase total tax changed.');
   }
 
   const remainingLines = [...actual.lines];
   for (const targetLine of expected.targetLines) {
-    const targetIndex = remainingLines.findIndex((line) => targetLineHash(line) === targetLineHash(targetLine));
+    const targetIndex = remainingLines.findIndex((line) =>
+      purchaseTargetLineMatches(
+        expected.globalTaxCalculation,
+        expected.totalTaxCents,
+        actual.totalTaxCents,
+        targetLine,
+        line,
+      ) || targetLineHash(line) === targetLineHash(targetLine));
     if (targetIndex === -1) return drift('Expected target Purchase line is missing or changed.');
     remainingLines.splice(targetIndex, 1);
   }

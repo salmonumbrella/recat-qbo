@@ -25,6 +25,7 @@ import {
   rebuildDepositLines,
   rebuildJournalEntryLines,
   rebuildPurchaseLines,
+  revokeIntuitToken,
   sumLinesPostingTo,
   type RawDeposit,
   type RawJournalEntry,
@@ -34,6 +35,7 @@ import {
 import { hashLineWriteContent } from './lineWrite.js';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -76,6 +78,44 @@ describe('OAuth token errors', () => {
 
     expect(error).toBeInstanceOf(QboAuthError);
     expect(error).toMatchObject({ reason: 'INTUIT_UNAVAILABLE' });
+  });
+});
+
+describe('OAuth token revocation', () => {
+  it('aborts a delayed best-effort revoke at the explicit timeout without logging its capability', async () => {
+    vi.useFakeTimers();
+    let settleFetch: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((resolve, reject) => {
+        settleFetch = resolve;
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      }));
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const warnLog = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const revoking = revokeIntuitToken({
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      token: 'REFRESH_TOKEN_SENTINEL',
+    });
+
+    try {
+      const request = fetchMock.mock.calls[0]?.[1];
+      expect(request?.signal).toBeInstanceOf(AbortSignal);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(request?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(request?.signal?.aborted).toBe(true);
+      await expect(revoking).resolves.toBeUndefined();
+      expect(errorLog).not.toHaveBeenCalled();
+      expect(warnLog).not.toHaveBeenCalled();
+    } finally {
+      settleFetch?.(new Response('', { status: 200 }));
+      await revoking;
+    }
   });
 });
 
@@ -182,6 +222,70 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     });
     await expect(client.fetchPurchaseSnapshot('missing')).resolves.toBeNull();
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/purchase/P%2F1?minorversion=75');
+  });
+
+  it('propagates reconciliation cancellation to the actual Purchase GET', async () => {
+    let rejectFetch: ((error: Error) => void) | undefined;
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        rejectFetch = reject;
+        init?.signal?.addEventListener('abort', () => {
+          reject(new Error('aborted'));
+        });
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    const reading = realClient().client.fetchPurchaseSnapshot(
+      'purchase-generic',
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    controller.abort();
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+    await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+    rejectFetch?.(new Error('settled'));
+  });
+
+  it('cancels while token refresh is pending and never starts a late Purchase GET', async () => {
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn(async () =>
+      new Promise<Response>((resolve) => {
+        resolveRefresh = resolve;
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onTokensRefreshed = vi.fn(async () => undefined);
+    const client = new RealQboClient({
+      realmId: 'realm-generic',
+      environment: 'sandbox',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+      tokens: {
+        accessToken: 'expired-access',
+        refreshToken: 'refresh-token',
+        expiresAt: Date.now() - 1,
+      },
+      holdingAccountQboIds: [],
+      onTokensRefreshed,
+    });
+    const controller = new AbortController();
+
+    const reading = client.fetchPurchaseSnapshot(
+      'purchase-generic',
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+
+    resolveRefresh?.(new Response(JSON.stringify({
+      access_token: 'fresh-access',
+      refresh_token: 'fresh-refresh',
+      expires_in: 3600,
+    })));
+    await vi.waitFor(() => expect(onTokensRefreshed).toHaveBeenCalledOnce());
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('refreshes once after a 401 and retries a tax-profile request', async () => {

@@ -66,6 +66,7 @@ function createDb(companyIds = ['company-1']) {
     }),
   });
   const db = {
+    $queryRawUnsafe: vi.fn(async () => [{ locked: 1 }]),
     company: {
       findUniqueOrThrow: vi.fn(async ({ where }: { where: { id: string } }) => {
         const company = companies.get(where.id);

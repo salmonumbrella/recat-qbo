@@ -592,6 +592,7 @@ describe('postTransaction guards', () => {
 const DURABLE_COMPANY_ID = '00000000-0000-4000-8000-000000000110';
 const DURABLE_TRANSACTION_ID = '00000000-0000-4000-8000-000000000120';
 const DURABLE_ACTOR_ID = '00000000-0000-4000-8000-000000000130';
+const DURABLE_TAG_ID = '00000000-0000-4000-8000-000000000140';
 
 const beforePurchase: QboPurchaseSnapshot = {
   qboId: 'purchase-generic',
@@ -745,9 +746,18 @@ function durableTransaction() {
       taxCode: 'Generic tax',
       taxCodeQboId: 'tax-generic',
       memo: 'Prepared purchase',
+      tags: [{ tagId: DURABLE_TAG_ID }],
     }],
-    txnTags: [] as { tagId: string }[],
+    txnTags: [{ tagId: DURABLE_TAG_ID }],
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 class FakeDurableDb {
@@ -764,11 +774,42 @@ class FakeDurableDb {
   private sequence = 0;
   private failNextAttemptRead = false;
 
+  $queryRawUnsafe = vi.fn(async () => [{ locked: 1 }]);
+
+  agentCompanyConfig = {
+    findUnique: vi.fn(async () => ({ configVersion: 'verified-writeback-v1' })),
+  };
+
   transaction = {
     findUnique: vi.fn(async () => this.transactionRow),
     update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
       Object.assign(this.transactionRow, data);
       return this.transactionRow;
+    }),
+    updateMany: vi.fn(async ({ where, data }: {
+      where: {
+        id: string;
+        companyId: string;
+        qboType: string;
+        qboId: string;
+        qboSyncToken: string;
+        revision: number;
+        status: string;
+      };
+      data: Record<string, unknown>;
+    }) => {
+      const row = this.transactionRow;
+      if (
+        row.id !== where.id
+        || row.companyId !== where.companyId
+        || row.qboType !== where.qboType
+        || row.qboId !== where.qboId
+        || row.qboSyncToken !== where.qboSyncToken
+        || row.revision !== where.revision
+        || row.status !== where.status
+      ) return { count: 0 };
+      Object.assign(row, data);
+      return { count: 1 };
     }),
   };
 
@@ -940,8 +981,14 @@ class FakeDurableDb {
     try {
       return await callback(this);
     } catch (error) {
+      const concurrentAttempts = (
+        typeof error === 'object'
+        && error !== null
+        && 'code' in error
+        && error.code === 'P2002'
+      ) ? this.attempts : null;
       this.transactionRow = transactionBefore;
-      this.attempts = attemptsBefore;
+      this.attempts = concurrentAttempts ?? attemptsBefore;
       throw error;
     }
   }
@@ -1020,6 +1067,7 @@ function durableDeps(
   const leaseOwners: string[] = [];
   let invocationSequence = 0;
   const invocationId = vi.fn(() => `invocation-${++invocationSequence}`);
+  const onVerifiedCategorizationOutcome = vi.fn(async () => undefined);
   const deps: DurableWritebackDeps = {
     db: db as unknown as DurableWritebackDb,
     getClient,
@@ -1033,6 +1081,7 @@ function durableDeps(
     renewLease,
     invocationId,
     now: () => new Date('2026-07-28T12:00:00.000Z'),
+    onVerifiedCategorizationOutcome,
     ...overrides,
   };
   return {
@@ -1042,6 +1091,7 @@ function durableDeps(
     authorize,
     renewLease,
     invocationId,
+    onVerifiedCategorizationOutcome,
     leaseOwners,
     client,
     getClient,
@@ -1147,6 +1197,19 @@ function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number)
 }
 
 describe('commitStagedCategorization durable lifecycle', () => {
+  it('keeps null actors forbidden on the public durable write path', async () => {
+    const fixture = durableDeps();
+    fixture.authorize.mockImplementation(async (actorId) => actorId !== null);
+
+    await expect(commitStagedCategorization({
+      ...commitInput(),
+      actor: { id: null, label: 'Untrusted system input' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('loads only active tax rates so inactive legacy null rows cannot break a live commit', async () => {
     const fixture = durableDeps();
     fixture.db.qboTaxRate.findMany.mockImplementation(async (args) => {
@@ -1209,6 +1272,118 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
     expect(fixture.getClient).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('emits the canonical staged categorization only after the verified state is durable', async () => {
+    const fixture = durableDeps();
+    fixture.onVerifiedCategorizationOutcome.mockImplementationOnce(async (outcome) => {
+      expect(fixture.db.attempts[0]?.status).toBe('VERIFIED');
+      expect(fixture.db.transactionRow.status).toBe('POSTED');
+      expect(outcome).toEqual({
+        companyId: DURABLE_COMPANY_ID,
+        transactionId: DURABLE_TRANSACTION_ID,
+        inputRevision: 1,
+        requestId: 'request-generic',
+        operation: 'posted',
+        proposal: {
+          taxCalculation: 'TaxInclusive',
+          lines: [{
+            idx: 0,
+            subtotalCents: -1000,
+            taxCents: -50,
+            totalCents: -1050,
+            categoryQboId: 'expense-generic',
+            taxCodeQboId: 'tax-generic',
+            memo: 'Prepared purchase',
+            tagIds: [DURABLE_TAG_ID],
+          }],
+          tagIds: [DURABLE_TAG_ID],
+        },
+        candidateContext: {
+          schemaVersion: 'rule-candidate-v1',
+          matchField: 'payee',
+          matchText: 'generic supplier',
+          conditionFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          configVersion: 'verified-writeback-v1',
+          source: 'user',
+        },
+      });
+    });
+
+    const result = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(result).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a verified write verified when evidence evaluation fails and retries the hook on replay', async () => {
+    const fixture = durableDeps();
+    fixture.onVerifiedCategorizationOutcome.mockRejectedValue(new Error('evaluation unavailable'));
+
+    const first = await commitStagedCategorization(commitInput(), fixture.deps);
+    const replay = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(first).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(replay).toEqual(first);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not emit evidence outcomes for dry runs or uncertain writes', async () => {
+    const dryRun = durableDeps();
+    dryRun.db.transactionRow.company.dryRun = true;
+    await commitStagedCategorization(commitInput(), dryRun.deps);
+    expect(dryRun.onVerifiedCategorizationOutcome).not.toHaveBeenCalled();
+
+    const uncertain = durableDeps();
+    uncertain.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockResolvedValueOnce({ ...structuredClone(verifiedPurchase), totalCents: -999 });
+    await commitStagedCategorization(commitInput(), uncertain.deps);
+    expect(uncertain.onVerifiedCategorizationOutcome).not.toHaveBeenCalled();
+  });
+
+  it('does not replay an old posted outcome over a newer revision post', async () => {
+    const fixture = durableDeps();
+    await commitStagedCategorization(commitInput(), fixture.deps);
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce({ ...structuredClone(beforePurchase), syncToken: '9' });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue(currentQboTxn('8'));
+
+    await undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps);
+
+    fixture.db.transactionRow.status = 'PENDING';
+    fixture.db.transactionRow.revision = 2;
+    fixture.db.transactionRow.qboSyncToken = '9';
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce({ ...structuredClone(beforePurchase), syncToken: '9' })
+      .mockResolvedValueOnce({ ...structuredClone(verifiedPurchase), syncToken: '10' });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue(currentQboTxn('9'));
+    await commitStagedCategorization({
+      ...commitInput('request-new-revision'),
+      expectedRevision: 2,
+    }, fixture.deps);
+
+    await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(fixture.onVerifiedCategorizationOutcome.mock.calls.map(([outcome]) => [
+      outcome.operation,
+      outcome.requestId,
+    ])).toEqual([
+      ['posted', 'request-generic'],
+      ['reverted', 'request-undo'],
+      ['posted', 'request-new-revision'],
+    ]);
   });
 
   it('threads MCP authorization through the initial and final pre-send checks', async () => {
@@ -1391,6 +1566,22 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.getClient).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
     expect(fixture.authorize).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects a persisted FAILED replay as fixed non-retryable exhaustion', async () => {
+    const fixture = durableDeps();
+    const attempt = seedAttempt(fixture.db, 'FAILED', 'request-generic');
+    attempt.errorCode = 'LIVE_MUTATION_RETRY_EXHAUSTED';
+    attempt.errorMessage = 'The guarded live mutation exhausted its retry budget.';
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({
+      code: 'LIVE_MUTATION_RETRY_EXHAUSTED',
+      message: 'The guarded live mutation exhausted its retry budget.',
+    });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
   it('rechecks authorization before returning a recorded verified commit result', async () => {
@@ -1826,6 +2017,26 @@ describe('commitStagedCategorization durable lifecycle', () => {
     });
   });
 
+  it('persists the live uncertainty hook in the same attempt and transaction transition', async () => {
+    const onUncertainMutation = vi.fn(async () => undefined);
+    const fixture = durableDeps(undefined, { onUncertainMutation });
+    fixture.sendPreparedWrite.mockRejectedValueOnce(new QboRequestTimeout());
+
+    await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(onUncertainMutation).toHaveBeenCalledOnce();
+    expect(onUncertainMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        errorCode: 'QBO_WRITE_UNCERTAIN',
+        attempt: expect.objectContaining({ requestId: 'request-generic' }),
+        transaction: expect.objectContaining({ id: DURABLE_TRANSACTION_ID }),
+      }),
+    );
+    expect(fixture.db.attempts[0]?.status).toBe('UNCERTAIN');
+    expect(fixture.db.transactionRow.status).toBe('ERROR');
+  });
+
   it('marks readback mismatch uncertain and never posted', async () => {
     const fixture = durableDeps();
     fixture.fetchPurchaseSnapshot
@@ -1931,6 +2142,82 @@ describe('legacy retryError with durable attempts', () => {
 });
 
 describe('reconcileMutationAttempt', () => {
+  it('does not finalize when reconciliation is cancelled immediately after readback', async () => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = 'ERROR';
+    seedAttempt(db, 'UNCERTAIN');
+    const controller = new AbortController();
+    const restarted = durableDeps(db, {
+      reconciliationSignal: controller.signal,
+    });
+    restarted.fetchPurchaseSnapshot.mockReset().mockImplementation(async () => {
+      controller.abort();
+      return structuredClone(verifiedPurchase);
+    });
+
+    await expect(reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, restarted.deps)).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(db.attempts[0]?.status).toBe('UNCERTAIN');
+    expect(db.transactionRow.status).toBe('ERROR');
+  });
+
+  it('rechecks cancellation inside the locked finalization transaction', async () => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = 'ERROR';
+    seedAttempt(db, 'UNCERTAIN');
+    const controller = new AbortController();
+    const restarted = durableDeps(db, {
+      reconciliationSignal: controller.signal,
+    });
+    restarted.fetchPurchaseSnapshot.mockReset().mockResolvedValue(
+      structuredClone(verifiedPurchase),
+    );
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const transact = db.$transaction.bind(db);
+    vi.spyOn(db, '$transaction').mockImplementation(async (callback) => {
+      entered.resolve();
+      await release.promise;
+      return transact(callback);
+    });
+
+    const reconciling = reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, restarted.deps);
+    await entered.promise;
+    controller.abort();
+    release.resolve();
+
+    await expect(reconciling).rejects.toMatchObject({ name: 'AbortError' });
+    expect(db.attempts[0]?.status).toBe('UNCERTAIN');
+    expect(db.transactionRow.status).toBe('ERROR');
+  });
+
+  it('rolls back finalization when the exact transaction CAS loses', async () => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = 'ERROR';
+    seedAttempt(db, 'UNCERTAIN');
+    const restarted = durableDeps(db);
+    restarted.fetchPurchaseSnapshot.mockReset().mockResolvedValue(
+      structuredClone(verifiedPurchase),
+    );
+    db.transaction.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    await expect(reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, restarted.deps)).rejects.toMatchObject({
+      code: 'LIVE_RECONCILIATION_BINDING_MISMATCH',
+    });
+
+    expect(db.attempts[0]?.status).toBe('UNCERTAIN');
+    expect(db.transactionRow.status).toBe('ERROR');
+  });
+
   it('rechecks the exact MCP authorization after lease renewal and before QBO readback', async () => {
     const fixture = durableDeps();
     fixture.db.transactionRow.status = 'ERROR';
@@ -1994,6 +2281,31 @@ describe('reconcileMutationAttempt', () => {
     expect(restarted.preparePurchaseRecategorization).not.toHaveBeenCalled();
     expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
     expect(db.transactionRow.status).toBe(status);
+    if (_label === 'neither') {
+      expect(db.attempts[0]).toMatchObject({
+        status: 'UNCERTAIN',
+        errorCode: 'QBO_READBACK_MISMATCH',
+      });
+    }
+  });
+
+  it('durably classifies a missing reconciliation snapshot as a readback mismatch', async () => {
+    const db = new FakeDurableDb();
+    db.transactionRow.status = 'ERROR';
+    seedAttempt(db, 'UNCERTAIN');
+    const restarted = durableDeps(db);
+    restarted.fetchPurchaseSnapshot.mockReset().mockResolvedValue(null);
+
+    const first = await reconcileMutationAttempt({
+      requestId: 'request-existing',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, restarted.deps);
+
+    expect(first).toMatchObject({
+      outcome: 'UNCERTAIN',
+      error: { code: 'QBO_READBACK_MISMATCH' },
+    });
+    expect(restarted.fetchPurchaseSnapshot).toHaveBeenCalledOnce();
   });
 
   it('reconciles an uncertain write after sync supersedes the moved-out queue row', async () => {
