@@ -3107,6 +3107,8 @@ async function sendAndVerifyPrepared(
       auditAttribution,
     );
   } catch {
+    // A failed readback cannot prove whether QBO accepted the exact body.
+    // Do not compound that uncertainty with an automatic restore write.
     return markUncertain(
       d,
       attempt,

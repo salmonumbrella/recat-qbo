@@ -271,6 +271,59 @@ interface PreservedLineFields {
   classRef?: QboRef;
 }
 
+const RESTORABLE_LINE_FIELDS = new Set([
+  'Id',
+  'LineNum',
+  'Amount',
+  'Description',
+  'DetailType',
+  'DepositLineDetail',
+]);
+
+const RESTORABLE_DETAIL_FIELDS = new Set([
+  'AccountRef',
+  'Entity',
+  'PaymentMethodRef',
+  'ClassRef',
+  'TaxCodeRef',
+  'TaxApplicableOn',
+]);
+const RESTORABLE_REFERENCE_FIELDS = new Set(['value', 'name']);
+const DETAIL_REFERENCE_FIELDS = [
+  'AccountRef',
+  'Entity',
+  'PaymentMethodRef',
+  'ClassRef',
+  'TaxCodeRef',
+] as const;
+
+function hasUnsupportedReferenceField(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) &&
+    Object.keys(value).some((field) => !RESTORABLE_REFERENCE_FIELDS.has(field));
+}
+
+function assertRestorableHoldingLine(line: RawDepositLine): void {
+  const unsupportedLineField = Object.keys(line).find(
+    (field) => !RESTORABLE_LINE_FIELDS.has(field),
+  );
+  const detail = line.DepositLineDetail;
+  const unsupportedDetailField = detail === undefined
+    ? undefined
+    : Object.keys(detail).find((field) => !RESTORABLE_DETAIL_FIELDS.has(field));
+  const unsupportedReferenceField = detail === undefined
+    ? undefined
+    : DETAIL_REFERENCE_FIELDS.find((field) => hasUnsupportedReferenceField(detail[field]));
+  if (
+    unsupportedLineField === undefined &&
+    unsupportedDetailField === undefined &&
+    unsupportedReferenceField === undefined
+  ) return;
+  preparationError(
+    'QBO_DEPOSIT_UNSUPPORTED',
+    'Holding transaction line contains fields that cannot be preserved through verified undo.',
+  );
+}
+
 function optionalReference(value: unknown, label: string): QboRef | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -423,6 +476,7 @@ export function prepareDepositRecategorization(args: {
       ) {
         preparationError('QBO_DEPOSIT_UNSUPPORTED', 'Holding transaction line has an unsupported shape.');
       }
+      assertRestorableHoldingLine(rawLine);
       exactCents(rawLine.Amount);
       holdingLineIndexes.push(index);
       holdingRawLines.push(rawLine);

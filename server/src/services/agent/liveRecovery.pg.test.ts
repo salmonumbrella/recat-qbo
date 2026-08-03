@@ -447,9 +447,9 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
 
   it('converges duplicate reconciliation with one fresh QBO read and atomic run/job truth', async () => {
     const fixture = await seedRecovery();
-    const fetchPurchaseSnapshot = vi.fn(async () => fixture.expected);
+    const fetchPreparedSnapshot = vi.fn(async () => fixture.expected);
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot,
+      fetchPreparedSnapshot,
     } as unknown as QboClient);
     const candidates = await listLiveReconciliationCandidates(fixture.companyId);
     expect(candidates).toEqual([fixture.input]);
@@ -463,7 +463,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
       'IN_PROGRESS',
       'VERIFIED',
     ]);
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
     const [attempt, transaction, job, run, config] = await Promise.all([
       prisma.qboMutationAttempt.findUniqueOrThrow({ where: { requestId: fixture.requestId } }),
       prisma.transaction.findUniqueOrThrow({ where: { id: fixture.transactionId } }),
@@ -481,7 +481,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
       outcome: 'VERIFIED',
       status: 'POSTED',
     });
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
   });
 
   it('discovers connected durable recovery after mutable live mode is turned off', async () => {
@@ -533,9 +533,9 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
         },
       },
     });
-    const fetchPurchaseSnapshot = vi.fn(async () => fixture.expected);
+    const fetchPreparedSnapshot = vi.fn(async () => fixture.expected);
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot,
+      fetchPreparedSnapshot,
     } as unknown as QboClient);
 
     await expect(reconcileScheduledLiveMutation({
@@ -544,7 +544,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     })).rejects.toMatchObject({
       code: 'LIVE_RECONCILIATION_BINDING_MISMATCH',
     });
-    expect(fetchPurchaseSnapshot).not.toHaveBeenCalled();
+    expect(fetchPreparedSnapshot).not.toHaveBeenCalled();
   });
 
   it('rejects cross-revision reconciliation in every loader before QBO access', async () => {
@@ -618,7 +618,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
 
   it('rechecks the checkpoint before finalization when durable state changes after QBO readback', async () => {
     const fixture = await seedRecovery();
-    const fetchPurchaseSnapshot = vi.fn(async () => {
+    const fetchPreparedSnapshot = vi.fn(async () => {
       await prisma.agentRun.updateMany({
         where: { jobId: fixture.requestId },
         data: {
@@ -631,7 +631,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
       return fixture.expected;
     });
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot,
+      fetchPreparedSnapshot,
     } as unknown as QboClient);
 
     await expect(
@@ -639,7 +639,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     ).rejects.toMatchObject({
       code: 'LIVE_RECONCILIATION_BINDING_MISMATCH',
     });
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
     await expect(prisma.qboMutationAttempt.findUniqueOrThrow({
       where: { requestId: fixture.requestId },
     })).resolves.toMatchObject({ status: 'UNCERTAIN' });
@@ -712,7 +712,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     const readStarted = deferred<void>();
     const releaseRead = deferred<QboPurchaseSnapshot>();
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot: vi.fn(async () => {
+      fetchPreparedSnapshot: vi.fn(async () => {
         readStarted.resolve();
         return releaseRead.promise;
       }),
@@ -755,7 +755,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     const readStarted = deferred<void>();
     const releaseRead = deferred<QboPurchaseSnapshot>();
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot: vi.fn(async () => {
+      fetchPreparedSnapshot: vi.fn(async () => {
         readStarted.resolve();
         return releaseRead.promise;
       }),
@@ -783,7 +783,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
   it('row-locks finalization against a non-locking sync mirror update', async () => {
     const fixture = await seedRecovery();
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot: vi.fn(async () => fixture.expected),
+      fetchPreparedSnapshot: vi.fn(async () => fixture.expected),
     } as unknown as QboClient);
     const attemptLocked = deferred<void>();
     const releaseAttempt = deferred<void>();
@@ -845,21 +845,21 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
 
   it('persists a safe mismatch code and stronger pause after one inconclusive read', async () => {
     const fixture = await seedRecovery();
-    const fetchPurchaseSnapshot = vi.fn()
+    const fetchPreparedSnapshot = vi.fn()
       .mockResolvedValueOnce({
         ...fixture.expected,
         totalCents: -999,
       })
       .mockResolvedValueOnce(fixture.expected);
     vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-      fetchPurchaseSnapshot,
+      fetchPreparedSnapshot,
     } as unknown as QboClient);
 
     await expect(reconcileScheduledLiveMutation(fixture.input)).resolves.toMatchObject({
       outcome: 'UNCERTAIN',
       error: { code: 'QBO_READBACK_MISMATCH' },
     });
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
     const [attempt, run, job, config] = await Promise.all([
       prisma.qboMutationAttempt.findUniqueOrThrow({ where: { requestId: fixture.requestId } }),
       prisma.agentRun.findFirstOrThrow({ where: { jobId: fixture.requestId } }),
@@ -898,7 +898,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     await expect(reconcileLiveMutation(fixture.input, {
       actor: { id: categorizer.id, label: 'Generic categorizer' },
     })).rejects.toMatchObject({ code: 'FORBIDDEN' });
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+    expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
 
     const admin = await prisma.user.create({
       data: {
@@ -913,7 +913,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
       outcome: 'VERIFIED',
       status: 'POSTED',
     });
-    expect(fetchPurchaseSnapshot).toHaveBeenCalledTimes(2);
+    expect(fetchPreparedSnapshot).toHaveBeenCalledTimes(2);
   });
 
   it.each(['instance', 'membership'] as const)(
@@ -942,12 +942,12 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
           });
       const readStarted = deferred<void>();
       const releaseRead = deferred<QboPurchaseSnapshot>();
-      const fetchPurchaseSnapshot = vi.fn(async () => {
+      const fetchPreparedSnapshot = vi.fn(async () => {
         readStarted.resolve();
         return releaseRead.promise;
       });
       const forCompany = vi.spyOn(qboFactory, 'forCompany').mockResolvedValue({
-        fetchPurchaseSnapshot,
+        fetchPreparedSnapshot,
       } as unknown as QboClient);
 
       const reconciling = reconcileLiveMutation(fixture.input, {
@@ -973,7 +973,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
       releaseRead.resolve(fixture.expected);
 
       await expect(reconciling).rejects.toMatchObject({ code: 'FORBIDDEN' });
-      expect(fetchPurchaseSnapshot).toHaveBeenCalledOnce();
+      expect(fetchPreparedSnapshot).toHaveBeenCalledOnce();
       await expect(prisma.qboMutationAttempt.findUniqueOrThrow({
         where: { requestId: fixture.requestId },
       })).resolves.toMatchObject({ status: 'UNCERTAIN' });
@@ -1010,7 +1010,7 @@ describePostgres('live breaker and reconciliation PostgreSQL composition', () =>
     const deps: DurableWritebackDeps = {
       db,
       getClient: async () => ({
-        fetchPurchaseSnapshot: async () => ({
+        fetchPreparedSnapshot: async () => ({
           ...fixture.expected,
           totalCents: -999,
         }),

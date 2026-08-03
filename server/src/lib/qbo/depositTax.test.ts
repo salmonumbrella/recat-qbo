@@ -42,9 +42,7 @@ function completeDeposit(overrides: Partial<RawDeposit> = {}): RawDeposit {
           Entity: { value: 'payer', name: 'Generic Payer' },
           PaymentMethodRef: { value: 'payment-method', name: 'Generic Method' },
           ClassRef: { value: 'class', name: 'Generic Class' },
-          GenericDetailField: 'restore only modeled fields',
         },
-        GenericLineField: 'target field',
       },
       {
         Id: 'untouched',
@@ -358,6 +356,30 @@ describe('prepareDepositRecategorization', () => {
     );
   });
 
+  it.each([
+    ['LinkedTxn', { LinkedTxn: [{ TxnId: 'payment-generic', TxnType: 'Payment' }] }],
+    ['unknown top-level field', { GenericLineField: 'semantic data' }],
+    ['CheckNum', { DepositLineDetail: { CheckNum: 'CHECK-GENERIC' } }],
+    ['TxnType', { DepositLineDetail: { TxnType: 'Payment' } }],
+    ['unknown detail field', { DepositLineDetail: { GenericDetailField: 'semantic data' } }],
+  ])('rejects a holding line with unsupported %s before rebuilding it', (_label, extra) => {
+    const raw = completeDeposit();
+    const holdingLine = raw.Line![0]!;
+    Object.assign(holdingLine, extra);
+    if (extra.DepositLineDetail !== undefined) {
+      holdingLine.DepositLineDetail = {
+        ...completeDeposit().Line![0]!.DepositLineDetail,
+        ...extra.DepositLineDetail,
+      };
+    }
+
+    expect(() => prepare(raw, staged(), snapshotFor(raw))).toThrowError(
+      expect.objectContaining<QboDepositPreparationError>({
+        code: 'QBO_DEPOSIT_UNSUPPORTED',
+      }),
+    );
+  });
+
   it('does not carry a stale aggregate tax into non-tax-bearing untouched lines', () => {
     const raw = completeDeposit({ TxnTaxDetail: { TotalTax: 3 } });
     const before = { ...snapshotFor(raw), totalTaxCents: 300 };
@@ -432,7 +454,7 @@ describe('prepareDepositRecategorization', () => {
     }
   });
 
-  it('rejects invalid known QBO reference fields while retaining unknown fields', () => {
+  it('rejects invalid or unsupported QBO reference fields', () => {
     const malformed = completeDeposit();
     (malformed.Line![0]!.DepositLineDetail!.Entity as Record<string, unknown>).name = 42;
 
@@ -440,17 +462,26 @@ describe('prepareDepositRecategorization', () => {
       expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_REFERENCE_MISSING' }),
     );
 
-    const valid = completeDeposit();
-    (valid.Line![0]!.DepositLineDetail!.Entity as Record<string, unknown>).GenericRefField =
-      'preserve me';
-    expect(
-      prepare(valid, staged(), snapshotFor(valid))
-        .body.Line![1]!.DepositLineDetail!.Entity,
-    ).toMatchObject({
-      value: 'payer',
-      name: 'Generic Payer',
-      GenericRefField: 'preserve me',
-    });
+    for (const field of [
+      'AccountRef',
+      'Entity',
+      'PaymentMethodRef',
+      'ClassRef',
+      'TaxCodeRef',
+    ] as const) {
+      const unsupported = completeDeposit();
+      const detail = unsupported.Line![0]!.DepositLineDetail!;
+      const reference = field === 'TaxCodeRef'
+        ? (detail.TaxCodeRef = { value: SALES_TAX_CODE })
+        : detail[field]!;
+      (reference as Record<string, unknown>).GenericRefField = 'semantic data';
+
+      expect(() => prepare(unsupported, staged(), snapshotFor(unsupported))).toThrowError(
+        expect.objectContaining<QboDepositPreparationError>({
+          code: 'QBO_DEPOSIT_UNSUPPORTED',
+        }),
+      );
+    }
   });
 
   it('rejects unsupported shapes, missing references, mixed untouched tax mode, unsafe cents, balance drift, and stale tokens', () => {
@@ -532,6 +563,27 @@ describe('prepareDepositRecategorization', () => {
 });
 
 describe('prepareDepositRestore', () => {
+  it('accepts QBO LineNum enrichment through preparation and verified restore', () => {
+    const raw = completeDeposit();
+    raw.Line![0]!.LineNum = 7;
+    const original = prepare(raw, staged(), snapshotFor(raw));
+    const current: RawDeposit = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: { TotalTax: 7 },
+      Line: [
+        original.body.Line![0]!,
+        { ...original.body.Line![1]!, LineNum: 7 },
+      ],
+    };
+
+    expect(prepareDepositRestore({
+      current,
+      prepared: original,
+      requestId: 'request-restore-line-num',
+    })).toMatchObject({ operation: 'restore', qboType: 'Deposit' });
+  });
+
   it('restores modeled target fields in exact before order with the fresh SyncToken', () => {
     const original = prepare();
     const current: RawDeposit = {
