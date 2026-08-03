@@ -21,7 +21,14 @@ import {
   AttachmentError,
   type AttachmentBlobReader,
 } from '../services/attachments/types.js';
+import { EntityLeaseError } from '../services/entityLease.js';
 import { createReceipts } from '../services/receipts/intake.js';
+import {
+  attachMatchedReceipt,
+  confirmReceiptMatch,
+  rematchReceipt,
+  undoAttachedReceipt,
+} from '../services/receipts/matching.js';
 import {
   getReceiptDetail,
   listReceipts,
@@ -111,6 +118,14 @@ const receiptReprocessSchema = z.object({
   expectedRevision: z.number().int().min(0).max(2_147_483_646),
   idempotencyKey: z.string().trim().min(1).max(128),
 }).strict();
+const receiptRematchSchema = z.object({
+  expectedReceiptRevision: z.number().int().min(0).max(2_147_483_646),
+}).strict();
+const receiptConfirmMatchSchema = z.object({
+  expectedReceiptRevision: z.number().int().min(0).max(2_147_483_646),
+  expectedTransactionRevision: z.number().int().min(0).max(2_147_483_647),
+}).strict();
+const receiptAttachmentMutationSchema = receiptConfirmMatchSchema;
 
 export function parseReceiptListQuery(input: unknown): ReceiptQuery {
   const parsed = validate(receiptListQuerySchema)(input);
@@ -132,6 +147,25 @@ export function parseReceiptListQuery(input: unknown): ReceiptQuery {
 }
 
 function receiptHttpError(error: unknown): never {
+  if (error instanceof EntityLeaseError) {
+    throw new HttpError(409, error.message, error.code);
+  }
+  if (error instanceof AttachmentError) {
+    const status = error.code === 'ATTACHMENT_FORBIDDEN'
+      ? 403
+      : error.code === 'ATTACHMENT_NOT_FOUND'
+        ? 404
+        : error.code === 'ATTACHMENT_TOO_LARGE'
+          || error.code === 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED'
+          || error.code === 'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED'
+          ? 413
+          : error.code === 'ATTACHMENT_BUSY'
+            || error.code === 'ATTACHMENT_PROVIDER_UNCERTAIN'
+            || error.code === 'IDEMPOTENCY_CONFLICT'
+            ? 409
+            : 400;
+    throw new HttpError(status, error.message, error.code);
+  }
   if (!(error instanceof ReceiptError)) throw error;
   const status = error.code === 'RECEIPT_FORBIDDEN'
     ? 403
@@ -383,6 +417,66 @@ receiptsRouter.post(
     ));
     res.status(202).json(await receiptCall(() =>
       getReceiptDetail(req.company!.id, req.params.receiptId!)));
+  }),
+);
+
+receiptsRouter.post(
+  '/:receiptId/rematch',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptRematchSchema)(req.body);
+    res.json(await receiptCall(() => rematchReceipt({
+      actor: attachmentActorForUser(req.user!),
+      companyId: req.company!.id,
+      documentId: req.params.receiptId!,
+      expectedReceiptRevision: body.expectedReceiptRevision,
+    })));
+  }),
+);
+
+receiptsRouter.post(
+  '/:receiptId/matches/:transactionId/confirm',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptConfirmMatchSchema)(req.body);
+    res.json(await receiptCall(() => confirmReceiptMatch({
+      actor: attachmentActorForUser(req.user!),
+      companyId: req.company!.id,
+      documentId: req.params.receiptId!,
+      transactionId: req.params.transactionId!,
+      expectedReceiptRevision: body.expectedReceiptRevision,
+      expectedTransactionRevision: body.expectedTransactionRevision,
+    })));
+  }),
+);
+
+receiptsRouter.post(
+  '/:receiptId/attach',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptAttachmentMutationSchema)(req.body);
+    res.status(202).json(await receiptCall(() => attachMatchedReceipt({
+      actor: attachmentActorForUser(req.user!),
+      companyId: req.company!.id,
+      documentId: req.params.receiptId!,
+      expectedReceiptRevision: body.expectedReceiptRevision,
+      expectedTransactionRevision: body.expectedTransactionRevision,
+    })));
+  }),
+);
+
+receiptsRouter.post(
+  '/:receiptId/undo',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptAttachmentMutationSchema)(req.body);
+    res.status(202).json(await receiptCall(() => undoAttachedReceipt({
+      actor: attachmentActorForUser(req.user!),
+      companyId: req.company!.id,
+      documentId: req.params.receiptId!,
+      expectedReceiptRevision: body.expectedReceiptRevision,
+      expectedTransactionRevision: body.expectedTransactionRevision,
+    })));
   }),
 );
 

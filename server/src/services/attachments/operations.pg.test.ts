@@ -21,6 +21,7 @@ import {
   deleteTransactionAttachment,
   refreshTransactionAttachments,
   reconcileAttachmentOperation,
+  reconcileReceiptAttachmentOperation,
   recoverStuckAttachmentOperations,
   retryAttachmentOperation,
   saveExternalAttachmentLocally,
@@ -30,6 +31,7 @@ import {
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
+const BLOB_EXPIRES_AT = new Date('2100-01-01T00:00:00.000Z');
 
 function pdf(content: string): Uint8Array {
   return Buffer.from(`%PDF-1.7\n${content}`);
@@ -121,6 +123,96 @@ describePostgres('attachment operation PostgreSQL lifecycle', () => {
     }, { db });
   }
 
+  it('attaches an authorized receipt blob without a staged-file copy', async () => {
+    const context = await fixture();
+    const content = pdf('internal receipt source');
+    const blob = await db.attachmentBlob.create({
+      data: {
+        companyId: context.company.id,
+        state: 'READY',
+        sha256: '6'.repeat(64),
+        sizeBytes: BigInt(content.byteLength),
+        contentType: 'application/pdf',
+        chunkCount: 1,
+        expiresAt: BLOB_EXPIRES_AT,
+        chunks: { create: { ordinal: 0, content } },
+      },
+    });
+    const receipt = await db.receiptDocument.create({
+      data: {
+        companyId: context.company.id,
+        blobId: blob.id,
+        originalFilename: 'internal-receipt.pdf',
+        contentType: 'application/pdf',
+        sizeBytes: BigInt(content.byteLength),
+        sha256: '6'.repeat(64),
+        sourceKind: 'WEB_UPLOAD',
+        status: 'MATCHED',
+        matchedTransactionId: context.transaction.id,
+        matchedTransactionRevision: context.transaction.revision,
+      },
+    });
+
+    const result = await attachTransactionFiles({
+      actor: context.actor,
+      companyId: context.company.id,
+      transactionId: context.transaction.id,
+      idempotencyKey: 'receipt-source-1',
+      sources: [{
+        kind: 'receipt',
+        documentId: receipt.id,
+        blobId: blob.id,
+        filename: receipt.originalFilename,
+        contentType: receipt.contentType,
+        sizeBytes: receipt.sizeBytes,
+        sha256: receipt.sha256,
+        retainLocally: true,
+      }],
+    }, context.deps);
+
+    expect(result.status).toBe('VERIFIED');
+    await expect(db.attachmentOperation.findUniqueOrThrow({
+      where: { id: result.operationId },
+      select: { receiptDocumentId: true },
+    })).resolves.toEqual({ receiptDocumentId: receipt.id });
+    await expect(db.transactionAttachment.findUniqueOrThrow({
+      where: { id: result.files[0]!.id },
+      select: { blobId: true, retainLocally: true },
+    })).resolves.toEqual({ blobId: blob.id, retainLocally: true });
+    await expect(db.stagedAttachment.count({
+      where: { companyId: context.company.id },
+    })).resolves.toBe(0);
+    await db.receiptDocument.update({
+      where: { id: receipt.id },
+      data: {
+        status: 'ATTACHED',
+        transactionAttachmentId: result.files[0]!.id,
+      },
+    });
+
+    const deleted = await deleteTransactionAttachment({
+      actor: context.actor,
+      companyId: context.company.id,
+      transactionId: context.transaction.id,
+      attachmentId: result.files[0]!.id,
+      scope: 'everywhere',
+      idempotencyKey: `receipt-undo:${receipt.id}:1`,
+      receiptDocumentId: receipt.id,
+    }, context.deps);
+    expect(deleted.status).toBe('DELETED');
+    await expect(db.attachmentOperation.findUniqueOrThrow({
+      where: { id: deleted.operationId },
+      select: { receiptDocumentId: true },
+    })).resolves.toEqual({ receiptDocumentId: receipt.id });
+    await expect(db.receiptDocument.findUniqueOrThrow({
+      where: { id: receipt.id },
+      select: { blobId: true },
+    })).resolves.toEqual({ blobId: blob.id });
+    await expect(db.attachmentBlob.findUnique({
+      where: { id: blob.id },
+    })).resolves.not.toBeNull();
+  });
+
   it('replays exactly, rejects changed inputs, and retries only failed partial files', async () => {
     const context = await fixture();
     const first = await stage(
@@ -180,6 +272,111 @@ describePostgres('attachment operation PostgreSQL lifecycle', () => {
     expect(complete.status).toBe('VERIFIED');
     expect(providerAfterFirst).toHaveLength(2);
     expect(new Set(providerAfterFirst.map((row) => row.note)).size).toBe(2);
+  });
+
+  it.each([
+    {
+      label: 'attach',
+      kind: 'ATTACH' as const,
+      idempotencyKey: `receipt-attach:${randomUUID()}:1`,
+      attachmentStatus: 'FAILED' as const,
+    },
+    {
+      label: 'undo',
+      kind: 'DELETE_EVERYWHERE' as const,
+      idempotencyKey: `receipt-undo:${randomUUID()}:1`,
+      attachmentStatus: 'ATTACHED' as const,
+    },
+  ])(
+    'requires the receipt workflow to retry a failed $label operation',
+    async ({ kind, idempotencyKey, attachmentStatus }) => {
+      const context = await fixture();
+      const attachment = await db.transactionAttachment.create({
+        data: {
+          companyId: context.company.id,
+          transactionId: context.transaction.id,
+          originalFilename: 'receipt-managed.pdf',
+          contentType: 'application/pdf',
+          sizeBytes: 8n,
+          sha256: 'a'.repeat(64),
+          sourceKind: 'LOCAL_UPLOAD',
+          retainLocally: false,
+          status: attachmentStatus,
+          qboAttachableId: kind === 'DELETE_EVERYWHERE'
+            ? 'receipt-managed-qbo-id'
+            : null,
+          qboSyncToken: kind === 'DELETE_EVERYWHERE' ? '0' : null,
+          recatMarker: randomUUID(),
+        },
+      });
+      const receipt = await db.receiptDocument.create({
+        data: {
+          companyId: context.company.id,
+          originalFilename: 'receipt-managed.pdf',
+          contentType: 'application/pdf',
+          sizeBytes: attachment.sizeBytes,
+          sha256: randomUUID().replaceAll('-', '').repeat(2),
+          sourceKind: 'WEB_UPLOAD',
+          status: kind === 'ATTACH' ? 'MATCHED' : 'ATTACHED',
+          matchedTransactionId: context.transaction.id,
+          matchedTransactionRevision: context.transaction.revision,
+          transactionAttachmentId: kind === 'DELETE_EVERYWHERE'
+            ? attachment.id
+            : null,
+        },
+      });
+      const operation = await db.attachmentOperation.create({
+        data: {
+          kind,
+          actorKey: context.actor.actorKey,
+          companyId: context.company.id,
+          transactionId: context.transaction.id,
+          receiptDocumentId: receipt.id,
+          idempotencyKey,
+          requestHash: 'b'.repeat(64),
+          inputHash: 'c'.repeat(64),
+          status: 'FAILED',
+          fileCount: 1,
+          totalBytes: attachment.sizeBytes,
+          files: {
+            create: {
+              attachmentId: attachment.id,
+              ordinal: 0,
+              status: 'FAILED',
+              errorCode: 'PROVIDER_REJECTED',
+            },
+          },
+        },
+      });
+
+      await expect(retryAttachmentOperation(
+        context.actor,
+        operation.id,
+        context.deps,
+      )).rejects.toMatchObject({
+        code: 'ATTACHMENT_BUSY',
+        message: expect.stringContaining('receipt workflow'),
+      });
+    },
+  );
+
+  it('reserves receipt idempotency keys from public attachment sources', async () => {
+    const context = await fixture();
+    const staged = await stage(
+      context.company.id,
+      context.actor.actorKey,
+      'reserved-prefix',
+    );
+
+    await expect(attachTransactionFiles({
+      actor: context.actor,
+      companyId: context.company.id,
+      transactionId: context.transaction.id,
+      idempotencyKey: `receipt-attach:${randomUUID()}:1`,
+      sources: [{ kind: 'upload', uploadId: staged.id }],
+    }, context.deps)).rejects.toMatchObject({
+      code: 'ATTACHMENT_INVALID_INPUT',
+    });
   });
 
   it('replays a concurrent identical request after staging handoff', async () => {
@@ -495,6 +692,67 @@ describePostgres('attachment operation PostgreSQL lifecycle', () => {
       status: 'ATTACHED',
       retainedLocally: false,
     });
+    expect(getMockRealm(MOCK_REALM_HARBOR).attachments).toHaveLength(1);
+  });
+
+  it('reconciles an uncertain receipt operation only through the receipt workflow', async () => {
+    const context = await fixture();
+    const staged = await stage(
+      context.company.id,
+      context.actor.actorKey,
+      'receipt-uncertain',
+    );
+    const stagedRow = await db.stagedAttachment.findUniqueOrThrow({
+      where: { id: staged.id },
+    });
+    const receipt = await db.receiptDocument.create({
+      data: {
+        companyId: context.company.id,
+        blobId: stagedRow.blobId,
+        originalFilename: staged.filename,
+        contentType: staged.contentType,
+        sizeBytes: BigInt(staged.sizeBytes),
+        sha256: staged.sha256,
+        sourceKind: 'WEB_UPLOAD',
+        status: 'MATCHED',
+        matchedTransactionId: context.transaction.id,
+        matchedTransactionRevision: context.transaction.revision,
+      },
+    });
+    getMockRealm(MOCK_REALM_HARBOR).attachmentTimeoutAfterAccept = true;
+    const uncertain = await attachTransactionFiles({
+      actor: context.actor,
+      companyId: context.company.id,
+      transactionId: context.transaction.id,
+      idempotencyKey: `receipt-attach:${randomUUID()}:1`,
+      sources: [{
+        kind: 'receipt',
+        documentId: receipt.id,
+        blobId: stagedRow.blobId,
+        filename: receipt.originalFilename,
+        contentType: receipt.contentType,
+        sizeBytes: receipt.sizeBytes,
+        sha256: receipt.sha256,
+        retainLocally: true,
+      }],
+    }, context.deps);
+    expect(uncertain.status).toBe('UNCERTAIN');
+
+    await expect(reconcileAttachmentOperation(
+      context.actor,
+      uncertain.operationId,
+      context.deps,
+    )).rejects.toMatchObject({
+      code: 'ATTACHMENT_BUSY',
+      message: expect.stringContaining('receipt workflow'),
+    });
+
+    const reconciled = await reconcileReceiptAttachmentOperation(
+      context.actor,
+      uncertain.operationId,
+      context.deps,
+    );
+    expect(reconciled.status).toBe('VERIFIED');
     expect(getMockRealm(MOCK_REALM_HARBOR).attachments).toHaveLength(1);
   });
 

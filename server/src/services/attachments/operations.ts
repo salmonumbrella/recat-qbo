@@ -59,12 +59,25 @@ export interface AttachmentActor {
   memberships: readonly { companyId: string; role: string }[];
 }
 
+export type InternalAttachmentSource =
+  | AttachmentSourceInput
+  | {
+      kind: 'receipt';
+      documentId: string;
+      blobId: string;
+      filename: string;
+      contentType: string;
+      sizeBytes: bigint;
+      sha256: string;
+      retainLocally: boolean;
+    };
+
 export interface AttachFilesInput {
   actor: AttachmentActor;
   companyId: string;
   transactionId: string;
   idempotencyKey: string;
-  sources: readonly AttachmentSourceInput[];
+  sources: readonly InternalAttachmentSource[];
 }
 
 export interface DeleteAttachmentInput {
@@ -74,6 +87,7 @@ export interface DeleteAttachmentInput {
   attachmentId: string;
   scope: 'local' | 'everywhere';
   idempotencyKey: string;
+  receiptDocumentId?: string;
 }
 
 export interface AttachmentOperationDependencies {
@@ -105,7 +119,8 @@ export interface AttachmentOperationHashInput {
 }
 
 interface ResolvedSource {
-  stagedId: string;
+  stagedId: string | null;
+  receiptDocumentId: string | null;
   blobId: string;
   filename: string;
   contentType: string;
@@ -186,6 +201,7 @@ function deletionOperationHash(input: DeleteAttachmentInput): string {
     attachmentId: input.attachmentId,
     scope: input.scope,
     idempotencyKey: input.idempotencyKey,
+    receiptDocumentId: input.receiptDocumentId ?? null,
   }), 'utf8').digest('hex');
 }
 
@@ -198,12 +214,20 @@ function sourceRequestHash(input: AttachFilesInput): string {
     sources: input.sources.map((source) =>
       source.kind === 'upload'
         ? { kind: source.kind, uploadId: source.uploadId }
-        : {
+        : source.kind === 'https'
+          ? {
             kind: source.kind,
             urlHash: createHash('sha256')
               .update(source.url, 'utf8')
               .digest('hex'),
-          }),
+          }
+          : {
+              kind: source.kind,
+              documentId: source.documentId,
+              blobId: source.blobId,
+              sha256: source.sha256,
+              retainLocally: source.retainLocally,
+            }),
   }), 'utf8').digest('hex');
 }
 
@@ -356,6 +380,7 @@ function attachmentDto(
 function operationDto(row: OperationRow): AttachmentOperationDto {
   const statuses = row.files.map((file) => file.status);
   const status = deriveAttachmentOperationStatus(statuses);
+  const receiptManaged = isReceiptManagedOperation(row);
   return {
     operationId: row.id,
     status,
@@ -363,7 +388,8 @@ function operationDto(row: OperationRow): AttachmentOperationDto {
       attachmentDto(file.attachment, file.status)),
     actions: {
       canRetry:
-        row.kind !== 'DELETE_LOCAL'
+        !receiptManaged
+        && row.kind !== 'DELETE_LOCAL'
         && statuses.some(
           (fileStatus) =>
             fileStatus === 'FAILED' || fileStatus === 'QBO_MISSING',
@@ -373,6 +399,26 @@ function operationDto(row: OperationRow): AttachmentOperationDto {
       ),
     },
   };
+}
+
+function isReceiptManagedOperation(
+  row: Pick<OperationRow, 'receiptDocumentId'>,
+): boolean {
+  return row.receiptDocumentId !== null;
+}
+
+function usesReservedReceiptKey(idempotencyKey: string): boolean {
+  return idempotencyKey.startsWith('receipt-attach:')
+    || idempotencyKey.startsWith('receipt-undo:');
+}
+
+function requireGenericAttachmentOperation(row: OperationRow): void {
+  if (!isReceiptManagedOperation(row)) return;
+  throw new AttachmentError(
+    'ATTACHMENT_BUSY',
+    'Retry or reconcile this operation through the receipt workflow.',
+    true,
+  );
 }
 
 async function loadOperation(
@@ -450,7 +496,55 @@ async function resolveSources(
   }
   const budget = createAttachmentBatchBudget(QBO_MAX_UPLOAD_REQUEST_BYTES);
   const staged: StagedAttachmentDto[] = [];
-  for (const source of input.sources) {
+  const receipts = new Map<number, ResolvedSource>();
+  for (const [index, source] of input.sources.entries()) {
+    if (source.kind === 'receipt') {
+      const row = await db.receiptDocument.findFirst({
+        where: {
+          id: source.documentId,
+          companyId: input.companyId,
+          blobId: source.blobId,
+          matchedTransactionId: input.transactionId,
+          transactionAttachmentId: null,
+          status: { in: ['MATCHED', 'ATTACHING'] },
+          deletedAt: null,
+        },
+        include: {
+          blob: { select: { id: true, sha256: true, state: true } },
+        },
+      });
+      const sizeBytes = Number(source.sizeBytes);
+      if (
+        !row
+        || !row.blob
+        || row.blob.state !== 'READY'
+        || row.blob.sha256 !== source.sha256
+        || row.originalFilename !== source.filename
+        || row.contentType !== source.contentType
+        || row.sizeBytes !== source.sizeBytes
+        || row.sha256 !== source.sha256
+        || row.retainLocally !== source.retainLocally
+        || !Number.isSafeInteger(sizeBytes)
+      ) {
+        throw new AttachmentError(
+          'ATTACHMENT_NOT_FOUND',
+          'Receipt attachment source was not found.',
+        );
+      }
+      budget.consume(sizeBytes);
+      receipts.set(index, {
+        stagedId: null,
+        receiptDocumentId: row.id,
+        blobId: row.blob.id,
+        filename: row.originalFilename,
+        contentType: row.contentType,
+        sizeBytes,
+        sha256: row.sha256,
+        sourceKind: 'LOCAL_UPLOAD',
+        retainLocally: row.retainLocally,
+      });
+      continue;
+    }
     if (source.kind === 'https') {
       staged.push(await (deps?.importHttps ?? importHttpsAttachment)({
         companyId: input.companyId,
@@ -503,7 +597,7 @@ async function resolveSources(
     },
   });
   const byId = new Map(rows.map((row) => [row.id, row]));
-  return staged.map((source) => {
+  const resolvedStaged = staged.map((source) => {
     const row = byId.get(source.id);
     if (
       !row
@@ -519,6 +613,7 @@ async function resolveSources(
     }
     return {
       stagedId: row.id,
+      receiptDocumentId: null,
       blobId: row.blob.id,
       filename: row.originalFilename,
       contentType: row.contentType,
@@ -527,6 +622,12 @@ async function resolveSources(
       sourceKind: row.sourceKind as 'LOCAL_UPLOAD' | 'HTTPS_IMPORT',
       retainLocally: row.retainLocally,
     };
+  });
+  let stagedIndex = 0;
+  return input.sources.map((_source, index) => {
+    const receipt = receipts.get(index);
+    if (receipt) return receipt;
+    return resolvedStaged[stagedIndex++]!;
   });
 }
 
@@ -837,6 +938,7 @@ async function dispatchAttach(
             id: { in: releasableBlobIds },
             stagedFiles: { none: {} },
             attachments: { none: {} },
+            receiptDocuments: { none: {} },
           },
         });
       }
@@ -874,6 +976,28 @@ export async function attachTransactionFiles(
     transactionId: input.transactionId,
     idempotencyKey: input.idempotencyKey,
   });
+  const receiptSources = input.sources.filter(
+    (source) => source.kind === 'receipt',
+  );
+  if (
+    receiptSources.length > 1
+    || (receiptSources.length === 1 && input.sources.length !== 1)
+  ) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'A receipt attachment operation must contain exactly one receipt.',
+    );
+  }
+  const receiptDocumentId = receiptSources[0]?.documentId ?? null;
+  if (
+    receiptDocumentId === null
+    && usesReservedReceiptKey(input.idempotencyKey)
+  ) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'The receipt attachment idempotency namespace is reserved.',
+    );
+  }
   authorize(input.actor, input.companyId, 'categorizer');
   const db = dbOf(deps);
   const requestHash = sourceRequestHash(input);
@@ -930,6 +1054,39 @@ export async function attachTransactionFiles(
   try {
     await db.$transaction(async (tx) => {
       for (const source of sources) {
+        if (source.stagedId === null) {
+          const receipt = await tx.receiptDocument.findFirst({
+            where: {
+              id: source.receiptDocumentId!,
+              companyId: input.companyId,
+              blobId: source.blobId,
+              matchedTransactionId: input.transactionId,
+              transactionAttachmentId: null,
+              status: { in: ['MATCHED', 'ATTACHING'] },
+              deletedAt: null,
+            },
+            include: {
+              blob: { select: { sha256: true, state: true } },
+            },
+          });
+          if (
+            !receipt
+            || receipt.blob?.state !== 'READY'
+            || receipt.blob.sha256 !== source.sha256
+            || receipt.sha256 !== source.sha256
+            || receipt.originalFilename !== source.filename
+            || receipt.contentType !== source.contentType
+            || receipt.sizeBytes !== BigInt(source.sizeBytes)
+            || receipt.retainLocally !== source.retainLocally
+          ) {
+            throw new AttachmentError(
+              'ATTACHMENT_BUSY',
+              'Receipt attachment source changed.',
+              true,
+            );
+          }
+          continue;
+        }
         const consumed = await tx.stagedAttachment.updateMany({
           where: {
             id: source.stagedId,
@@ -955,6 +1112,7 @@ export async function attachTransactionFiles(
           actorKey: input.actor.actorKey,
           companyId: input.companyId,
           transactionId: input.transactionId,
+          receiptDocumentId,
           idempotencyKey: input.idempotencyKey,
           requestHash,
           inputHash,
@@ -991,9 +1149,11 @@ export async function attachTransactionFiles(
             status: 'STAGED',
           },
         });
-        await tx.stagedAttachment.delete({
-          where: { id: source.stagedId },
-        });
+        if (source.stagedId !== null) {
+          await tx.stagedAttachment.delete({
+            where: { id: source.stagedId },
+          });
+        }
       }
     });
   } catch (error) {
@@ -1177,6 +1337,7 @@ async function finalizeProviderDelete(
           id: file.attachment.blobId,
           stagedFiles: { none: {} },
           attachments: { none: {} },
+          receiptDocuments: { none: {} },
         },
       });
     }
@@ -1320,6 +1481,7 @@ export async function retryAttachmentOperation(
 ): Promise<AttachmentOperationDto> {
   const row = await loadOperation(dbOf(deps), operationId);
   authorize(actor, row.companyId, 'categorizer');
+  requireGenericAttachmentOperation(row);
   if (row.files.some((file) => file.status === 'UNCERTAIN')) {
     throw new AttachmentError(
       'ATTACHMENT_PROVIDER_UNCERTAIN',
@@ -1337,9 +1499,33 @@ export async function reconcileAttachmentOperation(
   operationId: string,
   deps?: AttachmentOperationDependencies,
 ): Promise<AttachmentOperationDto> {
+  return reconcileLoadedAttachmentOperation(actor, operationId, deps, false);
+}
+
+export async function reconcileReceiptAttachmentOperation(
+  actor: AttachmentActor,
+  operationId: string,
+  deps?: AttachmentOperationDependencies,
+): Promise<AttachmentOperationDto> {
+  return reconcileLoadedAttachmentOperation(actor, operationId, deps, true);
+}
+
+async function reconcileLoadedAttachmentOperation(
+  actor: AttachmentActor,
+  operationId: string,
+  deps: AttachmentOperationDependencies | undefined,
+  receiptManaged: boolean,
+): Promise<AttachmentOperationDto> {
   const db = dbOf(deps);
   let row = await loadOperation(db, operationId);
   authorize(actor, row.companyId, 'categorizer');
+  if (receiptManaged !== isReceiptManagedOperation(row)) {
+    if (!receiptManaged) requireGenericAttachmentOperation(row);
+    throw new AttachmentError(
+      'ATTACHMENT_NOT_FOUND',
+      'Receipt attachment operation was not found.',
+    );
+  }
   const uncertain = row.files.filter((file) => file.status === 'UNCERTAIN');
   if (uncertain.length === 0) return operationDto(row);
   await db.$transaction(async (transaction) => {
@@ -1442,6 +1628,7 @@ export async function reconcileAttachmentOperation(
                   id: file.attachment.blobId,
                   stagedFiles: { none: {} },
                   attachments: { none: {} },
+                  receiptDocuments: { none: {} },
                 },
               });
             }
@@ -1533,6 +1720,7 @@ export async function recoverStuckAttachmentOperations(
   const cutoff = new Date(now.getTime() - STUCK_OPERATION_AGE_MS);
   const candidates = await db.attachmentOperation.findMany({
     where: {
+      receiptDocumentId: null,
       status: { in: ['PREPARED', 'COMMITTING', 'DELETING'] },
       updatedAt: { lte: cutoff },
     },
@@ -1687,6 +1875,16 @@ export async function deleteTransactionAttachment(
     transactionId: input.transactionId,
     idempotencyKey: input.idempotencyKey,
   });
+  const receiptDocumentId = input.receiptDocumentId ?? null;
+  if (
+    receiptDocumentId === null
+    && usesReservedReceiptKey(input.idempotencyKey)
+  ) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'The receipt attachment idempotency namespace is reserved.',
+    );
+  }
   authorize(input.actor, input.companyId, 'categorizer');
   const db = dbOf(deps);
   const inputHash = deletionOperationHash(input);
@@ -1721,6 +1919,24 @@ export async function deleteTransactionAttachment(
       'Attachment was not found.',
     );
   }
+  if (receiptDocumentId !== null) {
+    const receipt = await db.receiptDocument.findFirst({
+      where: {
+        id: receiptDocumentId,
+        companyId: input.companyId,
+        matchedTransactionId: input.transactionId,
+        transactionAttachmentId: input.attachmentId,
+        deletedAt: null,
+      },
+      select: { id: true },
+    });
+    if (!receipt) {
+      throw new AttachmentError(
+        'ATTACHMENT_NOT_FOUND',
+        'Receipt attachment operation was not found.',
+      );
+    }
+  }
   const operationId = randomUUID();
   const kind: AttachmentOperationKind = input.scope === 'local'
     ? 'DELETE_LOCAL'
@@ -1748,6 +1964,7 @@ export async function deleteTransactionAttachment(
           actorKey: input.actor.actorKey,
           companyId: input.companyId,
           transactionId: input.transactionId,
+          receiptDocumentId,
           idempotencyKey: input.idempotencyKey,
           requestHash: inputHash,
           inputHash,
