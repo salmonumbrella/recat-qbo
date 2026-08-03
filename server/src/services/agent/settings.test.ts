@@ -59,7 +59,7 @@ describe('shadow agent company settings', () => {
       provider: 'openrouter',
       evidenceThreshold: 50,
       companyConcurrency: 1,
-      dailyLiveWriteLimit: 100,
+      dailyLiveWriteLimit: 25,
       decisionModel: configuredProvider.agentDecisionModel,
       verifierModel: configuredProvider.agentVerifierModel,
     });

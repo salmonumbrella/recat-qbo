@@ -20,7 +20,11 @@ import { z } from 'zod';
 const DEFAULT_SCHEDULE_MINUTES = 10;
 const DEFAULT_COMPANY_CONCURRENCY = 1;
 const DEFAULT_EVIDENCE_THRESHOLD = 50;
-const DEFAULT_DAILY_LIVE_WRITE_LIMIT = 100;
+// Deliberately low out of the box. The cap exists to bound damage before
+// anyone has evidence the model is right on *this* company's books, and 25
+// mistakes is a recoverable afternoon where 100 is not. Operators raise it
+// once live writes have held up under spot-checking.
+const DEFAULT_DAILY_LIVE_WRITE_LIMIT = 25;
 const MAX_SCHEDULE_MINUTES = 24 * 60;
 const MAX_COMPANY_CONCURRENCY = 4;
 const MAX_DAILY_LIVE_WRITE_LIMIT = 10_000;

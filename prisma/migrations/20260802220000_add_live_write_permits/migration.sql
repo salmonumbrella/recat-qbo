@@ -1,5 +1,5 @@
 ALTER TABLE "AgentCompanyConfig"
-ADD COLUMN "dailyLiveWriteLimit" INTEGER NOT NULL DEFAULT 100;
+ADD COLUMN "dailyLiveWriteLimit" INTEGER NOT NULL DEFAULT 25;
 
 CREATE TABLE "LiveWritePermit" (
   "requestId" TEXT NOT NULL,

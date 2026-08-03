@@ -488,7 +488,7 @@ model AgentCompanyConfig {
   scheduleMinutes    Int      @default(10)
   companyConcurrency Int      @default(1)
   evidenceThreshold  Int      @default(50)
-  dailyLiveWriteLimit Int     @default(100)
+  dailyLiveWriteLimit Int     @default(25)
   limits             Json
   configVersion      String
   liveRequested              Boolean   @default(false)
