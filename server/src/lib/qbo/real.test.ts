@@ -8,6 +8,8 @@ import {
   QboAuthError,
   QboRequestTimeout,
   QboSyncTokenConflict,
+  type QboDepositPreparedWrite,
+  type QboDepositSnapshot,
   type QboPreparedLineWrite,
   type QboPreparedWrite,
 } from './types.js';
@@ -16,6 +18,7 @@ import {
   RealQboClient,
   exchangeAuthCode,
   mapDeposit,
+  mapDepositSnapshot,
   mapJournalEntry,
   mapPurchase,
   mapPurchaseSnapshot,
@@ -35,6 +38,7 @@ import {
   type RawReport,
 } from './real.js';
 import { hashLineWriteContent } from './lineWrite.js';
+import { QboWriteSafetyError } from './writeSafety.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -601,6 +605,142 @@ describe('RealQboClient attachment HTTP seam', () => {
 });
 
 describe('RealQboClient purchase-tax HTTP seam', () => {
+  it('reads the close date and exact cleared/reconciled transaction identity', async () => {
+    const report = (id: string, type: string): RawReport => ({
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: { Row: [{ ColData: [{ value: '2026-08-01', id }, { value: type }] }] },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: { BookCloseDate: '2026-07-31' } }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report('deposit-1', 'Deposit'))))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report('other-id', 'Deposit'))));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Deposit',
+      qboId: 'deposit-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).resolves.toEqual({
+      bookCloseDate: '2026-07-31',
+      cleared: true,
+      reconciled: false,
+    });
+    expect(decodeURIComponent(String(fetchMock.mock.calls[1]?.[0])))
+      .toContain('cleared=Cleared');
+    expect(decodeURIComponent(String(fetchMock.mock.calls[2]?.[0])))
+      .toContain('cleared=Reconciled');
+  });
+
+  it('canonicalizes the TransactionList Expense label to a Purchase entity', async () => {
+    const report = (type: string): RawReport => ({
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: {
+        Row: [{
+          ColData: [{ value: '2026-08-01', id: 'purchase-1' }, { value: type }],
+        }],
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report('Expense'))))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report('Purchase')))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).resolves.toMatchObject({ cleared: true, reconciled: true });
+  });
+
+  it('fails closed when the exact provider identity has an unknown report type', async () => {
+    const unknownType: RawReport = {
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: {
+        Row: [{
+          ColData: [{ value: '2026-08-01', id: 'purchase-1' }, { value: 'Localized expense' }],
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockImplementation(async () => new Response(JSON.stringify(unknownType))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+  });
+
+  it.each([
+    {},
+    { QueryResponse: { Preferences: [] } },
+    { QueryResponse: { Preferences: [{ AccountingInfoPrefs: { BookCloseDate: 'not-a-date' } }] } },
+  ])('fails closed when closing-date preferences are unavailable', async (preferencesBody) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(preferencesBody)),
+    ));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).rejects.toBeInstanceOf(QboWriteSafetyError);
+  });
+
+  it('treats an explicit absent close date and empty filtered reports as safe evidence', async () => {
+    const emptyReport: RawReport = {
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: { Row: [] },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(emptyReport)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(emptyReport))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).resolves.toEqual({
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+    });
+  });
+
+  it('fails closed when a matching filtered report row has no provider identity', async () => {
+    const ambiguousReport: RawReport = {
+      Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
+      Rows: { Row: [{ ColData: [{ value: '2026-08-01' }, { value: 'Purchase' }] }] },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValue(new Response(JSON.stringify(ambiguousReport))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-1',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    })).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+  });
+
   it('requests and normalizes valid and malformed tax profiles', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -767,6 +907,125 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it('reads a prepared Deposit snapshot from the Deposit endpoint', async () => {
+    const rawDeposit: RawDeposit = {
+      Id: 'D/1',
+      SyncToken: '2',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      GlobalTaxCalculation: 'TaxExcluded',
+      TxnTaxDetail: { TotalTax: 0.5 },
+      Line: [{
+        Id: 'LINE_GENERIC',
+        Amount: 10,
+        Description: 'Generic sale',
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'INCOME_GENERIC' },
+          TaxCodeRef: { value: 'TAX_GENERIC' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      Deposit: rawDeposit,
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      realClient().client.fetchPreparedSnapshot('Deposit', 'D/1'),
+    ).resolves.toEqual(mapDepositSnapshot(rawDeposit));
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/deposit/D%2F1?minorversion=75',
+    );
+  });
+
+  it('dispatches prepared recategorization and restore to the Deposit pure functions', async () => {
+    const raw: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      Line: [{
+        Id: 'LINE_HOLDING',
+        Amount: 10.5,
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: { AccountRef: { value: 'HOLDING_GENERIC' } },
+      }],
+    };
+    const before: QboDepositSnapshot = mapDepositSnapshot(raw);
+    const staged = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxCalculation: 'TaxExcluded',
+      totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: 1000,
+        taxCents: 50,
+        totalCents: 1050,
+        categoryQboId: 'INCOME_GENERIC',
+        taxCodeQboId: 'TAX_GENERIC',
+        memo: 'Generic sale',
+      }],
+      tagIds: [],
+    } as const;
+    const client = realClient(undefined, ['HOLDING_GENERIC']).client;
+    const txn = mapDeposit(raw, new Set(['HOLDING_GENERIC']));
+
+    const prepared = await client.prepareRecategorization(
+      txn,
+      staged,
+      before,
+      'REQUEST_DEPOSIT',
+    );
+    expect(prepared).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'recategorize',
+      body: {
+        Id: raw.Id,
+        Line: [{
+          Id: 'LINE_HOLDING',
+          Amount: 10,
+          DepositLineDetail: {
+            AccountRef: { value: 'INCOME_GENERIC' },
+            TaxCodeRef: { value: 'TAX_GENERIC' },
+            TaxApplicableOn: 'Sales',
+          },
+        }],
+      },
+    });
+
+    const postedRaw: RawDeposit = {
+      ...prepared.body,
+      SyncToken: '8',
+      TxnTaxDetail: { TotalTax: 0.5 },
+      Line: structuredClone(prepared.body.Line),
+    };
+    await expect(client.preparePurchaseRestore(
+      mapDeposit(postedRaw, new Set(['HOLDING_GENERIC'])),
+      prepared,
+      'REQUEST_WRONG_COMPATIBILITY_RESTORE',
+    )).rejects.toThrow(/Purchase compatibility restore/i);
+    const restore = await client.prepareRestore(
+      mapDeposit(postedRaw, new Set(['HOLDING_GENERIC'])),
+      prepared,
+      'REQUEST_DEPOSIT_RESTORE',
+    );
+    expect(restore).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'restore',
+      requestId: 'REQUEST_DEPOSIT_RESTORE',
+      body: {
+        Id: raw.Id,
+        SyncToken: '8',
+        Line: [{ Id: 'LINE_HOLDING', Amount: 10.5 }],
+      },
+    });
+  });
+
   it('refreshes once after a 401 and retries a tax-profile request', async () => {
     const onTokensRefreshed = vi.fn(async () => undefined);
     const fetchMock = vi.fn()
@@ -834,7 +1093,7 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       TotalAmt: 10,
       PrivateNote: 'generic private note',
       AccountRef: { value: 'ACCOUNT_PAYMENT' },
-      CurrencyRef: { value: 'CAD' },
+      CurrencyRef: { value: 'CUR' },
       ExchangeRate: 1.25,
       GlobalTaxCalculation: 'TaxInclusive',
       TxnTaxDetail: { TotalTax: 0.48 },
@@ -878,6 +1137,51 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
       body: JSON.stringify(body),
     });
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends exact prepared Deposit JSON to the Deposit endpoint and requires its response token', async () => {
+    const body: RawDeposit = {
+      Id: 'DEPOSIT_GENERIC',
+      SyncToken: '7',
+      TxnDate: '2026-07-01',
+      TotalAmt: 10,
+      DepositToAccountRef: { value: 'BANK_GENERIC' },
+      Line: [],
+    };
+    const prepared = {
+      operation: 'recategorize',
+      qboType: 'Deposit',
+      qboId: body.Id,
+      requestId: 'REQUEST_GENERIC',
+      requestHash: 'hash-generic',
+      body,
+      before: {} as QboDepositPreparedWrite['before'],
+      expected: {} as QboDepositPreparedWrite['expected'],
+    } satisfies QboDepositPreparedWrite;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Deposit: { ...body, SyncToken: '8' },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        Purchase: { SyncToken: '9' },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).resolves.toEqual({
+      ok: true,
+      newSyncToken: '8',
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/deposit?requestid=REQUEST_GENERIC&minorversion=75',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+
+    await expect(realClient().client.sendPreparedWrite(prepared)).rejects.toThrow(
+      /Deposit SyncToken/,
+    );
   });
 
   it.each([
@@ -1489,7 +1793,7 @@ describe('RealQboClient prepared transfer line writes', () => {
 const HOLDING = new Set(['4']);
 
 describe('tax read normalization', () => {
-  it('normalizes purchase rate components without retaining the raw response', () => {
+  it('normalizes distinct purchase and sales rate components without retaining the raw response', () => {
     expect(
       mapTaxCode({
         Id: 'GST5',
@@ -1499,15 +1803,13 @@ describe('tax read normalization', () => {
         PurchaseTaxRateList: {
           TaxRateDetail: [{ TaxRateRef: { value: 'RATE5' }, TaxTypeApplicable: 'TaxOnAmount' }],
         },
+        SalesTaxRateList: {
+          TaxRateDetail: [{ TaxRateRef: { value: 'RATE7' }, TaxTypeApplicable: 'TaxOnAmount' }],
+        },
       }),
-    ).toEqual({
-      qboId: 'GST5',
-      name: 'GST 5%',
-      description: null,
-      active: true,
-      taxable: true,
+    ).toMatchObject({
       purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
-      sourceUpdatedAt: null,
+      salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
     });
   });
 
@@ -1521,6 +1823,18 @@ describe('tax read normalization', () => {
             { TaxRateRef: { value: 'GST5' }, TaxTypeApplicable: 'TaxOnAmount' },
             { TaxTypeApplicable: 'TaxOnTax' },
           ],
+        },
+      }),
+    ).toThrow(/rate reference/i);
+  });
+
+  it('rejects a malformed sales component before it reaches the cache', () => {
+    expect(() =>
+      mapTaxCode({
+        Id: 'CODE',
+        Name: 'Code',
+        SalesTaxRateList: {
+          TaxRateDetail: [{ TaxTypeApplicable: 'TaxOnAmount' }],
         },
       }),
     ).toThrow(/rate reference/i);

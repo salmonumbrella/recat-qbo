@@ -7,6 +7,7 @@
 
 import type { QboDiagnosticCode, StagedCategorization } from '@recat/shared';
 import type { AttachmentBlobReader } from '../../services/attachments/types.js';
+import type { QboWriteSafetyEvidence, QboWriteSafetyTarget } from './writeSafety.js';
 
 export interface QboTokenSet {
   accessToken: string;
@@ -82,6 +83,7 @@ export interface QboTaxCodeInfo {
   active: boolean;
   taxable: boolean | null;
   purchaseRates: { taxRateQboId: string; taxTypeApplicable: string }[];
+  salesRates: { taxRateQboId: string; taxTypeApplicable: string }[];
   sourceUpdatedAt: string | null;
 }
 
@@ -154,6 +156,71 @@ export interface RawPurchase {
   [key: string]: unknown;
 }
 
+export interface RawDepositLine {
+  Id?: string;
+  Amount?: number;
+  Description?: string;
+  DetailType?: string;
+  DepositLineDetail?: {
+    AccountRef?: QboRef;
+    Entity?: QboRef;
+    PaymentMethodRef?: QboRef;
+    ClassRef?: QboRef;
+    TaxCodeRef?: QboRef;
+    TaxApplicableOn?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+/** Complete QBO Deposit update shape. Unknown fields are retained verbatim. */
+export interface RawDeposit {
+  Id: string;
+  SyncToken: string;
+  TxnDate?: string;
+  TotalAmt?: number;
+  DocNumber?: string;
+  PrivateNote?: string;
+  DepositToAccountRef?: QboRef;
+  CurrencyRef?: QboRef;
+  ExchangeRate?: number;
+  Line?: RawDepositLine[];
+  GlobalTaxCalculation?: string;
+  TxnTaxDetail?: {
+    TotalTax?: number;
+    [key: string]: unknown;
+  };
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface QboDepositSnapshot {
+  qboId: string;
+  syncToken: string;
+  totalCents: number;
+  depositToAccountQboId: string | null;
+  date: string;
+  globalTaxCalculation: string | null;
+  totalTaxCents: number | null;
+  /** Canonical fingerprint of writable entity fields that a tax write does not change. */
+  preservedHash: string;
+  lines: Array<{
+    id: string | null;
+    amountCents: number;
+    description: string | null;
+    accountQboId: string | null;
+    entityQboId: string | null;
+    paymentMethodQboId: string | null;
+    classQboId: string | null;
+    taxCodeQboId: string | null;
+    taxApplicableOn: string | null;
+    /** Full canonical raw-line fingerprint for untouched-line verification. */
+    rawHash: string;
+    /** Stable write-intent fingerprint excluding QBO-assigned/enriched fields. */
+    targetHash: string;
+  }>;
+}
+
 export interface QboPurchaseExpectedState {
   qboId: string;
   totalCents: number;
@@ -166,12 +233,27 @@ export interface QboPurchaseExpectedState {
   untouchedLineHashes: string[];
 }
 
-export interface QboPreparedWrite {
+export interface QboDepositExpectedState {
+  qboId: string;
+  totalCents: number;
+  depositToAccountQboId: string | null;
+  date: string;
+  globalTaxCalculation: string | null;
+  totalTaxCents: number | null;
+  preservedHash: string;
+  targetLines: QboDepositSnapshot['lines'];
+  untouchedLineHashes: string[];
+}
+
+interface QboPreparedWriteBase {
   operation: 'recategorize' | 'restore';
-  qboType: 'Purchase';
   qboId: string;
   requestId: string;
   requestHash: string;
+}
+
+export interface QboPurchasePreparedWrite extends QboPreparedWriteBase {
+  qboType: 'Purchase';
   body: RawPurchase;
   before: QboPurchaseSnapshot;
   expected: QboPurchaseExpectedState;
@@ -201,34 +283,6 @@ export interface QboLineWriteSplit {
   memo?: string;
 }
 
-export interface RawDepositLine {
-  Id?: string;
-  Amount?: number;
-  Description?: string;
-  DetailType?: string;
-  DepositLineDetail?: {
-    AccountRef?: QboRef;
-    Entity?: QboRef;
-    PaymentMethodRef?: QboRef;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-/** Complete QBO Deposit update shape. Unknown fields are retained verbatim. */
-export interface RawDeposit {
-  Id: string;
-  SyncToken: string;
-  TxnDate?: string;
-  TotalAmt?: number;
-  DocNumber?: string;
-  PrivateNote?: string;
-  DepositToAccountRef?: QboRef;
-  Line?: RawDepositLine[];
-  status?: string;
-  [key: string]: unknown;
-}
-
 export interface RawJournalEntryLine {
   Id?: string;
   Amount?: number;
@@ -253,6 +307,15 @@ export interface RawJournalEntry {
   status?: string;
   [key: string]: unknown;
 }
+
+export interface QboDepositPreparedWrite extends QboPreparedWriteBase {
+  qboType: 'Deposit';
+  body: RawDeposit;
+  before: QboDepositSnapshot;
+  expected: QboDepositExpectedState;
+}
+
+export type QboPreparedWrite = QboPurchasePreparedWrite | QboDepositPreparedWrite;
 
 /** One normalized row of a QBO-computed financial statement (values in dollars). */
 export interface QboStatementRow {
@@ -419,15 +482,22 @@ export interface QboClient {
     qboId: string,
     signal?: AbortSignal,
   ): Promise<QboPurchaseSnapshot | null>;
+  fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence>;
   fetchLineWriteSnapshot(
     qboType: QboTxn['qboType'],
     qboId: string,
   ): Promise<QboLineWriteSnapshot | null>;
 
-  preparePurchaseRecategorization(
+  fetchPreparedSnapshot(
+    qboType: 'Purchase' | 'Deposit',
+    qboId: string,
+    signal?: AbortSignal,
+  ): Promise<QboPurchaseSnapshot | QboDepositSnapshot | null>;
+
+  prepareRecategorization(
     txn: QboTxn,
     staged: StagedCategorization,
-    before: QboPurchaseSnapshot,
+    before: QboPurchaseSnapshot | QboDepositSnapshot,
     requestId: string,
   ): Promise<QboPreparedWrite>;
 
@@ -445,6 +515,12 @@ export interface QboClient {
   ): Promise<QboLineWriteResult>;
 
   preparePurchaseRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPreparedWrite>;
+
+  prepareRestore(
     txn: QboTxn,
     prepared: QboPreparedWrite,
     requestId: string,

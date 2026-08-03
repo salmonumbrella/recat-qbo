@@ -747,14 +747,16 @@ model QboAccount {
 }
 
 model QboTaxRate {
-  id              String    @id @default(uuid())
-  companyId       String
-  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  qboId           String
-  name            String
-  description     String?
-  active          Boolean   @default(true)
-  rateValue       Decimal   @db.Decimal(9, 6)
+  id          String   @id @default(uuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId       String
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  // Previously synced caches may retain inactive rows with no value.
+  // Runtime tax calculations query only normalized non-null rows.
+  rateValue   Decimal? @db.Decimal(9, 6)
   sourceUpdatedAt DateTime?
   updatedAt       DateTime  @updatedAt
 
@@ -762,18 +764,20 @@ model QboTaxRate {
 }
 
 model QboTaxCode {
-  id                   String    @id @default(uuid())
-  companyId            String
-  company              Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  qboId                String
-  name                 String
-  description          String?
-  active               Boolean   @default(true)
-  taxable              Boolean?
-  purchaseTaxRateList  Json
-  combinedPurchaseRate Decimal?  @db.Decimal(9, 6)
-  sourceUpdatedAt      DateTime?
-  updatedAt            DateTime  @updatedAt
+  id                      String   @id @default(uuid())
+  companyId               String
+  company                 Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboId                   String
+  name                    String
+  description             String?
+  active                  Boolean  @default(true)
+  taxable                 Boolean?
+  purchaseTaxRateList     Json
+  salesTaxRateList        Json     @default("[]")
+  combinedPurchaseRate    Decimal? @db.Decimal(9, 6)
+  combinedSalesRate       Decimal? @db.Decimal(9, 6)
+  sourceUpdatedAt         DateTime?
+  updatedAt               DateTime @updatedAt
 
   @@unique([companyId, qboId])
 }

@@ -132,6 +132,62 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     };
   }
 
+  async function seedDepositSalesTax(): Promise<Fixture> {
+    const fixture = await seed();
+    const accountQboId = fixture.input.proposal.lines[0]!.categoryQboId;
+    await Promise.all([
+      stageClient.company.update({
+        where: { id: fixture.companyId },
+        data: {
+          taxSupportStatus: 'ready',
+          taxUsingSalesTax: true,
+          taxSupportReason: null,
+        },
+      }),
+      stageClient.transaction.update({
+        where: { id: fixture.transactionId },
+        data: { qboType: 'Deposit', amount: '107.00' },
+      }),
+      stageClient.qboTaxRate.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: 'sales-rate-7',
+          name: 'Generic sales rate',
+          rateValue: 7,
+        },
+      }),
+      stageClient.qboTaxCode.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: 'sales-code-standard',
+          name: 'Generic sales tax',
+          taxable: true,
+          purchaseTaxRateList: [],
+          salesTaxRateList: [{ taxRateQboId: 'sales-rate-7', taxTypeApplicable: 'TaxOnAmount' }],
+          combinedSalesRate: 7,
+        },
+      }),
+    ]);
+    return {
+      ...fixture,
+      key: { ...fixture.key, qboType: 'Deposit' },
+      input: {
+        ...fixture.input,
+        proposal: {
+          taxCalculation: 'TaxInclusive',
+          lines: [{
+            grossCents: 10_700,
+            categoryQboId: accountQboId,
+            taxCodeQboId: 'sales-code-standard',
+            memo: 'Generic deposit line',
+            tagIds: [],
+          }],
+          tagIds: [],
+        },
+      },
+    };
+  }
+
   async function cleanup(fixture: Fixture): Promise<void> {
     await stageClient.qboEntityLease.deleteMany({
       where: fixture.key,
@@ -168,6 +224,23 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
       beforeSnapshot: { syncToken: '0', kind: 'generic-test' },
     };
   }
+
+  it('stages positive Deposit sales tax with database-backed references', async () => {
+    const fixture = await seedDepositSalesTax();
+
+    try {
+      await expect(
+        stageCategorization(fixture.input, realStageDeps(stageClient)),
+      ).resolves.toMatchObject({
+        transactionId: fixture.transactionId,
+        revision: 1,
+        totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
+        lines: [{ subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 }],
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
 
   it('makes stage lose without mutation while a leased PREPARED insert commits', async () => {
     const fixture = await seed();
@@ -325,6 +398,7 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         SyncToken: '0',
         TxnDate: '2026-07-28',
         TotalAmt: 10.5,
+        GlobalTaxCalculation: 'NotApplicable',
         AccountRef: { value: 'payment-generic' },
         Line: [{
           Amount: 10.5,
@@ -387,7 +461,18 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     const client: Partial<QboClient> = {
       fetchTxn: vi.fn(async () => structuredClone(freshTxn)),
       fetchPurchaseSnapshot: vi.fn(async () => structuredClone(beforeSnapshot)),
+      fetchPreparedSnapshot: vi.fn(async () => structuredClone(beforeSnapshot)),
+      fetchWriteSafety: vi.fn(async () => ({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })),
       preparePurchaseRecategorization: vi.fn(async () => {
+        prepareStarted.resolve();
+        await allowPreparation.promise;
+        return structuredClone(prepared);
+      }),
+      prepareRecategorization: vi.fn(async () => {
         prepareStarted.resolve();
         await allowPreparation.promise;
         return structuredClone(prepared);

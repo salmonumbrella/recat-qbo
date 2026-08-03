@@ -1,5 +1,6 @@
 import type { CallToolResult, JSONObject } from '@modelcontextprotocol/server';
 import { HttpError } from '../lib/http.js';
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
@@ -21,6 +22,9 @@ export type SafeToolErrorCode =
   | 'INVALID_INPUT'
   | 'COMPANY_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
+  | 'QBO_PERIOD_CLOSED'
+  | 'QBO_TRANSACTION_LOCKED'
+  | 'QBO_WRITE_SAFETY_UNAVAILABLE'
   | 'RATE_LIMITED';
 
 const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
@@ -29,6 +33,9 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   INVALID_INPUT: 'Check the tool arguments and try again.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
+  QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
+  QBO_TRANSACTION_LOCKED: 'QuickBooks reports this transaction as cleared or reconciled.',
+  QBO_WRITE_SAFETY_UNAVAILABLE: 'QuickBooks write-safety status is unavailable.',
   RATE_LIMITED: 'Too many requests were made. Wait briefly and try again.',
 };
 
@@ -187,6 +194,13 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
     return 'COMPANY_UNAVAILABLE';
   }
   if (error instanceof WritebackLifecycleError) {
+    if (
+      error.code === 'QBO_PERIOD_CLOSED'
+      || error.code === 'QBO_TRANSACTION_LOCKED'
+      || error.code === 'QBO_WRITE_SAFETY_UNAVAILABLE'
+    ) {
+      return error.code;
+    }
     if (error.code === 'FORBIDDEN') return 'FORBIDDEN';
     if (
       error.code === 'TRANSACTION_NOT_FOUND'
@@ -203,6 +217,7 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
 
 function safeCode(error: unknown): SafeToolErrorCode {
   if (error instanceof McpSchemaBoundsError) return 'INVALID_INPUT';
+  if (error instanceof QboWriteSafetyError) return error.code;
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;
   if (!(error instanceof HttpError)) return 'COMPANY_UNAVAILABLE';

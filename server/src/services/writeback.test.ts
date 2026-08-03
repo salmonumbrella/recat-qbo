@@ -5,6 +5,8 @@ import {
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboClient,
+  type QboDepositPreparedWrite,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
   type QboPurchaseSnapshot,
   type QboTxn,
@@ -139,11 +141,14 @@ interface FakeTxnRow {
   status: string;
   category: string | null;
   categoryQboId: string | null;
+  taxCalculation: string | null;
+  taxCodeQboId: string | null;
   splitLines: {
     idx: number;
     amount: number;
     category: string;
     categoryQboId: string | null;
+    taxCodeQboId?: string | null;
     memo: string | null;
     tags: { tagId: string }[];
   }[];
@@ -159,6 +164,13 @@ interface FakeTxnRow {
     holdingAccountIds: string[];
     taxSupportStatus?: string;
     taxUsingSalesTax?: boolean | null;
+    taxSupportReason?: string | null;
+    cachedSalesCodes?: {
+      active: boolean;
+      taxable: boolean | null;
+      salesTaxRateList: unknown;
+      combinedSalesRate: number | null;
+    }[];
   };
 }
 
@@ -177,6 +189,8 @@ function makeTxnRow(overrides: Partial<FakeTxnRow> = {}): FakeTxnRow {
     status: 'PENDING',
     category: 'Software subscriptions',
     categoryQboId: '25',
+    taxCalculation: null,
+    taxCodeQboId: null,
     splitLines: [],
     postedAt: null,
     postedByUserId: null,
@@ -188,17 +202,19 @@ function makeTxnRow(overrides: Partial<FakeTxnRow> = {}): FakeTxnRow {
   };
 }
 
-function freshQboTxn(syncToken = '0'): QboTxn {
+function freshQboTxn(syncToken = '0', qboType: 'Purchase' | 'Deposit' = 'Purchase'): QboTxn {
   return {
     qboId: '6',
-    qboType: 'Purchase',
+    qboType,
     syncToken,
     date: '2026-07-05',
     payee: 'WEBFLOW.COM',
     amount: -29,
     bankAccount: 'Visa ·0392',
     lines: [{ id: '1', amount: 29, accountQboId: '4', accountName: 'Ask My Accountant' }],
-    raw: {},
+    raw: qboType === 'Purchase'
+      ? { AccountRef: { value: 'payment-generic' } }
+      : { DepositToAccountRef: { value: 'payment-generic' } },
   };
 }
 
@@ -221,6 +237,9 @@ function makeFakeDb(row: FakeTxnRow) {
     qboMutationAttempt: {
       findFirst: vi.fn(async () => null),
     },
+    qboTaxCode: {
+      findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
+    },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db)),
   };
   return db;
@@ -233,9 +252,17 @@ function makeDeps(
 ): { deps: WritebackDeps; db: ReturnType<typeof makeFakeDb>; audit: ReturnType<typeof vi.fn> } {
   const db = makeFakeDb(row);
   const audit = vi.fn(async () => undefined);
+  const safeClient: Partial<QboClient> = {
+    fetchWriteSafety: async () => ({
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+    }),
+    ...client,
+  };
   const deps: WritebackDeps = {
     db: db as unknown as PrismaClient,
-    getClient: async () => client as QboClient,
+    getClient: async () => safeClient as QboClient,
     audit,
     envDryRun,
   };
@@ -314,6 +341,72 @@ describe('postTransaction SyncToken conflict handling', () => {
   });
 });
 
+describe('legacy write safety', () => {
+  it.each(['Purchase', 'Deposit'] as const)(
+    'blocks a locked %s before posting and preserves PENDING state',
+    async (qboType) => {
+      const row = makeTxnRow({ qboType });
+      const recategorize = vi.fn();
+      const fetchWriteSafety = vi.fn(async () => ({
+        bookCloseDate: null,
+        cleared: qboType === 'Purchase',
+        reconciled: qboType === 'Deposit',
+      }));
+      const { deps } = makeDeps(row, {
+        fetchTxn: async () => freshQboTxn('0', qboType),
+        fetchWriteSafety,
+        recategorize,
+      });
+
+      const result = await postTransaction(
+        'txn-1',
+        { id: 'u-1', label: 'Generic User' },
+        {},
+        deps,
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        status: 'PENDING',
+        error: { code: 'QBO_TRANSACTION_LOCKED' },
+      });
+      expect(fetchWriteSafety).toHaveBeenCalledWith({
+        qboType,
+        qboId: '6',
+        txnDate: '2026-07-05',
+        bankAccountQboId: 'payment-generic',
+      });
+      expect(recategorize).not.toHaveBeenCalled();
+      expect(row.status).toBe('PENDING');
+    },
+  );
+
+  it('rechecks safety after a SyncToken conflict before retrying', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn().mockRejectedValueOnce(new QboSyncTokenConflict());
+    const fetchWriteSafety = vi
+      .fn()
+      .mockResolvedValueOnce({ bookCloseDate: null, cleared: false, reconciled: false })
+      .mockResolvedValueOnce({ bookCloseDate: null, cleared: true, reconciled: false });
+    const { deps } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn('1'),
+      fetchWriteSafety,
+      recategorize,
+    });
+
+    const result = await postTransaction(
+      'txn-1',
+      { id: 'u-1', label: 'Generic User' },
+      {},
+      deps,
+    );
+
+    expect(result).toMatchObject({ status: 'PENDING', error: { code: 'QBO_TRANSACTION_LOCKED' } });
+    expect(fetchWriteSafety).toHaveBeenCalledTimes(2);
+    expect(recategorize).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('postTransaction dual-write honesty', () => {
   it('marks ERROR with a "verify in QuickBooks" message when the DB commit fails after a successful QBO write', async () => {
     const row = makeTxnRow();
@@ -338,6 +431,34 @@ describe('postTransaction dual-write honesty', () => {
 
 describe('undoPost', () => {
   const postedCompany = { id: 'co-1', dryRun: true, tagsRequired: false, holdingAccountIds: ['4'] };
+
+  it.each(['Purchase', 'Deposit'] as const)(
+    'blocks a locked %s before legacy undo and preserves POSTED state',
+    async (qboType) => {
+      const row = makeTxnRow({
+        qboType,
+        status: 'POSTED',
+        postedAt: new Date(),
+        company: postedCompany,
+      });
+      const moveToAccount = vi.fn();
+      const { deps } = makeDeps(row, {
+        fetchTxn: async () => freshQboTxn('4', qboType),
+        fetchWriteSafety: async () => ({
+          bookCloseDate: null,
+          cleared: true,
+          reconciled: false,
+        }),
+        moveToAccount,
+      });
+
+      await expect(
+        undoPost('txn-1', { id: 'u-1', label: 'Generic User' }, deps),
+      ).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+      expect(moveToAccount).not.toHaveBeenCalled();
+      expect(row.status).toBe('POSTED');
+    },
+  );
 
   it('blocks a tax-ready Purchase before legacy undo status or QBO work', async () => {
     const row = makeTxnRow({
@@ -368,12 +489,81 @@ describe('undoPost', () => {
     expect(row.status).toBe('PENDING');
   });
 
+  it('blocks a canonically sales-ready Deposit before legacy undo work', async () => {
+    const row = makeTxnRow({
+      qboType: 'Deposit',
+      status: 'DRY_RUN',
+      postedAt: new Date(),
+      company: {
+        id: 'company-generic',
+        dryRun: true,
+        tagsRequired: false,
+        holdingAccountIds: ['4'],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: true,
+        taxSupportReason: null,
+        cachedSalesCodes: [{
+          active: true,
+          taxable: true,
+          salesTaxRateList: [{
+            taxRateQboId: 'sales-rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          combinedSalesRate: 5,
+        }],
+      },
+    });
+    const fetchTxn = vi.fn();
+    const moveToAccount = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, moveToAccount });
+
+    await expect(
+      undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
+    ).rejects.toMatchObject<WritebackLifecycleError>({
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+      message: 'Tax-ready Deposits must use staged categorization.',
+    });
+    expect(db.transaction.update).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+    expect(moveToAccount).not.toHaveBeenCalled();
+  });
+
+  it('keeps a staged Deposit out of legacy undo after sales-tax readiness is lost', async () => {
+    const row = makeTxnRow({
+      qboType: 'Deposit',
+      status: 'DRY_RUN',
+      postedAt: new Date(),
+      taxCalculation: 'TaxInclusive',
+      company: {
+        id: 'company-generic',
+        dryRun: true,
+        tagsRequired: false,
+        holdingAccountIds: ['4'],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: false,
+        taxSupportReason: 'References unavailable',
+        cachedSalesCodes: [],
+      },
+    });
+    const fetchTxn = vi.fn();
+    const moveToAccount = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn, moveToAccount });
+
+    await expect(
+      undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
+    ).rejects.toMatchObject<WritebackLifecycleError>({
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+    expect(moveToAccount).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['unsupported readiness', 'Purchase', 'unsupported', true],
     ['setup-incomplete readiness', 'Purchase', 'needs_setup', true],
-    ['tax disabled', 'Purchase', 'ready', false],
     ['unavailable readiness', 'Purchase', undefined, undefined],
-    ['non-Purchase transaction', 'Deposit', 'ready', true],
+    ['sales-tax-disabled Deposit', 'Deposit', 'ready', false],
   ] as const)('preserves legacy undo behavior for %s', async (
     _case,
     qboType,
@@ -477,6 +667,97 @@ describe('postTransaction guards', () => {
     expect(row.status).toBe('POSTED');
   });
 
+  it('blocks a canonically sales-ready Deposit before legacy post work', async () => {
+    const row = makeTxnRow({
+      qboType: 'Deposit',
+      company: {
+        id: 'company-generic',
+        dryRun: true,
+        tagsRequired: false,
+        holdingAccountIds: ['4'],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: true,
+        taxSupportReason: null,
+        cachedSalesCodes: [{
+          active: true,
+          taxable: true,
+          salesTaxRateList: [{
+            taxRateQboId: 'sales-rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          combinedSalesRate: 5,
+        }],
+      },
+    });
+    const fetchTxn = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn });
+
+    await expect(
+      postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
+    ).rejects.toMatchObject<WritebackLifecycleError>({
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+      message: 'Tax-ready Deposits must use staged categorization.',
+    });
+    expect(db.transaction.update).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+  });
+
+  it('keeps a staged Deposit out of legacy post after sales-tax readiness is lost', async () => {
+    const row = makeTxnRow({
+      qboType: 'Deposit',
+      taxCalculation: 'TaxInclusive',
+      company: {
+        id: 'company-generic',
+        dryRun: true,
+        tagsRequired: false,
+        holdingAccountIds: ['4'],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: false,
+        taxSupportReason: 'References unavailable',
+        cachedSalesCodes: [],
+      },
+    });
+    const fetchTxn = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn });
+
+    await expect(
+      postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
+    ).rejects.toMatchObject<WritebackLifecycleError>({
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(db.transaction.update).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+  });
+
+  it('keeps a transaction with a durable categorization attempt out of legacy post', async () => {
+    const row = makeTxnRow({
+      qboType: 'Deposit',
+      taxCalculation: null,
+      company: {
+        id: 'company-generic',
+        dryRun: true,
+        tagsRequired: false,
+        holdingAccountIds: ['4'],
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: false,
+        cachedSalesCodes: [],
+      },
+    });
+    const fetchTxn = vi.fn();
+    const { deps, db } = makeDeps(row, { fetchTxn });
+    db.qboMutationAttempt.findFirst.mockResolvedValueOnce({ id: 'attempt-generic' });
+
+    await expect(
+      postTransaction('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, {}, deps),
+    ).rejects.toMatchObject<WritebackLifecycleError>({
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(db.transaction.update).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+  });
+
   it('applies the tax-ready Purchase guard to every bulk item', async () => {
     const row = makeTxnRow({
       payee: 'Generic supplier',
@@ -512,9 +793,8 @@ describe('postTransaction guards', () => {
   it.each([
     ['unsupported readiness', 'Purchase', 'unsupported', true],
     ['setup-incomplete readiness', 'Purchase', 'needs_setup', true],
-    ['tax disabled', 'Purchase', 'ready', false],
     ['unavailable readiness', 'Purchase', undefined, undefined],
-    ['non-Purchase transaction', 'Deposit', 'ready', true],
+    ['sales-tax-disabled Deposit', 'Deposit', 'ready', false],
   ] as const)('preserves legacy behavior for %s', async (
     _case,
     qboType,
@@ -663,26 +943,140 @@ const stagedPurchase: StagedCategorization = {
   tagIds: [],
 };
 
-function preparedWrite(requestId = 'request-generic'): QboPreparedWrite {
-  const body: QboPreparedWrite['body'] = {
-      Id: 'purchase-generic',
+const beforeDeposit: QboDepositSnapshot = {
+  qboId: 'deposit-generic',
+  syncToken: '7',
+  totalCents: 1050,
+  depositToAccountQboId: 'payment-generic',
+  date: '2026-07-28',
+  globalTaxCalculation: null,
+  totalTaxCents: null,
+  preservedHash: 'deposit-preserved',
+  lines: [{
+    id: 'line-holding',
+    amountCents: 1050,
+    description: null,
+    accountQboId: 'holding-generic',
+    entityQboId: 'entity-generic',
+    paymentMethodQboId: null,
+    classQboId: null,
+    taxCodeQboId: null,
+    taxApplicableOn: null,
+    rawHash: 'holding-raw',
+    targetHash: 'holding-target',
+  }],
+};
+
+const expectedDeposit = {
+  qboId: 'deposit-generic',
+  totalCents: 1050,
+  depositToAccountQboId: 'payment-generic',
+  date: '2026-07-28',
+  globalTaxCalculation: 'TaxInclusive',
+  totalTaxCents: 50,
+  preservedHash: 'deposit-preserved',
+  targetLines: [{
+    id: null,
+    amountCents: 1050,
+    description: 'Prepared deposit',
+    accountQboId: 'income-generic',
+    entityQboId: 'entity-generic',
+    paymentMethodQboId: null,
+    classQboId: null,
+    taxCodeQboId: 'tax-generic',
+    taxApplicableOn: 'Sales',
+    rawHash: 'target-raw-before-id',
+    targetHash: 'target-hash',
+  }],
+  untouchedLineHashes: [],
+};
+
+const verifiedDeposit: QboDepositSnapshot = {
+  ...beforeDeposit,
+  syncToken: '8',
+  globalTaxCalculation: 'TaxInclusive',
+  totalTaxCents: 50,
+  lines: [{
+    ...expectedDeposit.targetLines[0]!,
+    id: 'line-posted',
+    rawHash: 'target-raw-after-id',
+  }],
+};
+
+const stagedDeposit: StagedCategorization = {
+  transactionId: DURABLE_TRANSACTION_ID,
+  revision: 1,
+  taxCalculation: 'TaxInclusive',
+  totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+  lines: [{
+    idx: 0,
+    subtotalCents: 1000,
+    taxCents: 50,
+    totalCents: 1050,
+    categoryQboId: 'income-generic',
+    taxCodeQboId: 'tax-generic',
+    memo: 'Prepared deposit',
+    tagIds: [],
+  }],
+  tagIds: [],
+};
+
+type PreparedEntity = 'Purchase' | 'Deposit';
+
+function preparedWrite(
+  requestId = 'request-generic',
+  qboType: PreparedEntity = 'Purchase',
+): QboPreparedWrite {
+  if (qboType === 'Deposit') {
+    const body: QboDepositPreparedWrite['body'] = {
+      Id: 'deposit-generic',
       SyncToken: '7',
       TxnDate: '2026-07-28',
       TotalAmt: 10.5,
-      AccountRef: { value: 'payment-generic' },
+      DepositToAccountRef: { value: 'payment-generic' },
       GlobalTaxCalculation: 'TaxInclusive',
       Line: [{
-        Amount: 10,
-        Description: 'Prepared purchase',
-        DetailType: 'AccountBasedExpenseLineDetail',
-        AccountBasedExpenseLineDetail: {
-          AccountRef: { value: 'expense-generic' },
+        Amount: 10.5,
+        Description: 'Prepared deposit',
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'income-generic' },
+          Entity: { value: 'entity-generic' },
           TaxCodeRef: { value: 'tax-generic' },
-          TaxAmount: 0.5,
-          TaxInclusiveAmt: 10.5,
+          TaxApplicableOn: 'Sales',
         },
       }],
     };
+    return {
+      operation: 'recategorize',
+      qboType: 'Deposit',
+      qboId: 'deposit-generic',
+      requestId,
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before: structuredClone(beforeDeposit),
+      expected: structuredClone(expectedDeposit),
+    };
+  }
+  const body = {
+    Id: 'purchase-generic',
+    SyncToken: '7',
+    TxnDate: '2026-07-28',
+    TotalAmt: 10.5,
+    AccountRef: { value: 'payment-generic' },
+    GlobalTaxCalculation: 'TaxInclusive',
+    Line: [{
+      Amount: 10,
+      Description: 'Prepared purchase',
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'expense-generic' },
+        TaxCodeRef: { value: 'tax-generic' },
+        TaxAmount: 0.5,
+        TaxInclusiveAmt: 10.5,
+      },
+    }],
+  };
   return {
     operation: 'recategorize',
     qboType: 'Purchase',
@@ -693,6 +1087,66 @@ function preparedWrite(requestId = 'request-generic'): QboPreparedWrite {
     before: structuredClone(beforePurchase),
     expected: structuredClone(expectedPurchase),
   };
+}
+
+function restoredWrite(
+  original: QboPreparedWrite,
+  requestId: string,
+): QboPreparedWrite {
+  if (original.qboType === 'Deposit') {
+    const body: QboDepositPreparedWrite['body'] = {
+      Id: original.qboId,
+      SyncToken: '8',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      DepositToAccountRef: { value: 'payment-generic' },
+      Line: [{
+        Id: 'line-holding',
+        Amount: 10.5,
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          Entity: { value: 'entity-generic' },
+        },
+      }],
+    };
+    return {
+      operation: 'restore',
+      qboType: 'Deposit',
+      qboId: original.qboId,
+      requestId,
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before: structuredClone(verifiedDeposit),
+      expected: {
+        qboId: original.before.qboId,
+        totalCents: original.before.totalCents,
+        depositToAccountQboId: original.before.depositToAccountQboId,
+        date: original.before.date,
+        globalTaxCalculation: original.before.globalTaxCalculation,
+        totalTaxCents: original.before.totalTaxCents,
+        preservedHash: original.before.preservedHash,
+        targetLines: structuredClone(original.before.lines),
+        untouchedLineHashes: [],
+      },
+    };
+  }
+  const prepared = preparedWrite(requestId);
+  const body = { ...prepared.body, SyncToken: '8' };
+  return {
+    ...prepared,
+    operation: 'restore',
+    requestHash: hashPreparedWriteBody(body),
+    body,
+    before: structuredClone(verifiedPurchase),
+    expected: {
+      ...original.expected,
+      globalTaxCalculation: original.before.globalTaxCalculation,
+      totalTaxCents: original.before.totalTaxCents,
+      targetLines: original.before.lines,
+      untouchedLineHashes: [],
+    },
+  } as QboPreparedWrite;
 }
 
 interface DurableAttemptRow {
@@ -714,17 +1168,18 @@ interface DurableAttemptRow {
   updatedAt: Date;
 }
 
-function durableTransaction() {
+function durableTransaction(qboType: PreparedEntity = 'Purchase') {
+  const deposit = qboType === 'Deposit';
   return {
     id: DURABLE_TRANSACTION_ID,
     companyId: DURABLE_COMPANY_ID,
-    qboId: 'purchase-generic',
-    qboType: 'Purchase',
+    qboId: deposit ? 'deposit-generic' : 'purchase-generic',
+    qboType,
     qboSyncToken: '7',
     revision: 1,
     status: 'PENDING',
-    amount: -10.5,
-    payee: 'Generic Supplier',
+    amount: deposit ? 10.5 : -10.5,
+    payee: deposit ? 'Generic Customer' : 'Generic Supplier',
     postedAt: null as Date | null,
     postedByUserId: null as string | null,
     errorCode: null as string | null,
@@ -737,18 +1192,19 @@ function durableTransaction() {
       holdingAccountIds: ['holding-generic'],
       taxSupportStatus: 'ready',
       taxUsingSalesTax: true,
+      taxSupportReason: null,
     },
     splitLines: [{
       idx: 0,
-      amount: -10.5,
-      category: 'Prepared purchase',
-      categoryQboId: 'expense-generic',
+      amount: deposit ? 10.5 : -10.5,
+      category: deposit ? 'Prepared deposit' : 'Prepared purchase',
+      categoryQboId: deposit ? 'income-generic' : 'expense-generic',
       taxCode: 'Generic tax',
       taxCodeQboId: 'tax-generic',
-      memo: 'Prepared purchase',
-      tags: [{ tagId: DURABLE_TAG_ID }],
+      memo: deposit ? 'Prepared deposit' : 'Prepared purchase',
+      tags: deposit ? [] : [{ tagId: DURABLE_TAG_ID }],
     }],
-    txnTags: [{ tagId: DURABLE_TAG_ID }],
+    txnTags: deposit ? [] : [{ tagId: DURABLE_TAG_ID }],
   };
 }
 
@@ -761,7 +1217,7 @@ function deferred<T>() {
 }
 
 class FakeDurableDb {
-  transactionRow = durableTransaction();
+  transactionRow;
   attempts: DurableAttemptRow[] = [];
   failVerifiedCommitOnce = false;
   failUncertainTransactionOnce = false;
@@ -779,6 +1235,10 @@ class FakeDurableDb {
   agentCompanyConfig = {
     findUnique: vi.fn(async () => ({ configVersion: 'verified-writeback-v1' })),
   };
+
+  constructor(qboType: PreparedEntity = 'Purchase') {
+    this.transactionRow = durableTransaction(qboType);
+  }
 
   transaction = {
     findUnique: vi.fn(async () => this.transactionRow),
@@ -943,6 +1403,8 @@ class FakeDurableDb {
     findMany: vi.fn(async ({ where }: { where: { qboId: { in: string[] } } }) =>
       where.qboId.in.includes('expense-generic')
         ? [{ qboId: 'expense-generic', active: true }]
+        : where.qboId.in.includes('income-generic')
+          ? [{ qboId: 'income-generic', active: true }]
         : []),
   };
 
@@ -956,6 +1418,11 @@ class FakeDurableDb {
         taxRateQboId: 'rate-generic',
         taxTypeApplicable: 'TaxOnAmount',
       }],
+      salesTaxRateList: [{
+        taxRateQboId: 'rate-generic',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+      combinedSalesRate: 5,
     }]),
   };
 
@@ -994,14 +1461,18 @@ class FakeDurableDb {
   }
 }
 
-function currentQboTxn(syncToken = '7'): QboTxn {
+function currentQboTxn(
+  syncToken = '7',
+  qboType: PreparedEntity = 'Purchase',
+): QboTxn {
+  const deposit = qboType === 'Deposit';
   return {
-    qboId: 'purchase-generic',
-    qboType: 'Purchase',
+    qboId: deposit ? 'deposit-generic' : 'purchase-generic',
+    qboType,
     syncToken,
     date: '2026-07-28',
-    payee: 'Generic Supplier',
-    amount: -10.5,
+    payee: deposit ? 'Generic Customer' : 'Generic Supplier',
+    amount: deposit ? 10.5 : -10.5,
     bankAccount: 'Generic payment account',
     lines: [{
       id: 'line-holding',
@@ -1017,50 +1488,58 @@ function durableDeps(
   db = new FakeDurableDb(),
   overrides: Partial<DurableWritebackDeps> = {},
 ) {
+  const qboType = db.transactionRow.qboType as PreparedEntity;
+  const beforeSnapshot =
+    qboType === 'Deposit' ? beforeDeposit : beforePurchase;
+  const verifiedSnapshot =
+    qboType === 'Deposit' ? verifiedDeposit : verifiedPurchase;
   const audit = vi.fn(async () => undefined);
-  const preparePurchaseRecategorization = vi.fn(async (
+  const prepareRecategorization = vi.fn(async (
     _txn: QboTxn,
     _staged: StagedCategorization,
-    _before: QboPurchaseSnapshot,
+    before: QboPurchaseSnapshot | QboDepositSnapshot,
     requestId: string,
-  ) => preparedWrite(requestId));
-  const preparePurchaseRestore = vi.fn(async (
+  ) => {
+    const prepared = preparedWrite(requestId, qboType);
+    const body = { ...prepared.body, SyncToken: before.syncToken };
+    return {
+      ...prepared,
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before: structuredClone(before),
+    } as QboPreparedWrite;
+  });
+  const prepareRestore = vi.fn(async (
     _txn: QboTxn,
     original: QboPreparedWrite,
     requestId: string,
-  ): Promise<QboPreparedWrite> => {
-    const base = preparedWrite(requestId);
-    const body = { ...base.body, SyncToken: '8' };
-    return {
-      ...base,
-      operation: 'restore',
-      requestHash: hashPreparedWriteBody(body),
-      body,
-      before: original.before,
-      expected: {
-        ...original.expected,
-        globalTaxCalculation: original.before.globalTaxCalculation,
-        totalTaxCents: original.before.totalTaxCents,
-        targetLines: original.before.lines,
-        untouchedLineHashes: [],
-      },
-    };
-  });
+  ): Promise<QboPreparedWrite> => restoredWrite(original, requestId));
   const sendPreparedWrite = vi.fn(async (prepared: QboPreparedWrite) => ({
     ok: true as const,
     newSyncToken: prepared.operation === 'restore' ? '9' : '8',
   }));
-  const fetchPurchaseSnapshot = vi
-    .fn<() => Promise<QboPurchaseSnapshot | null>>()
-    .mockResolvedValueOnce(structuredClone(beforePurchase))
-    .mockResolvedValue(structuredClone(verifiedPurchase));
+  const fetchPreparedSnapshot = vi
+    .fn<() => Promise<QboPurchaseSnapshot | QboDepositSnapshot | null>>()
+    .mockResolvedValueOnce(structuredClone(beforeSnapshot))
+    .mockResolvedValue(structuredClone(verifiedSnapshot));
+  const fetchWriteSafety = vi.fn(async () => ({
+    bookCloseDate: null,
+    cleared: false,
+    reconciled: false,
+  }));
   const client: Partial<QboClient> = {
-    fetchTxn: vi.fn(async () => currentQboTxn()),
-    fetchPurchaseSnapshot,
-    preparePurchaseRecategorization,
-    preparePurchaseRestore,
+    fetchTxn: vi.fn(async () => currentQboTxn('7', qboType)),
+    fetchPreparedSnapshot,
+    fetchWriteSafety,
+    prepareRecategorization,
+    prepareRestore,
     sendPreparedWrite,
   };
+  Object.assign(client, {
+    fetchPurchaseSnapshot: fetchPreparedSnapshot,
+    preparePurchaseRecategorization: prepareRecategorization,
+    preparePurchaseRestore: prepareRestore,
+  });
   const getClient = vi.fn(async () => client as QboClient);
   const authorize = vi.fn(async () => true);
   const renewLease = vi.fn(async () => undefined);
@@ -1095,10 +1574,14 @@ function durableDeps(
     leaseOwners,
     client,
     getClient,
-    preparePurchaseRecategorization,
-    preparePurchaseRestore,
+    preparePurchaseRecategorization: prepareRecategorization,
+    preparePurchaseRestore: prepareRestore,
+    prepareRecategorization,
+    prepareRestore,
     sendPreparedWrite,
-    fetchPurchaseSnapshot,
+    fetchPurchaseSnapshot: fetchPreparedSnapshot,
+    fetchPreparedSnapshot,
+    fetchWriteSafety,
   };
 }
 
@@ -1119,22 +1602,14 @@ function seedAttempt(
   operation = 'recategorize',
 ): DurableAttemptRow {
   const now = new Date('2026-07-28T12:00:00.000Z');
-  const recategorization = preparedWrite(requestId);
-  const restoreBody = { ...recategorization.body, SyncToken: '8' };
+  const qboType = db.transactionRow.qboType as PreparedEntity;
+  const beforeSnapshot =
+    qboType === 'Deposit' ? beforeDeposit : beforePurchase;
+  const verifiedSnapshot =
+    qboType === 'Deposit' ? verifiedDeposit : verifiedPurchase;
+  const recategorization = preparedWrite(requestId, qboType);
   const persisted = operation === 'restore'
-    ? {
-        ...recategorization,
-        operation: 'restore' as const,
-        requestHash: hashPreparedWriteBody(restoreBody),
-        body: restoreBody,
-        expected: {
-          ...recategorization.expected,
-          globalTaxCalculation: recategorization.before.globalTaxCalculation,
-          totalTaxCents: recategorization.before.totalTaxCents,
-          targetLines: recategorization.before.lines,
-          untouchedLineHashes: [],
-        },
-      }
+    ? restoredWrite(recategorization, requestId)
     : recategorization;
   const row: DurableAttemptRow = {
     id: `seed-${db.attempts.length + 1}`,
@@ -1146,10 +1621,16 @@ function seedAttempt(
     expectedSyncToken: operation === 'restore' ? '8' : '7',
     requestHash: persisted.requestHash,
     requestPayload: persisted,
-    beforeSnapshot: structuredClone(operation === 'restore' ? verifiedPurchase : beforePurchase),
+    beforeSnapshot: structuredClone(
+      operation === 'restore' ? verifiedSnapshot : beforeSnapshot,
+    ),
     responseSnapshot:
       status === 'VERIFIED'
-        ? structuredClone(operation === 'restore' ? { ...beforePurchase, syncToken: '9' } : verifiedPurchase)
+        ? structuredClone(
+            operation === 'restore'
+              ? { ...beforeSnapshot, syncToken: '9' }
+              : verifiedSnapshot,
+          )
         : null,
     verification:
       status === 'VERIFIED'
@@ -1166,6 +1647,27 @@ function seedAttempt(
   };
   db.attempts.push(row);
   return row;
+}
+
+function withPreparedQboId(
+  prepared: QboPreparedWrite,
+  qboId: string,
+): QboPreparedWrite {
+  const changed = structuredClone(prepared);
+  changed.qboId = qboId;
+  changed.body.Id = qboId;
+  changed.before.qboId = qboId;
+  changed.expected.qboId = qboId;
+  return changed;
+}
+
+function withPreparedBeforeTotal(
+  prepared: QboPreparedWrite,
+  totalCents: number,
+): QboPreparedWrite {
+  const changed = structuredClone(prepared);
+  changed.before.totalCents = totalCents;
+  return changed;
 }
 
 function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number) {
@@ -1210,6 +1712,39 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['Purchase', { bookCloseDate: '2026-07-28', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
+    ['Deposit', { bookCloseDate: null, cleared: false, reconciled: true }, 'QBO_TRANSACTION_LOCKED'],
+  ] as const)(
+    'blocks a safety-locked %s before COMMITTING or sending',
+    async (qboType, evidence, code) => {
+      const fixture = durableDeps(new FakeDurableDb(qboType));
+      fixture.fetchWriteSafety.mockResolvedValueOnce(evidence);
+
+      await expect(
+        commitStagedCategorization(commitInput(), fixture.deps),
+      ).rejects.toMatchObject({ code });
+
+      expect(fixture.fetchWriteSafety).toHaveBeenCalledWith({
+        qboType,
+        qboId: qboType === 'Purchase' ? 'purchase-generic' : 'deposit-generic',
+        txnDate: '2026-07-28',
+        bankAccountQboId: 'payment-generic',
+      });
+      expect(fixture.db.attempts).toHaveLength(0);
+      expect(fixture.prepareRecategorization).not.toHaveBeenCalled();
+      expect(fixture.db.qboMutationAttempt.updateMany.mock.calls).not.toContainEqual([
+        expect.objectContaining({ data: { status: 'COMMITTING' } }),
+      ]);
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+
+      const retry = durableDeps(fixture.db);
+      await expect(
+        commitStagedCategorization(commitInput(), retry.deps),
+      ).resolves.toMatchObject({ ok: true, outcome: 'VERIFIED' });
+    },
+  );
+
   it('loads only active tax rates so inactive legacy null rows cannot break a live commit', async () => {
     const fixture = durableDeps();
     fixture.db.qboTaxRate.findMany.mockImplementation(async (args) => {
@@ -1230,7 +1765,11 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
     expect(result).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'POSTED' });
     expect(fixture.db.qboTaxRate.findMany).toHaveBeenCalledWith({
-      where: { companyId: DURABLE_COMPANY_ID, active: true },
+      where: {
+        companyId: DURABLE_COMPANY_ID,
+        active: true,
+        rateValue: { not: null },
+      },
     });
   });
 
@@ -1725,6 +2264,116 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(restarted.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it('rechecks closed-period safety when resuming a persisted PREPARED request', async () => {
+    const db = new FakeDurableDb();
+    seedAttempt(db, 'PREPARED', 'request-generic');
+    const restarted = durableDeps(db);
+    restarted.fetchWriteSafety.mockResolvedValueOnce({
+      bookCloseDate: '2026-07-28',
+      cleared: false,
+      reconciled: false,
+    });
+
+    await expect(
+      commitStagedCategorization(commitInput(), restarted.deps),
+    ).rejects.toMatchObject({ code: 'QBO_PERIOD_CLOSED' });
+
+    expect(restarted.preparePurchaseRecategorization).not.toHaveBeenCalled();
+    expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(db.attempts[0]).toMatchObject({
+      status: 'RETRYABLE',
+      errorCode: 'QBO_PERIOD_CLOSED',
+    });
+  });
+
+  it('resumes a persisted PREPARED request when current account and tax references are unavailable', async () => {
+    const db = new FakeDurableDb();
+    seedAttempt(db, 'PREPARED', 'request-generic');
+    db.transactionRow.company.taxSupportStatus = 'needs_setup';
+    db.transactionRow.company.taxUsingSalesTax = false;
+    db.qboAccount.findMany.mockResolvedValue([]);
+    db.qboTaxCode.findMany.mockResolvedValue([]);
+    db.qboTaxRate.findMany.mockResolvedValue([]);
+    const restarted = durableDeps(db);
+
+    const result = await commitStagedCategorization(commitInput(), restarted.deps);
+
+    expect(result).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'POSTED' });
+    expect(db.qboAccount.findMany).not.toHaveBeenCalled();
+    expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(db.qboTaxRate.findMany).not.toHaveBeenCalled();
+    expect(restarted.preparePurchaseRecategorization).not.toHaveBeenCalled();
+    expect(restarted.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['wrong entity ID', (attempt: DurableAttemptRow) => {
+      attempt.requestPayload = withPreparedQboId(
+        attempt.requestPayload as QboPreparedWrite,
+        'purchase-other',
+      );
+    }],
+    ['wrong entity type', (attempt: DurableAttemptRow) => {
+      attempt.requestPayload = preparedWrite(attempt.requestId, 'Deposit');
+      attempt.beforeSnapshot = structuredClone(beforeDeposit);
+    }],
+    ['wrong request ID', (attempt: DurableAttemptRow) => {
+      (attempt.requestPayload as QboPreparedWrite).requestId = 'request-other';
+    }],
+    ['wrong operation', (attempt: DurableAttemptRow) => {
+      (attempt.requestPayload as QboPreparedWrite).operation = 'restore';
+    }],
+    ['before snapshot mismatch', (attempt: DurableAttemptRow) => {
+      attempt.beforeSnapshot = {
+        ...structuredClone(beforePurchase),
+        totalCents: -999,
+      };
+    }],
+  ] as const)(
+    'rejects a PREPARED resume bound to the %s before QBO access',
+    async (_label, mutate) => {
+      const fixture = durableDeps();
+      const attempt = seedAttempt(fixture.db, 'PREPARED', 'request-generic');
+      mutate(attempt);
+
+      await expect(
+        commitStagedCategorization(commitInput(), fixture.deps),
+      ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['wrong operation', (prepared: QboPreparedWrite) => {
+      prepared.operation = 'restore';
+      return prepared;
+    }],
+    ['wrong request ID', (prepared: QboPreparedWrite) => {
+      prepared.requestId = 'request-other';
+      return prepared;
+    }],
+    ['wrong entity type', () => preparedWrite('request-generic', 'Deposit')],
+    ['wrong entity ID', (prepared: QboPreparedWrite) =>
+      withPreparedQboId(prepared, 'purchase-other')],
+    ['wrong before snapshot', (prepared: QboPreparedWrite) =>
+      withPreparedBeforeTotal(prepared, -999)],
+  ] as const)(
+    'rejects a freshly prepared recategorization with %s before persistence or send',
+    async (_label, mutate) => {
+      const fixture = durableDeps();
+      fixture.prepareRecategorization.mockResolvedValueOnce(
+        mutate(preparedWrite('request-generic')),
+      );
+
+      await expect(
+        commitStagedCategorization(commitInput(), fixture.deps),
+      ).rejects.toMatchObject({ code: 'QBO_STATE_DRIFT' });
+      expect(fixture.db.attempts).toHaveLength(0);
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ['authorization', (fixture: ReturnType<typeof durableDeps>) => {
       fixture.authorize.mockResolvedValue(false);
@@ -1732,9 +2381,6 @@ describe('commitStagedCategorization durable lifecycle', () => {
     ['revision', (fixture: ReturnType<typeof durableDeps>) => {
       fixture.db.transactionRow.revision = 2;
     }, 'STALE_REVISION'],
-    ['references', (fixture: ReturnType<typeof durableDeps>) => {
-      fixture.db.qboTaxCode.findMany.mockResolvedValue([]);
-    }, 'TAX_CODE_UNAVAILABLE'],
     ['QuickBooks drift', (fixture: ReturnType<typeof durableDeps>) => {
       fixture.fetchPurchaseSnapshot.mockReset().mockResolvedValue({
         ...structuredClone(beforePurchase),
@@ -1795,7 +2441,9 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(new Set(fixture.leaseOwners).size).toBe(2);
     expect(fixture.leaseOwners).not.toContain('request-generic');
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
-    expect(results.every((result) => result.outcome === 'VERIFIED')).toBe(true);
+    expect(results.some((result) => result.outcome === 'VERIFIED')).toBe(true);
+    expect(results.every((result) =>
+      result.outcome === 'VERIFIED' || result.outcome === 'IN_PROGRESS')).toBe(true);
     expect(db.attempts[0]?.status).toBe('VERIFIED');
     expect(db.transactionRow.status).toBe('POSTED');
   });
@@ -2124,6 +2772,66 @@ describe('commitStagedCategorization durable lifecycle', () => {
     });
     expect(JSON.stringify(auditPayload)).not.toMatch(/SyncToken|body|snapshot|secret/i);
   });
+
+  it.each(['Purchase', 'Deposit'] as const)(
+    'replays an idempotent %s DRY_RUN commit without QBO access',
+    async (qboType) => {
+      const fixture = durableDeps(new FakeDurableDb(qboType));
+      fixture.db.transactionRow.company.dryRun = true;
+      const input = commitInput(`request-${qboType.toLowerCase()}-dry-run`);
+
+      const first = await commitStagedCategorization(input, fixture.deps);
+      const replay = await commitStagedCategorization(input, fixture.deps);
+
+      expect(replay).toEqual(first);
+      expect(replay).toMatchObject({
+        ok: true,
+        status: 'DRY_RUN',
+        outcome: 'DRY_RUN',
+      });
+      expect(fixture.db.attempts).toHaveLength(1);
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['summary identity', (attempt: DurableAttemptRow) => {
+      attempt.requestPayload = {
+        ...(attempt.requestPayload as Record<string, unknown>),
+        qboId: 'purchase-other',
+      };
+    }],
+    ['before sentinel', (attempt: DurableAttemptRow) => {
+      attempt.beforeSnapshot = { outcome: 'PREPARED' };
+    }],
+    ['verification sentinel', (attempt: DurableAttemptRow) => {
+      attempt.verification = { outcome: 'DRY_RUN', status: 'POSTED' };
+    }],
+    ['unexpected response', (attempt: DurableAttemptRow) => {
+      attempt.responseSnapshot = { outcome: 'DRY_RUN' };
+    }],
+  ] as const)(
+    'rejects a malformed DRY_RUN %s instead of broadly bypassing validation',
+    async (_label, mutate) => {
+      const fixture = durableDeps();
+      fixture.db.transactionRow.company.dryRun = true;
+      await commitStagedCategorization(
+        commitInput('request-malformed-dry-run'),
+        fixture.deps,
+      );
+      mutate(fixture.db.attempts[0]!);
+
+      await expect(
+        commitStagedCategorization(
+          commitInput('request-malformed-dry-run'),
+          fixture.deps,
+        ),
+      ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('legacy retryError with durable attempts', () => {
@@ -2384,6 +3092,39 @@ describe('reconcileMutationAttempt', () => {
     ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
     expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['wrong entity ID', (attempt: DurableAttemptRow) => {
+      attempt.requestPayload = withPreparedQboId(
+        attempt.requestPayload as QboPreparedWrite,
+        'purchase-other',
+      );
+    }],
+    ['before snapshot mismatch', (attempt: DurableAttemptRow) => {
+      attempt.beforeSnapshot = {
+        ...structuredClone(beforePurchase),
+        totalCents: -999,
+      };
+    }],
+  ] as const)(
+    'rejects reconciliation state bound to the %s before QBO access',
+    async (_label, mutate) => {
+      const db = new FakeDurableDb();
+      db.transactionRow.status = 'ERROR';
+      const attempt = seedAttempt(db, 'UNCERTAIN');
+      mutate(attempt);
+      const restarted = durableDeps(db);
+
+      await expect(
+        reconcileMutationAttempt({
+          requestId: 'request-existing',
+          actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+        }, restarted.deps),
+      ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+      expect(restarted.getClient).not.toHaveBeenCalled();
+      expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('prepareCategorizationUndo', () => {
@@ -2830,6 +3571,95 @@ describe('undoCategorization', () => {
     expect(fixture.db.transactionRow.status).toBe('REVERTED');
   });
 
+  it('blocks a reconciled transaction before a prepared undo can enter COMMITTING', async () => {
+    const fixture = postedFixture();
+    fixture.fetchWriteSafety.mockResolvedValueOnce({
+      bookCloseDate: null,
+      cleared: true,
+      reconciled: false,
+    });
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo-locked',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+
+    expect(fixture.db.attempts).toHaveLength(1);
+    expect(fixture.prepareRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('prepares and verifies undo from persisted proof when current references are unavailable', async () => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.company.taxSupportStatus = 'needs_setup';
+    fixture.db.transactionRow.company.taxUsingSalesTax = false;
+    fixture.db.qboAccount.findMany.mockResolvedValue([]);
+    fixture.db.qboTaxCode.findMany.mockResolvedValue([]);
+    fixture.db.qboTaxRate.findMany.mockResolvedValue([]);
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce(structuredClone(verifiedPurchase))
+      .mockResolvedValueOnce({
+        ...structuredClone(beforePurchase),
+        syncToken: '9',
+      });
+
+    const result = await undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps);
+
+    expect(result).toMatchObject({ ok: true, status: 'REVERTED', outcome: 'VERIFIED' });
+    expect(fixture.db.qboAccount.findMany).not.toHaveBeenCalled();
+    expect(fixture.db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(fixture.db.qboTaxRate.findMany).not.toHaveBeenCalled();
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['wrong operation', (prepared: QboPreparedWrite) => {
+      prepared.operation = 'recategorize';
+      return prepared;
+    }],
+    ['wrong request ID', (prepared: QboPreparedWrite) => {
+      prepared.requestId = 'request-other';
+      return prepared;
+    }],
+    ['wrong entity type', () => preparedWrite('request-undo', 'Deposit')],
+    ['wrong entity ID', (prepared: QboPreparedWrite) =>
+      withPreparedQboId(prepared, 'purchase-other')],
+    ['wrong before snapshot', (prepared: QboPreparedWrite) =>
+      withPreparedBeforeTotal(prepared, -999)],
+  ] as const)(
+    'rejects a freshly prepared restore with %s before persistence or send',
+    async (_label, mutate) => {
+      const fixture = postedFixture();
+      fixture.prepareRestore.mockResolvedValueOnce(
+        mutate(restoredWrite(
+          preparedWrite('request-existing'),
+          'request-undo',
+        )),
+      );
+
+      await expect(
+        undoCategorization({
+          transactionId: DURABLE_TRANSACTION_ID,
+          companyId: DURABLE_COMPANY_ID,
+          requestId: 'request-undo',
+          actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+        }, fixture.deps),
+      ).rejects.toMatchObject({ code: 'QBO_STATE_DRIFT' });
+      expect(fixture.db.attempts).toHaveLength(1);
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    },
+  );
+
   it('replays a recorded verified undo after disconnect without another QBO client or send', async () => {
     const fixture = postedFixture();
     const input = {
@@ -2926,7 +3756,9 @@ describe('undoCategorization', () => {
     expect(new Set(fixture.leaseOwners).size).toBe(2);
     expect(fixture.leaseOwners).not.toContain('request-undo');
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
-    expect(results.every((result) => result.outcome === 'VERIFIED')).toBe(true);
+    expect(results.some((result) => result.outcome === 'VERIFIED')).toBe(true);
+    expect(results.every((result) =>
+      result.outcome === 'VERIFIED' || result.outcome === 'IN_PROGRESS')).toBe(true);
     expect(fixture.db.attempts.at(-1)?.status).toBe('VERIFIED');
     expect(fixture.db.transactionRow.status).toBe('REVERTED');
   });
@@ -3007,5 +3839,492 @@ describe('undoCategorization', () => {
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
     expect(fixture.db.attempts.at(-1)?.status).toBe('RETRYABLE');
     expect(fixture.db.transactionRow.status).toBe('POSTED');
+  });
+});
+
+function depositDurableFixture() {
+  const db = new FakeDurableDb('Deposit');
+  // Purchase readiness is deliberately not ready. Deposit readiness must come
+  // from the cached sales-code fields instead.
+  db.transactionRow.company.taxSupportStatus = 'needs_setup';
+  return durableDeps(db);
+}
+
+it('filters legacy null tax rates before a durable Deposit commit', async () => {
+  const fixture = depositDurableFixture();
+  fixture.db.qboTaxRate.findMany.mockImplementation(async (args) => {
+    expect(args).toEqual({
+      where: {
+        companyId: DURABLE_COMPANY_ID,
+        active: true,
+        rateValue: { not: null },
+      },
+    });
+    return [{
+      qboId: 'rate-generic',
+      name: 'Generic rate',
+      active: true,
+      rateValue: 5,
+    }];
+  });
+
+  await expect(commitStagedCategorization(commitInput(), fixture.deps)).resolves.toMatchObject({
+    ok: true,
+    outcome: 'VERIFIED',
+  });
+});
+
+describe.each(['Purchase', 'Deposit'] as const)(
+  '%s tax-exclusive staged reconstruction',
+  (qboType) => {
+    it('jointly inverts exact two-line 5% totals with grouped cent allocation', async () => {
+      const db = new FakeDurableDb(qboType);
+      const deposit = qboType === 'Deposit';
+      db.transactionRow.amount = 210.11;
+      db.transactionRow.taxCalculation = 'TaxExcluded';
+      db.transactionRow.splitLines = [
+        {
+          idx: 0,
+          amount: 105.01,
+          category: deposit ? 'Prepared deposit A' : 'Prepared purchase A',
+          categoryQboId: deposit ? 'income-generic-a' : 'expense-generic-a',
+          taxCode: 'Generic tax A',
+          taxCodeQboId: 'tax-generic-a',
+          memo: 'Prepared A',
+        },
+        {
+          idx: 1,
+          amount: 105.1,
+          category: deposit ? 'Prepared deposit B' : 'Prepared purchase B',
+          categoryQboId: deposit ? 'income-generic-b' : 'expense-generic-b',
+          taxCode: 'Generic tax B',
+          taxCodeQboId: 'tax-generic-b',
+          memo: 'Prepared B',
+        },
+      ];
+      const fixture = durableDeps(db);
+      fixture.db.qboAccount.findMany.mockResolvedValue([
+        { qboId: deposit ? 'income-generic-a' : 'expense-generic-a', active: true },
+        { qboId: deposit ? 'income-generic-b' : 'expense-generic-b', active: true },
+      ]);
+      fixture.db.qboTaxCode.findMany.mockResolvedValue([
+        {
+          qboId: 'tax-generic-a',
+          name: 'Generic tax A',
+          active: true,
+          taxable: true,
+          purchaseTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          salesTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          combinedSalesRate: 5,
+        },
+        {
+          qboId: 'tax-generic-b',
+          name: 'Generic tax B',
+          active: true,
+          taxable: true,
+          purchaseTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          salesTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          combinedSalesRate: 5,
+        },
+      ]);
+
+      await commitStagedCategorization(commitInput(), fixture.deps);
+
+      expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+        expect.objectContaining({ qboType }),
+        expect.objectContaining({
+          taxCalculation: 'TaxExcluded',
+          totals: {
+            subtotalCents: 20_010,
+            taxCents: 1_001,
+            totalCents: 21_011,
+          },
+          lines: [
+            expect.objectContaining({
+              subtotalCents: 10_001,
+              taxCents: 500,
+              totalCents: 10_501,
+            }),
+            expect.objectContaining({
+              subtotalCents: 10_009,
+              taxCents: 501,
+              totalCents: 10_510,
+            }),
+          ],
+        }),
+        qboType === 'Deposit' ? beforeDeposit : beforePurchase,
+        'request-generic',
+      );
+    });
+
+    it('fails closed when no exact tax-exclusive inverse exists', async () => {
+      const db = new FakeDurableDb(qboType);
+      db.transactionRow.amount = 0.01;
+      db.transactionRow.taxCalculation = 'TaxExcluded';
+      db.transactionRow.splitLines[0]!.amount = 0.01;
+      const fixture = durableDeps(db);
+      fixture.db.qboTaxRate.findMany.mockResolvedValue([{
+        qboId: 'rate-generic',
+        name: 'Generic rate',
+        active: true,
+        rateValue: 100,
+      }]);
+
+      await expect(
+        commitStagedCategorization(commitInput(), fixture.deps),
+      ).rejects.toMatchObject({ code: 'TAX_AMOUNT_INVALID' });
+      expect(fixture.prepareRecategorization).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        label: '12 equal 10001-cent subtotals',
+        subtotals: Array<number>(12).fill(10_001),
+        taxes: [501, ...Array<number>(11).fill(500)],
+      },
+      {
+        label: '20-line supported largest-remainder shape',
+        subtotals: Array<number>(20).fill(10_010),
+        taxes: [
+          ...Array<number>(10).fill(501),
+          ...Array<number>(10).fill(500),
+        ],
+      },
+    ])('reconstructs the valid max-shape case: $label', async ({
+      subtotals,
+      taxes,
+    }) => {
+      const db = new FakeDurableDb(qboType);
+      const deposit = qboType === 'Deposit';
+      const totals = subtotals.map((subtotal, index) => subtotal + taxes[index]!);
+      db.transactionRow.amount =
+        totals.reduce((sum, total) => sum + total, 0) / 100;
+      db.transactionRow.taxCalculation = 'TaxExcluded';
+      db.transactionRow.splitLines = totals.map((total, index) => ({
+        idx: index,
+        amount: total / 100,
+        category: `Prepared ${qboType} ${index}`,
+        categoryQboId: `${deposit ? 'income' : 'expense'}-max-${index}`,
+        taxCode: `Generic tax ${index}`,
+        taxCodeQboId: `tax-max-${index}`,
+        memo: `Prepared ${index}`,
+      }));
+      const fixture = durableDeps(db);
+      fixture.db.qboAccount.findMany.mockResolvedValue(
+        totals.map((_total, index) => ({
+          qboId: `${deposit ? 'income' : 'expense'}-max-${index}`,
+          active: true,
+        })),
+      );
+      fixture.db.qboTaxCode.findMany.mockResolvedValue(
+        totals.map((_total, index) => ({
+          qboId: `tax-max-${index}`,
+          name: `Generic tax ${index}`,
+          active: true,
+          taxable: true,
+          purchaseTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          salesTaxRateList: [{
+            taxRateQboId: 'rate-generic',
+            taxTypeApplicable: 'TaxOnAmount',
+          }],
+          combinedSalesRate: 5,
+        })),
+      );
+
+      await commitStagedCategorization(commitInput(), fixture.deps);
+
+      expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+        expect.objectContaining({ qboType }),
+        expect.objectContaining({
+          taxCalculation: 'TaxExcluded',
+          totals: {
+            subtotalCents: subtotals.reduce((sum, value) => sum + value, 0),
+            taxCents: taxes.reduce((sum, value) => sum + value, 0),
+            totalCents: totals.reduce((sum, value) => sum + value, 0),
+          },
+          lines: subtotals.map((subtotalCents, index) =>
+            expect.objectContaining({
+              idx: index,
+              subtotalCents,
+              taxCents: taxes[index],
+              totalCents: totals[index],
+            })),
+        }),
+        qboType === 'Deposit' ? beforeDeposit : beforePurchase,
+        'request-generic',
+      );
+    });
+  },
+);
+
+describe('Deposit durable lifecycle matrix', () => {
+  it('persists the Deposit union member before send and fences the Deposit entity', async () => {
+    const fixture = depositDurableFixture();
+    fixture.sendPreparedWrite.mockImplementationOnce(async (prepared) => {
+      expect(fixture.db.attempts[0]).toMatchObject({
+        status: 'COMMITTING',
+        expectedSyncToken: '7',
+        requestHash: prepared.requestHash,
+        beforeSnapshot: beforeDeposit,
+        requestPayload: {
+          qboType: 'Deposit',
+          qboId: 'deposit-generic',
+          body: { DepositToAccountRef: { value: 'payment-generic' } },
+        },
+      });
+      expect(fixture.db.transactionRow.status).toBe('PENDING');
+      return { ok: true, newSyncToken: '8' };
+    });
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: 'POSTED',
+      outcome: 'VERIFIED',
+    });
+    expect(fixture.client.fetchTxn).toHaveBeenCalledWith(
+      'Deposit',
+      'deposit-generic',
+    );
+    expect(fixture.fetchPreparedSnapshot).toHaveBeenCalledWith(
+      'Deposit',
+      'deposit-generic',
+    );
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.objectContaining({ qboType: 'Deposit' }),
+      stagedDeposit,
+      beforeDeposit,
+      'request-generic',
+    );
+    expect(fixture.renewLease).toHaveBeenNthCalledWith(1, {
+      companyId: DURABLE_COMPANY_ID,
+      qboType: 'Deposit',
+      qboId: 'deposit-generic',
+    }, 'invocation-1');
+  });
+
+  it('returns a verified Deposit request replay without a second send', async () => {
+    const fixture = depositDurableFixture();
+
+    const first = await commitStagedCategorization(commitInput(), fixture.deps);
+    const replay = await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(replay).toEqual(first);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.db.attempts).toHaveLength(1);
+  });
+
+  it.each([
+    ['entity fingerprint', (payload: QboDepositPreparedWrite) => {
+      (payload.expected as { preservedHash?: string }).preservedHash = '';
+    }],
+    ['untouched-line fingerprint', (payload: QboDepositPreparedWrite) => {
+      payload.before.lines[0]!.rawHash = '';
+    }],
+    ['target-line fingerprint', (payload: QboDepositPreparedWrite) => {
+      payload.expected.targetLines[0]!.targetHash = '';
+    }],
+  ])('fails closed on a persisted Deposit with a missing %s', async (_label, mutate) => {
+    const fixture = depositDurableFixture();
+    const attempt = seedAttempt(
+      fixture.db,
+      'PREPARED',
+      'request-generic',
+    );
+    mutate(attempt.requestPayload as QboDepositPreparedWrite);
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('reconstructs exact tax-exclusive Deposit staged cents from persisted totals', async () => {
+    const fixture = depositDurableFixture();
+    fixture.db.transactionRow.taxCalculation = 'TaxExcluded';
+
+    await commitStagedCategorization(commitInput(), fixture.deps);
+
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.objectContaining({ qboType: 'Deposit' }),
+      {
+        ...stagedDeposit,
+        taxCalculation: 'TaxExcluded',
+        totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+        lines: [{
+          ...stagedDeposit.lines[0]!,
+          subtotalCents: 1000,
+          taxCents: 50,
+          totalCents: 1050,
+        }],
+      },
+      beforeDeposit,
+      'request-generic',
+    );
+  });
+
+  it('keeps an ambiguous Deposit timeout uncertain until restart reconciliation', async () => {
+    const fixture = depositDurableFixture();
+    fixture.sendPreparedWrite.mockRejectedValueOnce(new QboRequestTimeout());
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+    });
+    expect(fixture.db.transactionRow.status).toBe('ERROR');
+    expect(fixture.db.attempts[0]?.status).toBe('UNCERTAIN');
+
+    const restarted = durableDeps(fixture.db);
+    restarted.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValue(structuredClone(verifiedDeposit));
+    await expect(
+      reconcileMutationAttempt({
+        requestId: 'request-generic',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, restarted.deps),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: 'POSTED',
+      outcome: 'VERIFIED',
+    });
+    expect(restarted.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionRow.qboSyncToken).toBe('8');
+  });
+
+  it('does not finalize a Deposit after send without exact readback', async () => {
+    const fixture = depositDurableFixture();
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(beforeDeposit))
+      .mockResolvedValueOnce({
+        ...structuredClone(verifiedDeposit),
+        totalCents: 999,
+      });
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+    });
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.db.transactionRow.status).toBe('ERROR');
+    expect(fixture.db.attempts[0]?.status).toBe('UNCERTAIN');
+  });
+
+  it('restores a verified Deposit exactly through the prepared lifecycle', async () => {
+    const fixture = depositDurableFixture();
+    let qboSnapshot: QboDepositSnapshot = structuredClone(beforeDeposit);
+    fixture.fetchPreparedSnapshot.mockImplementation(
+      async () => structuredClone(qboSnapshot),
+    );
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => currentQboTxn(qboSnapshot.syncToken, 'Deposit'),
+    );
+    fixture.sendPreparedWrite.mockImplementation(async (prepared) => {
+      qboSnapshot = prepared.operation === 'restore'
+        ? { ...structuredClone(beforeDeposit), syncToken: '9' }
+        : structuredClone(verifiedDeposit);
+      return {
+        ok: true,
+        newSyncToken: qboSnapshot.syncToken,
+      };
+    });
+
+    await commitStagedCategorization(commitInput(), fixture.deps);
+    await expect(
+      undoCategorization({
+        transactionId: DURABLE_TRANSACTION_ID,
+        companyId: DURABLE_COMPANY_ID,
+        requestId: 'request-deposit-restore',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, fixture.deps),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: 'REVERTED',
+      outcome: 'VERIFIED',
+    });
+    expect(fixture.prepareRestore).toHaveBeenCalledWith(
+      expect.objectContaining({ qboType: 'Deposit', syncToken: '8' }),
+      expect.objectContaining({ qboType: 'Deposit', operation: 'recategorize' }),
+      'request-deposit-restore',
+    );
+    expect(fixture.db.attempts.at(-1)?.requestPayload).toMatchObject({
+      qboType: 'Deposit',
+      operation: 'restore',
+      expected: {
+        globalTaxCalculation: null,
+        totalTaxCents: null,
+        targetLines: beforeDeposit.lines,
+      },
+    });
+    expect(qboSnapshot).toEqual({ ...beforeDeposit, syncToken: '9' });
+  });
+
+  it('rejects Deposit drift before preparing restore', async () => {
+    const fixture = depositDurableFixture();
+    seedAttempt(fixture.db, 'VERIFIED');
+    fixture.db.transactionRow.status = 'POSTED';
+    fixture.db.transactionRow.qboSyncToken = '8';
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValue({
+        ...structuredClone(verifiedDeposit),
+        totalCents: 999,
+      });
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(currentQboTxn('8', 'Deposit'));
+
+    await expect(
+      undoCategorization({
+        transactionId: DURABLE_TRANSACTION_ID,
+        companyId: DURABLE_COMPANY_ID,
+        requestId: 'request-deposit-restore',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_STATE_DRIFT' });
+    expect(fixture.prepareRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionRow.status).toBe('POSTED');
+  });
+
+  it('records a Deposit dry-run without creating a QBO client', async () => {
+    const fixture = depositDurableFixture();
+    fixture.db.transactionRow.company.dryRun = true;
+
+    await expect(
+      commitStagedCategorization(commitInput('request-deposit-dry-run'), fixture.deps),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: 'DRY_RUN',
+      outcome: 'DRY_RUN',
+    });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.db.attempts[0]?.requestPayload).toMatchObject({
+      qboType: 'Deposit',
+      qboId: 'deposit-generic',
+    });
   });
 });

@@ -20,6 +20,7 @@ function code(qboId: string) {
     active: true,
     taxable: qboId !== 'OOS',
     purchaseRates: qboId === 'OOS' ? [] : [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+    salesRates: [],
     sourceUpdatedAt: '2026-07-27T16:00:00.000Z',
   };
 }
@@ -119,6 +120,71 @@ describe('refreshTaxReference', () => {
     cache = createDb();
   });
 
+  it('caches independent purchase and sales references', async () => {
+    const purchaseOnly = { ...code('PURCHASE_ONLY'), salesRates: [] };
+    const salesOnly = {
+      ...code('SALES_ONLY'),
+      purchaseRates: [],
+      salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+    };
+    const nonTax = { ...code('OOS'), name: 'Explicit non-tax treatment' };
+
+    const result = await refreshTaxReference('company-1', { force: true }, depsWith(cache, [purchaseOnly, salesOnly, nonTax]));
+
+    expect(cache.taxCode('company-1', 'PURCHASE_ONLY')).toMatchObject({
+      purchaseTaxRateList: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+      salesTaxRateList: [],
+      combinedPurchaseRate: 5,
+      combinedSalesRate: null,
+    });
+    expect(cache.taxCode('company-1', 'SALES_ONLY')).toMatchObject({
+      purchaseTaxRateList: [],
+      salesTaxRateList: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+      combinedPurchaseRate: null,
+      combinedSalesRate: 7,
+    });
+    expect(result.readiness).toMatchObject({
+      status: 'ready',
+      salesStatus: 'ready',
+    });
+    expect(result.readiness.taxCodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ qboId: 'PURCHASE_ONLY', combinedPurchaseRate: 5, combinedSalesRate: null }),
+    ]));
+    expect(result.readiness.salesTaxCodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ qboId: 'SALES_ONLY', combinedPurchaseRate: null, combinedSalesRate: 7 }),
+    ]));
+    expect(result.readiness.salesTaxCodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ qboId: 'OOS', combinedSalesRate: null }),
+    ]));
+  });
+
+  it.each([
+    ['inactive sales rate', { ...code('SALES'), purchaseRates: [], salesRates: [{ taxRateQboId: 'OLD', taxTypeApplicable: 'TaxOnAmount' }] }, [
+      ...rates,
+      { qboId: 'OLD', name: 'Old rate', description: null, active: false, rateValue: 7, sourceUpdatedAt: null },
+    ]],
+    ['multiple sales components', { ...code('SALES'), purchaseRates: [], salesRates: [
+      { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+    ] }, rates],
+  ] as const)('does not declare sales readiness for %s', async (_case, salesCode, taxRates) => {
+    const result = await refreshTaxReference('company-1', { force: true }, depsWith(cache, [salesCode], undefined, taxRates));
+
+    expect(result.readiness).toMatchObject({ status: 'needs_setup', salesStatus: 'needs_setup', salesTaxCodes: [] });
+  });
+
+  it('fails closed when a tax code references an unknown sales rate', async () => {
+    const badCode = {
+      ...code('SALES'),
+      salesRates: [{ taxRateQboId: 'MISSING', taxTypeApplicable: 'TaxOnAmount' }],
+    };
+
+    await expect(refreshTaxReference('company-1', { force: true }, depsWith(cache, [badCode]))).rejects.toThrow(
+      'unknown tax rate',
+    );
+    expect(cache.taxCodes.size).toBe(0);
+  });
+
   it('marks disappeared references inactive in the same transaction', async () => {
     await refreshTaxReference('company-1', { force: true }, depsWith(cache, [code('GST5'), code('OOS')]));
     await refreshTaxReference('company-1', { force: true }, depsWith(cache, [code('OOS')]));
@@ -139,6 +205,27 @@ describe('refreshTaxReference', () => {
     expect(cache.company).toMatchObject({
       taxSupportStatus: 'needs_setup',
       taxSupportReason: 'Tax reference refresh failed.',
+    });
+  });
+
+  it('fails closed for cached sales readiness after an upstream refresh failure', async () => {
+    const salesCode = {
+      ...code('SALES_ONLY'),
+      salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+    };
+    await refreshTaxReference('company-1', { force: true }, depsWith(cache, [salesCode]));
+    const failingDeps = depsWith(cache, [salesCode]);
+    failingDeps.getClient = vi.fn(async () => {
+      throw new Error('upstream unavailable');
+    });
+
+    await expect(refreshTaxReference('company-1', { force: true }, failingDeps)).rejects.toThrow('upstream unavailable');
+
+    await expect(getTaxReadiness('company-1', failingDeps)).resolves.toMatchObject({
+      status: 'needs_setup',
+      salesStatus: 'needs_setup',
+      salesReason: 'Tax reference refresh failed.',
+      salesTaxCodes: [],
     });
   });
 

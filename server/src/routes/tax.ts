@@ -1,4 +1,4 @@
-// Read-only purchase-tax reference endpoints. The cached QBO reference remains
+// Read-only tax reference endpoints. The cached QBO reference remains
 // complete internally; HTTP responses deliberately expose only a bounded slice.
 
 import { Router } from 'express';

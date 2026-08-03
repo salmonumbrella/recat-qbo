@@ -7,7 +7,13 @@ import type {
 } from '@recat/shared';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { calculatePurchaseTransaction } from '../lib/qbo/purchaseTax.js';
+import {
+  calculatePurchaseTransaction,
+  calculateSalesTransaction,
+  reconstructPurchaseTaxExcludedTransaction,
+  reconstructSalesTaxExcludedTransaction,
+} from '../lib/qbo/purchaseTax.js';
+import { cachedSalesTaxReadiness } from './tax/reference.js';
 import {
   EntityLeaseError,
   fenceEntityLeaseOwnership,
@@ -50,14 +56,16 @@ interface TaxCodeRow {
   active: boolean;
   taxable: boolean | null;
   purchaseTaxRateList: unknown;
+  salesTaxRateList: unknown;
   combinedPurchaseRate?: number | string | { toString(): string } | null;
+  combinedSalesRate: number | string | { toString(): string } | null;
 }
 
 interface TaxRateRow {
   qboId: string;
   name: string;
   active: boolean;
-  rateValue: number | string | { toString(): string };
+  rateValue: number | string | { toString(): string } | null;
 }
 
 interface CompanyTaxRow {
@@ -144,12 +152,16 @@ export interface CategorizationDb {
   };
   qboTaxCode: {
     findMany(args: {
-      where: { companyId: string; qboId: WhereIn<string> };
+      where: { companyId: string; qboId?: WhereIn<string> };
     }): Promise<TaxCodeRow[]>;
   };
   qboTaxRate: {
     findMany(args: {
-      where: { companyId: string; active: true };
+      where: {
+        companyId: string;
+        active?: true;
+        rateValue?: { not: null };
+      };
     }): Promise<TaxRateRow[]>;
   };
   splitLine: {
@@ -335,7 +347,17 @@ function decimalToCents(value: TransactionRow['amount']): number {
 function assertSignedLines(
   transactionCents: number,
   proposal: CategorizationProposal,
+  qboType: string,
 ): void {
+  if (
+    qboType === 'Deposit' &&
+    (transactionCents <= 0 || proposal.lines.some((line) => line.grossCents <= 0))
+  ) {
+    throw new CategorizationError(
+      'UNBALANCED_TOTAL',
+      'Line totals must be nonzero, match the transaction direction, and balance exactly.',
+    );
+  }
   const transactionSign = Math.sign(transactionCents);
   const linesHaveWrongSign = proposal.lines.some(
     (line) => line.grossCents === 0 || Math.sign(line.grossCents) !== transactionSign,
@@ -348,20 +370,11 @@ function assertSignedLines(
   }
 }
 
-function taxReadiness(company: CompanyTaxRow, codes: TaxCodeRow[]): TaxReadinessDto {
+function taxReadiness(company: CompanyTaxRow, codes: TaxCodeRow[]): Pick<TaxReadinessDto, 'status' | 'reason' | 'usingSalesTax'> {
   return {
     status: company.taxSupportStatus as TaxReadinessDto['status'],
     reason: company.taxSupportReason,
     usingSalesTax: company.taxUsingSalesTax,
-    refreshedAt: company.taxReferenceRefreshedAt?.toISOString() ?? null,
-    taxCodes: codes.map((code) => ({
-      qboId: code.qboId,
-      name: code.name,
-      active: code.active,
-      taxable: code.taxable,
-      combinedPurchaseRate:
-        code.combinedPurchaseRate == null ? null : Number(code.combinedPurchaseRate),
-    })),
   };
 }
 
@@ -384,7 +397,7 @@ async function validateStage(
     );
   }
   const transactionCents = decimalToCents(transaction.amount);
-  assertSignedLines(transactionCents, proposal);
+  assertSignedLines(transactionCents, proposal, transaction.qboType);
 
   const accountIds = unique(proposal.lines.map((line) => line.categoryQboId));
   const tagIds = unique([
@@ -423,10 +436,10 @@ async function validateStage(
       totalCents: line.grossCents,
     }));
   } else {
-    if (transaction.qboType !== 'Purchase') {
+    if (transaction.qboType !== 'Purchase' && transaction.qboType !== 'Deposit') {
       throw new CategorizationError(
         'TAX_REQUIRES_PURCHASE',
-        'Tax selection is supported only for Purchase transactions.',
+        'Tax selection is unsupported for this transaction type.',
       );
     }
     if (proposal.lines.some((line) => line.taxCodeQboId == null)) {
@@ -436,64 +449,99 @@ async function validateStage(
       );
     }
 
-    const taxCodeIds = unique(proposal.lines.map((line) => line.taxCodeQboId!));
     const [company, taxCodes, taxRates] = await Promise.all([
       db.company.findUnique({ where: { id: input.companyId } }),
       db.qboTaxCode.findMany({
-        where: { companyId: input.companyId, qboId: { in: taxCodeIds } },
+        where: { companyId: input.companyId },
       }),
       db.qboTaxRate.findMany({
-        where: { companyId: input.companyId, active: true },
+        where: {
+          companyId: input.companyId,
+          active: true,
+          rateValue: { not: null },
+        },
       }),
     ]);
     if (!company) {
       throw new CategorizationError('TRANSACTION_NOT_FOUND', 'Transaction company was not found.');
     }
-    const readiness = taxReadiness(company, taxCodes);
-    if (readiness.status !== 'ready' || readiness.usingSalesTax !== true) {
+    const ready = transaction.qboType === 'Deposit'
+      ? cachedSalesTaxReadiness(
+          company.taxUsingSalesTax,
+          taxCodes,
+          company.taxSupportReason,
+        ).status === 'ready'
+      : taxReadiness(company, taxCodes).status === 'ready' && company.taxUsingSalesTax === true;
+    if (!ready) {
       throw new CategorizationError(
         'TAX_NOT_READY',
-        readiness.reason ?? 'Purchase tax references are not ready.',
+        'Tax references are not ready.',
       );
     }
 
-    const calculation = calculatePurchaseTransaction(
-      {
-        companyId: input.companyId,
-        taxCalculation: proposal.taxCalculation,
-        lines: proposal.lines.map((line) => ({
-          grossCents: line.grossCents,
-          taxCodeQboId: line.taxCodeQboId!,
-        })),
-      },
-      {
-        companyId: input.companyId,
-        codes: taxCodes.map((code) => ({
-          qboId: code.qboId,
-          name: code.name,
-          description: null,
-          active: code.active,
-          taxable: code.taxable,
-          purchaseRates: code.purchaseTaxRateList as {
-            taxRateQboId: string;
-            taxTypeApplicable: string;
-          }[],
-          sourceUpdatedAt: null,
-        })),
-        rates: taxRates.map((rate) => ({
-          qboId: rate.qboId,
-          name: rate.name,
-          description: null,
-          active: rate.active,
-          rateValue: Number(rate.rateValue),
-          sourceUpdatedAt: null,
-        })),
-      },
-    );
+    const taxReference = {
+      companyId: input.companyId,
+      codes: taxCodes.map((code) => ({
+        qboId: code.qboId,
+        name: code.name,
+        description: null,
+        active: code.active,
+        taxable: code.taxable,
+        purchaseRates: code.purchaseTaxRateList as {
+          taxRateQboId: string;
+          taxTypeApplicable: string;
+        }[],
+        salesRates: code.salesTaxRateList as {
+          taxRateQboId: string;
+          taxTypeApplicable: string;
+        }[],
+        sourceUpdatedAt: null,
+      })),
+      rates: taxRates.filter((rate) => rate.rateValue !== null).map((rate) => ({
+        qboId: rate.qboId,
+        name: rate.name,
+        description: null,
+        active: rate.active,
+        rateValue: Number(rate.rateValue),
+        sourceUpdatedAt: null,
+      })),
+    };
+    const taxLines = proposal.lines.map((line) => ({
+      grossCents: line.grossCents,
+      taxCodeQboId: line.taxCodeQboId!,
+    }));
+    const calculateTransaction = transaction.qboType === 'Deposit'
+      ? calculateSalesTransaction
+      : calculatePurchaseTransaction;
+    const reconstructTaxExcluded = transaction.qboType === 'Deposit'
+      ? reconstructSalesTaxExcludedTransaction
+      : reconstructPurchaseTaxExcludedTransaction;
+    const calculation = proposal.taxCalculation === 'TaxExcluded'
+      ? reconstructTaxExcluded(
+          {
+            companyId: input.companyId,
+            lines: taxLines,
+          },
+          taxReference,
+        )
+      : calculateTransaction(
+          {
+            companyId: input.companyId,
+            taxCalculation: proposal.taxCalculation,
+            lines: taxLines,
+          },
+          taxReference,
+        );
+    if (calculation === null) {
+      throw new CategorizationError(
+        'TAX_AMOUNT_INVALID',
+        'Tax-exclusive line totals cannot be reconstructed uniquely.',
+      );
+    }
     if (!calculation.eligible) {
       throw new CategorizationError(
         calculation.reason,
-        `Purchase tax calculation failed${calculation.lineIndex === undefined
+        `Tax calculation failed${calculation.lineIndex === undefined
           ? ''
           : ` at line ${calculation.lineIndex + 1}`}.`,
       );

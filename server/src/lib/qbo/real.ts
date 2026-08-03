@@ -34,7 +34,9 @@ import {
   type QboLineWriteSnapshot,
   type QboLineWriteSplit,
   type QboPreparedLineWrite,
+  type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboStatement,
   type QboStatementRow,
   type QboPurchaseSnapshot,
@@ -76,6 +78,16 @@ import {
   parseQboAttachmentUploadResponse,
   parseSupportedQboAttachable,
 } from './attachments.js';
+import {
+  mapDepositSnapshot as mapDepositSnapshotBody,
+  prepareDepositRecategorization as prepareDepositRecategorizationBody,
+  prepareDepositRestore as prepareDepositRestoreBody,
+} from './depositTax.js';
+import {
+  QboWriteSafetyError,
+  type QboWriteSafetyEvidence,
+  type QboWriteSafetyTarget,
+} from './writeSafety.js';
 
 export {
   rebuildDepositLines,
@@ -158,6 +170,7 @@ interface RawAccount {
 
 export interface RawPreferences {
   TaxPrefs?: { UsingSalesTax?: boolean; PartnerTaxEnabled?: boolean };
+  AccountingInfoPrefs?: { BookCloseDate?: unknown };
 }
 
 export interface RawTaxRate {
@@ -176,6 +189,9 @@ export interface RawTaxCode {
   Active?: boolean;
   Taxable?: boolean;
   PurchaseTaxRateList?: {
+    TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
+  };
+  SalesTaxRateList?: {
     TaxRateDetail?: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[];
   };
   MetaData?: RawMetaData;
@@ -363,6 +379,68 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
   return out;
 }
 
+function canonicalSafetyReportType(value: string | undefined): 'Purchase' | 'Deposit' | null {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'deposit') return 'Deposit';
+  if (
+    normalized === 'purchase'
+    || normalized === 'expense'
+    || normalized === 'check'
+    || normalized === 'cheque'
+    || normalized === 'credit card expense'
+    || normalized === 'credit card charge'
+  ) return 'Purchase';
+  return null;
+}
+
+function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget): boolean {
+  const columns = raw.Columns?.Column ?? [];
+  const dateIndex = columns.findIndex((column) => column.ColType === 'tx_date');
+  const typeIndex = columns.findIndex((column) => column.ColType === 'txn_type');
+  if (dateIndex < 0 || typeIndex < 0) {
+    throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+  }
+  let found = false;
+  const walk = (rows: RawReportRow[]): void => {
+    for (const row of rows) {
+      if (row.Rows?.Row) walk(row.Rows.Row);
+      if (!row.ColData || row.type === 'Section') continue;
+      const date = row.ColData[dateIndex];
+      if (date?.value !== target.txnDate) continue;
+      const type = canonicalSafetyReportType(row.ColData[typeIndex]?.value);
+      const id = date.id ?? row.ColData[0]?.id;
+      if (id === target.qboId) {
+        if (type !== target.qboType) {
+          throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+        }
+        found = true;
+        continue;
+      }
+      if (type === target.qboType && (id === undefined || id === '')) {
+        throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+      }
+    }
+  };
+  walk(raw.Rows?.Row ?? []);
+  return found;
+}
+
+function closeDate(preferences: RawPreferences | undefined): string | null {
+  if (preferences?.AccountingInfoPrefs === undefined) {
+    throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+  }
+  const value = preferences.AccountingInfoPrefs.BookCloseDate;
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) {
+    throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+  }
+  return value;
+}
+
 /** The whole-company transaction-log columns, in the order we ask for them.
  * account_name = the bank/credit-card side; other_account = QBO's "Split"
  * column, i.e. the categorization. */
@@ -517,16 +595,21 @@ export function mapTaxRate(raw: RawTaxRate): QboTaxRateInfo {
 }
 
 export function mapTaxCode(raw: RawTaxCode): QboTaxCodeInfo {
+  const mapRates = (
+    details: { TaxRateRef?: QboRef; TaxTypeApplicable?: string }[] | undefined,
+    direction: 'purchase' | 'sales',
+  ) => (details ?? []).map((detail) => ({
+    taxRateQboId: requiredTaxIdentity(detail.TaxRateRef?.value, `${direction} rate reference`),
+    taxTypeApplicable: requiredTaxIdentity(detail.TaxTypeApplicable, 'component type'),
+  }));
   return {
     qboId: requiredTaxIdentity(raw.Id, 'code Id'),
     name: raw.Name,
     description: raw.Description ?? null,
     active: activeOrDefault(raw.Active, 'tax-code'),
     taxable: typeof raw.Taxable === 'boolean' ? raw.Taxable : null,
-    purchaseRates: (raw.PurchaseTaxRateList?.TaxRateDetail ?? []).map((detail) => ({
-      taxRateQboId: requiredTaxIdentity(detail.TaxRateRef?.value, 'purchase rate reference'),
-      taxTypeApplicable: requiredTaxIdentity(detail.TaxTypeApplicable, 'component type'),
-    })),
+    purchaseRates: mapRates(raw.PurchaseTaxRateList?.TaxRateDetail, 'purchase'),
+    salesRates: mapRates(raw.SalesTaxRateList?.TaxRateDetail, 'sales'),
     sourceUpdatedAt: sourceUpdatedAt(raw.MetaData),
   };
 }
@@ -581,6 +664,10 @@ export function mapPurchaseSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
       : signedCents(raw.TxnTaxDetail.TotalTax),
     lines,
   };
+}
+
+export function mapDepositSnapshot(raw: RawDeposit): QboDepositSnapshot {
+  return mapDepositSnapshotBody(raw);
 }
 
 function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
@@ -1165,12 +1252,14 @@ export class RealQboClient implements QboClient {
     }
   }
 
-  private async requestPreparedWrite(prepared: QboPreparedWrite): Promise<{ Purchase?: RawPurchase }> {
+  private async requestPreparedWrite(
+    prepared: QboPreparedWrite,
+  ): Promise<{ Purchase?: RawPurchase; Deposit?: RawDeposit }> {
     return this.requestPreparedBody(
-      '/purchase',
+      `/${entityPath(prepared.qboType)}`,
       prepared.requestId,
       prepared.body,
-    ) as Promise<{ Purchase?: RawPurchase }>;
+    ) as Promise<{ Purchase?: RawPurchase; Deposit?: RawDeposit }>;
   }
 
   private toError(status: number, bodyText: string): Error {
@@ -1248,6 +1337,44 @@ export class RealQboClient implements QboClient {
   async getTaxProfile(): Promise<QboTaxProfile> {
     const rows = await this.queryAll('select * from Preferences', 'Preferences');
     return mapTaxProfile(rows[0]);
+  }
+
+  async fetchWriteSafety(target: QboWriteSafetyTarget): Promise<QboWriteSafetyEvidence> {
+    if (
+      (target.qboType !== 'Purchase' && target.qboType !== 'Deposit')
+      || target.qboId.trim() === ''
+      || target.bankAccountQboId.trim() === ''
+      || !/^\d{4}-\d{2}-\d{2}$/u.test(target.txnDate)
+    ) throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+
+    try {
+      const query = (status: 'Cleared' | 'Reconciled') => {
+        const params = new URLSearchParams({
+          start_date: target.txnDate,
+          end_date: target.txnDate,
+          account: target.bankAccountQboId,
+          cleared: status,
+          columns: 'tx_date,txn_type',
+        });
+        return this.request<RawReport>('GET', `/reports/TransactionList?${params.toString()}`);
+      };
+      const [preferences, cleared, reconciled] = await Promise.all([
+        this.queryAll('select * from Preferences', 'Preferences'),
+        query('Cleared'),
+        query('Reconciled'),
+      ]);
+      if (preferences.length !== 1) {
+        throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+      }
+      return {
+        bookCloseDate: closeDate(preferences[0]),
+        cleared: reportContainsSafetyTarget(cleared, target),
+        reconciled: reportContainsSafetyTarget(reconciled, target),
+      };
+    } catch (error) {
+      if (error instanceof QboWriteSafetyError) throw error;
+      throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+    }
   }
 
   async listTaxCodes(): Promise<QboTaxCodeInfo[]> {
@@ -1424,6 +1551,36 @@ export class RealQboClient implements QboClient {
     }
   }
 
+  async fetchPreparedSnapshot(
+    qboType: 'Purchase' | 'Deposit',
+    qboId: string,
+    signal?: AbortSignal,
+  ): Promise<QboPurchaseSnapshot | QboDepositSnapshot | null> {
+    if (qboType === 'Purchase') return this.fetchPurchaseSnapshot(qboId, signal);
+    try {
+      if (qboType === 'Deposit') {
+        const body = await abortableRequest(
+          this.request<{ Deposit?: RawDeposit }>(
+            'GET',
+            `/deposit/${encodeURIComponent(qboId)}`,
+            undefined,
+            false,
+            signal,
+          ),
+          signal,
+        );
+        return body.Deposit ? mapDepositSnapshot(body.Deposit) : null;
+      }
+      throw new Error('Prepared snapshots support Purchase and Deposit transactions only.');
+    } catch (err) {
+      if (
+        err instanceof QboObjectNotFoundError
+        || (err instanceof Error && /not\s*found/i.test(err.message))
+      ) return null;
+      throw err;
+    }
+  }
+
   async fetchLineWriteSnapshot(
     qboType: QboTxn['qboType'],
     qboId: string,
@@ -1438,35 +1595,66 @@ export class RealQboClient implements QboClient {
     };
   }
 
+  async prepareRecategorization(
+    txn: QboTxn,
+    staged: StagedCategorization,
+    before: QboPurchaseSnapshot | QboDepositSnapshot,
+    requestId: string,
+  ): Promise<QboPreparedWrite> {
+    if (txn.qboType === 'Purchase' && 'accountQboId' in before) {
+      return preparePurchaseRecategorizationBody({
+        current: txn.raw as RawPurchase,
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    if (txn.qboType === 'Deposit' && 'depositToAccountQboId' in before) {
+      return prepareDepositRecategorizationBody({
+        current: txn.raw as RawDeposit,
+        holdingAccountQboIds: [...this.holdingIds],
+        staged,
+        before,
+        requestId,
+      });
+    }
+    throw new Error('Prepared writes require a matching Purchase or Deposit snapshot.');
+  }
+
   async preparePurchaseRecategorization(
     txn: QboTxn,
     staged: StagedCategorization,
     before: QboPurchaseSnapshot,
     requestId: string,
-  ): Promise<QboPreparedWrite> {
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared tax-aware writes support Purchase transactions only.');
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || !('accountQboId' in before)) {
+      throw new Error('Purchase compatibility recategorization requires a Purchase transaction.');
     }
-    return preparePurchaseRecategorizationBody({
-      current: txn.raw as RawPurchase,
-      holdingAccountQboIds: [...this.holdingIds],
+    const prepared = await this.prepareRecategorization(
+      txn,
       staged,
       before,
       requestId,
-    });
+    );
+    if (prepared.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility recategorization returned a non-Purchase write.');
+    }
+    return prepared;
   }
 
   async sendPreparedWrite(prepared: QboPreparedWrite): Promise<QboWriteResult> {
     const response = await this.requestPreparedWrite(prepared);
-    if (
-      typeof response.Purchase?.SyncToken !== 'string' ||
-      response.Purchase.SyncToken.trim() === ''
-    ) {
-      throw new Error('QuickBooks prepared write response omitted the updated Purchase SyncToken.');
+    const responseEntity =
+      prepared.qboType === 'Purchase' ? response.Purchase : response.Deposit;
+    if (typeof responseEntity?.SyncToken !== 'string' || responseEntity.SyncToken.trim() === '') {
+      throw new Error(
+        `QuickBooks prepared write response omitted the updated ${prepared.qboType} SyncToken.`,
+      );
     }
     return {
       ok: true,
-      newSyncToken: response.Purchase.SyncToken,
+      newSyncToken: responseEntity.SyncToken,
     };
   }
 
@@ -1520,19 +1708,47 @@ export class RealQboClient implements QboClient {
     });
   }
 
-  async preparePurchaseRestore(
+  async prepareRestore(
     txn: QboTxn,
     prepared: QboPreparedWrite,
     requestId: string,
   ): Promise<QboPreparedWrite> {
-    if (txn.qboType !== 'Purchase') {
-      throw new Error('Prepared restore supports Purchase transactions only.');
+    if (txn.qboType === 'Purchase' && prepared.qboType === 'Purchase') {
+      return preparePurchaseRestoreBody({
+        current: txn.raw as RawPurchase,
+        prepared,
+        requestId,
+      });
     }
-    return preparePurchaseRestoreBody({
-      current: txn.raw as RawPurchase,
+    if (txn.qboType === 'Deposit' && prepared.qboType === 'Deposit') {
+      return prepareDepositRestoreBody({
+        current: txn.raw as RawDeposit,
+        prepared,
+        requestId,
+      });
+    }
+    throw new Error('Prepared restore requires matching Purchase or Deposit transactions.');
+  }
+
+  async preparePurchaseRestore(
+    txn: QboTxn,
+    prepared: QboPreparedWrite,
+    requestId: string,
+  ): Promise<QboPurchasePreparedWrite> {
+    if (txn.qboType !== 'Purchase' || prepared.qboType !== 'Purchase') {
+      throw new Error(
+        'Purchase compatibility restore requires a Purchase transaction and prepared write.',
+      );
+    }
+    const restore = await this.prepareRestore(
+      txn,
       prepared,
       requestId,
-    });
+    );
+    if (restore.qboType !== 'Purchase') {
+      throw new Error('Purchase compatibility restore returned a non-Purchase write.');
+    }
+    return restore;
   }
 
   async listTxnsInAccounts(accountQboIds: string[]): Promise<QboTxn[]> {
