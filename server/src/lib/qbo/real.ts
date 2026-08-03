@@ -114,6 +114,13 @@ class QboHttpNotFoundError extends Error {
   }
 }
 
+class QboObjectNotFoundError extends Error {
+  constructor(message = 'QuickBooks object was not found.') {
+    super(message);
+    this.name = 'QboObjectNotFoundError';
+  }
+}
+
 export type QboEnvironment = 'sandbox' | 'production';
 
 function apiBase(environment: QboEnvironment): string {
@@ -1177,6 +1184,14 @@ export class RealQboClient implements QboClient {
     const first = errors[0];
     // 5010 = "Stale Object Error": the entity was edited after our read.
     if (errors.some((e) => e.code === '5010')) return new QboSyncTokenConflict();
+    // 610 is QBO's application-level not-found response. It is commonly
+    // returned as HTTP 400 when a referenced object has been made inactive.
+    if (errors.some((e) => e.code === '610')) {
+      return new QboObjectNotFoundError(
+        firstNonEmpty(first?.Detail, first?.Message)
+          ?? 'QuickBooks object was not found.',
+      );
+    }
     if (status === 404) return new QboHttpNotFoundError();
     if (status === 401 || status === 403) {
       return new QboAuthError(first?.Message ?? `QuickBooks auth error (${status})`);
@@ -1282,7 +1297,10 @@ export class RealQboClient implements QboClient {
         raw: body.Attachable,
       };
     } catch (error) {
-      if (error instanceof QboHttpNotFoundError) {
+      if (
+        error instanceof QboHttpNotFoundError
+        || error instanceof QboObjectNotFoundError
+      ) {
         return null;
       }
       throw error;
@@ -1398,7 +1416,10 @@ export class RealQboClient implements QboClient {
       );
       return body.Purchase ? mapPurchaseSnapshot(body.Purchase) : null;
     } catch (err) {
-      if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
+      if (
+        err instanceof QboObjectNotFoundError
+        || (err instanceof Error && /not\s*found/i.test(err.message))
+      ) return null;
       throw err;
     }
   }
@@ -1573,9 +1594,10 @@ export class RealQboClient implements QboClient {
       const body = await this.request<{ JournalEntry?: RawJournalEntry }>('GET', path);
       return body.JournalEntry ? mapJournalEntry(body.JournalEntry, this.holdingIds) : null;
     } catch (err) {
-      // 610 = Object Not Found (deleted). Surfaced by message since fault codes
-      // are folded into the Error in toError().
-      if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
+      if (
+        err instanceof QboObjectNotFoundError
+        || (err instanceof Error && /not\s*found/i.test(err.message))
+      ) return null;
       throw err;
     }
   }

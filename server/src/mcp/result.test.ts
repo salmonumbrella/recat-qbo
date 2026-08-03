@@ -10,6 +10,7 @@ import { TransferExecutionError } from '../services/transferExecution.js';
 import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
 import { AttachmentError } from '../services/attachments/types.js';
+import { ReceiptError } from '../services/receipts/types.js';
 import { safeToolFailure, toolSuccess } from './result.js';
 
 describe('MCP tool results', () => {
@@ -36,6 +37,25 @@ describe('MCP tool results', () => {
       error: { code: 'NOT_FOUND' },
     });
     expect(JSON.stringify([forbidden, missing])).not.toContain('sentinel');
+  });
+
+  it.each([
+    ['RECEIPT_FORBIDDEN', 'FORBIDDEN'],
+    ['RECEIPT_NOT_FOUND', 'NOT_FOUND'],
+    ['RECEIPT_INVALID_INPUT', 'INVALID_INPUT'],
+    ['RECEIPT_TYPE_UNSUPPORTED', 'INVALID_INPUT'],
+    ['RECEIPT_IDEMPOTENCY_CONFLICT', 'INVALID_INPUT'],
+    ['RECEIPT_STALE', 'INVALID_INPUT'],
+  ] as const)('maps %s without exposing receipt detail', (receiptCode, safeCode) => {
+    const result = safeToolFailure(
+      new ReceiptError(receiptCode, 'SENTINEL_PRIVATE_RECEIPT_DETAIL'),
+      'request-receipt',
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: safeCode },
+    });
+    expect(JSON.stringify(result)).not.toContain('SENTINEL_PRIVATE_RECEIPT_DETAIL');
   });
 
   it('returns matching text and structured content', () => {

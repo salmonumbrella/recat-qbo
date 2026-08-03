@@ -160,7 +160,14 @@ describe('private receipt extractor client', () => {
       api_key: 'provider-private-key',
       provider_headers: input().provider.headers,
       max_pages: 20,
+      business: {
+        names: ['Synthetic Company'],
+        addresses: [],
+        tax_ids: [],
+      },
     });
+    expect((workerRequest.business as Record<string, unknown>).taxIds)
+      .toBeUndefined();
     const file = form.get('file');
     expect(file).toBeInstanceOf(File);
     expect((file as File).name).toBe('synthetic.png');
@@ -177,6 +184,36 @@ describe('private receipt extractor client', () => {
           amount: '1.2',
         }],
       },
+    });
+  });
+
+  it('accepts high-precision provider cost metadata from the extractor', async () => {
+    const costUsd = '0.00000012345678901234';
+    const result = await extractReceipt(input(), deps({
+      fetch: vi.fn(async () =>
+        jsonResponse(validExtractionResponse({ cost_usd: costUsd }))),
+    }));
+
+    expect(result.costUsd).toBe(costUsd);
+  });
+
+  it('classifies negative provider cost as an invalid response', async () => {
+    await expect(extractReceipt(input(), deps({
+      fetch: vi.fn(async () =>
+        jsonResponse(validExtractionResponse({ cost_usd: '-0.01' }))),
+    }))).rejects.toMatchObject({
+      code: 'RECEIPT_EXTRACTOR_RESPONSE_INVALID',
+      transient: false,
+    });
+  });
+
+  it('classifies malformed provider cost as an invalid response', async () => {
+    await expect(extractReceipt(input(), deps({
+      fetch: vi.fn(async () =>
+        jsonResponse(validExtractionResponse({ cost_usd: 'NaN' }))),
+    }))).rejects.toMatchObject({
+      code: 'RECEIPT_EXTRACTOR_RESPONSE_INVALID',
+      transient: false,
     });
   });
 

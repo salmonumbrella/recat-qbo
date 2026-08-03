@@ -129,7 +129,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine reads and thirteen conservatively annotated action tools', async () => {
+  it('registers exactly nine core reads and twenty conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -152,8 +152,15 @@ describe('Recat MCP read tools', () => {
       'list_transaction_attachments',
       'get_attachment_download',
       'delete_transaction_attachment',
+      'create_receipt_upload',
+      'ingest_receipt',
+      'list_receipts',
+      'get_receipt',
+      'list_receipt_matches',
+      'confirm_receipt_match',
+      'attach_receipt',
     ]);
-    expect(tools).toHaveLength(22);
+    expect(tools).toHaveLength(29);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -280,6 +287,51 @@ describe('Recat MCP read tools', () => {
         annotations: {
           readOnlyHint: false,
           destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'create_receipt_upload',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'ingest_receipt',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      ...['list_receipts', 'get_receipt', 'list_receipt_matches'].map((name) => ({
+        name,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      })),
+      {
+        name: 'confirm_receipt_match',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'attach_receipt',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
           idempotentHint: true,
           openWorldHint: true,
         },
