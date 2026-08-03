@@ -4,6 +4,7 @@ import type { ReceiptStatsDto } from '@recat/shared';
 import { receipts } from '../../lib/api';
 import ReceiptDropzone from '../../components/receipts/ReceiptDropzone';
 import { useApp } from '../../state/AppContext';
+import { readPreference, writePreference } from '../../lib/storage';
 
 type Timeframe = '30' | '90' | 'all';
 
@@ -36,9 +37,7 @@ export default function ReceiptDashboard() {
     : null;
   const [timeframe, setTimeframe] = useState<Timeframe>(() => {
     const value = activeCompanyId
-      ? globalThis.localStorage?.getItem(
-          `recat_receipt_dashboard_timeframe:${activeCompanyId}`,
-        )
+      ? readPreference(`recat_receipt_dashboard_timeframe:${activeCompanyId}`)
       : null;
     return value === '90' || value === 'all' ? value : '30';
   });
@@ -106,7 +105,7 @@ export default function ReceiptDashboard() {
           onChange={(event) => {
             const next = event.target.value as Timeframe;
             setTimeframe(next);
-            if (storageKey) globalThis.localStorage?.setItem(storageKey, next);
+            if (storageKey) writePreference(storageKey, next);
           }}
         >
           <option value="30">Last 30 days</option>
