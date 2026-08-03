@@ -12,9 +12,15 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
   type QboAccountTxn,
+  type QboAttachable,
+  type QboAttachmentDownload,
+  type QboAttachmentRef,
+  type QboAttachmentUploadFile,
+  type QboAttachmentUploadOutcome,
   type QboLogTxn,
   type QboClient,
   type QboCompanyInfo,
@@ -104,6 +110,10 @@ interface MockTransfer {
   lastUpdated: string;
 }
 
+export interface MockAttachmentRecord extends QboAttachable {
+  contentBase64: string;
+}
+
 export interface MockRealm {
   realmId: string;
   legalName: string;
@@ -116,6 +126,9 @@ export interface MockRealm {
   /** Authoritative full QBO-shaped Purchase bodies, including unknown fields. */
   rawPurchases: RawPurchase[];
   transfers: MockTransfer[];
+  attachments: MockAttachmentRecord[];
+  attachmentUploadFaults: Record<string, { code: string; message: string }>;
+  attachmentTimeoutAfterAccept: boolean;
   nextId: number;
 }
 
@@ -218,6 +231,9 @@ function buildHarborRealm(): MockRealm {
     purchaseSnapshots: [],
     rawPurchases: [],
     transfers: [],
+    attachments: [],
+    attachmentUploadFaults: {},
+    attachmentTimeoutAfterAccept: false,
     nextId: 1000,
   };
 }
@@ -342,6 +358,9 @@ function buildBluebirdRealm(): MockRealm {
     ],
     rawPurchases: [],
     transfers: [],
+    attachments: [],
+    attachmentUploadFaults: {},
+    attachmentTimeoutAfterAccept: false,
     nextId: 1000,
   };
 }
@@ -432,6 +451,32 @@ function isPersistedTransfer(value: unknown): value is MockTransfer {
     typeof value.date === 'string' &&
     (value.memo === undefined || typeof value.memo === 'string') &&
     typeof value.lastUpdated === 'string'
+  );
+}
+
+function isPersistedAttachment(value: unknown): value is MockAttachmentRecord {
+  return (
+    isRecord(value)
+    && isNonEmptyString(value.id)
+    && isNonEmptyString(value.syncToken)
+    && isNonEmptyString(value.filename)
+    && isNonEmptyString(value.contentType)
+    && typeof value.sizeBytes === 'number'
+    && Number.isSafeInteger(value.sizeBytes)
+    && value.sizeBytes >= 0
+    && isNullableString(value.note)
+    && Array.isArray(value.refs)
+    && value.refs.length > 0
+    && value.refs.every((ref) => (
+      isRecord(ref)
+      && (
+        ref.qboType === 'Purchase'
+        || ref.qboType === 'Deposit'
+        || ref.qboType === 'JournalEntry'
+      )
+      && isNonEmptyString(ref.qboId)
+    ))
+    && typeof value.contentBase64 === 'string'
   );
 }
 
@@ -602,6 +647,11 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
     Array.isArray(persisted.transfers) && persisted.transfers.every(isPersistedTransfer)
       ? persisted.transfers
       : current.transfers;
+  const attachments =
+    Array.isArray(persisted.attachments)
+    && persisted.attachments.every(isPersistedAttachment)
+      ? persisted.attachments
+      : current.attachments;
   const persistedPurchaseSnapshots = isPersistedPurchaseSnapshotArray(
     persisted.purchaseSnapshots,
   )
@@ -642,6 +692,7 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
     transfers === current.transfers &&
     purchaseSnapshots === current.purchaseSnapshots &&
     rawPurchases === current.rawPurchases &&
+    attachments === current.attachments &&
     nextId === current.nextId
   ) {
     return current;
@@ -652,6 +703,7 @@ export function mergePersistedMockRealm(current: MockRealm, persisted: unknown):
     purchaseSnapshots,
     rawPurchases,
     transfers,
+    attachments,
     nextId,
   };
 }
@@ -1080,6 +1132,130 @@ export class MockQboClient implements QboClient {
   async listTaxRates(): Promise<QboTaxRateInfo[]> {
     await ensureMockRealmsHydrated();
     return this.realm.taxRates.map((rate) => ({ ...rate }));
+  }
+
+  async uploadAttachments(
+    ref: QboAttachmentRef,
+    files: QboAttachmentUploadFile[],
+    _requestId: string,
+  ): Promise<QboAttachmentUploadOutcome[]> {
+    await ensureMockRealmsHydrated();
+    if (!this.findEntity(ref.qboType, ref.qboId)) {
+      throw new Error(`Mock QBO: ${ref.qboType} ${ref.qboId} not found`);
+    }
+    const outcomes: QboAttachmentUploadOutcome[] = [];
+    for (const file of files) {
+      const configuredFault =
+        this.realm.attachmentUploadFaults[String(file.ordinal)];
+      if (configuredFault) {
+        outcomes.push({
+          ordinal: file.ordinal,
+          outcome: 'FAILED',
+          ...configuredFault,
+        });
+        continue;
+      }
+      const reader = await file.openContent();
+      if (
+        reader.sizeBytes !== file.sizeBytes
+        || reader.contentType !== file.contentType
+      ) {
+        throw new Error('Mock QBO: attachment content metadata changed');
+      }
+      const chunks: Buffer[] = [];
+      let sizeBytes = 0;
+      for await (const chunk of reader.chunks()) {
+        const copied = Buffer.from(chunk);
+        sizeBytes += copied.byteLength;
+        if (sizeBytes > file.sizeBytes) {
+          throw new Error('Mock QBO: attachment content exceeded its declared size');
+        }
+        chunks.push(copied);
+      }
+      if (sizeBytes !== file.sizeBytes) {
+        throw new Error('Mock QBO: attachment content did not match its declared size');
+      }
+      const record: MockAttachmentRecord = {
+        id: `attachable-${this.realm.nextId++}`,
+        syncToken: '0',
+        filename: file.filename,
+        contentType: file.contentType,
+        sizeBytes,
+        note: `Recat reference: ${file.marker}`,
+        refs: [{ ...ref }],
+        contentBase64: Buffer.concat(chunks).toString('base64'),
+      };
+      this.realm.attachments.push(record);
+      outcomes.push({
+        ordinal: file.ordinal,
+        outcome: 'ATTACHED',
+        attachable: structuredClone(record),
+      });
+    }
+    await persistMockRealm(this.realmId);
+    if (this.realm.attachmentTimeoutAfterAccept) {
+      this.realm.attachmentTimeoutAfterAccept = false;
+      throw new QboRequestTimeout(
+        'Mock QBO accepted the attachment batch but did not confirm it.',
+      );
+    }
+    return outcomes;
+  }
+
+  async listAttachments(ref: QboAttachmentRef): Promise<QboAttachable[]> {
+    await ensureMockRealmsHydrated();
+    return this.realm.attachments
+      .filter((attachment) =>
+        attachment.refs.some(
+          (candidate) =>
+            candidate.qboType === ref.qboType
+            && candidate.qboId === ref.qboId,
+        ))
+      .map(({ contentBase64: _contentBase64, ...attachment }) =>
+        structuredClone(attachment));
+  }
+
+  async getAttachment(id: string): Promise<QboAttachable | null> {
+    await ensureMockRealmsHydrated();
+    const record = this.realm.attachments.find(
+      (attachment) => attachment.id === id,
+    );
+    if (!record) return null;
+    const { contentBase64: _contentBase64, ...attachment } = record;
+    return structuredClone(attachment);
+  }
+
+  async openAttachmentDownload(id: string): Promise<QboAttachmentDownload> {
+    await ensureMockRealmsHydrated();
+    const record = this.realm.attachments.find(
+      (attachment) => attachment.id === id,
+    );
+    if (!record) throw new Error(`Mock QBO: attachment ${id} not found`);
+    const content = Buffer.from(record.contentBase64, 'base64');
+    return {
+      contentType: record.contentType,
+      sizeBytes: record.sizeBytes,
+      body: (async function* () {
+        yield content;
+      })(),
+    };
+  }
+
+  async deleteAttachment(input: {
+    id: string;
+    syncToken: string;
+    requestId: string;
+  }): Promise<void> {
+    await ensureMockRealmsHydrated();
+    const index = this.realm.attachments.findIndex(
+      (attachment) => attachment.id === input.id,
+    );
+    if (index === -1) throw new Error(`Mock QBO: attachment ${input.id} not found`);
+    if (this.realm.attachments[index]!.syncToken !== input.syncToken) {
+      throw new QboSyncTokenConflict();
+    }
+    this.realm.attachments.splice(index, 1);
+    await persistMockRealm(this.realmId);
   }
 
   async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {

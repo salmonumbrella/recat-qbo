@@ -6,6 +6,7 @@
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
 import type { QboDiagnosticCode, StagedCategorization } from '@recat/shared';
+import type { AttachmentBlobReader } from '../../services/attachments/types.js';
 
 export interface QboTokenSet {
   accessToken: string;
@@ -307,6 +308,46 @@ export interface QboLineWriteResult extends QboWriteResult {
   snapshot: QboLineWriteSnapshot;
 }
 
+export interface QboAttachmentRef {
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  qboId: string;
+}
+
+export interface QboAttachable {
+  id: string;
+  syncToken: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  note: string | null;
+  refs: readonly QboAttachmentRef[];
+}
+
+export interface QboAttachmentDownload {
+  contentType: string;
+  sizeBytes: number | null;
+  body: AsyncIterable<Uint8Array>;
+}
+
+export interface QboAttachmentUploadFile {
+  ordinal: number;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  marker: string;
+  openContent(): Promise<AttachmentBlobReader>;
+}
+
+export type QboAttachmentUploadOutcome =
+  | { ordinal: number; outcome: 'ATTACHED'; attachable: QboAttachable }
+  | { ordinal: number; outcome: 'FAILED'; code: string; message: string };
+
+export interface QboMultipartBody {
+  contentType: string;
+  contentLength: number;
+  openStream(): AsyncIterable<Uint8Array>;
+}
+
 export class QboSyncTokenConflict extends Error {
   code = 'SYNC_TOKEN_CONFLICT' as const;
   constructor(message = 'SyncToken conflict — this transaction was edited in QuickBooks after our last sync.') {
@@ -352,6 +393,19 @@ export interface QboClient {
   getTaxProfile(): Promise<QboTaxProfile>;
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
+  uploadAttachments(
+    ref: QboAttachmentRef,
+    files: QboAttachmentUploadFile[],
+    requestId: string,
+  ): Promise<QboAttachmentUploadOutcome[]>;
+  listAttachments(ref: QboAttachmentRef): Promise<QboAttachable[]>;
+  getAttachment(id: string): Promise<QboAttachable | null>;
+  openAttachmentDownload(id: string): Promise<QboAttachmentDownload>;
+  deleteAttachment(input: {
+    id: string;
+    syncToken: string;
+    requestId: string;
+  }): Promise<void>;
   fetchPurchaseSnapshot(
     qboId: string,
     signal?: AbortSignal,

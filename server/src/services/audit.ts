@@ -34,6 +34,46 @@ export interface MutationAuditInput {
   };
 }
 
+export interface AttachmentAuditInput {
+  attachmentCount: number;
+  totalBytes: number;
+  sourceKinds: readonly (
+    | 'LOCAL_UPLOAD'
+    | 'HTTPS_IMPORT'
+    | 'QBO_EXTERNAL'
+  )[];
+  state:
+    | 'PREPARED'
+    | 'COMMITTING'
+    | 'PARTIAL'
+    | 'VERIFIED'
+    | 'FAILED'
+    | 'UNCERTAIN'
+    | 'DELETING'
+    | 'DELETED';
+}
+
+export function normalizeAttachmentAuditMetadata(
+  input: AttachmentAuditInput,
+): {
+  attachmentCount: number;
+  sizeBucket: 'UNDER_1MB' | '1MB_TO_10MB' | '10MB_TO_100MB';
+  sourceKinds: AttachmentAuditInput['sourceKinds'][number][];
+  state: AttachmentAuditInput['state'];
+} {
+  const sizeBucket = input.totalBytes < 1_000_000
+    ? 'UNDER_1MB'
+    : input.totalBytes < 10_000_000
+      ? '1MB_TO_10MB'
+      : '10MB_TO_100MB';
+  return {
+    attachmentCount: Math.max(0, Math.min(20, input.attachmentCount)),
+    sizeBucket,
+    sourceKinds: [...new Set(input.sourceKinds)].sort(),
+    state: input.state,
+  };
+}
+
 export interface AuditInput {
   companyId: string;
   /** userId, or null/undefined for system actions */

@@ -305,7 +305,12 @@ export type AuditAction =
   | 'transfer'
   | 'auto-posted'
   | 'rule-candidate-dismissed'
-  | 'rule-candidate-activated';
+  | 'rule-candidate-activated'
+  | 'attachment_uploaded'
+  | 'attachment_reconciled'
+  | 'attachment_local_copy_deleted'
+  | 'attachment_deleted_everywhere'
+  | 'attachment_error';
 
 export interface MembershipDto {
   companyId: string;
@@ -378,10 +383,66 @@ export interface CompanyDto {
   holdingAccountIds: string[];
   dryRun: boolean;
   tagsRequired: boolean;
+  retainAttachmentFiles: boolean;
   connectedAt: string;
   disconnectedAt: string | null;
   lastSyncedAt: string | null;
 }
+
+export type AttachmentStatus =
+  | 'STAGED'
+  | 'UPLOADING'
+  | 'ATTACHED'
+  | 'FAILED'
+  | 'UNCERTAIN'
+  | 'RECONCILING'
+  | 'DELETING'
+  | 'DELETED'
+  | 'QBO_MISSING';
+
+export interface AttachmentDto {
+  id: string;
+  transactionId: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  sourceKind: 'LOCAL_UPLOAD' | 'HTTPS_IMPORT' | 'QBO_EXTERNAL';
+  retainedLocally: boolean;
+  status: AttachmentStatus;
+  qboAttached: boolean;
+  canPreview: boolean;
+  error: { code: string; message: string } | null;
+}
+
+export interface AttachmentOperationDto {
+  operationId: string;
+  status:
+    | 'PREPARED'
+    | 'COMMITTING'
+    | 'PARTIAL'
+    | 'VERIFIED'
+    | 'FAILED'
+    | 'UNCERTAIN'
+    | 'DELETING'
+    | 'DELETED';
+  files: AttachmentDto[];
+  actions: {
+    canRetry: boolean;
+    requiresReconciliation: boolean;
+  };
+}
+
+export interface AttachmentUploadGrantDto {
+  uploadUrl: string;
+  grant: string;
+  expiresAt: string;
+  maxFileCount: number;
+  maxEncodedRequestBytes: number;
+}
+
+export type AttachmentSourceInput =
+  | { kind: 'upload'; uploadId: string }
+  | { kind: 'https'; url: string };
 
 export interface QboPreflightDto {
   ok: boolean;
@@ -752,6 +813,7 @@ export interface CompanyPatchBody {
   holdingAccountIds?: string[];
   dryRun?: boolean;
   tagsRequired?: boolean;
+  retainAttachmentFiles?: boolean;
 }
 
 export interface ApiError {

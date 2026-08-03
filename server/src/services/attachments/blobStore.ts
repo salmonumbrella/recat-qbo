@@ -1,0 +1,429 @@
+import { createHash } from 'node:crypto';
+import type { PrismaClient } from '@prisma/client';
+import { prisma } from '../../lib/prisma.js';
+import {
+  type AttachmentBatchBudget,
+  type AttachmentBlobReader,
+  AttachmentError,
+  type StageAttachmentInput,
+  type StagedAttachmentDto,
+} from './types.js';
+import {
+  ATTACHMENT_DETECTION_BYTES,
+  BLOB_CHUNK_BYTES,
+  detectAllowedAttachment,
+  normalizeAttachmentFilename,
+  QBO_MAX_UPLOAD_REQUEST_BYTES,
+} from './validation.js';
+
+const CHUNK_READ_PAGE = 16;
+
+export interface AttachmentBlobStoreDeps {
+  readonly db?: PrismaClient;
+  readonly now?: () => Date;
+}
+
+function resolvedDb(deps?: AttachmentBlobStoreDeps): PrismaClient {
+  return deps?.db ?? prisma;
+}
+
+function isUniqueConstraint(error: unknown): boolean {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'P2002'
+  );
+}
+
+function assertStageInput(input: StageAttachmentInput, now: Date): void {
+  if (
+    typeof input.companyId !== 'string'
+    || input.companyId.length < 1
+    || input.companyId.length > 120
+    || typeof input.actorKey !== 'string'
+    || input.actorKey.length < 1
+    || Buffer.byteLength(input.actorKey, 'utf8') > 160
+    || !(input.expiresAt instanceof Date)
+    || !Number.isFinite(input.expiresAt.getTime())
+    || input.expiresAt <= now
+  ) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'Attachment staging scope or expiry is invalid.',
+    );
+  }
+}
+
+export function createAttachmentBatchBudget(maxBytes: number): AttachmentBatchBudget {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'Attachment byte budget must be a positive safe integer.',
+    );
+  }
+  let usedBytes = 0;
+  return {
+    maxBytes,
+    get usedBytes() {
+      return usedBytes;
+    },
+    consume(bytes: number) {
+      if (!Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new AttachmentError(
+          'ATTACHMENT_INVALID_INPUT',
+          'Attachment byte count must be a non-negative safe integer.',
+        );
+      }
+      if (usedBytes + bytes > maxBytes) {
+        throw new AttachmentError(
+          'ATTACHMENT_TOO_LARGE',
+          'Attachment content exceeds the upload byte limit.',
+        );
+      }
+      usedBytes += bytes;
+    },
+  };
+}
+
+export async function* rechunkAttachmentContent(
+  content: AsyncIterable<Uint8Array>,
+): AsyncIterable<Uint8Array> {
+  let pending = new Uint8Array(BLOB_CHUNK_BYTES);
+  let pendingBytes = 0;
+
+  for await (const sourceChunk of content) {
+    if (!(sourceChunk instanceof Uint8Array)) {
+      throw new AttachmentError(
+        'ATTACHMENT_INVALID_INPUT',
+        'Attachment stream yielded an invalid chunk.',
+      );
+    }
+    let offset = 0;
+    while (offset < sourceChunk.byteLength) {
+      const copyBytes = Math.min(
+        BLOB_CHUNK_BYTES - pendingBytes,
+        sourceChunk.byteLength - offset,
+      );
+      pending.set(sourceChunk.subarray(offset, offset + copyBytes), pendingBytes);
+      pendingBytes += copyBytes;
+      offset += copyBytes;
+      if (pendingBytes === BLOB_CHUNK_BYTES) {
+        yield pending;
+        pending = new Uint8Array(BLOB_CHUNK_BYTES);
+        pendingBytes = 0;
+      }
+    }
+  }
+
+  if (pendingBytes > 0) yield pending.slice(0, pendingBytes);
+}
+
+async function removeProvisionalBlob(db: PrismaClient, blobId: string): Promise<void> {
+  try {
+    await db.attachmentBlob.deleteMany({
+      where: { id: blobId, state: 'STAGING' },
+    });
+  } catch {
+    // Cleanup is best effort; the expiry-bound collector owns crash leftovers.
+  }
+}
+
+function stagedDto(
+  staged: {
+    id: string;
+    companyId: string;
+    originalFilename: string;
+    contentType: string;
+    sizeBytes: bigint;
+    sourceKind: 'LOCAL_UPLOAD' | 'HTTPS_IMPORT' | 'QBO_EXTERNAL';
+    retainLocally: boolean;
+    expiresAt: Date;
+  },
+  sha256: string,
+): StagedAttachmentDto {
+  if (staged.sourceKind === 'QBO_EXTERNAL') {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'QuickBooks-native attachments cannot be local staging records.',
+    );
+  }
+  const sizeBytes = Number(staged.sizeBytes);
+  if (!Number.isSafeInteger(sizeBytes)) {
+    throw new AttachmentError('ATTACHMENT_TOO_LARGE', 'Attachment size is outside the safe range.');
+  }
+  return {
+    id: staged.id,
+    companyId: staged.companyId,
+    filename: staged.originalFilename,
+    contentType: staged.contentType,
+    sizeBytes,
+    sha256,
+    sourceKind: staged.sourceKind,
+    retainLocally: staged.retainLocally,
+    expiresAt: staged.expiresAt.toISOString(),
+  };
+}
+
+export async function stageAttachment(
+  input: StageAttachmentInput,
+  deps?: AttachmentBlobStoreDeps,
+): Promise<StagedAttachmentDto> {
+  const db = resolvedDb(deps);
+  const now = (deps?.now ?? (() => new Date()))();
+  assertStageInput(input, now);
+  const filename = normalizeAttachmentFilename(input.filename);
+  const provisional = await db.attachmentBlob.create({
+    data: {
+      companyId: input.companyId,
+      state: 'STAGING',
+      expiresAt: input.expiresAt,
+    },
+    select: { id: true },
+  });
+
+  const budget = createAttachmentBatchBudget(QBO_MAX_UPLOAD_REQUEST_BYTES);
+  const hash = createHash('sha256');
+  const detectionPrefix = new Uint8Array(ATTACHMENT_DETECTION_BYTES);
+  let detectionBytes = 0;
+  let chunkCount = 0;
+
+  try {
+    for await (const chunk of rechunkAttachmentContent(input.content)) {
+      budget.consume(chunk.byteLength);
+      hash.update(chunk);
+      if (detectionBytes < detectionPrefix.byteLength) {
+        const copyBytes = Math.min(
+          chunk.byteLength,
+          detectionPrefix.byteLength - detectionBytes,
+        );
+        detectionPrefix.set(chunk.subarray(0, copyBytes), detectionBytes);
+        detectionBytes += copyBytes;
+      }
+      await db.attachmentBlobChunk.create({
+        data: {
+          blobId: provisional.id,
+          ordinal: chunkCount,
+          content: Buffer.from(chunk),
+        },
+      });
+      chunkCount += 1;
+    }
+    if (budget.usedBytes === 0 || chunkCount === 0) {
+      throw new AttachmentError(
+        'ATTACHMENT_INVALID_INPUT',
+        'Attachment content must not be empty.',
+      );
+    }
+
+    const detected = await detectAllowedAttachment(
+      detectionPrefix.subarray(0, detectionBytes),
+      filename,
+      input.declaredContentType,
+    );
+    const sha256 = hash.digest('hex');
+    try {
+      const staged = await db.$transaction(async (transaction) => {
+        await transaction.attachmentBlob.update({
+          where: { id: provisional.id },
+          data: {
+            state: 'READY',
+            sha256,
+            sizeBytes: BigInt(budget.usedBytes),
+            contentType: detected.contentType,
+            chunkCount,
+            expiresAt: null,
+          },
+        });
+        return transaction.stagedAttachment.create({
+          data: {
+            companyId: input.companyId,
+            actorKey: input.actorKey,
+            blobId: provisional.id,
+            originalFilename: filename,
+            contentType: detected.contentType,
+            sizeBytes: BigInt(budget.usedBytes),
+            sourceKind: input.sourceKind,
+            retainLocally: input.retainLocally,
+            expiresAt: input.expiresAt,
+          },
+        });
+      });
+      return stagedDto(staged, sha256);
+    } catch (error) {
+      if (!isUniqueConstraint(error)) throw error;
+      const staged = await db.$transaction(async (transaction) => {
+        const canonical = await transaction.attachmentBlob.findUnique({
+          where: {
+            companyId_sha256: {
+              companyId: input.companyId,
+              sha256,
+            },
+          },
+          select: {
+            id: true,
+            state: true,
+            sizeBytes: true,
+            contentType: true,
+          },
+        });
+        if (
+          canonical?.state !== 'READY'
+          || canonical.contentType !== detected.contentType
+          || canonical.sizeBytes !== BigInt(budget.usedBytes)
+        ) {
+          throw new AttachmentError(
+            'ATTACHMENT_BUSY',
+            'An identical attachment is still being finalized.',
+            true,
+          );
+        }
+        const reference = await transaction.stagedAttachment.create({
+          data: {
+            companyId: input.companyId,
+            actorKey: input.actorKey,
+            blobId: canonical.id,
+            originalFilename: filename,
+            contentType: detected.contentType,
+            sizeBytes: BigInt(budget.usedBytes),
+            sourceKind: input.sourceKind,
+            retainLocally: input.retainLocally,
+            expiresAt: input.expiresAt,
+          },
+        });
+        await transaction.attachmentBlob.delete({
+          where: { id: provisional.id },
+        });
+        return reference;
+      });
+      return stagedDto(staged, sha256);
+    }
+  } catch (error) {
+    await removeProvisionalBlob(db, provisional.id);
+    throw error;
+  }
+}
+
+export async function openAttachmentBlob(
+  companyId: string,
+  blobId: string,
+  deps?: AttachmentBlobStoreDeps,
+): Promise<AttachmentBlobReader> {
+  const db = resolvedDb(deps);
+  const blob = await db.attachmentBlob.findFirst({
+    where: { id: blobId, companyId, state: 'READY' },
+    select: {
+      id: true,
+      sizeBytes: true,
+      contentType: true,
+    },
+  });
+  if (!blob || blob.contentType === null) {
+    throw new AttachmentError('ATTACHMENT_NOT_FOUND', 'Attachment content was not found.');
+  }
+  const sizeBytes = Number(blob.sizeBytes);
+  if (!Number.isSafeInteger(sizeBytes)) {
+    throw new AttachmentError('ATTACHMENT_TOO_LARGE', 'Attachment size is outside the safe range.');
+  }
+
+  return {
+    blobId: blob.id,
+    sizeBytes,
+    contentType: blob.contentType,
+    async *chunks() {
+      let lastOrdinal = -1;
+      while (true) {
+        const rows = await db.attachmentBlobChunk.findMany({
+          where: {
+            blobId: blob.id,
+            ordinal: { gt: lastOrdinal },
+          },
+          orderBy: { ordinal: 'asc' },
+          take: CHUNK_READ_PAGE,
+          select: {
+            ordinal: true,
+            content: true,
+          },
+        });
+        if (rows.length === 0) return;
+        for (const row of rows) {
+          lastOrdinal = row.ordinal;
+          yield row.content;
+        }
+      }
+    },
+  };
+}
+
+export async function releaseAttachmentBlob(
+  attachmentId: string,
+  deps?: AttachmentBlobStoreDeps,
+): Promise<void> {
+  const db = resolvedDb(deps);
+  await db.$transaction(async (transaction) => {
+    const attachment = await transaction.transactionAttachment.findUnique({
+      where: { id: attachmentId },
+      select: { blobId: true },
+    });
+    if (!attachment) {
+      throw new AttachmentError('ATTACHMENT_NOT_FOUND', 'Attachment was not found.');
+    }
+    if (attachment.blobId === null) return;
+    await transaction.transactionAttachment.update({
+      where: { id: attachmentId },
+      data: {
+        blobId: null,
+        retainLocally: false,
+      },
+    });
+    await transaction.attachmentBlob.deleteMany({
+      where: {
+        id: attachment.blobId,
+        stagedFiles: { none: {} },
+        attachments: { none: {} },
+      },
+    });
+  });
+}
+
+export async function collectUnreferencedBlobs(
+  limit: number,
+  deps?: AttachmentBlobStoreDeps,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+    throw new AttachmentError(
+      'ATTACHMENT_INVALID_INPUT',
+      'Attachment cleanup limit must be between 1 and 1000.',
+    );
+  }
+  const db = resolvedDb(deps);
+  const now = (deps?.now ?? (() => new Date()))();
+  return db.$transaction(async (transaction) => {
+    const candidates = await transaction.attachmentBlob.findMany({
+      where: {
+        stagedFiles: { none: {} },
+        attachments: { none: {} },
+        OR: [
+          { state: 'READY' },
+          { state: 'STAGING', expiresAt: { lte: now } },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+      select: { id: true },
+    });
+    if (candidates.length === 0) return 0;
+    const deleted = await transaction.attachmentBlob.deleteMany({
+      where: {
+        id: { in: candidates.map((candidate) => candidate.id) },
+        stagedFiles: { none: {} },
+        attachments: { none: {} },
+        OR: [
+          { state: 'READY' },
+          { state: 'STAGING', expiresAt: { lte: now } },
+        ],
+      },
+    });
+    return deleted.count;
+  });
+}

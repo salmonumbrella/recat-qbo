@@ -420,6 +420,101 @@ function undoFixture(status: string | null = null) {
   return { ...value, undo, sourceAttempt, sourceOperation };
 }
 
+describe('MCP attachment operation dispatch', () => {
+  function attachmentDto(
+    status: 'FAILED' | 'UNCERTAIN' | 'ATTACHED',
+  ) {
+    return {
+      operationId: 'attachment-operation-1',
+      status:
+        status === 'ATTACHED'
+          ? 'VERIFIED' as const
+          : status === 'UNCERTAIN'
+            ? 'UNCERTAIN' as const
+            : 'FAILED' as const,
+      files: [{
+        id: 'attachment-1',
+        transactionId: TRANSACTION_ID,
+        filename: 'receipt.pdf',
+        contentType: 'application/pdf',
+        sizeBytes: 100,
+        sourceKind: 'LOCAL_UPLOAD' as const,
+        retainedLocally: true,
+        status,
+        qboAttached: status === 'ATTACHED',
+        canPreview: true,
+        error: status === 'ATTACHED'
+          ? null
+          : { code: `ATTACHMENT_${status}`, message: 'Safe attachment error.' },
+      }],
+      actions: {
+        canRetry: status === 'FAILED',
+        requiresReconciliation: status === 'UNCERTAIN',
+      },
+    };
+  }
+
+  it('falls back only to an operation owned by the exact MCP actor key', async () => {
+    const value = fixture();
+    value.operations.splice(0);
+    const findAttachmentOperation = vi.fn(async (
+      _operationId: string,
+      actorKey: string,
+    ) => actorKey === `mcp:${principal.tokenId}`);
+    const getAttachmentOperation = vi.fn(async () =>
+      attachmentDto('ATTACHED'));
+    const result = await getMcpOperation(
+      principal,
+      { operationId: 'attachment-operation-1' },
+      {
+        ...value.deps,
+        findAttachmentOperation,
+        getAttachmentOperation,
+      },
+    );
+
+    expect(result).toMatchObject({
+      operationId: 'attachment-operation-1',
+      kind: 'attachment',
+      state: 'committed',
+      result: {
+        fileCount: 1,
+        attachedCount: 1,
+        failedCount: 0,
+        uncertainCount: 0,
+      },
+    });
+    expect(findAttachmentOperation).toHaveBeenCalledWith(
+      'attachment-operation-1',
+      `mcp:${principal.tokenId}`,
+    );
+  });
+
+  it('reconciles uncertain attachment operations before any retry dispatch', async () => {
+    const value = fixture();
+    value.operations.splice(0);
+    const retryAttachmentOperation = vi.fn(async () =>
+      attachmentDto('ATTACHED'));
+    const reconcileAttachmentOperation = vi.fn(async () =>
+      attachmentDto('ATTACHED'));
+    const result = await retryMcpOperation(
+      principal,
+      { operationId: 'attachment-operation-1' },
+      {
+        ...value.deps,
+        findAttachmentOperation: vi.fn(async () => true),
+        getAttachmentOperation: vi.fn(async () => attachmentDto('UNCERTAIN')),
+        retryAttachmentOperation,
+        reconcileAttachmentOperation,
+      },
+    );
+
+    expect(result).toMatchObject({ kind: 'attachment', state: 'committed' });
+    expect(reconcileAttachmentOperation).toHaveBeenCalledTimes(1);
+    expect(retryAttachmentOperation).not.toHaveBeenCalled();
+  });
+});
+
 describe('MCP categorization operation execution', () => {
   it('routes transfer status and retry through the shared paired-operation adapter', async () => {
     const f = fixture();

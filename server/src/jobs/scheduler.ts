@@ -14,6 +14,8 @@ import {
   stopAgentScheduler,
 } from '../services/agent/scheduler.js';
 import { syncCompany, type SyncKind } from '../services/sync.js';
+import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
+import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -155,6 +157,16 @@ async function digestTick(now: Date): Promise<void> {
 async function tick(): Promise<void> {
   const now = new Date();
   try {
+    await recoverStuckAttachmentOperations({ now });
+  } catch {
+    console.error('[jobs] attachment recovery failed');
+  }
+  try {
+    await runAttachmentCleanup({ now });
+  } catch {
+    console.error('[jobs] attachment cleanup failed');
+  }
+  try {
     await sweepStuckPosting();
     await pollTick(now);
     await nightlyTick(now);
@@ -174,6 +186,9 @@ export function startJobs(): void {
   startAgentScheduler();
   // Boot sweep: recover anything a previous process left mid-post.
   sweepStuckPosting().catch((err) => console.error('[jobs] boot stuck-POSTING sweep failed:', err));
+  recoverStuckAttachmentOperations()
+    .catch(() => console.error('[jobs] attachment recovery failed'));
+  runAttachmentCleanup().catch(() => console.error('[jobs] attachment cleanup failed'));
   runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.

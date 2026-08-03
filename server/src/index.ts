@@ -15,6 +15,12 @@ import { localAuthRouter } from './routes/localAuth.js';
 import { legalRouter } from './routes/legal.js';
 import { auditRouter } from './routes/audit.js';
 import { autopilotRouter } from './routes/autopilot.js';
+import {
+  attachmentDownloadsRouter,
+  attachmentUploadsRouter,
+  companyAttachmentGrantsRouter,
+  transactionAttachmentsRouter,
+} from './routes/attachments.js';
 import { companiesRouter } from './routes/companies.js';
 import { dashboardRouter, meRouter } from './routes/dashboard.js';
 import { instanceRouter, setupRouter } from './routes/instance.js';
@@ -96,6 +102,16 @@ app.use(qboOauthRouter); // /auth/qbo/callback, /auth/qbo/mock-consent
 // /api — company-scoped data routers first (specific paths), then the
 // company resource router.
 app.use('/api/users', usersRouter);
+app.use(
+  '/api/companies/:companyId/transactions/:transactionId/attachments',
+  transactionAttachmentsRouter,
+);
+app.use(
+  '/api/companies/:companyId/attachment-upload-grants',
+  companyAttachmentGrantsRouter,
+);
+app.use('/api/attachment-uploads', attachmentUploadsRouter);
+app.use('/api/attachment-downloads', attachmentDownloadsRouter);
 app.use('/api/companies/:companyId/transactions', companyTransactionsRouter);
 app.use('/api/companies/:companyId/transfer-candidates', transferCandidatesRouter);
 app.use('/api/companies/:companyId/tags', tagsRouter);

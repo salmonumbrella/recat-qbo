@@ -22,6 +22,7 @@ import SuggestionsCard from './settings/SuggestionsCard';
 import TeamCard from './settings/TeamCard';
 import TaxCard from './settings/TaxCard';
 import McpTokensCard from './settings/McpTokensCard';
+import AttachmentRetentionCard from './settings/AttachmentRetentionCard';
 import { errMsg, fmtWhen } from './settings/format';
 
 export default function Settings() {
@@ -200,6 +201,8 @@ export default function Settings() {
             holdingOptions={holdingOptions}
             reloadSyncLog={reloadSyncLog}
           />
+
+          <AttachmentRetentionCard />
 
           <TaxCard />
 

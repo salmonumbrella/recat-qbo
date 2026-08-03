@@ -9,9 +9,35 @@ import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
 import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
+import { AttachmentError } from '../services/attachments/types.js';
 import { safeToolFailure, toolSuccess } from './result.js';
 
 describe('MCP tool results', () => {
+  it('maps attachment failures without exposing private detail', () => {
+    const forbidden = safeToolFailure(
+      new AttachmentError(
+        'ATTACHMENT_FORBIDDEN',
+        'private attachment filename sentinel.pdf',
+      ),
+      'request-attachment',
+    );
+    const missing = safeToolFailure(
+      new AttachmentError(
+        'ATTACHMENT_NOT_FOUND',
+        'private provider id sentinel',
+      ),
+      'request-attachment',
+    );
+
+    expect(forbidden.structuredContent).toMatchObject({
+      error: { code: 'FORBIDDEN' },
+    });
+    expect(missing.structuredContent).toMatchObject({
+      error: { code: 'NOT_FOUND' },
+    });
+    expect(JSON.stringify([forbidden, missing])).not.toContain('sentinel');
+  });
+
   it('returns matching text and structured content', () => {
     const result = toolSuccess({ items: [{ id: 'company-a' }] });
 

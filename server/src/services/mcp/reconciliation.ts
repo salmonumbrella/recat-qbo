@@ -15,6 +15,7 @@ import {
   createPreparedOperation,
   hasValidMcpOperationIntegrity,
   loadOwnedOperation,
+  McpOperationError,
   normalizeMcpOperationIdempotencyKey,
   type CreatePreparedOperationInput,
   type McpOperationRecord,
@@ -36,6 +37,17 @@ import {
   type McpTransferExecutionDeps,
   type McpTransferOperationDto,
 } from './transfers.js';
+import {
+  getAttachmentOperation,
+  reconcileAttachmentOperation,
+  retryAttachmentOperation,
+  type AttachmentActor,
+  type AttachmentOperationDependencies,
+} from '../attachments/operations.js';
+import {
+  projectMcpAttachmentOperation,
+  type McpAttachmentOperationProjection,
+} from '../../mcp/attachmentTools.js';
 
 export type McpOperationState =
   | 'prepared'
@@ -58,17 +70,18 @@ export type McpOperationPhase =
 
 export interface McpOperationDto {
   operationId: string;
-  kind: McpOperationKind;
+  kind: McpOperationKind | 'attachment';
   companyId?: string;
   transactionId?: string;
   sourceRevision?: number;
   preparedRevision?: number;
-  expiresAt: string;
+  expiresAt?: string;
   state: McpOperationState;
   phase: McpOperationPhase;
   result: null
     | { outcome: DurableMutationOutcome; status: TxnStatus }
-    | McpTransferOperationDto['result'];
+    | McpTransferOperationDto['result']
+    | McpAttachmentOperationProjection['result'];
   error: null | { code: string; message: string };
   actions: {
     canCommit: boolean;
@@ -153,6 +166,14 @@ export interface McpOperationExecutionDeps {
   transfer?: Omit<McpTransferExecutionDeps, 'store'>;
   getTransferOperation?: typeof getMcpTransferOperation;
   retryTransferOperation?: typeof retryMcpTransferOperation;
+  findAttachmentOperation?: (
+    operationId: string,
+    actorKey: string,
+  ) => Promise<boolean>;
+  getAttachmentOperation?: typeof getAttachmentOperation;
+  retryAttachmentOperation?: typeof retryAttachmentOperation;
+  reconcileAttachmentOperation?: typeof reconcileAttachmentOperation;
+  attachmentDependencies?: AttachmentOperationDependencies;
 }
 
 export type McpOperationExecutionErrorCode =
@@ -188,14 +209,74 @@ interface LoadedExecution {
   attemptCorrupt: boolean;
 }
 
+function attachmentActor(principal: McpPrincipal): AttachmentActor {
+  return {
+    kind: 'mcp',
+    actorKey: `mcp:${principal.tokenId}`,
+    userId: principal.userId,
+    isInstanceAdmin: principal.isInstanceAdmin,
+    memberships: principal.memberships.map((membership) => ({
+      companyId: membership.companyId,
+      role: membership.role,
+    })),
+  };
+}
+
+async function ownsAttachmentOperation(
+  principal: McpPrincipal,
+  operationId: string,
+  dependencies: McpOperationExecutionDeps,
+): Promise<boolean> {
+  const actorKey = `mcp:${principal.tokenId}`;
+  if (dependencies.findAttachmentOperation) {
+    return dependencies.findAttachmentOperation(operationId, actorKey);
+  }
+  const row = await prisma.attachmentOperation.findFirst({
+    where: { id: operationId, actorKey },
+    select: { id: true },
+  });
+  return row !== null;
+}
+
+async function getOwnedAttachmentOperation(
+  principal: McpPrincipal,
+  operationId: string,
+  dependencies: McpOperationExecutionDeps,
+): Promise<McpAttachmentOperationProjection> {
+  if (!await ownsAttachmentOperation(principal, operationId, dependencies)) {
+    throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+  }
+  const get = dependencies.getAttachmentOperation ?? getAttachmentOperation;
+  return projectMcpAttachmentOperation(await get(
+    attachmentActor(principal),
+    operationId,
+    dependencies.attachmentDependencies,
+  ));
+}
+
 export async function getMcpOperation(
   principal: McpPrincipal,
   input: GetMcpOperationInput,
   dependencies: McpOperationExecutionDeps = {},
 ): Promise<McpCategorizationOperationDto> {
-  const owned = await loadOwnedOperation(input.operationId, principal, {
-    store: storeFrom(dependencies),
-  });
+  let owned: McpOperationRecord;
+  try {
+    owned = await loadOwnedOperation(input.operationId, principal, {
+      store: storeFrom(dependencies),
+    });
+  } catch (error) {
+    if (
+      error instanceof McpOperationError
+      && error.code === 'OPERATION_NOT_FOUND'
+    ) {
+      return getOwnedAttachmentOperation(
+        principal,
+        input.operationId,
+        dependencies,
+      );
+    }
+    throw error;
+  }
   if (owned.kind === 'transfer') {
     const getTransfer = dependencies.getTransferOperation
       ?? getMcpTransferOperation;
@@ -347,9 +428,43 @@ export async function retryMcpOperation(
   input: RetryMcpOperationInput,
   dependencies: McpOperationExecutionDeps = {},
 ): Promise<McpCategorizationOperationDto> {
-  const owned = await loadOwnedOperation(input.operationId, principal, {
-    store: storeFrom(dependencies),
-  });
+  let owned: McpOperationRecord;
+  try {
+    owned = await loadOwnedOperation(input.operationId, principal, {
+      store: storeFrom(dependencies),
+    });
+  } catch (error) {
+    if (
+      error instanceof McpOperationError
+      && error.code === 'OPERATION_NOT_FOUND'
+    ) {
+      const current = await getOwnedAttachmentOperation(
+        principal,
+        input.operationId,
+        dependencies,
+      );
+      const actor = attachmentActor(principal);
+      const result = current.actions.requiresReconciliation
+        ? await (
+            dependencies.reconcileAttachmentOperation
+            ?? reconcileAttachmentOperation
+          )(
+            actor,
+            input.operationId,
+            dependencies.attachmentDependencies,
+          )
+        : await (
+            dependencies.retryAttachmentOperation
+            ?? retryAttachmentOperation
+          )(
+            actor,
+            input.operationId,
+            dependencies.attachmentDependencies,
+          );
+      return projectMcpAttachmentOperation(result);
+    }
+    throw error;
+  }
   if (owned.kind === 'transfer') {
     const retryTransfer = dependencies.retryTransferOperation
       ?? retryMcpTransferOperation;

@@ -28,8 +28,14 @@ import {
   MCP_AUTHORED_SCHEMA_BOUNDS,
   toBoundedJsonSchema,
 } from './schemaBounds.js';
+import {
+  ATTACHMENT_TOOL_NAMES,
+  attachmentToolDefinitions,
+  mcpAttachmentOperations,
+  type McpAttachmentOperations,
+} from './attachmentTools.js';
 
-export const MUTATION_TOOL_NAMES = [
+const CORE_MUTATION_TOOL_NAMES = [
   'prepare_categorization',
   'commit_categorization',
   'get_operation',
@@ -40,7 +46,12 @@ export const MUTATION_TOOL_NAMES = [
   'commit_transfer',
 ] as const;
 
-export interface McpMutationOperations {
+export const MUTATION_TOOL_NAMES = [
+  ...CORE_MUTATION_TOOL_NAMES,
+  ...ATTACHMENT_TOOL_NAMES,
+] as const;
+
+export interface McpMutationOperations extends McpAttachmentOperations {
   prepareCategorization(
     principal: McpPrincipal,
     input: PrepareMcpCategorizationInput,
@@ -76,6 +87,7 @@ export interface McpMutationOperations {
 }
 
 export const mcpMutationOperations: McpMutationOperations = Object.freeze({
+  ...mcpAttachmentOperations,
   prepareCategorization: prepareMcpCategorization,
   commitCategorization: commitMcpCategorization,
   getOperation: getMcpOperation,
@@ -242,14 +254,20 @@ const operationResult = z.strictObject({
     'REVERTED',
   ]),
 });
+const attachmentOperationResult = z.strictObject({
+  fileCount: z.number().int().min(0).max(MAX_LINES),
+  attachedCount: z.number().int().min(0).max(MAX_LINES),
+  failedCount: z.number().int().min(0).max(MAX_LINES),
+  uncertainCount: z.number().int().min(0).max(MAX_LINES),
+});
 const operationOutput = z.strictObject({
   operationId: uuid,
-  kind: z.enum(['categorization', 'transfer', 'undo']),
+  kind: z.enum(['categorization', 'transfer', 'undo', 'attachment']),
   companyId: uuid.optional(),
   transactionId: uuid.optional(),
   sourceRevision: revision.optional(),
   preparedRevision: revision.optional(),
-  expiresAt: z.iso.datetime(),
+  expiresAt: z.iso.datetime().optional(),
   state: z.enum([
     'prepared',
     'committed',
@@ -294,6 +312,7 @@ const operationOutput = z.strictObject({
         ]),
       }),
     }),
+    attachmentOperationResult,
   ]).nullable(),
   error: z.strictObject({
     code: z.string().min(1).max(64),
@@ -311,7 +330,7 @@ const operationOutput = z.strictObject({
     'sourceRevision',
     'preparedRevision',
   ] as const;
-  if (value.kind === 'transfer') {
+  if (value.kind === 'transfer' || value.kind === 'attachment') {
     for (const field of privateScalarFields) {
       if (value[field] !== undefined) {
         context.addIssue({
@@ -321,14 +340,42 @@ const operationOutput = z.strictObject({
         });
       }
     }
+    if (value.expiresAt !== undefined && value.kind === 'attachment') {
+      context.addIssue({
+        code: 'custom',
+        path: ['expiresAt'],
+        message: 'Attachment status must not expose an artificial expiry.',
+      });
+    }
+    if (value.expiresAt === undefined && value.kind === 'transfer') {
+      context.addIssue({
+        code: 'custom',
+        path: ['expiresAt'],
+        message: 'Transfer status requires its expiry.',
+      });
+    }
     if (
-      value.result !== null
+      value.kind === 'transfer'
+      && value.result !== null
       && !('complete' in value.result)
     ) {
       context.addIssue({
         code: 'custom',
         path: ['result'],
         message: 'Transfer status requires a paired-leg result.',
+      });
+    }
+    if (
+      value.kind === 'attachment'
+      && (
+        value.result === null
+        || !('fileCount' in value.result)
+      )
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['result'],
+        message: 'Attachment status requires bounded file counts.',
       });
     }
   } else {
@@ -340,6 +387,13 @@ const operationOutput = z.strictObject({
           message: 'Single-transaction status requires its scalar binding.',
         });
       }
+    }
+    if (value.expiresAt === undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['expiresAt'],
+        message: 'Prepared operation status requires its expiry.',
+      });
     }
     if (
       value.result !== null
@@ -496,6 +550,14 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
         input as { operationId: string; idempotencyKey?: string },
       ),
   },
+  ...attachmentToolDefinitions.map((definition) => ({
+    ...definition,
+    invoke: (
+      operations: McpMutationOperations,
+      principal: McpPrincipal,
+      input: unknown,
+    ) => definition.invoke(operations, principal, input),
+  })),
 ] as const;
 
 for (const { inputSchema, outputSchema } of mutationToolDefinitions) {

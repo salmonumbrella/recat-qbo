@@ -9,6 +9,7 @@ import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
 import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
+import { AttachmentError } from '../services/attachments/types.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -68,6 +69,20 @@ const WRITEBACK_INVALID_CODES = new Set([
 ]);
 
 function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof AttachmentError) {
+    if (error.code === 'ATTACHMENT_FORBIDDEN') return 'FORBIDDEN';
+    if (error.code === 'ATTACHMENT_NOT_FOUND') return 'NOT_FOUND';
+    if (
+      error.code === 'ATTACHMENT_INVALID_INPUT'
+      || error.code === 'ATTACHMENT_TOO_LARGE'
+      || error.code === 'ATTACHMENT_TYPE_UNSUPPORTED'
+      || error.code === 'ATTACHMENT_MIME_MISMATCH'
+      || error.code === 'IDEMPOTENCY_CONFLICT'
+    ) {
+      return 'INVALID_INPUT';
+    }
+    return 'COMPANY_UNAVAILABLE';
+  }
   if (error instanceof McpTransferExecutionError) {
     switch (error.code) {
       case 'OPERATION_NOT_FOUND':

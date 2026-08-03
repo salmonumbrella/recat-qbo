@@ -906,7 +906,7 @@ describe('stateless MCP handler', () => {
     expect(second.result.structuredContent.identity.userId).toBe('second');
   });
 
-  it('publishes and routes the same eight mutation tools for modern and legacy clients', async () => {
+  it('publishes and routes the same mutation tools for modern and legacy clients', async () => {
     const mutations = mockMutations();
     const handler = createRecatMcpHandler(mockReads(), mutations);
     const modernList = await modern(handler, 'tools/list', {}, {
