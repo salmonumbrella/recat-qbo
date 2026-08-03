@@ -41,6 +41,11 @@ vi.mock('../lib/api', () => ({
     reorder: vi.fn(),
     test: vi.fn(),
   },
+  ruleCandidates: {
+    list: vi.fn().mockResolvedValue({ candidates: [], nextCursor: null }),
+    activate: vi.fn(),
+    dismiss: vi.fn(),
+  },
 }));
 
 import Rules from './Rules';

@@ -1006,6 +1006,79 @@ describe('preparePurchaseRecategorization', () => {
 });
 
 describe('preparePurchaseRestore', () => {
+  it('prepares restore after QBO normalizes a non-taxable write to null/default fields', () => {
+    const originalRaw = completePurchase({
+      TotalAmt: 10,
+      TxnTaxDetail: { TotalTax: 0.5 },
+      Line: [completePurchase().Line![0]!],
+    });
+    const before = {
+      ...snapshotFor(originalRaw),
+      totalCents: -1_000,
+      totalTaxCents: -50,
+      lines: [snapshotFor(originalRaw).lines[0]!],
+    };
+    const nonTaxableStage: StagedCategorization = {
+      ...staged('NotApplicable'),
+      totals: { subtotalCents: -1_000, taxCents: 0, totalCents: -1_000 },
+      lines: [{
+        ...staged('NotApplicable').lines[0]!,
+        subtotalCents: -1_000,
+        taxCents: 0,
+        totalCents: -1_000,
+      }],
+    };
+    const original = prepare(originalRaw, nonTaxableStage, before);
+    const current: RawPurchase = {
+      ...original.body,
+      SyncToken: '8',
+      TxnTaxDetail: undefined,
+      Line: [{
+        ...original.body.Line![0]!,
+        Id: 'PROVIDER_ASSIGNED_TARGET',
+        AccountBasedExpenseLineDetail: {
+          ...original.body.Line![0]!.AccountBasedExpenseLineDetail,
+          TaxCodeRef: { value: 'PROVIDER_DEFAULT_NON_TAX' },
+        },
+      }],
+    };
+
+    const restore = preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_NORMALIZED_NON_TAX',
+    });
+
+    expect(restore.body.Line).toEqual([
+      expect.objectContaining({
+        Id: 'LINE_HOLDING',
+        AccountBasedExpenseLineDetail: expect.objectContaining({
+          AccountRef: { value: HOLDING_ACCOUNT },
+        }),
+      }),
+    ]);
+    expect(() => preparePurchaseRestore({
+      current: { ...current, TxnTaxDetail: { TotalTax: 0.01 } },
+      prepared: original,
+      requestId: 'REQUEST_RESTORE_TAX_DRIFT',
+    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({
+      code: 'QBO_STATE_DRIFT',
+    }));
+    expect(() => preparePurchaseRestore({
+      current: { ...current, TxnTaxDetail: { TotalTax: 0.01 } },
+      prepared: {
+        ...original,
+        expected: {
+          ...original.expected,
+          totalTaxCents: -1,
+        },
+      },
+      requestId: 'REQUEST_RESTORE_EQUAL_TAX_DRIFT',
+    })).toThrowError(expect.objectContaining<QboPurchasePreparationError>({
+      code: 'QBO_STATE_DRIFT',
+    }));
+  });
+
   it('restores the exact before snapshot target with the current SyncToken', () => {
     const original = prepare();
     const current: RawPurchase = {

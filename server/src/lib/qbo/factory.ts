@@ -14,6 +14,7 @@ import type {
   QboClientFactory,
   QboCompanyInfo,
   QboConnectMode,
+  QboRevocationSource,
   QboTokenSet,
 } from './types.js';
 import { env, redirectUri } from '../../env.js';
@@ -215,20 +216,24 @@ export const qboFactory: QboClientFactory = {
     return clientForCompany(await loadCompany(companyId));
   },
 
-  async revoke(companyId: string): Promise<void> {
-    const company = await prisma.company.findUnique({ where: { id: companyId } });
-    if (!company?.refreshToken) return;
-    if (isMockRealmId(company.realmId)) return; // nothing to revoke for demo companies
-    try {
-      const creds = await refreshCreds();
-      const { decrypt } = await import('../crypto.js');
-      await revokeIntuitToken({
-        clientId: creds.clientId,
-        clientSecret: creds.clientSecret,
-        token: decrypt(company.refreshToken),
-      });
-    } catch {
-      // best effort
-    }
-  },
 };
+
+/**
+ * Uses a token snapshot captured by the local disconnect transaction. All
+ * credential/provider preparation happens here, after local authority is gone.
+ */
+export async function revokeCapturedQboToken(source: QboRevocationSource): Promise<void> {
+  const encryptedRefreshToken = source.refreshToken;
+  if (encryptedRefreshToken === null || isMockRealmId(source.realmId)) return;
+  try {
+    const creds = await refreshCreds();
+    const { decrypt } = await import('../crypto.js');
+    await revokeIntuitToken({
+      clientId: creds.clientId,
+      clientSecret: creds.clientSecret,
+      token: decrypt(encryptedRefreshToken),
+    });
+  } catch {
+    // best effort; local disconnect authority has already been committed
+  }
+}

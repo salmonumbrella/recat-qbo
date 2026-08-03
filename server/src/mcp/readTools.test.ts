@@ -367,6 +367,61 @@ describe('Recat MCP read tools', () => {
     expect(oversized.result.isError).toBe(true);
   });
 
+  it('returns non-empty rule review state and activation provenance', async () => {
+    const operations = reads();
+    vi.mocked(operations.listRules).mockResolvedValueOnce({
+      items: [{
+        id: 'rule-a',
+        companyId: 'company-a',
+        priority: 0,
+        matchField: 'payee',
+        matchText: 'Coffee',
+        category: 'Meals',
+        categoryQboId: 'account-a',
+        taxCalculation: null,
+        taxCode: null,
+        taxCodeQboId: null,
+        tagIds: [],
+        autoPost: false,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        reviewRequiredAt: '2026-01-02T00:00:00.000Z',
+        reviewReason: 'Verified outcomes now conflict with this learned rule.',
+        origin: {
+          candidateId: 'candidate-a',
+          evidenceCount: 3,
+          schemaVersion: 'schema-v1',
+          configVersion: 'config-v2',
+        },
+        valid: true,
+        invalidReasons: [],
+      }],
+      nextCursor: null,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'list_rules',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.items).toEqual([
+      expect.objectContaining({
+        reviewRequiredAt: '2026-01-02T00:00:00.000Z',
+        reviewReason: 'Verified outcomes now conflict with this learned rule.',
+        origin: {
+          candidateId: 'candidate-a',
+          evidenceCount: 3,
+          schemaVersion: 'schema-v1',
+          configVersion: 'config-v2',
+        },
+      }),
+    ]);
+  });
+
   it('replaces a large invalid service output with one small safe failure', async () => {
     const outputSentinel = 'PRIVATE_LARGE_OUTPUT_SENTINEL';
     const operations = reads();

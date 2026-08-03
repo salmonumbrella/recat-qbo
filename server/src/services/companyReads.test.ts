@@ -523,6 +523,55 @@ describe('company read services', () => {
     expect(results.map((result) => result.items.length)).toEqual([1, 1, 1, 1, 1, 1, 1]);
   });
 
+  it('projects rule review state and activation provenance through bounded reads', async () => {
+    const db = makeDb();
+    db.rule.findMany.mockResolvedValue([{
+      id: 'rule-1',
+      companyId: COMPANY_ID,
+      priority: 0,
+      matchText: 'Coffee',
+      category: 'Meals',
+      categoryQboId: 'acct-1',
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+      autoPost: false,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      reviewRequiredAt: new Date('2026-01-02T00:00:00.000Z'),
+      reviewReason: 'Verified outcomes now conflict with this learned rule.',
+      ruleTags: [],
+      candidateOrigin: {
+        id: 'candidate-1',
+        evidenceCount: 5,
+        activationEvidenceCount: 3,
+        schemaVersion: 'schema-v1',
+        configVersion: 'config-v2',
+        unsafe: 'drop',
+      },
+    }]);
+    db.qboAccount.findMany.mockResolvedValue([{ qboId: 'acct-1', active: true }]);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.listRules(USER_ID, COMPANY_ID)).resolves.toMatchObject({
+      items: [{
+        reviewRequiredAt: '2026-01-02T00:00:00.000Z',
+        reviewReason: 'Verified outcomes now conflict with this learned rule.',
+        origin: {
+          candidateId: 'candidate-1',
+          evidenceCount: 3,
+          schemaVersion: 'schema-v1',
+          configVersion: 'config-v2',
+        },
+      }],
+    });
+    expect(db.rule.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      include: {
+        ruleTags: { select: { tagId: true } },
+        candidateOrigin: true,
+      },
+    }));
+  });
+
   it('uses live suggestions and complete transfer candidates in transaction DTOs', async () => {
     const db = makeDb();
     db.transaction.findMany.mockResolvedValue([

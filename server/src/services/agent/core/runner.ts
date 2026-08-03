@@ -9,6 +9,8 @@ import {
   AGENT_MODEL_PROMPT_VERSION,
   AgentModelError,
   type AgentModel,
+  type AgentModelErrorClassification,
+  type AgentModelErrorCode,
   type AgentModelHistoryEntry,
   type AgentModelInput,
   type AgentModelUsage,
@@ -118,6 +120,10 @@ export interface AgentRunResult {
   readonly toolCalls: number;
   readonly verificationMode: AgentVerificationMode;
   readonly diagnosticCode: AgentRunDiagnosticCode;
+  readonly providerFailure?: {
+    readonly code: AgentModelErrorCode;
+    readonly classification: AgentModelErrorClassification;
+  };
 }
 
 interface RunState {
@@ -136,7 +142,11 @@ interface RunState {
 
 type ModelLoopOutcome =
   | { readonly ok: true; readonly decision: AgentDecision }
-  | { readonly ok: false; readonly code: AgentRunDiagnosticCode };
+  | {
+      readonly ok: false;
+      readonly code: AgentRunDiagnosticCode;
+      readonly providerFailure?: AgentRunResult['providerFailure'];
+    };
 
 type TerminalCause = 'timeout' | 'cancelled';
 
@@ -246,7 +256,7 @@ export async function runShadowDecision(
       terminalFailure: () => terminalFailure(terminalCause),
     });
     if (!primary.ok) {
-      return finish(systemAbstention(primary.code), primary.code);
+      return finish(systemAbstention(primary.code), primary.code, primary.providerFailure);
     }
 
     const primaryVerification = verifyAgentDecision(validatedSnapshot, primary.decision);
@@ -293,7 +303,7 @@ export async function runShadowDecision(
     });
     if (!review.ok) {
       const reviewCode = reviewFailureCode(review.code);
-      return finish(systemAbstention(reviewCode), reviewCode);
+      return finish(systemAbstention(reviewCode), reviewCode, review.providerFailure);
     }
     if (review.decision.kind === 'abstain') {
       return finish(
@@ -342,6 +352,7 @@ export async function runShadowDecision(
       readonly decision: DeepReadonly<AgentDecision>;
     },
     diagnosticCode: AgentRunDiagnosticCode,
+    providerFailure?: AgentRunResult['providerFailure'],
   ): AgentRunResult {
     const durationMs = safeDuration(clock.now(), startedAtMs);
     const usage = aggregateUsage(state);
@@ -358,6 +369,7 @@ export async function runShadowDecision(
       toolCalls: state.toolCalls,
       verificationMode: reviewExecuted ? configuredReviewMode : 'deterministic',
       diagnosticCode,
+      ...(providerFailure === undefined ? {} : { providerFailure }),
     });
   }
 }
@@ -415,7 +427,12 @@ async function runModelLoop(options: {
     } catch (error) {
       const terminal = options.terminalFailure();
       if (terminal !== undefined) return failed(terminal);
-      if (error instanceof AgentModelError) return failed(error.code);
+      if (error instanceof AgentModelError) {
+        return failed(error.code, {
+          code: error.code,
+          classification: error.classification,
+        });
+      }
       return failed('AGENT_RUN_MODEL_ERROR');
     }
 
@@ -742,8 +759,15 @@ function systemAbstention(
   };
 }
 
-function failed(code: AgentRunDiagnosticCode): ModelLoopOutcome {
-  return { ok: false, code };
+function failed(
+  code: AgentRunDiagnosticCode,
+  providerFailure?: AgentRunResult['providerFailure'],
+): ModelLoopOutcome {
+  return {
+    ok: false,
+    code,
+    ...(providerFailure === undefined ? {} : { providerFailure }),
+  };
 }
 
 function terminalFailure(

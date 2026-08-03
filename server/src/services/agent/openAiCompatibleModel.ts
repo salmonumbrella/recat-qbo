@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   parseAgentDecision,
   agentDecisionJsonSchema,
@@ -18,10 +19,19 @@ import {
   type AgentTransactionSnapshot,
 } from './core/snapshot.js';
 import {
+  agentLiveReviewJsonSchema,
+  agentLiveReviewSchemaName,
+} from './core/verifier.js';
+import {
   TOOL_DEFINITIONS,
   type AgentToolCall,
   type AgentToolName,
 } from './core/tools.js';
+import type {
+  LiveAgentModel,
+  LiveModelProbe,
+  LiveModelReviewResponse,
+} from './liveVerifier.js';
 
 const OPENROUTER_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const MAX_RESPONSE_BYTES = 32 * 1024;
@@ -32,6 +42,13 @@ const MAX_CANDIDATE_BYTES = 32 * 1024;
 const MAX_TOOL_CALLS = 20;
 const MAX_IDENTIFIER_LENGTH = 200;
 const MAX_MODEL_LENGTH = 200;
+const MODEL_HEALTH_SCHEMA_NAME = 'recat_model_health_v1';
+const MODEL_HEALTH_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ok'],
+  properties: { ok: { const: true, type: 'boolean' } },
+} as const;
 
 type OpenRouterConfig = {
   readonly provider: 'openrouter';
@@ -83,10 +100,12 @@ const REVIEW_INSTRUCTION = [
   'Return one schema-compliant corrected decision envelope or call one or more fixed tools.',
 ].join(' ');
 
-export class OpenAiCompatibleAgentModel implements AgentModel {
+export class OpenAiCompatibleAgentModel implements AgentModel, LiveAgentModel {
   readonly identity: AgentModelIdentity;
+  readonly healthAuthority: string;
   private readonly endpoint: string;
   private readonly headers: Readonly<Record<string, string>>;
+  private readonly hasCredential: boolean;
 
   constructor(config: OpenAiCompatibleAgentModelConfig) {
     const model = validModel(config.model);
@@ -106,6 +125,13 @@ export class OpenAiCompatibleAgentModel implements AgentModel {
         ...(nonempty(config.apiKey) ? { Authorization: `Bearer ${config.apiKey}` } : {}),
       });
     }
+    this.hasCredential = Object.hasOwn(this.headers, 'Authorization');
+    this.healthAuthority = createHash('sha256').update(JSON.stringify({
+      version: 1,
+      identity: this.identity,
+      endpoint: this.endpoint,
+      headers: this.headers,
+    }), 'utf8').digest('hex');
   }
 
   async nextTurn(input: AgentModelInput, signal: AbortSignal): Promise<AgentModelTurn> {
@@ -127,6 +153,114 @@ export class OpenAiCompatibleAgentModel implements AgentModel {
       },
     });
 
+    const responseText = await this.request(body, signal);
+    return parseProviderResponse(responseText);
+  }
+
+  async probe(signal: AbortSignal): Promise<LiveModelProbe> {
+    this.assertLiveCredential();
+    const body = JSON.stringify({
+      model: this.identity.model,
+      temperature: 0,
+      messages: [
+        {
+          role: 'system',
+          content: 'Recat model health probe. Return the required fixed JSON value.',
+        },
+        {
+          role: 'user',
+          content: '{"purpose":"credential_and_model_health","accountingData":false}',
+        },
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: MODEL_HEALTH_SCHEMA_NAME,
+          strict: true,
+          schema: MODEL_HEALTH_JSON_SCHEMA,
+        },
+      },
+    });
+    const response = parseStructuredProviderResponse(
+      await this.request(body, signal),
+      this.identity.provider,
+    );
+    if (
+      !isRecord(response.raw)
+      || Object.keys(response.raw).length !== 1
+      || response.raw.ok !== true
+    ) {
+      throw invalidResponse();
+    }
+    return { identity: response.identity };
+  }
+
+  async reviewLiveDecision(
+    input: {
+      readonly snapshot: AgentTransactionSnapshot;
+      readonly candidateDecision: ReturnType<typeof parseAgentDecision>;
+    },
+    signal: AbortSignal,
+  ): Promise<LiveModelReviewResponse> {
+    this.assertLiveCredential();
+    let snapshotPayload: unknown;
+    let candidateDecision: ReturnType<typeof parseAgentDecision>;
+    try {
+      snapshotPayload = JSON.parse(
+        serializeAgentSnapshot(input.snapshot, MAX_SNAPSHOT_BYTES),
+      ) as unknown;
+      candidateDecision = parseAgentDecision({ decision: input.candidateDecision });
+    } catch {
+      throw new AgentModelError('AGENT_MODEL_INPUT_INVALID', 'terminal');
+    }
+    const body = JSON.stringify({
+      model: this.identity.model,
+      temperature: 0,
+      messages: [
+        {
+          role: 'system',
+          content: [
+            `Recat live verifier prompt ${AGENT_MODEL_PROMPT_VERSION}.`,
+            'Independently approve only when the exact candidate is fully supported by the exact immutable snapshot.',
+            'Return only the fixed review schema. Do not correct or replace the candidate.',
+          ].join(' '),
+        },
+        {
+          role: 'user',
+          content: safeCanonicalJson({
+            purpose: 'distinct_live_review',
+            snapshot: snapshotPayload,
+            candidateDecision,
+          }),
+        },
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: agentLiveReviewSchemaName,
+          strict: true,
+          schema: agentLiveReviewJsonSchema,
+        },
+      },
+    });
+    const response = parseStructuredProviderResponse(
+      await this.request(body, signal),
+      this.identity.provider,
+    );
+    return {
+      identity: response.identity,
+      rawReview: response.raw,
+    };
+  }
+
+  private assertLiveCredential(): void {
+    if (!this.hasCredential) {
+      throw new AgentModelError('AGENT_MODEL_CONFIG_INVALID', 'terminal');
+    }
+  }
+
+  private async request(body: string, signal: AbortSignal): Promise<string> {
+    if (signal.aborted) throw aborted();
     let response: Response;
     try {
       response = await fetch(this.endpoint, {
@@ -148,9 +282,7 @@ export class OpenAiCompatibleAgentModel implements AgentModel {
         retryableStatus(response.status) ? 'retryable' : 'terminal',
       );
     }
-
-    const responseText = await readBoundedResponse(response, signal);
-    return parseProviderResponse(responseText);
+    return readBoundedResponse(response, signal);
   }
 }
 
@@ -569,6 +701,53 @@ function parseProviderResponse(text: string): AgentModelTurn {
   }
 
   throw invalidResponse();
+}
+
+function parseStructuredProviderResponse(
+  text: string,
+  provider: AgentModelIdentity['provider'],
+): { readonly identity: AgentModelIdentity; readonly raw: unknown } {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw invalidResponse();
+  }
+  if (
+    !isRecord(body)
+    || typeof body.model !== 'string'
+    || body.model.trim() === ''
+    || body.model.length > MAX_MODEL_LENGTH
+    || !Array.isArray(body.choices)
+    || body.choices.length !== 1
+  ) {
+    throw invalidResponse();
+  }
+  const choice = body.choices[0];
+  if (
+    !isRecord(choice)
+    || choice.finish_reason !== 'stop'
+    || !isRecord(choice.message)
+    || typeof choice.message.content !== 'string'
+    || choice.message.content.trim() === ''
+    || (choice.message.tool_calls !== undefined && choice.message.tool_calls !== null)
+  ) {
+    throw invalidResponse();
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(choice.message.content);
+  } catch {
+    throw invalidResponse();
+  }
+  if (!isRecord(raw)) throw invalidResponse();
+  return {
+    identity: {
+      provider,
+      model: body.model,
+    },
+    raw,
+  };
 }
 
 function parseToolCall(rawCall: unknown, seenIds: Set<string>): AgentToolCall {

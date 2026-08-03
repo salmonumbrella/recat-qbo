@@ -14,6 +14,10 @@ import {
 } from './core/model.js';
 import { buildAgentSnapshot } from './core/snapshot.js';
 import { TOOL_DEFINITIONS } from './core/tools.js';
+import {
+  agentLiveReviewJsonSchema,
+  agentLiveReviewSchemaName,
+} from './core/verifier.js';
 import { OpenAiCompatibleAgentModel } from './openAiCompatibleModel.js';
 
 const MAX_RESPONSE_BYTES = 32 * 1024;
@@ -113,6 +117,129 @@ afterEach(() => {
 });
 
 describe('OpenAiCompatibleAgentModel requests', () => {
+  it('uses a credential-backed non-accounting structured probe and returns provider identity', async () => {
+    let capturedInit: RequestInit | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      capturedInit = init;
+      return jsonResponse(completionResponse(JSON.stringify({ ok: true }), {
+        extra: { model: 'Resolved/Model' },
+      }));
+    }));
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'custom',
+      model: 'requested-alias',
+      baseUrl: 'https://models.invalid/v1',
+      apiKey: 'synthetic-health-key',
+    });
+
+    await expect(model.probe(new AbortController().signal)).resolves.toEqual({
+      identity: { provider: 'custom', model: 'Resolved/Model' },
+    });
+    const body = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      model: 'requested-alias',
+      temperature: 0,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'recat_model_health_v1',
+          strict: true,
+        },
+      },
+    });
+    const messages = body.messages as Array<{ content: string }>;
+    expect(JSON.parse(messages[1]!.content)).toEqual({
+      purpose: 'credential_and_model_health',
+      accountingData: false,
+    });
+    expect(messages[1]!.content).not.toMatch(/transaction|category|taxCode|counterparty/i);
+    expect(String(capturedInit?.body)).not.toContain('synthetic-health-key');
+  });
+
+  it('refuses live probes without a credential before transport', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'custom',
+      model: 'requested-alias',
+      baseUrl: 'https://models.invalid/v1',
+    });
+
+    await expect(model.probe(new AbortController().signal)).rejects.toMatchObject({
+      code: 'AGENT_MODEL_CONFIG_INVALID',
+      message: 'Invalid agent model configuration.',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('sends exact snapshot and decision under the explicit live approval schema', async () => {
+    let capturedInit: RequestInit | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      capturedInit = init;
+      return jsonResponse(completionResponse(JSON.stringify({
+        approved: true,
+        issues: [],
+      }), {
+        extra: { model: 'resolved/reviewer' },
+      }));
+    }));
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'openrouter',
+      model: 'review-alias',
+      apiKey: 'synthetic-review-key',
+    });
+    const input = modelInput();
+    const candidateDecision = parseAgentDecision(decisionEnvelope());
+
+    await expect(model.reviewLiveDecision({
+      snapshot: input.snapshot,
+      candidateDecision,
+    }, new AbortController().signal)).resolves.toEqual({
+      identity: { provider: 'openrouter', model: 'resolved/reviewer' },
+      rawReview: { approved: true, issues: [] },
+    });
+    const body = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      model: 'review-alias',
+      temperature: 0,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: agentLiveReviewSchemaName,
+          strict: true,
+          schema: agentLiveReviewJsonSchema,
+        },
+      },
+    });
+    const messages = body.messages as Array<{ content: string }>;
+    const reviewPayload = JSON.parse(messages[1]!.content) as Record<string, unknown>;
+    expect(reviewPayload).toMatchObject({
+      purpose: 'distinct_live_review',
+      snapshot: { transaction: { id: UUID_1, revision: 3 } },
+      candidateDecision,
+    });
+    expect(JSON.stringify(body)).not.toContain('synthetic-review-key');
+  });
+
+  it.each([
+    completionResponse(JSON.stringify({ ok: true })),
+    completionResponse(JSON.stringify({ ok: true }), { extra: { model: '' } }),
+    completionResponse(JSON.stringify({ ok: false }), { extra: { model: 'resolved/model' } }),
+  ])('fails closed for an unresolved or invalid health response %#', async (response) => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(response)));
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'custom',
+      model: 'requested-alias',
+      baseUrl: 'https://models.invalid/v1',
+      apiKey: 'synthetic-health-key',
+    });
+
+    await expect(model.probe(new AbortController().signal)).rejects.toMatchObject({
+      code: 'AGENT_MODEL_RESPONSE_INVALID',
+      message: 'Invalid agent model response.',
+    });
+  });
+
   it('sends the exact fixed OpenRouter request using only the snapshot and bounded history', async () => {
     const input = modelInput();
     const model = new OpenAiCompatibleAgentModel({

@@ -352,7 +352,10 @@ export interface QboClient {
   getTaxProfile(): Promise<QboTaxProfile>;
   listTaxCodes(): Promise<QboTaxCodeInfo[]>;
   listTaxRates(): Promise<QboTaxRateInfo[]>;
-  fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null>;
+  fetchPurchaseSnapshot(
+    qboId: string,
+    signal?: AbortSignal,
+  ): Promise<QboPurchaseSnapshot | null>;
   fetchLineWriteSnapshot(
     qboType: QboTxn['qboType'],
     qboId: string,
@@ -447,6 +450,13 @@ export interface QboClient {
 /** How a connection is made: real Intuit OAuth, or the built-in demo. */
 export type QboConnectMode = 'real' | 'demo';
 
+export interface QboRevocationSource {
+  realmId: string;
+  refreshToken: string | null;
+}
+
+export type QboRevocationCapability = () => Promise<void>;
+
 export interface QboClientFactory {
   /** Consent URL for the connect flow (state = CSRF token). mode 'demo' →
    * the built-in fake consent page; 'real' → the Intuit authorize URL. */
@@ -456,6 +466,4 @@ export interface QboClientFactory {
   /** Client for a connected company; dispatches mock vs real on the
    * company's realmId. Persists rotated tokens via the callback. */
   forCompany(companyId: string): Promise<QboClient>;
-  /** Revoke tokens on disconnect (best effort; no-op for demo companies). */
-  revoke(companyId: string): Promise<void>;
 }

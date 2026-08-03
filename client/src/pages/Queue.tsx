@@ -36,6 +36,7 @@ import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
 import RulePrompt from '../components/RulePrompt';
 import TaxCodePicker from '../components/TaxCodePicker';
+import { AutopilotQueueStatus } from './settings/AutopilotCard';
 
 // ---------------------------------------------------------------------------
 // Prototype-state mapping & small helpers
@@ -197,6 +198,7 @@ export default function Queue() {
   const {
     activeCompany,
     activeCompanyId,
+    role,
     accounts,
     tags,
     setPendingCount,
@@ -2114,6 +2116,14 @@ export default function Queue() {
           </button>
         </div>
       </div>
+
+      {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
+        <AutopilotQueueStatus
+          key={activeCompanyId}
+          companyId={activeCompanyId}
+          surface="queue"
+        />
+      )}
 
       {taxReadiness?.status !== 'ready' && (
         <div

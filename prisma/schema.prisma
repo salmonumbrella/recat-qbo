@@ -140,6 +140,12 @@ model Company {
   syncLogs          SyncLog[]
   memberships       Membership[]
   logTags           LogTag[]
+  agentConfig       AgentCompanyConfig?
+  agentJobs         AgentJob[]
+  agentRuns         AgentRun[]
+  autopilotRuleCandidates AutopilotRuleCandidate[]
+  autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
+  liveWritePermits LiveWritePermit[]
 }
 
 model Transaction {
@@ -172,6 +178,8 @@ model Transaction {
   updatedAt      DateTime  @updatedAt
   txnTags        TxnTag[]
   qboMutationAttempts QboMutationAttempt[]
+  autopilotRuleCandidateEvidence AutopilotRuleCandidateEvidence[]
+  autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
 
   @@unique([companyId, qboType, qboId])
   @@index([companyId, status])
@@ -260,7 +268,10 @@ model Rule {
   autoPost      Boolean   @default(false)
   createdById   String?
   createdAt     DateTime  @default(now())
+  reviewRequiredAt DateTime?
+  reviewReason     String?
   ruleTags      RuleTag[]
+  candidateOrigin AutopilotRuleCandidate? @relation("ActivatedCandidateRule")
 }
 
 model RuleTag {
@@ -388,6 +399,7 @@ model QboMutationAttempt {
   verification      Json?
   errorCode         String?
   errorMessage      String?
+  ruleCandidateFoldedAt DateTime?
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 
@@ -463,6 +475,167 @@ model AppConfig {
   value     String // encrypted where sensitive
   encrypted Boolean  @default(false)
   updatedAt DateTime @updatedAt
+}
+
+model AgentCompanyConfig {
+  companyId          String   @id
+  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  mode               String   @default("off")
+  /// A provider name only. Credentials remain in encrypted instance settings.
+  provider           String
+  decisionModel      String
+  verifierModel      String
+  scheduleMinutes    Int      @default(10)
+  companyConcurrency Int      @default(1)
+  evidenceThreshold  Int      @default(50)
+  dailyLiveWriteLimit Int     @default(100)
+  limits             Json
+  configVersion      String
+  liveRequested              Boolean   @default(false)
+  liveAcceptedPolicyVersion  String?
+  liveAcceptedConfigVersion  String?
+  liveAcceptedProviderBinding String?
+  liveEnabledAt              DateTime?
+  liveEnabledByUserId        String?
+  livePausedAt               DateTime?
+  livePauseCode              String?
+  livePauseMessage           String?
+  updatedAt          DateTime @updatedAt
+}
+
+model LiveWritePermit {
+  requestId    String   @id
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  utcDay       DateTime @db.Date
+  limitAtIssue Int
+  createdAt    DateTime @default(now())
+
+  @@index([companyId, utcDay])
+}
+
+model AgentJob {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  revision       Int
+  configVersion  String
+  status         String
+  dueAt          DateTime
+  lockOwner      String?
+  leaseExpiresAt DateTime?
+  attemptCount   Int      @default(0)
+  lastErrorCode  String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  runs           AgentRun[]
+
+  @@unique([companyId, transactionId, revision, configVersion])
+  @@index([status, dueAt])
+}
+
+model AgentRun {
+  id             String   @id @default(uuid())
+  jobId          String
+  job            AgentJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId  String
+  revision       Int
+  configVersion  String
+  attemptCount   Int
+  status         String
+  snapshot       Json
+  decision       Json?
+  verification   Json?
+  decisionModel  String
+  verifierModel  String
+  verifierKind   String
+  promptVersion  String
+  schemaVersion  String
+  durationMs     Int?
+  usage          Json?
+  errorCode      String?
+  createdAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  @@index([companyId, createdAt])
+  @@index([transactionId, revision])
+  @@unique([jobId, attemptCount])
+}
+
+/// Inert, explainable rule proposal derived only from durable VERIFIED writes.
+/// State values are gathering | ready | conflict | dismissed | activated | stale.
+model AutopilotRuleCandidate {
+  id                       String                  @id @default(uuid())
+  companyId                String
+  company                  Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  conditionFingerprint     String
+  schemaVersion            String
+  configVersion            String
+  matchField               String                  @default("payee")
+  matchText                String
+  state                    String                  @default("gathering")
+  winningActionFingerprint String?
+  categoryQboId            String?
+  taxCalculation           String?
+  taxCodeQboId             String?
+  tagIds                   Json                    @default("[]")
+  evidenceCount            Int                     @default(0)
+  conflictingEvidenceCount Int                     @default(0)
+  dismissedAt              DateTime?
+  dismissedByUserId        String?
+  activatedAt              DateTime?
+  activatedByUserId        String?
+  activationEvidenceCount  Int?
+  activationActionFingerprint String?
+  activatedRuleId          String?                 @unique
+  activatedRule            Rule?                   @relation("ActivatedCandidateRule", fields: [activatedRuleId], references: [id], onDelete: SetNull)
+  evidence                 AutopilotRuleCandidateEvidence[]
+  createdAt                DateTime                @default(now())
+  updatedAt                DateTime                @updatedAt
+
+  @@unique([companyId, conditionFingerprint, schemaVersion, configVersion])
+  @@index([companyId, state, updatedAt])
+}
+
+/// Append-preserving outcome evidence. A correction/revert marks earlier rows
+/// inactive; requestId makes VERIFIED replay idempotent.
+model AutopilotRuleCandidateEvidence {
+  id                 String        @id @default(uuid())
+  candidateId        String
+  candidate          AutopilotRuleCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  transactionId      String
+  transaction        Transaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  inputRevision      Int
+  requestId          String        @unique
+  source             String
+  actionFingerprint  String
+  pattern            Json
+  active             Boolean       @default(true)
+  observedAt         DateTime      @default(now())
+  invalidatedAt      DateTime?
+  invalidationReason String?
+
+  @@index([candidateId, active])
+  @@index([transactionId, active])
+}
+
+/// Immutable receipt showing that one durable VERIFIED mutation was considered.
+/// It prevents a replay from moving evidence after mutable transaction data or
+/// company configuration changes.
+model AutopilotRuleCandidateFold {
+  requestId     String      @id
+  companyId     String
+  company       Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  operation     String
+  processedAt   DateTime    @default(now())
+
+  @@index([companyId, processedAt])
+  @@index([transactionId])
 }
 
 model WebhookEvent {

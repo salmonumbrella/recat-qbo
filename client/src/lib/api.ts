@@ -5,6 +5,9 @@
 // marked with a TODO — server routes will be built to match this file.
 
 import type {
+  AgentCompanySettingsDto,
+  AgentRunStatus,
+  AutopilotRunOutcome,
   AuditEntryDto,
   AuthMethodsDto,
   CategorizeBody,
@@ -17,6 +20,8 @@ import type {
   DashboardDataDto,
   DashboardWidget,
   InstanceSettingsDto,
+  LivePauseStateDto,
+  LiveReadinessDto,
   CreateMcpTokenResponse,
   McpTokenListResponse,
   PollInterval,
@@ -27,6 +32,7 @@ import type {
   Role,
   ReconcileCategorizationBody,
   RuleDto,
+  RuleCandidateDto,
   RuleTestResult,
   SavedReportConfig,
   SavedReportDto,
@@ -48,6 +54,8 @@ import type {
   UserDto,
   ApiError as ApiErrorBody,
 } from '@recat/shared';
+
+export type { LivePauseStateDto, LiveReadinessDto } from '@recat/shared';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -243,6 +251,115 @@ export interface AuditListResponse {
   entries: AuditEntryDto[];
   nextCursor: string | null;
 }
+
+export interface AutopilotEvidenceDto {
+  eligibleRuns: number;
+  agreements: number;
+  disagreements: number;
+  threshold: number;
+  thresholdMet: boolean;
+}
+
+export interface AutopilotQueueHealthDto {
+  queued: number;
+  running: number;
+  retrying: number;
+  terminal: number;
+  cancelled: number;
+  earliestDueAt: string | null;
+  earliestLeaseExpiryAt: string | null;
+}
+
+export interface AutopilotOverviewDto {
+  settings: AgentCompanySettingsDto;
+  liveWrites: {
+    utcDay: string;
+    used: number;
+    limit: number;
+  };
+  queue: AutopilotQueueHealthDto;
+  evidence: AutopilotEvidenceDto;
+}
+
+export interface AutopilotRunDto {
+  id: string;
+  status: AgentRunStatus | 'unavailable';
+  outcome: AutopilotRunOutcome;
+  operationId: string | null;
+  attemptCount: number;
+  configVersion: string;
+  proposal:
+    | {
+        kind: 'proposal';
+        taxCalculation: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+        confidence: number;
+        lineCount: number;
+        evidenceKinds: ('category' | 'rule' | 'similar_transaction' | 'tax_code')[];
+      }
+    | {
+        kind: 'abstain';
+        reasonCode:
+          | 'INSUFFICIENT_CONTEXT'
+          | 'CONFLICTING_EVIDENCE'
+          | 'UNSUPPORTED_TRANSACTION'
+          | 'INVALID_TAX_STATE'
+          | 'PROVIDER_FAILURE';
+      }
+    | null;
+  verification: {
+    diagnosticCode: string | null;
+    verifierKind: 'deterministic' | 'same_model' | 'distinct_model' | 'unavailable';
+    evidence: {
+      state: 'eligible' | 'invalidated';
+      agreement?: boolean;
+      invalidationReason?: 'corrected' | 'reverted';
+    } | null;
+  };
+  models: {
+    decision: string;
+    verifier: string;
+    promptVersion: string;
+    schemaVersion: string;
+  };
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  } | null;
+  timing: {
+    durationMs: number | null;
+    createdAt: string;
+    completedAt: string | null;
+  };
+  errorCode: string | null;
+}
+
+export interface AutopilotRunListDto {
+  runs: AutopilotRunDto[];
+  nextCursor: string | null;
+}
+
+export interface AutopilotSettingsPatch {
+  mode?: AgentCompanySettingsDto['mode'];
+  provider?: AgentCompanySettingsDto['provider'];
+  decisionModel?: string;
+  verifierModel?: string;
+  scheduleMinutes?: number;
+  companyConcurrency?: number;
+  evidenceThreshold?: number;
+  dailyLiveWriteLimit?: number;
+  limits?: Partial<AgentCompanySettingsDto['limits']>;
+}
+
+export interface EnableLiveBody {
+  confirmation: string;
+  acceptedPolicyVersion: string;
+}
+
+export type LiveReconciliationResult = Omit<
+  CategorizationMutationResult,
+  'transactionId' | 'requestId'
+>;
 
 export interface PlReportParams {
   /** number of months (e.g. '6') or 'ytd'. TODO(server): confirm encoding. */
@@ -442,6 +559,25 @@ export const rules = {
     api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),
 };
 
+export const ruleCandidates = {
+  list: (companyId: string, cursor?: string) =>
+    api.get<{ candidates: RuleCandidateDto[]; nextCursor: string | null }>(
+      `/api/companies/${companyId}/rule-candidates${qs({ cursor })}`,
+    ),
+  get: (companyId: string, candidateId: string) =>
+    api.get<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}`,
+    ),
+  dismiss: (companyId: string, candidateId: string) =>
+    api.post<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}/dismiss`,
+    ),
+  activate: (companyId: string, candidateId: string) =>
+    api.post<RuleCandidateDto>(
+      `/api/companies/${companyId}/rule-candidates/${candidateId}/activate`,
+    ),
+};
+
 export const savedReports = {
   list: (companyId: string) => api.get<SavedReportDto[]>(`/api/companies/${companyId}/reports/saved`),
   create: (companyId: string, name: string, config: SavedReportConfig) =>
@@ -523,6 +659,43 @@ export const tax = {
   /** Force a fresh QBO reference read (company admin only); it never writes QBO tax settings. */
   refresh: (companyId: string) =>
     api.post<TaxRefreshResponse>(`/api/companies/${companyId}/tax/refresh`),
+};
+
+/** Durable shadow operations. These endpoints expose summaries only and never mutate QBO. */
+export const autopilot = {
+  get: (companyId: string) =>
+    api.get<AutopilotOverviewDto>(`/api/companies/${companyId}/autopilot`),
+  patch: (companyId: string, body: AutopilotSettingsPatch) =>
+    api.patch<AgentCompanySettingsDto>(`/api/companies/${companyId}/autopilot`, body),
+  listRuns: (companyId: string, params: { cursor?: string; limit?: number } = {}) =>
+    api.get<AutopilotRunListDto>(
+      `/api/companies/${companyId}/autopilot/runs${qs(params)}`,
+    ),
+  run: (companyId: string, runId: string) =>
+    api.get<AutopilotRunDto>(`/api/companies/${companyId}/autopilot/runs/${runId}`),
+  getReadiness: (companyId: string) =>
+    api.get<LiveReadinessDto>(
+      `/api/companies/${companyId}/autopilot/live-readiness`,
+    ),
+  enableLive: (companyId: string, body: EnableLiveBody) =>
+    api.post<LiveReadinessDto>(
+      `/api/companies/${companyId}/autopilot/enable-live`,
+      body,
+    ),
+  pauseLive: (companyId: string) =>
+    api.post<LivePauseStateDto>(
+      `/api/companies/${companyId}/autopilot/pause-live`,
+      {},
+    ),
+  reconcileLive: (companyId: string, operationId: string) =>
+    api.post<LiveReconciliationResult>(
+      `/api/companies/${companyId}/autopilot/reconcile/${encodeURIComponent(operationId)}`,
+      {},
+    ),
+  cancelQueued: (companyId: string) =>
+    api.post<{ cancelled: number }>(
+      `/api/companies/${companyId}/autopilot/cancel-queued`,
+    ),
 };
 
 /** Instance-level user management — instance admins only. */

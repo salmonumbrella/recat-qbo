@@ -714,6 +714,9 @@ describe('stateless MCP handler', () => {
       ),
       autoPost: false,
       createdAt: '2026-07-28T00:00:00.000Z',
+      reviewRequiredAt: null,
+      reviewReason: null,
+      origin: null,
       valid: false,
       invalidReasons: Array.from(
         { length: 4 },

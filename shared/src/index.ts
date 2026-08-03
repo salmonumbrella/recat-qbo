@@ -181,6 +181,121 @@ export type PollInterval = 5 | 10 | 30 | 60;
 export type SuggestionSource = 'rule' | 'history' | 'ai';
 export type SuggestionSetting = 'builtin' | 'ai' | 'off';
 export type SuggestionProvider = 'custom' | 'openrouter';
+
+export type AgentMode = 'off' | 'shadow';
+export type AgentJobStatus = 'queued' | 'running' | 'retry' | 'completed' | 'cancelled' | 'terminal';
+/** Exact durable AgentRun.status values. UI meaning is projected separately. */
+export type AgentRunStatus =
+  | 'running'
+  | 'verified'
+  | 'abstain'
+  | 'failed'
+  | 'posted_verified'
+  | 'dry_run'
+  | 'unchanged'
+  | 'uncertain'
+  | 'retryable';
+
+export type AutopilotRunOutcome =
+  | 'shadow_proposed'
+  | 'shadow_verified'
+  | 'abstained'
+  | 'failed_before_write'
+  | 'posted_verified'
+  | 'possible_write_uncertain'
+  | 'readback_mismatch'
+  | 'reconciled_unchanged'
+  | 'reconciled_posted'
+  | 'reverted'
+  | 'retrying'
+  | 'in_progress'
+  | 'dry_run'
+  | 'unavailable';
+
+export interface AgentLimitsDto {
+  maxToolCalls: number;
+  maxTurns: number;
+  maxContextBytes: number;
+  maxResponseBytes: number;
+  timeoutMs: number;
+}
+
+/** Company-scoped shadow configuration. Provider credentials are never included. */
+export interface AgentCompanySettingsDto {
+  mode: AgentMode;
+  provider: SuggestionProvider;
+  decisionModel: string;
+  verifierModel: string;
+  scheduleMinutes: number;
+  companyConcurrency: number;
+  evidenceThreshold: number;
+  dailyLiveWriteLimit: number;
+  limits: AgentLimitsDto;
+  configVersion: string;
+}
+
+export type LiveGateCode =
+  | 'SHADOW_MODE_UNHEALTHY'
+  | 'EVIDENCE_INSUFFICIENT'
+  | 'SHADOW_AGREEMENT_INSUFFICIENT'
+  | 'SHADOW_ABSTENTION_EXCESSIVE'
+  | 'SHADOW_ERROR_RATE_EXCESSIVE'
+  | 'VERIFIER_NOT_DISTINCT'
+  | 'PROVIDER_UNHEALTHY'
+  | 'TAX_REFERENCE_STALE'
+  | 'QBO_DISCONNECTED'
+  | 'WRITEBACK_DISABLED'
+  | 'UNRESOLVED_MUTATION'
+  | 'WORKER_UNHEALTHY'
+  | 'LIVE_POLICY_NOT_ACCEPTED';
+
+/** Safe, bounded activation readiness status; provider and accounting details stay server-side. */
+export interface LiveGateResult {
+  code: LiveGateCode;
+  ok: boolean;
+  message: string;
+}
+
+export interface LivePauseStateDto {
+  liveRequested: boolean;
+  enabled: boolean;
+  paused: boolean;
+  pauseCode: string | null;
+  pauseMessage: string | null;
+}
+
+export interface LiveReadinessDto {
+  policyVersion: string;
+  gates: LiveGateResult[];
+  evidence: {
+    completedSince: string;
+    completedThrough: string;
+    eligibleRuns: number;
+    threshold: number;
+    minimumAgreement: number;
+    maximumAbstentionRate: number;
+    maximumErrorRate: number;
+  };
+  models: {
+    provider: string;
+    decisionAlias: string;
+    verifierAlias: string;
+    decisionIdentity: string | null;
+    verifierIdentity: string | null;
+  };
+  policy: {
+    supportedEntities: ['Purchase'];
+    minimumConfidence: number;
+    policyAccepted: boolean;
+    configurationAccepted: boolean;
+    modelBindingAccepted: boolean;
+  };
+  state: LivePauseStateDto;
+  lastAction: {
+    outcome: AutopilotRunOutcome;
+    at: string;
+  } | null;
+}
 export type AuditAction =
   | 'posted'
   | 'dry-run'
@@ -188,7 +303,9 @@ export type AuditAction =
   | 'reverted'
   | 'superseded'
   | 'transfer'
-  | 'auto-posted';
+  | 'auto-posted'
+  | 'rule-candidate-dismissed'
+  | 'rule-candidate-activated';
 
 export interface MembershipDto {
   companyId: string;
@@ -386,6 +503,56 @@ export interface RuleDto {
   tagIds: string[];
   autoPost: boolean;
   createdAt: string;
+  reviewRequiredAt: string | null;
+  reviewReason: string | null;
+  origin: {
+    candidateId: string;
+    evidenceCount: number;
+    schemaVersion: string;
+    configVersion: string;
+  } | null;
+}
+
+export type RuleCandidateState =
+  | 'ready'
+  | 'conflict'
+  | 'stale'
+  | 'dismissed'
+  | 'activated';
+
+export interface RuleCandidateEvidenceDto {
+  transactionId: string;
+  source: 'user' | 'autopilot' | 'mcp';
+  observedAt: string;
+}
+
+export interface RuleCandidateDto {
+  id: string;
+  companyId: string;
+  state: RuleCandidateState;
+  matchField: 'payee';
+  matchText: string;
+  category: string | null;
+  categoryQboId: string | null;
+  taxCalculation: TaxCalculation | null;
+  taxCode: string | null;
+  taxCodeQboId: string | null;
+  tagIds: string[];
+  evidenceCount: number;
+  conflictingEvidenceCount: number;
+  evidenceThreshold: number;
+  schemaVersion: string;
+  configVersion: string;
+  staleReasons: string[];
+  canActivate: boolean;
+  activatedRuleId: string | null;
+  provenance: {
+    user: number;
+    autopilot: number;
+    mcp: number;
+  };
+  evidence: RuleCandidateEvidenceDto[];
+  updatedAt: string;
 }
 
 export interface SavedReportConfig {

@@ -87,6 +87,7 @@ const OAUTH_SCOPE = 'com.intuit.quickbooks.accounting';
 const MINOR_VERSION = '75';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const PREPARED_WRITE_TIMEOUT_MS = 30_000;
+const REVOKE_TIMEOUT_MS = 5_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
 
@@ -762,6 +763,8 @@ export async function refreshTokenGrant(args: {
 
 /** Best-effort revoke; never throws. */
 export async function revokeIntuitToken(args: { clientId: string; clientSecret: string; token: string }): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REVOKE_TIMEOUT_MS);
   try {
     await fetch(OAUTH_REVOKE_URL, {
       method: 'POST',
@@ -771,9 +774,12 @@ export async function revokeIntuitToken(args: { clientId: string; clientSecret: 
         Accept: 'application/json',
       },
       body: JSON.stringify({ token: args.token }),
+      signal: controller.signal,
     });
   } catch {
     // best effort — a failed revoke must not block disconnect
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -843,8 +849,15 @@ export class RealQboClient implements QboClient {
 
   // ---- HTTP ----
 
-  private async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, retried = false): Promise<T> {
+  private async request<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    retried = false,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const accessToken = await this.ensureFreshToken();
+    if (signal?.aborted) throw abortedRequest();
     const sep = path.includes('?') ? '&' : '?';
     const res = await fetch(`${this.base}${path}${sep}minorversion=${MINOR_VERSION}`, {
       method,
@@ -854,11 +867,12 @@ export class RealQboClient implements QboClient {
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
     });
     if (res.status === 401 && !retried) {
       // Access token invalidated server-side: refresh once and retry.
       await this.refresh();
-      return this.request<T>(method, path, body, true);
+      return this.request<T>(method, path, body, true, signal);
     }
     const text = await res.text();
     if (!res.ok) throw this.toError(res.status, text);
@@ -1016,9 +1030,21 @@ export class RealQboClient implements QboClient {
     return rows.map(mapTaxRate);
   }
 
-  async fetchPurchaseSnapshot(qboId: string): Promise<QboPurchaseSnapshot | null> {
+  async fetchPurchaseSnapshot(
+    qboId: string,
+    signal?: AbortSignal,
+  ): Promise<QboPurchaseSnapshot | null> {
     try {
-      const body = await this.request<{ Purchase?: RawPurchase }>('GET', `/purchase/${encodeURIComponent(qboId)}`);
+      const body = await abortableRequest(
+        this.request<{ Purchase?: RawPurchase }>(
+          'GET',
+          `/purchase/${encodeURIComponent(qboId)}`,
+          undefined,
+          false,
+          signal,
+        ),
+        signal,
+      );
       return body.Purchase ? mapPurchaseSnapshot(body.Purchase) : null;
     } catch (err) {
       if (err instanceof Error && /not\s*found/i.test(err.message)) return null;
@@ -1331,6 +1357,27 @@ export class RealQboClient implements QboClient {
     const res = await this.request<{ Transfer?: { Id?: string } }>('POST', '/transfer', body);
     return { qboId: res.Transfer?.Id ?? '' };
   }
+}
+
+function abortedRequest(): Error {
+  const error = new Error('QuickBooks request was cancelled.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function abortableRequest<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal === undefined) return operation;
+  if (signal.aborted) return Promise.reject(abortedRequest());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortedRequest());
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
 }
 
 function entityPath(qboType: QboTxn['qboType']): string {
