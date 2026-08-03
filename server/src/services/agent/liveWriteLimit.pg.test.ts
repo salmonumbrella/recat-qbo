@@ -18,7 +18,7 @@ describePostgres('daily live-write permit PostgreSQL invariant', () => {
     await prisma?.$disconnect();
   });
 
-  it('issues exactly 100 default permits under 101 concurrent requests', async () => {
+  it('issues exactly 25 default permits under 26 concurrent requests', async () => {
     const suffix = randomUUID();
     const company = await prisma.company.create({
       data: {
@@ -47,7 +47,7 @@ describePostgres('daily live-write permit PostgreSQL invariant', () => {
 
     try {
       const outcomes = await Promise.allSettled(
-        Array.from({ length: 101 }, (_, index) =>
+        Array.from({ length: 26 }, (_, index) =>
           prisma.$transaction(async (transaction) => {
             await lockCompanyMutationScope(transaction, company.id);
             return issueLiveWritePermit(transaction, {
@@ -58,7 +58,7 @@ describePostgres('daily live-write permit PostgreSQL invariant', () => {
         ),
       );
 
-      expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(100);
+      expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(25);
       expect(outcomes.filter((outcome) =>
         outcome.status === 'rejected'
           && typeof outcome.reason === 'object'
@@ -73,7 +73,7 @@ describePostgres('daily live-write permit PostgreSQL invariant', () => {
             AND "utcDay" = (clock_timestamp() AT TIME ZONE 'UTC')::date`,
         company.id,
       );
-      expect(Number(rows[0]?.count)).toBe(100);
+      expect(Number(rows[0]?.count)).toBe(25);
     } finally {
       await prisma.company.delete({ where: { id: company.id } });
     }
