@@ -10,6 +10,8 @@ import type {
   AttachmentDto,
   AttachmentOperationDto,
   AttachmentSourceInput,
+  AttachmentStoragePolicyDto,
+  AttachmentInstanceStoragePolicyDto,
   AttachmentUploadGrantDto,
   AutopilotRunOutcome,
   AuditEntryDto,
@@ -459,6 +461,8 @@ export const auth = {
 export const companies = {
   list: () => api.get<CompanyDto[]>('/api/companies'),
   patch: (id: string, body: CompanyPatchBody) => api.patch<CompanyDto>(`/api/companies/${id}`, body),
+  attachmentStoragePolicy: (id: string) =>
+    api.get<AttachmentStoragePolicyDto>(`/api/companies/${id}/attachment-storage-policy`),
   sync: (id: string) => api.post<void>(`/api/companies/${id}/sync`),
   /** Consent URL for connecting a (new) company — mode=demo → the built-in
    * fake consent page; mode=real → Intuit OAuth (env picks sandbox/production). */
@@ -742,6 +746,19 @@ export const instanceSettings = {
   /** Send a test email via the current SMTP config; defaults to the caller's address. */
   testEmail: (to?: string) =>
     api.post<TestEmailResponse>('/api/instance/settings/test-email', to !== undefined ? { to } : {}),
+};
+
+export const attachmentStoragePolicy = {
+  getInstance: () =>
+    api.get<AttachmentInstanceStoragePolicyDto>('/api/instance/attachment-storage-policy'),
+  patchInstance: (body: {
+    companyQuotaBytes?: string;
+    instanceQuotaBytes?: string;
+    retentionDays?: number;
+  }) => api.patch<AttachmentInstanceStoragePolicyDto>(
+    '/api/instance/attachment-storage-policy',
+    body,
+  ),
 };
 
 export const qboDiagnostics = {

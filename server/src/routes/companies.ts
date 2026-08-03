@@ -27,6 +27,15 @@ import {
 import { syncCompany } from '../services/sync.js';
 import { createOauthState } from './qboOauth.js';
 import { teamRouter } from './team.js';
+import {
+  ATTACHMENT_POLICY_BOUNDS,
+  resolveAttachmentStoragePolicy,
+} from '../services/attachments/policy.js';
+import {
+  getAttachmentStoragePolicyDefaults,
+  getAttachmentStoragePolicyDto,
+} from '../services/attachments/policyStore.js';
+import { AttachmentError } from '../services/attachments/types.js';
 
 function jsonStringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
@@ -68,6 +77,18 @@ const patchBody = z.object({
   dryRun: z.boolean().optional(),
   tagsRequired: z.boolean().optional(),
   retainAttachmentFiles: z.boolean().optional(),
+  attachmentQuotaBytes: z.union([
+    z.string().regex(/^\d+$/).transform((value) => BigInt(value)).refine(
+      (value) => value >= ATTACHMENT_POLICY_BOUNDS.companyQuotaMinBytes
+        && value <= ATTACHMENT_POLICY_BOUNDS.companyQuotaMaxBytes,
+    ),
+    z.null(),
+  ]).optional(),
+  attachmentRetentionDays: z.number().int()
+    .min(ATTACHMENT_POLICY_BOUNDS.retentionMinDays)
+    .max(ATTACHMENT_POLICY_BOUNDS.retentionMaxDays)
+    .nullable()
+    .optional(),
 });
 
 const holdingAccountsBody = z.object({ holdingAccountIds: z.array(z.string().min(1)).min(1) });
@@ -120,6 +141,19 @@ const connectHandler = asyncHandler(async (req, res) => {
 companiesRouter.get('/connect-url', requireInstanceAdmin, connectHandler);
 companiesRouter.post('/connect', requireInstanceAdmin, connectHandler);
 
+companiesRouter.get(
+  '/:companyId/attachment-storage-policy',
+  withCompany({ allowDisconnected: true }),
+  requireRole('viewer'),
+  asyncHandler(async (req, res) => {
+    const policy = await getAttachmentStoragePolicyDto(scopedCompany(req).id);
+    if (policy === null) {
+      throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    }
+    res.json(policy);
+  }),
+);
+
 function qboDiagnosticStatus(code: QboDiagnosticCode): number {
   return code === 'COMPANY_DISCONNECTED' ? 409 : 502;
 }
@@ -151,6 +185,28 @@ companiesRouter.patch(
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
     const patch = validate(patchBody)(req.body);
+    const attachmentPolicyChanged = patch.attachmentQuotaBytes !== undefined
+      || patch.attachmentRetentionDays !== undefined;
+    if (attachmentPolicyChanged) {
+      if (req.user?.isInstanceAdmin !== true) {
+        throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
+      }
+      try {
+        resolveAttachmentStoragePolicy({
+          attachmentQuotaBytes: patch.attachmentQuotaBytes === undefined
+            ? company.attachmentQuotaBytes
+            : patch.attachmentQuotaBytes,
+          attachmentRetentionDays: patch.attachmentRetentionDays === undefined
+            ? company.attachmentRetentionDays
+            : patch.attachmentRetentionDays,
+        }, await getAttachmentStoragePolicyDefaults());
+      } catch (error) {
+        if (error instanceof AttachmentError && error.code === 'ATTACHMENT_POLICY_INVALID') {
+          throw new HttpError(400, error.message, error.code);
+        }
+        throw error;
+      }
+    }
 
     const holdingChanged =
       patch.holdingAccountIds !== undefined &&

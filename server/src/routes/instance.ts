@@ -4,7 +4,7 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { redirectUri, webhookUrl } from '../env.js';
+import { attachmentPolicyEnvManaged, redirectUri, webhookUrl } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
@@ -17,6 +17,17 @@ import {
   updateInstanceSettings,
 } from '../services/instanceSettings.js';
 import { issueMagicLink } from '../services/magicLink.js';
+import {
+  ATTACHMENT_POLICY_BOUNDS,
+  resolveAttachmentStoragePolicy,
+} from '../services/attachments/policy.js';
+import {
+  ATTACHMENT_POLICY_CONFIG_KEYS,
+  ATTACHMENT_STORAGE_INSTANCE_LOCK,
+  getAttachmentInstanceStoragePolicyDto,
+  getAttachmentStoragePolicyDefaults,
+} from '../services/attachments/policyStore.js';
+import { AttachmentError } from '../services/attachments/types.js';
 
 // ---------------------------------------------------------------------------
 // /api/instance/settings
@@ -44,6 +55,21 @@ const settingsPatchBody = z.object({
   smtpUser: z.string().optional(),
   smtpPass: z.string().optional(),
   smtpFrom: z.string().trim().optional(),
+});
+
+const storagePolicyPatchBody = z.object({
+  companyQuotaBytes: z.string().regex(/^\d+$/).transform((value) => BigInt(value))
+    .refine((value) => value >= ATTACHMENT_POLICY_BOUNDS.companyQuotaMinBytes
+      && value <= ATTACHMENT_POLICY_BOUNDS.companyQuotaMaxBytes)
+    .optional(),
+  instanceQuotaBytes: z.string().regex(/^\d+$/).transform((value) => BigInt(value))
+    .refine((value) => value >= ATTACHMENT_POLICY_BOUNDS.instanceQuotaMinBytes
+      && value <= ATTACHMENT_POLICY_BOUNDS.instanceQuotaMaxBytes)
+    .optional(),
+  retentionDays: z.number().int()
+    .min(ATTACHMENT_POLICY_BOUNDS.retentionMinDays)
+    .max(ATTACHMENT_POLICY_BOUNDS.retentionMaxDays)
+    .optional(),
 });
 
 export const instanceRouter = Router();
@@ -91,6 +117,70 @@ instanceRouter.patch(
     // The mailer caches its transport briefly — new SMTP values apply at once.
     invalidateMailerCache();
     res.json(await getInstanceSettingsDto());
+  }),
+);
+
+instanceRouter.get(
+  '/attachment-storage-policy',
+  asyncHandler(async (_req, res) => {
+    res.json(await getAttachmentInstanceStoragePolicyDto());
+  }),
+);
+
+instanceRouter.patch(
+  '/attachment-storage-policy',
+  asyncHandler(async (req, res) => {
+    const patch = validate(storagePolicyPatchBody)(req.body);
+    if (
+      (patch.companyQuotaBytes !== undefined && attachmentPolicyEnvManaged.companyQuotaBytes)
+      || (patch.instanceQuotaBytes !== undefined && attachmentPolicyEnvManaged.instanceQuotaBytes)
+      || (patch.retentionDays !== undefined && attachmentPolicyEnvManaged.retentionDays)
+    ) {
+      throw new HttpError(
+        409,
+        'This attachment storage setting is managed by the environment.',
+        'ATTACHMENT_POLICY_ENV_MANAGED',
+      );
+    }
+    await prisma.$transaction(async (transaction) => {
+      await transaction.$queryRaw`
+        SELECT pg_advisory_xact_lock(${ATTACHMENT_STORAGE_INSTANCE_LOCK})::text`;
+      const current = await getAttachmentStoragePolicyDefaults(transaction);
+      const candidate = {
+        companyQuotaBytes: patch.companyQuotaBytes ?? current.companyQuotaBytes,
+        instanceQuotaBytes: patch.instanceQuotaBytes ?? current.instanceQuotaBytes,
+        retentionDays: patch.retentionDays ?? current.retentionDays,
+      };
+      try {
+        resolveAttachmentStoragePolicy({
+          attachmentQuotaBytes: null,
+          attachmentRetentionDays: null,
+        }, candidate);
+        const companyOverrides = await transaction.company.findMany({
+          where: { attachmentQuotaBytes: { not: null } },
+          select: { attachmentQuotaBytes: true, attachmentRetentionDays: true },
+        });
+        for (const company of companyOverrides) {
+          resolveAttachmentStoragePolicy(company, candidate);
+        }
+      } catch (error) {
+        if (error instanceof AttachmentError && error.code === 'ATTACHMENT_POLICY_INVALID') {
+          throw new HttpError(400, error.message, error.code);
+        }
+        throw error;
+      }
+      for (const [field, value] of Object.entries(patch)) {
+        const key = ATTACHMENT_POLICY_CONFIG_KEYS[
+          field as keyof typeof ATTACHMENT_POLICY_CONFIG_KEYS
+        ];
+        await transaction.appConfig.upsert({
+          where: { key },
+          update: { value: value.toString(), encrypted: false },
+          create: { key, value: value.toString(), encrypted: false },
+        });
+      }
+    });
+    res.json(await getAttachmentInstanceStoragePolicyDto());
   }),
 );
 

@@ -74,7 +74,7 @@ describePostgres('attachment cleanup on PostgreSQL', () => {
     })).resolves.toBe(1);
   });
 
-  it('preserves active, READY, and referenced blobs while collecting only safe candidates', async () => {
+  it('preserves active handles and not-due blobs while collecting only due candidates', async () => {
     const fixture = await company();
     const now = new Date('2026-07-30T00:00:00.000Z');
     const active = await db.attachmentBlob.create({
@@ -92,6 +92,7 @@ describePostgres('attachment cleanup on PostgreSQL', () => {
         sizeBytes: 10n,
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: new Date('2026-07-29T00:00:00.000Z'),
       },
     });
     await db.stagedAttachment.create({
@@ -115,6 +116,18 @@ describePostgres('attachment cleanup on PostgreSQL', () => {
         sizeBytes: 10n,
         contentType: 'application/pdf',
         chunkCount: 1,
+        expiresAt: new Date('2026-07-29T00:00:00.000Z'),
+      },
+    });
+    const notDue = await db.attachmentBlob.create({
+      data: {
+        companyId: fixture.id,
+        state: 'READY',
+        sha256: 'c'.repeat(64),
+        sizeBytes: 10n,
+        contentType: 'application/pdf',
+        chunkCount: 1,
+        expiresAt: new Date('2026-07-31T00:00:00.000Z'),
       },
     });
 
@@ -122,11 +135,70 @@ describePostgres('attachment cleanup on PostgreSQL', () => {
 
     expect(result.blobs).toBe(1);
     await expect(db.attachmentBlob.findMany({
-      where: { id: { in: [active.id, referenced.id, unreferenced.id] } },
+      where: { id: { in: [active.id, referenced.id, unreferenced.id, notDue.id] } },
       orderBy: { id: 'asc' },
       select: { id: true },
     })).resolves.toEqual(
-      [{ id: active.id }, { id: referenced.id }].sort((a, b) => a.id.localeCompare(b.id)),
+      [{ id: active.id }, { id: referenced.id }, { id: notDue.id }]
+        .sort((a, b) => a.id.localeCompare(b.id)),
     );
   });
+
+  it('expires physical bytes while preserving transaction attachment metadata', async () => {
+    const fixture = await company();
+    const transaction = await db.transaction.create({
+      data: {
+        companyId: fixture.id,
+        qboId: `purchase-${randomUUID()}`,
+        qboType: 'Purchase',
+        qboSyncToken: '1',
+        date: new Date('2026-07-29T00:00:00.000Z'),
+        payee: 'Synthetic supplier',
+        amount: '-10.00',
+        bankAccount: 'Synthetic bank',
+      },
+    });
+    const blob = await db.attachmentBlob.create({
+      data: {
+        companyId: fixture.id,
+        state: 'READY',
+        sha256: 'd'.repeat(64),
+        sizeBytes: 10n,
+        contentType: 'application/pdf',
+        chunkCount: 1,
+        expiresAt: new Date('2026-07-29T00:00:00.000Z'),
+      },
+    });
+    const attachment = await db.transactionAttachment.create({
+      data: {
+        companyId: fixture.id,
+        transactionId: transaction.id,
+        blobId: blob.id,
+        originalFilename: 'historical.pdf',
+        contentType: 'application/pdf',
+        sizeBytes: 10n,
+        sha256: 'd'.repeat(64),
+        sourceKind: 'LOCAL_UPLOAD',
+        retainLocally: true,
+        status: 'ATTACHED',
+        recatMarker: randomUUID(),
+      },
+    });
+
+    await expect(runAttachmentCleanup({
+      now: new Date('2026-07-30T00:00:00.000Z'),
+    }, { db })).resolves.toMatchObject({ blobs: 1 });
+    await expect(db.attachmentBlob.findUnique({
+      where: { id: blob.id },
+    })).resolves.toBeNull();
+    await expect(db.transactionAttachment.findUniqueOrThrow({
+      where: { id: attachment.id },
+      select: { blobId: true, originalFilename: true, sha256: true },
+    })).resolves.toEqual({
+      blobId: null,
+      originalFilename: 'historical.pdf',
+      sha256: 'd'.repeat(64),
+    });
+  });
+
 });

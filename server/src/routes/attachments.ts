@@ -135,6 +135,8 @@ function toHttpError(error: unknown): never {
       : error.code === 'ATTACHMENT_NOT_FOUND'
         ? 404
         : error.code === 'ATTACHMENT_TOO_LARGE'
+          || error.code === 'ATTACHMENT_COMPANY_QUOTA_EXCEEDED'
+          || error.code === 'ATTACHMENT_INSTANCE_QUOTA_EXCEEDED'
           ? 413
           : error.code === 'ATTACHMENT_BUSY'
             || error.code === 'ATTACHMENT_PROVIDER_UNCERTAIN'

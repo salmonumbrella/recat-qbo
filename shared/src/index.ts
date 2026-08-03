@@ -389,6 +389,26 @@ export interface CompanyDto {
   lastSyncedAt: string | null;
 }
 
+export interface AttachmentStoragePolicyDto {
+  companyQuotaBytes: string;
+  instanceQuotaBytes: string;
+  companyUsageBytes: string;
+  instanceUsageBytes: string;
+  retentionDays: number;
+  companyQuotaOverrideBytes: string | null;
+  companyRetentionOverrideDays: number | null;
+}
+
+export interface AttachmentInstanceStoragePolicyDto {
+  companyQuotaBytes: string;
+  instanceQuotaBytes: string;
+  instanceUsageBytes: string;
+  retentionDays: number;
+  companyQuotaFromEnv: boolean;
+  instanceQuotaFromEnv: boolean;
+  retentionFromEnv: boolean;
+}
+
 export type AttachmentStatus =
   | 'STAGED'
   | 'UPLOADING'
@@ -814,6 +834,8 @@ export interface CompanyPatchBody {
   dryRun?: boolean;
   tagsRequired?: boolean;
   retainAttachmentFiles?: boolean;
+  attachmentQuotaBytes?: string | null;
+  attachmentRetentionDays?: number | null;
 }
 
 export interface ApiError {
