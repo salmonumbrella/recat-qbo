@@ -16,6 +16,7 @@ import {
 import { syncCompany, type SyncKind } from '../services/sync.js';
 import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
+import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
@@ -25,6 +26,7 @@ let ticker: NodeJS.Timeout | null = null;
 const inFlight = new Set<string>();
 let lastNightlyDate = '';
 let lastDigestDate = '';
+let receiptTickInFlight = false;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
@@ -154,6 +156,16 @@ async function digestTick(now: Date): Promise<void> {
 
 // ---------------------------------------------------------------------------
 
+export async function runReceiptTick(): Promise<void> {
+  if (receiptTickInFlight) return;
+  receiptTickInFlight = true;
+  try {
+    await processReceiptTick();
+  } finally {
+    receiptTickInFlight = false;
+  }
+}
+
 async function tick(): Promise<void> {
   const now = new Date();
   try {
@@ -179,6 +191,11 @@ async function tick(): Promise<void> {
   } catch {
     console.error('[jobs] agent scheduler tick failed');
   }
+  try {
+    await runReceiptTick();
+  } catch {
+    console.error('[jobs] receipt scheduler tick failed');
+  }
 }
 
 export function startJobs(): void {
@@ -190,6 +207,7 @@ export function startJobs(): void {
     .catch(() => console.error('[jobs] attachment recovery failed'));
   runAttachmentCleanup().catch(() => console.error('[jobs] attachment cleanup failed'));
   runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
+  runReceiptTick().catch(() => console.error('[jobs] boot receipt scheduler tick failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();

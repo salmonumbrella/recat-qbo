@@ -15,6 +15,8 @@ services:
       QBO_ENVIRONMENT: ${QBO_ENVIRONMENT:-sandbox}
       QBO_WEBHOOK_VERIFIER_TOKEN: ${QBO_WEBHOOK_VERIFIER_TOKEN:-}
       QBO_MOCK: ${QBO_MOCK:-false}
+      RECEIPT_EXTRACTOR_URL: http://receipt-extractor:8485
+      RECEIPT_EXTRACTOR_TOKEN: ${RECEIPT_EXTRACTOR_TOKEN:?set RECEIPT_EXTRACTOR_TOKEN in .env}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
@@ -30,6 +32,8 @@ services:
       ATTACHMENT_RETENTION_DAYS: ${ATTACHMENT_RETENTION_DAYS:-}
     depends_on:
       db:
+        condition: service_healthy
+      receipt-extractor:
         condition: service_healthy
     restart: unless-stopped
 

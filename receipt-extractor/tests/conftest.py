@@ -13,6 +13,10 @@ def valid_request(**overrides: Any) -> dict[str, Any]:
         "model": "openai/gpt-4o-mini",
         "api_base": "https://openrouter.ai/api/v1",
         "api_key": "request-secret",
+        "provider_headers": {
+            "HTTP-Referer": "https://recat.example.invalid",
+            "X-Title": "Recat",
+        },
         "temperature": 0,
         "max_tokens": 8192,
         "parse_retries": 2,

@@ -163,6 +163,10 @@ def test_completion_contains_bounded_vision_payload_without_logging_key() -> Non
     kwargs = completion_kwargs(pages(), request())
     assert kwargs["api_key"] == "request-secret"
     assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
+    assert kwargs["extra_headers"] == {
+        "HTTP-Referer": "https://recat.example.invalid",
+        "X-Title": "Recat",
+    }
     assert kwargs["timeout"] == 110
     assert kwargs["response_format"] == {"type": "json_object"}
     image = kwargs["messages"][0]["content"][1]

@@ -29,6 +29,7 @@ import {
   type ReceiptQuery,
 } from '../services/receipts/query.js';
 import { ReceiptError } from '../services/receipts/types.js';
+import { reprocessReceipt } from '../services/receipts/worker.js';
 
 const receiptStatuses = [
   'RECEIVED',
@@ -105,6 +106,10 @@ const createReceiptsBodySchema = z.object({
 
 const receiptRevisionSchema = z.object({
   expectedRevision: z.coerce.number().int().min(0).max(2_147_483_647),
+}).strict();
+const receiptReprocessSchema = z.object({
+  expectedRevision: z.number().int().min(0).max(2_147_483_646),
+  idempotencyKey: z.string().trim().min(1).max(128),
 }).strict();
 
 export function parseReceiptListQuery(input: unknown): ReceiptQuery {
@@ -360,6 +365,23 @@ receiptsRouter.post(
       body.expectedRevision,
     ));
     res.json(await receiptCall(() =>
+      getReceiptDetail(req.company!.id, req.params.receiptId!)));
+  }),
+);
+
+receiptsRouter.post(
+  '/:receiptId/reprocess',
+  requireRole('categorizer'),
+  asyncHandler(async (req, res) => {
+    const body = validate(receiptReprocessSchema)(req.body);
+    await receiptCall(() => reprocessReceipt(
+      req.company!.id,
+      req.params.receiptId!,
+      req.user!.id,
+      body.expectedRevision,
+      body.idempotencyKey,
+    ));
+    res.status(202).json(await receiptCall(() =>
       getReceiptDetail(req.company!.id, req.params.receiptId!)));
   }),
 );
