@@ -971,6 +971,7 @@ export function AutopilotQueueStatus({
   const detailsId = useId();
   const generationRef = useRef(0);
 
+
   // A paused live mode, or a run that stopped before writing, has to reach the
   // operator whether or not the panel is expanded. Prefer the pause reason:
   // it persists, where a run error is a single event.
@@ -978,8 +979,21 @@ export function AutopilotQueueStatus({
     if (readiness?.state.paused) {
       return readiness.state.pauseMessage ?? 'Live mode paused';
     }
-    const stopped = runs.find((run) => run.errorCode);
-    return stopped?.errorCode ? runErrorLabel(stopped.errorCode) : null;
+    // Read current state, never infer it from run history. /autopilot/runs is
+    // an event log: it includes in-progress rows and shadow runs, neither of
+    // which says anything about live-write availability, and paging back
+    // through it can surface failures that were resolved days ago.
+    //
+    // Deliberately does no clock arithmetic. The cap resets on the server's UTC
+    // day, and the browser is not an authority on that, so a session left open
+    // across the rollover shows the notice until the next fetch. Expiring it
+    // locally needs a server-supplied relative duration; see the follow-up
+    // issue. Showing a stale stop is the safe direction — the alternative
+    // attempts traded it for suppressing a live cap or polling in a loop.
+    if (state && state.liveWrites.used >= state.liveWrites.limit) {
+      return runErrorLabel('LIVE_DAILY_LIMIT_REACHED');
+    }
+    return null;
   })();
 
   useEffect(() => {
