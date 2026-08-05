@@ -121,8 +121,57 @@ const READY: TaxReadinessDto = {
     active: true,
     taxable: true,
     combinedPurchaseRate: 5,
+    combinedSalesRate: null,
+  }],
+  salesStatus: 'needs_setup',
+  salesReason: null,
+  salesTaxCodes: [],
+};
+
+const SALES_READY: TaxReadinessDto = {
+  ...READY,
+  salesStatus: 'ready',
+  salesReason: null,
+  salesTaxCodes: [{
+    qboId: 'SALES_TAX_CODE',
+    name: 'Standard sales tax',
+    active: true,
+    taxable: true,
+    combinedPurchaseRate: null,
+    combinedSalesRate: 5,
   }],
 };
+
+const SALES_INACTIVE_CODE = {
+  qboId: 'SALES_TAX_INACTIVE',
+  name: 'Inactive sales tax',
+  active: false,
+  taxable: true,
+  combinedPurchaseRate: null,
+  combinedSalesRate: 5,
+};
+
+const SALES_NON_DIRECTIONAL_CODE = {
+  qboId: 'SALES_TAX_NON_DIRECTIONAL',
+  name: 'Non-sales tax',
+  active: true,
+  taxable: true,
+  combinedPurchaseRate: 5,
+  combinedSalesRate: null,
+};
+
+const INVALID_SALES_CODE_CASES: Array<[string, string, TaxReadinessDto]> = [
+  ['purchase-only', 'TAX_CODE_STANDARD', SALES_READY],
+  ['inactive', SALES_INACTIVE_CODE.qboId, {
+    ...SALES_READY,
+    salesTaxCodes: [...SALES_READY.salesTaxCodes, SALES_INACTIVE_CODE],
+  }],
+  ['removed', 'SALES_TAX_REMOVED', SALES_READY],
+  ['non-sales', SALES_NON_DIRECTIONAL_CODE.qboId, {
+    ...SALES_READY,
+    salesTaxCodes: [...SALES_READY.salesTaxCodes, SALES_NON_DIRECTIONAL_CODE],
+  }],
+];
 
 function transaction(overrides: Partial<TransactionDto> = {}): TransactionDto {
   return {
@@ -151,6 +200,18 @@ function transaction(overrides: Partial<TransactionDto> = {}): TransactionDto {
     activeCategorizationAttempt: null,
     ...overrides,
   };
+}
+
+function deposit(overrides: Partial<TransactionDto> = {}): TransactionDto {
+  return transaction({
+    qboId: 'DEPOSIT_GENERIC',
+    qboType: 'Deposit',
+    payee: 'Generic customer receipt',
+    amount: 10.5,
+    taxCode: 'Standard sales tax',
+    taxCodeQboId: 'SALES_TAX_CODE',
+    ...overrides,
+  });
 }
 
 const STAGED: StagedCategorization = {
@@ -194,14 +255,15 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function renderQueue(row = transaction()) {
+async function renderQueue(row: TransactionDto | TransactionDto[] = transaction()) {
+  const transactions = Array.isArray(row) ? row : [row];
   mocks.list.mockResolvedValue({
-    transactions: [row],
+    transactions,
     nextCursor: null,
-    pendingCount: row.status === 'PENDING' ? 1 : 0,
+    pendingCount: transactions.filter((transaction) => transaction.status === 'PENDING').length,
   });
   const view = render(<Queue />);
-  await screen.findByText('Generic supplier');
+  await screen.findByText(transactions[0]!.payee);
   return view;
 }
 
@@ -1174,6 +1236,9 @@ describe('tax-aware manual queue', () => {
       usingSalesTax: false,
       refreshedAt: null,
       taxCodes: [],
+      salesStatus: 'unsupported',
+      salesReason: 'Sales tax is disabled.',
+      salesTaxCodes: [],
     };
     const user = userEvent.setup();
     await renderQueue(transaction({
@@ -1204,4 +1269,147 @@ describe('tax-aware manual queue', () => {
       'Tax-ready purchases must be previewed and posted individually',
     );
   });
+
+  it('runs a sales-ready Deposit through the tax lifecycle with positive cents and Deposit undo copy', async () => {
+    mocks.taxReadiness = SALES_READY;
+    mocks.commit.mockResolvedValue(mutation({
+      ok: false,
+      status: 'ERROR',
+      outcome: 'UNCERTAIN',
+      error: { code: 'QBO_WRITE_UNCERTAIN', message: 'Verify the outcome.' },
+    }));
+    mocks.stage.mockResolvedValue({
+      ...STAGED,
+      totals: { subtotalCents: 1000, taxCents: 50, totalCents: 1050 },
+      lines: [{ ...STAGED.lines[0]!, subtotalCents: 1000, taxCents: 50, totalCents: 1050, taxCodeQboId: 'SALES_TAX_CODE' }],
+    });
+    const user = userEvent.setup();
+    await renderQueue(deposit());
+
+    expect(screen.getByLabelText('Sales tax for Generic customer receipt')).toHaveTextContent('Standard sales tax');
+    expect(screen.queryByLabelText('Purchase tax for Generic customer receipt')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.objectContaining({
+        lines: [expect.objectContaining({ grossCents: 1050, taxCodeQboId: 'SALES_TAX_CODE' })],
+      }),
+    ));
+    await user.click(await screen.findByRole('button', { name: /^post$/i }));
+    await waitFor(() => expect(mocks.commit).toHaveBeenCalled());
+    await user.click(await screen.findByRole('button', { name: /^reconcile$/i }));
+    await waitFor(() => expect(mocks.reconcile).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      '00000000-0000-4000-8000-000000000101',
+    ));
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringMatching(/original deposit/i));
+    await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalled());
+  });
+
+  it('keeps a sales-not-ready Deposit on the legacy workflow and leaves JournalEntry without tax controls', async () => {
+    mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
+    const user = userEvent.setup();
+    await renderQueue(deposit({ taxCalculation: null, taxCode: null, taxCodeQboId: null }));
+
+    expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+    await waitFor(() => expect(mocks.legacyPost).toHaveBeenCalledWith('TRANSACTION_GENERIC'));
+
+    mocks.taxReadiness = SALES_READY;
+    await renderQueue(transaction({ qboType: 'JournalEntry', taxCalculation: null, taxCode: null, taxCodeQboId: null }));
+    expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Purchase tax for Generic supplier')).not.toBeInTheDocument();
+  });
+
+  it('excludes a sales-ready Deposit from legacy bulk posting', async () => {
+    mocks.taxReadiness = SALES_READY;
+    const user = userEvent.setup();
+    await renderQueue(deposit());
+
+    await user.click(screen.getAllByRole('checkbox')[1]!);
+    await user.click(screen.getByRole('button', { name: /post 1 transaction/i }));
+
+    expect(mocks.bulkPost).not.toHaveBeenCalled();
+    expect(mocks.toast).toHaveBeenCalledWith(
+      'Tax-ready transactions must be previewed and posted individually',
+    );
+  });
+
+  it('keeps a reloaded tax-marked Deposit in the durable posting lifecycle when sales readiness is unavailable', async () => {
+    mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
+    await renderQueue(deposit());
+
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
+    expect(mocks.legacyPost).not.toHaveBeenCalled();
+  });
+
+  it('uses categorization undo for a reloaded posted Deposit when sales readiness is unavailable', async () => {
+    mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
+    const user = userEvent.setup();
+    await renderQueue(deposit({ status: 'POSTED', postedAt: '2026-07-28T00:00:00.000Z' }));
+
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+    await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      '00000000-0000-4000-8000-000000000101',
+    ));
+    expect(mocks.legacyUndo).not.toHaveBeenCalled();
+  });
+
+  it('rejects the entire mixed bulk selection when a sales-ready Deposit is selected', async () => {
+    mocks.taxReadiness = { ...SALES_READY, status: 'needs_setup', reason: 'Purchase tax needs setup.', taxCodes: [] };
+    const user = userEvent.setup();
+    await renderQueue([
+      transaction({ id: 'TRANSACTION_LEGACY', taxCalculation: null, taxCode: null, taxCodeQboId: null }),
+      deposit(),
+    ]);
+
+    await user.click(screen.getAllByRole('checkbox')[1]!);
+    await user.click(screen.getAllByRole('checkbox')[2]!);
+    await user.click(screen.getByRole('button', { name: /post 2 transactions/i }));
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(
+      'Tax-ready transactions must be previewed and posted individually',
+    ));
+    expect(mocks.bulkPost).not.toHaveBeenCalled();
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(INVALID_SALES_CODE_CASES)(
+    'does not stage an unsplit Deposit with a %s tax ID',
+    async (_kind, taxCodeQboId, readiness) => {
+      mocks.taxReadiness = readiness;
+      await renderQueue(deposit({ taxCodeQboId, taxCalculation: 'TaxInclusive' }));
+
+      expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+      expect(mocks.stage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(INVALID_SALES_CODE_CASES)(
+    'does not stage a split Deposit with a %s tax ID',
+    async (_kind, taxCodeQboId, readiness) => {
+      mocks.taxReadiness = readiness;
+      await renderQueue(deposit({
+        category: null,
+        categoryQboId: null,
+        taxCode: null,
+        taxCodeQboId: null,
+        splits: [{
+          amount: 10.5,
+          category: 'Generic expense',
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCode: 'Stale tax code',
+          taxCodeQboId,
+          tagIds: [],
+          memo: 'Generic split memo',
+        }],
+      }));
+
+      expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+      expect(mocks.stage).not.toHaveBeenCalled();
+    },
+  );
 });

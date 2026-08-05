@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { HttpError } from '../lib/http.js';
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
@@ -74,6 +75,9 @@ describe('MCP tool results', () => {
     [new HttpError(503, 'PRIVATE_COMPANY_SENTINEL', 'COMPANY_UNAVAILABLE'), 'COMPANY_UNAVAILABLE'],
     [new HttpError(409, 'PRIVATE_QBO_SENTINEL', 'QBO_DISCONNECTED'), 'QBO_DISCONNECTED'],
     [new HttpError(429, 'PRIVATE_RATE_SENTINEL', 'ANY_CODE'), 'RATE_LIMITED'],
+    [new QboWriteSafetyError('QBO_PERIOD_CLOSED', 'PRIVATE_CLOSE_SENTINEL'), 'QBO_PERIOD_CLOSED'],
+    [new QboWriteSafetyError('QBO_TRANSACTION_LOCKED', 'PRIVATE_LOCK_SENTINEL'), 'QBO_TRANSACTION_LOCKED'],
+    [new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE', 'PRIVATE_SAFETY_SENTINEL'), 'QBO_WRITE_SAFETY_UNAVAILABLE'],
   ])('maps an expected failure to stable safe code %s', (error, code) => {
     const result = safeToolFailure(error, 'request-safe');
 
@@ -187,6 +191,27 @@ describe('MCP tool results', () => {
         'PRIVATE_WRITE_CORRUPT_SENTINEL',
       ),
       'COMPANY_UNAVAILABLE',
+    ],
+    [
+      new WritebackLifecycleError(
+        'QBO_PERIOD_CLOSED',
+        'PRIVATE_WRITE_CLOSE_SENTINEL',
+      ),
+      'QBO_PERIOD_CLOSED',
+    ],
+    [
+      new WritebackLifecycleError(
+        'QBO_TRANSACTION_LOCKED',
+        'PRIVATE_WRITE_LOCK_SENTINEL',
+      ),
+      'QBO_TRANSACTION_LOCKED',
+    ],
+    [
+      new WritebackLifecycleError(
+        'QBO_WRITE_SAFETY_UNAVAILABLE',
+        'PRIVATE_WRITE_SAFETY_SENTINEL',
+      ),
+      'QBO_WRITE_SAFETY_UNAVAILABLE',
     ],
     [
       new WritebackLifecycleError(

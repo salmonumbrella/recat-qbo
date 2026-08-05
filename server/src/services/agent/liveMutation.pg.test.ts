@@ -28,6 +28,7 @@ import {
 } from './liveGates.js';
 import { pauseLiveCompany } from './circuitBreaker.js';
 import { updateShadowSettings, type AgentSettingsDb } from './settings.js';
+import { acquireAgentJobSuiteLock } from '../../test/postgresSuiteLock.js';
 import {
   liveTaxAuthorityDigest,
   type LiveMutationContext,
@@ -87,14 +88,28 @@ function deferred<T>() {
 describePostgres('guarded live mutation PostgreSQL composition', () => {
   let second: PrismaClient;
   let third: PrismaClient;
+  let lockClient: PrismaClient;
+  let releaseSuiteLock: (() => Promise<void>) | undefined;
 
   beforeAll(async () => {
     second = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
     third = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+    lockClient = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+    try {
+      releaseSuiteLock = await acquireAgentJobSuiteLock(lockClient);
+    } catch (error) {
+      await Promise.all([second.$disconnect(), third.$disconnect(), lockClient.$disconnect()]);
+      throw error;
+    }
   });
 
   afterAll(async () => {
-    await Promise.all([second.$disconnect(), third.$disconnect()]);
+    await releaseSuiteLock?.();
+    await Promise.all([
+      second.$disconnect(),
+      third.$disconnect(),
+      lockClient.$disconnect(),
+    ]);
   });
 
   async function seed(options: {
@@ -540,7 +555,13 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
   ): QboClient {
     return {
       fetchTxn: vi.fn(async () => currentTxn(fixture)),
-      fetchPurchaseSnapshot: vi.fn(snapshots),
+      fetchPreparedSnapshot: vi.fn(snapshots),
+      fetchWriteSafety: vi.fn(async () => ({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })),
+      prepareRecategorization: vi.fn(async () => prepared(fixture)),
       preparePurchaseRecategorization: vi.fn(async () => prepared(fixture)),
       sendPreparedWrite,
     } as unknown as QboClient;
@@ -1103,6 +1124,7 @@ describePostgres('guarded live mutation PostgreSQL composition', () => {
             taxRateQboId: 'rate-generic',
             taxTypeApplicable: 'TaxOnAmount',
           }],
+          salesRates: [],
           sourceUpdatedAt: null,
         }]),
       }),

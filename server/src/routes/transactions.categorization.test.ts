@@ -22,7 +22,9 @@ const mocks = vi.hoisted(() => ({
   bulkPost: vi.fn(),
   commitStagedCategorization: vi.fn(),
   companyFindUnique: vi.fn(),
+  getTaxReadiness: vi.fn(),
   membershipFindUnique: vi.fn(),
+  mutationAttemptFindFirst: vi.fn(),
   mutationAttemptFindUnique: vi.fn(),
   isLiveReconciliationOwnedRequest: vi.fn(),
   loadLiveReconciliationRequest: vi.fn(),
@@ -57,7 +59,10 @@ vi.mock('../lib/prisma.js', () => ({
     company: { findUnique: mocks.companyFindUnique },
     membership: { findUnique: mocks.membershipFindUnique },
     qboAccount: { findFirst: mocks.qboAccountFindFirst },
-    qboMutationAttempt: { findUnique: mocks.mutationAttemptFindUnique },
+    qboMutationAttempt: {
+      findFirst: mocks.mutationAttemptFindFirst,
+      findUnique: mocks.mutationAttemptFindUnique,
+    },
     rule: { findMany: mocks.ruleFindMany },
     ruleTag: { findMany: mocks.ruleTagFindMany },
     session: { findUnique: mocks.sessionFindUnique },
@@ -85,6 +90,10 @@ vi.mock('../services/agent/liveReconciliation.js', () => ({
   isLiveReconciliationOwnedRequest: mocks.isLiveReconciliationOwnedRequest,
   loadLiveReconciliationRequest: mocks.loadLiveReconciliationRequest,
   reconcileLiveMutation: mocks.reconcileLiveMutation,
+}));
+
+vi.mock('../services/tax/reference.js', () => ({
+  getTaxReadiness: mocks.getTaxReadiness,
 }));
 
 vi.mock('../services/writeback.js', () => ({
@@ -137,9 +146,9 @@ const transactionRow = {
   revision: 1,
   category: null,
   categoryQboId: null,
-  taxCalculation: 'TaxInclusive',
-  taxCode: 'Standard tax',
-  taxCodeQboId: 'TAX_CODE_STANDARD',
+  taxCalculation: null,
+  taxCode: null,
+  taxCodeQboId: null,
   suggestion: null,
   errorCode: null,
   errorMessage: null,
@@ -209,6 +218,8 @@ beforeEach(() => {
   mocks.transactionFindUnique.mockResolvedValue(transactionRow);
   mocks.transactionCount.mockResolvedValue(1);
   mocks.companyFindUnique.mockResolvedValue({ id: COMPANY_ID, disconnectedAt: null });
+  mocks.getTaxReadiness.mockResolvedValue({ salesStatus: 'ready' });
+  mocks.mutationAttemptFindFirst.mockResolvedValue(null);
   mocks.mutationAttemptFindUnique.mockResolvedValue({ transactionId: TRANSACTION_ID });
   mocks.stageCategorization.mockResolvedValue(stagedResult);
   mocks.commitStagedCategorization.mockResolvedValue(verifiedResult);
@@ -256,7 +267,12 @@ describe('tax-aware categorization action routes', () => {
 
     const [dto] = await transactionDtos(
       COMPANY_ID,
-      [transactionRow as never],
+      [{
+        ...transactionRow,
+        taxCalculation: 'TaxInclusive',
+        taxCode: 'Standard tax',
+        taxCodeQboId: 'TAX_CODE_STANDARD',
+      } as never],
       new Map(),
     );
 
@@ -380,7 +396,7 @@ describe('tax-aware categorization action routes', () => {
     }));
   });
 
-  it('maps the legacy tax-ready Purchase guard to a stable conflict response', async () => {
+  it('maps the tax-aware staging guard to a transaction-neutral conflict response', async () => {
     mocks.postTransaction.mockRejectedValue({
       name: 'WritebackLifecycleError',
       code: 'TAX_AWARE_STAGING_REQUIRED',
@@ -393,10 +409,31 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(409);
     expect(response.body).toEqual({
-      error: 'Tax-ready Purchases must use staged categorization.',
+      error: 'Tax-ready transactions must use staged categorization.',
       code: 'TAX_AWARE_STAGING_REQUIRED',
     });
     expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['QBO_PERIOD_CLOSED', 409, 'QuickBooks has closed this accounting period.'],
+    ['QBO_TRANSACTION_LOCKED', 409, 'QuickBooks reports this transaction as cleared or reconciled.'],
+    ['QBO_WRITE_SAFETY_UNAVAILABLE', 503, 'QuickBooks write-safety status is unavailable.'],
+  ])('maps a legacy post result error %s to a bounded response', async (code, status, message) => {
+    mocks.postTransaction.mockResolvedValue({
+      id: TRANSACTION_ID,
+      ok: false,
+      status: 'PENDING',
+      error: { code, message: 'internal provider report detail' },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/post`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(status);
+    expect(response.body).toEqual({ error: message, code });
+    expect(JSON.stringify(response.body)).not.toMatch(/internal|provider|private|secret/i);
   });
 
   it('blocks direct legacy categorization for a tax-ready Purchase before local mutation', async () => {
@@ -424,7 +461,90 @@ describe('tax-aware categorization action routes', () => {
     expect(mocks.transactionUpdate).not.toHaveBeenCalled();
   });
 
-  it('maps the legacy tax-ready Purchase undo guard without mutating locally', async () => {
+  it('blocks direct legacy categorization for a tax-ready Deposit before local mutation', async () => {
+    mocks.transactionFindUnique.mockResolvedValue({ ...transactionRow, qboType: 'Deposit' });
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: null,
+      taxSupportStatus: 'needs_setup',
+      taxUsingSalesTax: true,
+    });
+    mocks.getTaxReadiness.mockResolvedValue({ salesStatus: 'ready' });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Generic prepared income',
+        categoryQboId: 'INCOME_ACCOUNT',
+      });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Tax-ready transactions must use staged categorization.',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(mocks.qboAccountFindFirst).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('allows direct legacy Deposit categorization when only purchase references are ready', async () => {
+    mocks.transactionFindUnique.mockResolvedValue({
+      ...transactionRow,
+      qboType: 'Deposit',
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    });
+    mocks.companyFindUnique.mockResolvedValue({
+      id: COMPANY_ID,
+      disconnectedAt: null,
+      taxSupportStatus: 'ready',
+      taxUsingSalesTax: true,
+    });
+    mocks.getTaxReadiness.mockResolvedValue({ salesStatus: 'needs_setup' });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Generic prepared income',
+        categoryQboId: 'INCOME_ACCOUNT',
+      });
+
+    expect(response.status).toBe(200);
+    expect(mocks.getTaxReadiness).toHaveBeenCalledWith(COMPANY_ID);
+    expect(mocks.transactionUpdate).toHaveBeenCalled();
+  });
+
+  it('blocks direct legacy Deposit categorization after staged tax readiness is lost', async () => {
+    mocks.transactionFindUnique.mockResolvedValue({
+      ...transactionRow,
+      qboType: 'Deposit',
+      taxCalculation: 'TaxInclusive',
+      qboMutationAttempts: [],
+    });
+    mocks.getTaxReadiness.mockResolvedValue({ salesStatus: 'needs_setup' });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Generic prepared income',
+        categoryQboId: 'INCOME_ACCOUNT',
+      });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Tax-ready transactions must use staged categorization.',
+      code: 'TAX_AWARE_STAGING_REQUIRED',
+    });
+    expect(mocks.getTaxReadiness).not.toHaveBeenCalled();
+    expect(mocks.qboAccountFindFirst).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('maps the tax-aware undo guard without mutating locally', async () => {
     mocks.undoPost.mockRejectedValue({
       name: 'WritebackLifecycleError',
       code: 'TAX_AWARE_STAGING_REQUIRED',
@@ -437,7 +557,7 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(409);
     expect(response.body).toEqual({
-      error: 'Tax-ready Purchases must use staged categorization.',
+      error: 'Tax-ready transactions must use staged categorization.',
       code: 'TAX_AWARE_STAGING_REQUIRED',
     });
     expect(mocks.transactionUpdate).not.toHaveBeenCalled();
@@ -678,6 +798,46 @@ describe('tax-aware categorization action routes', () => {
     expect(JSON.stringify(response.body)).not.toContain('unsafe');
   });
 
+  it('maps a tax-code direction mismatch to a bounded client response', async () => {
+    mocks.stageCategorization.mockRejectedValue({
+      name: 'CategorizationError',
+      code: 'TAX_CODE_PURCHASE_ONLY',
+      message: 'internal tax component direction detail',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: 'A selected tax code is unsupported.',
+      code: 'TAX_CODE_PURCHASE_ONLY',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('internal');
+  });
+
+  it('maps an unsupported taxed transaction type without a Purchase-only message', async () => {
+    mocks.stageCategorization.mockRejectedValue({
+      name: 'CategorizationError',
+      code: 'TAX_REQUIRES_PURCHASE',
+      message: 'internal transaction type detail',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: 'Tax selection is unsupported for this transaction type.',
+      code: 'TAX_REQUIRES_PURCHASE',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('internal');
+  });
+
   it('maps an active staging attempt to a stable bounded resume conflict', async () => {
     mocks.stageCategorization.mockRejectedValue({
       name: 'CategorizationError',
@@ -791,6 +951,64 @@ describe('tax-aware categorization action routes', () => {
       error: 'Transaction not found.',
       code: 'TRANSACTION_NOT_FOUND',
     });
+  });
+
+  it.each([
+    ['QBO_PERIOD_CLOSED', 'QuickBooks has closed this accounting period.'],
+    ['QBO_TRANSACTION_LOCKED', 'QuickBooks reports this transaction as cleared or reconciled.'],
+    ['QBO_WRITE_SAFETY_UNAVAILABLE', 'QuickBooks write-safety status is unavailable.'],
+  ])('maps %s to a bounded conflict response', async (code, message) => {
+    mocks.commitStagedCategorization.mockRejectedValue({
+      name: 'QboWriteSafetyError',
+      code,
+      message: 'internal provider report detail',
+      report: { privateNote: 'secret' },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(code === 'QBO_WRITE_SAFETY_UNAVAILABLE' ? 503 : 409);
+    expect(response.body).toEqual({ error: message, code });
+    expect(JSON.stringify(response.body)).not.toMatch(/internal|provider|private|secret/i);
+  });
+
+  it.each([
+    [
+      'QBO_DEPOSIT_UNSUPPORTED',
+      'This transaction cannot use tax-aware Deposit writeback.',
+    ],
+    [
+      'QBO_REFERENCE_MISSING',
+      'Required QuickBooks references are unavailable.',
+    ],
+    [
+      'QBO_AMOUNT_UNSAFE',
+      'The transaction amount cannot be categorized safely.',
+    ],
+    [
+      'QBO_ENTITY_UNSUPPORTED',
+      'This transaction type cannot use tax-aware writeback.',
+    ],
+  ])('maps %s preparation failures to bounded client responses', async (code, message) => {
+    mocks.commitStagedCategorization.mockRejectedValue({
+      name: 'QboPreparationError',
+      code,
+      message: 'internal raw entity and reference detail',
+      rawPayload: { privateNote: 'secret' },
+      stack: 'internal stack',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: message, code });
+    expect(JSON.stringify(response.body)).not.toMatch(/raw|private|secret|stack|internal/i);
   });
 
   it.each([
@@ -1002,7 +1220,7 @@ describe('tax-aware categorization action routes', () => {
     ['unsupported readiness', 'Purchase', 'unsupported', true],
     ['setup-incomplete readiness', 'Purchase', 'needs_setup', true],
     ['tax disabled', 'Purchase', 'ready', false],
-    ['non-Purchase transaction', 'Deposit', 'ready', true],
+    ['unsupported transaction', 'JournalEntry', 'ready', true],
   ] as const)('preserves direct legacy categorization for %s', async (
     _case,
     qboType,

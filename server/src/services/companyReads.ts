@@ -13,7 +13,7 @@ import type {
   TransactionDto,
   TxnStatus,
 } from '@recat/shared';
-import { isUsableTaxCodeDto } from '@recat/shared';
+import { isUsableSalesTaxCodeDto, isUsableTaxCodeDto } from '@recat/shared';
 import { env } from '../env.js';
 import { HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
@@ -629,6 +629,10 @@ function taxCodeDto(row: Row): TaxCodeDto {
       row.combinedPurchaseRate === null || row.combinedPurchaseRate === undefined
         ? null
         : Number(row.combinedPurchaseRate),
+    combinedSalesRate:
+      row.combinedSalesRate === null || row.combinedSalesRate === undefined
+        ? null
+        : Number(row.combinedSalesRate),
   };
 }
 
@@ -640,7 +644,13 @@ export function boundedTaxReadiness(
   readiness: TaxReadinessDto,
   limit = MAX_READ_LIMIT,
 ): TaxReadinessDto {
-  return { ...readiness, taxCodes: eligibleTaxCodes(readiness).slice(0, limit) };
+  return {
+    ...readiness,
+    taxCodes: eligibleTaxCodes(readiness).slice(0, limit),
+    salesTaxCodes: readiness.salesTaxCodes
+      .filter(isUsableSalesTaxCodeDto)
+      .slice(0, limit),
+  };
 }
 
 function tagDto(row: Row): TagDto {
@@ -715,6 +725,9 @@ export function createCompanyReadService(
               usingSalesTax: null,
               refreshedAt: null,
               taxCodes: rows.map(taxCodeDto).filter(isUsableTaxCodeDto),
+              salesStatus: 'needs_setup',
+              salesReason: null,
+              salesTaxCodes: rows.map(taxCodeDto).filter(isUsableSalesTaxCodeDto),
             };
           }),
     suggestForMany:

@@ -601,12 +601,21 @@ describePostgres('transfer operation PostgreSQL durability', () => {
         untouchedLineHashes: [],
       },
     };
+    const fetchPreparedSnapshot = vi.fn(async () => structuredClone(before));
+    const prepareRecategorization = vi.fn(async () =>
+      structuredClone(preparedCategorization));
     const writebackClient = {
       fetchTxn: vi.fn(async () =>
         structuredClone(fixture.fresh.get(transaction.qboId) ?? null)),
-      fetchPurchaseSnapshot: vi.fn(async () => structuredClone(before)),
-      preparePurchaseRecategorization: vi.fn(async () =>
-        structuredClone(preparedCategorization)),
+      fetchPreparedSnapshot,
+      fetchWriteSafety: vi.fn(async () => ({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })),
+      prepareRecategorization,
+      fetchPurchaseSnapshot: fetchPreparedSnapshot,
+      preparePurchaseRecategorization: prepareRecategorization,
       sendPreparedWrite: vi.fn(async () => {
         throw new Error('lost-lease categorization must not send');
       }),

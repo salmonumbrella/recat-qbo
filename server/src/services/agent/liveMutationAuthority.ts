@@ -57,6 +57,7 @@ interface TaxCodeAuthorityRow {
   readonly active: boolean;
   readonly taxable: boolean | null;
   readonly purchaseTaxRateList: unknown;
+  readonly salesTaxRateList: unknown;
   readonly sourceUpdatedAt: Date | string | null;
 }
 
@@ -302,7 +303,7 @@ async function lockAndAssertReferenceAuthority(
   );
   const codes = await db.$queryRawUnsafe<TaxCodeAuthorityRow[]>(
     `SELECT "qboId", "name", "description", "active", "taxable",
-            "purchaseTaxRateList", "sourceUpdatedAt"
+            "purchaseTaxRateList", "salesTaxRateList", "sourceUpdatedAt"
        FROM "QboTaxCode"
       WHERE "companyId" = $1
       ORDER BY "qboId"
@@ -321,6 +322,7 @@ async function lockAndAssertReferenceAuthority(
       active: code.active,
       taxable: code.taxable,
       purchaseRates: purchaseRates(code.purchaseTaxRateList),
+      salesRates: purchaseRates(code.salesTaxRateList),
       sourceUpdatedAt: isoDate(code.sourceUpdatedAt),
     })),
     rates: rates.map((rate) => ({

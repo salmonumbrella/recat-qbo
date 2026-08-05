@@ -35,7 +35,11 @@ import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
 import RulePrompt from '../components/RulePrompt';
-import TaxCodePicker from '../components/TaxCodePicker';
+import TaxCodePicker, {
+  isUsableTaxCodeForDirection,
+  usableTaxCodesForDirection,
+} from '../components/TaxCodePicker';
+import type { TaxDirection } from '../components/TaxCodePicker';
 import { AutopilotQueueStatus } from './settings/AutopilotCard';
 import AttachmentPanel from '../components/AttachmentPanel';
 
@@ -375,10 +379,50 @@ export default function Queue() {
     [accounts],
   );
 
+  const taxDirectionFor = useCallback(
+    (t: TransactionDto): TaxDirection | null =>
+      t.qboType === 'Purchase' ? 'purchase' : t.qboType === 'Deposit' ? 'sales' : null,
+    [],
+  );
+
   const taxReadyFor = useCallback(
+    (t: TransactionDto): boolean => {
+      const direction = taxDirectionFor(t);
+      return direction === 'purchase'
+        ? taxReadiness?.status === 'ready'
+        : direction === 'sales'
+          ? taxReadiness?.salesStatus === 'ready'
+          : false;
+    },
+    [taxDirectionFor, taxReadiness],
+  );
+
+  const taxLabelFor = useCallback(
+    (t: TransactionDto): 'Purchase tax' | 'Sales tax' =>
+      taxDirectionFor(t) === 'sales' ? 'Sales tax' : 'Purchase tax',
+    [taxDirectionFor],
+  );
+
+  const taxCodesFor = useCallback(
+    (t: TransactionDto) =>
+      usableTaxCodesForDirection(taxReadiness, taxDirectionFor(t) ?? 'purchase'),
+    [taxDirectionFor, taxReadiness],
+  );
+
+  const isTaxCodeUsableFor = useCallback(
+    (t: TransactionDto, qboId: string): boolean =>
+      isUsableTaxCodeForDirection(taxReadiness, taxDirectionFor(t) ?? 'purchase', qboId),
+    [taxDirectionFor, taxReadiness],
+  );
+
+  const usesTaxLifecycleFor = useCallback(
     (t: TransactionDto): boolean =>
-      t.qboType === 'Purchase' && taxReadiness?.status === 'ready',
-    [taxReadiness],
+      taxDirectionFor(t) !== null && (
+        taxReadyFor(t) ||
+        t.taxCalculation !== null ||
+        taxState(t).mutation !== null
+      ),
+    [taxDirectionFor, taxReadyFor, taxState],
   );
 
   // Category options: real categories only — no bank/credit-card accounts,
@@ -626,7 +670,10 @@ export default function Queue() {
       for (const line of sourceLines) {
         const grossCents = exactCents(line.amount);
         if (grossCents === null || !line.categoryQboId) return null;
-        if (taxCalculation !== 'NotApplicable' && line.taxCodeQboId === null) return null;
+        if (
+          taxCalculation !== 'NotApplicable' &&
+          (line.taxCodeQboId === null || !isTaxCodeUsableFor(t, line.taxCodeQboId))
+        ) return null;
         lines.push({
           grossCents,
           categoryQboId: line.categoryQboId,
@@ -642,7 +689,7 @@ export default function Queue() {
         tagIds: [...t.tagIds],
       };
     },
-    [qboIdOf],
+    [qboIdOf, isTaxCodeUsableFor],
   );
 
   const stageTax = useCallback(
@@ -651,7 +698,7 @@ export default function Queue() {
       const current = taxState(t);
       const body = stageBodyFor(t, current);
       if (!body) {
-        toast('Choose a valid category and purchase tax for every line');
+        toast('Choose a valid category and tax code for every line');
         return;
       }
       const capturedVersion = taxVersionsRef.current[t.id] ?? current.version;
@@ -1076,7 +1123,7 @@ export default function Queue() {
   const undoTax = useCallback(
     (t: TransactionDto) => {
       if (!window.confirm(
-        'Undo this categorization in QuickBooks?\nThis will restore the original Purchase exactly.',
+        `Undo this categorization in QuickBooks?\nThis will restore the original ${t.qboType === 'Deposit' ? 'Deposit' : 'Purchase'} exactly.`,
       )) return;
       const requestId = createCategorizationRequestId();
       const mutation: TaxMutationState = {
@@ -1303,15 +1350,20 @@ export default function Queue() {
 
   const bulkPost = useCallback(async () => {
     if (!activeCompanyId) return;
-    if (!selReady.length) {
-      const hasTaxReadySelection = selPend.some((id) => {
-        const selected = rows.find((row) => row.id === id);
-        return selected ? taxReadyFor(selected) : false;
-      });
+    const taxLifecycleSelection = selPend
+      .map((id) => rows.find((row) => row.id === id))
+      .filter((row): row is TransactionDto => !!row && usesTaxLifecycleFor(row));
+    if (taxLifecycleSelection.length) {
       toast(
-        hasTaxReadySelection
-          ? 'Tax-ready purchases must be previewed and posted individually'
-          : tagsRequired
+        taxLifecycleSelection.some((row) => row.qboType === 'Deposit')
+          ? 'Tax-ready transactions must be previewed and posted individually'
+          : 'Tax-ready purchases must be previewed and posted individually',
+      );
+      return;
+    }
+    if (!selReady.length) {
+      toast(
+        tagsRequired
           ? 'Selection needs a category and at least one tag each'
           : 'Pick a category for the selection first',
       );
@@ -1354,6 +1406,7 @@ export default function Queue() {
     selPend,
     rows,
     taxReadyFor,
+    usesTaxLifecycleFor,
     tagsRequired,
     fetchAllTxns,
     toast,
@@ -1655,6 +1708,8 @@ export default function Queue() {
       return null;
     }
     const state = taxState(t);
+    const direction = taxDirectionFor(t);
+    const taxLabel = taxLabelFor(t);
     const isSplit = !!(t.splits && t.splits.length);
     const locked = hasActiveMutation(t);
     const canStage =
@@ -1675,8 +1730,9 @@ export default function Queue() {
         {!isSplit && (
           <TaxCodePicker
             id={`tax-code-${t.id}`}
-            label={`Purchase tax for ${t.payee}`}
+            label={`${taxLabel} for ${t.payee}`}
             readiness={taxReadiness}
+            direction={direction ?? 'purchase'}
             value={state.taxCodeQboId}
             disabled={locked}
             onChange={(taxCodeQboId) => {
@@ -1684,7 +1740,7 @@ export default function Queue() {
               patchRow(t.id, {
                 taxCodeQboId,
                 taxCode:
-                  taxReadiness?.taxCodes.find((code) => code.qboId === taxCodeQboId)?.name ?? null,
+                  taxCodesFor(t).find((code) => code.qboId === taxCodeQboId)?.name ?? null,
               });
               invalidateTaxStage(t, {
                 taxCodeQboId,
@@ -1902,10 +1958,7 @@ export default function Queue() {
   };
 
   const statusCell = (v: RowView, mobile: boolean) => {
-    const usesTaxLifecycle =
-      v.t.qboType === 'Purchase' &&
-      (taxReadyFor(v.t) || v.t.taxCalculation !== null || taxState(v.t).mutation !== null);
-    if (usesTaxLifecycle) return taxStatusCell(v, mobile);
+    if (usesTaxLifecycleFor(v.t)) return taxStatusCell(v, mobile);
     return (
     <>
       {v.ready && (

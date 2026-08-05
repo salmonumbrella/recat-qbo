@@ -1,24 +1,25 @@
-import type { QboPurchaseSnapshot } from '../../lib/qbo/types.js';
+import type {
+  QboDepositExpectedState,
+  QboDepositSnapshot,
+  QboPreparedWrite,
+  QboPurchaseExpectedState,
+  QboPurchaseSnapshot,
+} from '../../lib/qbo/types.js';
 import {
   purchaseTargetLineMatches,
   purchaseTotalTaxMatches,
 } from '../../lib/qbo/purchaseTax.js';
 
 type PurchaseLine = QboPurchaseSnapshot['lines'][number];
+type DepositLine = QboDepositSnapshot['lines'][number];
 
-export interface ExpectedPurchaseResult {
-  qboId: string;
-  totalCents: number;
-  accountQboId: string | null;
-  date: string;
-  direction: QboPurchaseSnapshot['direction'];
-  globalTaxCalculation: string | null;
-  totalTaxCents: number | null;
-  targetLines: PurchaseLine[];
-  untouchedLineHashes: string[];
-}
+export type ExpectedPurchaseResult = QboPurchaseExpectedState;
+export type ExpectedDepositResult = QboDepositExpectedState;
 
-export type PurchaseVerification = { ok: true } | { ok: false; code: 'QBO_STATE_DRIFT'; message: string };
+export type VerificationResult =
+  | { ok: true }
+  | { ok: false; code: 'QBO_STATE_DRIFT'; message: string };
+export type PurchaseVerification = VerificationResult;
 
 export function canonicalPurchaseLineHash(line: PurchaseLine): string {
   return JSON.stringify([
@@ -76,7 +77,36 @@ function omittedInclusiveTotalTaxMatches(
   }
   return derivedTotalTaxCents === expectedTotalTaxCents;
 }
-function drift(message: string): PurchaseVerification {
+export function canonicalDepositLineHash(line: DepositLine): string {
+  return JSON.stringify([
+    line.rawHash,
+    line.id,
+    line.amountCents,
+    line.description,
+    line.accountQboId,
+    line.entityQboId,
+    line.paymentMethodQboId,
+    line.classQboId,
+    line.taxCodeQboId,
+    line.taxApplicableOn,
+  ]);
+}
+
+function targetDepositLineHash(line: DepositLine): string {
+  return JSON.stringify([
+    line.targetHash,
+    line.amountCents,
+    line.description,
+    line.accountQboId,
+    line.entityQboId,
+    line.paymentMethodQboId,
+    line.classQboId,
+    line.taxCodeQboId,
+    line.taxApplicableOn,
+  ]);
+}
+
+function drift(message: string): VerificationResult {
   return { ok: false, code: 'QBO_STATE_DRIFT', message };
 }
 
@@ -125,4 +155,86 @@ export function verifyPurchaseResult(
   }
 
   return { ok: true };
+}
+
+export function verifyDepositResult(
+  expected: ExpectedDepositResult,
+  actual: QboDepositSnapshot,
+): VerificationResult {
+  if (actual.qboId !== expected.qboId) return drift('Deposit ID changed.');
+  if (actual.totalCents !== expected.totalCents) return drift('Deposit total changed.');
+  if (actual.depositToAccountQboId !== expected.depositToAccountQboId) {
+    return drift('Deposit account changed.');
+  }
+  if (actual.date !== expected.date) return drift('Deposit date changed.');
+  if (actual.globalTaxCalculation !== expected.globalTaxCalculation) {
+    return drift('Deposit global tax mode changed.');
+  }
+  if (actual.totalTaxCents !== expected.totalTaxCents) return drift('Deposit total tax changed.');
+  if (actual.preservedHash !== expected.preservedHash) {
+    return drift('Deposit preserved fields changed.');
+  }
+
+  const remainingLines = [...actual.lines];
+  for (const untouchedHash of expected.untouchedLineHashes) {
+    const untouchedIndex = remainingLines.findIndex(
+      (line) => canonicalDepositLineHash(line) === untouchedHash,
+    );
+    if (untouchedIndex === -1) return drift('Untouched Deposit lines changed.');
+    remainingLines.splice(untouchedIndex, 1);
+  }
+  for (const targetLine of expected.targetLines) {
+    const targetIndex = remainingLines.findIndex(
+      (line) =>
+        (targetLine.id === null || line.id === targetLine.id) &&
+        targetDepositLineHash(line) === targetDepositLineHash(targetLine),
+    );
+    if (targetIndex === -1) return drift('Expected target Deposit line is missing or changed.');
+    remainingLines.splice(targetIndex, 1);
+  }
+
+  if (remainingLines.length !== 0) {
+    return drift('Untouched Deposit lines changed.');
+  }
+
+  return { ok: true };
+}
+
+function isPurchaseSnapshot(
+  actual: QboPurchaseSnapshot | QboDepositSnapshot,
+): actual is QboPurchaseSnapshot {
+  return (
+    'accountQboId' in actual &&
+    'direction' in actual &&
+    !('depositToAccountQboId' in actual)
+  );
+}
+
+function isDepositSnapshot(
+  actual: QboPurchaseSnapshot | QboDepositSnapshot,
+): actual is QboDepositSnapshot {
+  return (
+    'depositToAccountQboId' in actual &&
+    !('accountQboId' in actual) &&
+    !('direction' in actual)
+  );
+}
+
+export function verifyPreparedResult(
+  prepared: QboPreparedWrite,
+  actual: QboPurchaseSnapshot | QboDepositSnapshot,
+): VerificationResult {
+  if (prepared.qboType === 'Purchase') {
+    if (!isPurchaseSnapshot(actual)) {
+      return drift('Prepared Purchase received a mismatched snapshot kind.');
+    }
+    return verifyPurchaseResult(prepared.expected, actual);
+  }
+  if (prepared.qboType === 'Deposit') {
+    if (!isDepositSnapshot(actual)) {
+      return drift('Prepared Deposit received a mismatched snapshot kind.');
+    }
+    return verifyDepositResult(prepared.expected, actual);
+  }
+  return drift('Prepared write has an unsupported transaction kind.');
 }

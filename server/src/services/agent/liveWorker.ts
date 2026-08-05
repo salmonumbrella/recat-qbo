@@ -790,6 +790,7 @@ interface LocalTaxCodeRow {
   readonly active: boolean;
   readonly taxable: boolean | null;
   readonly purchaseTaxRateList: unknown;
+  readonly salesTaxRateList: unknown;
   readonly sourceUpdatedAt: Date | null;
 }
 
@@ -1419,7 +1420,7 @@ async function loadProductionFreshLocal(
     const [codes, rates, providerBinding] = await Promise.all([
       tx.$queryRawUnsafe<LocalTaxCodeRow[]>(
         `SELECT "qboId", "name", "description", "active", "taxable",
-           "purchaseTaxRateList", "sourceUpdatedAt"
+           "purchaseTaxRateList", "salesTaxRateList", "sourceUpdatedAt"
          FROM "QboTaxCode"
          WHERE "companyId" = $1
          ORDER BY "qboId"`,
@@ -1500,6 +1501,7 @@ async function loadProductionFreshLocal(
             active: code.active,
             taxable: code.taxable,
             purchaseRates: purchaseRates(code.purchaseTaxRateList),
+            salesRates: purchaseRates(code.salesTaxRateList),
             sourceUpdatedAt: code.sourceUpdatedAt?.toISOString() ?? null,
           })),
           rates: rates.map((rate) => ({

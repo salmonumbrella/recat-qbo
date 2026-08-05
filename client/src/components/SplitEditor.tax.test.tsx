@@ -20,13 +20,18 @@ const READY: TaxReadinessDto = {
     active: true,
     taxable: true,
     combinedPurchaseRate: 5,
+    combinedSalesRate: null,
   }, {
     qboId: 'TAX_CODE_EXPLICIT_NONE',
     name: 'Explicit non-tax treatment',
     active: true,
     taxable: false,
     combinedPurchaseRate: null,
+    combinedSalesRate: null,
   }],
+  salesStatus: 'needs_setup',
+  salesReason: null,
+  salesTaxCodes: [],
 };
 
 const TXN: TransactionDto = {
@@ -72,6 +77,20 @@ const TXN: TransactionDto = {
   postedAt: null,
   postedBy: null,
   activeCategorizationAttempt: null,
+};
+
+const SALES_READY: TaxReadinessDto = {
+  ...READY,
+  salesStatus: 'ready',
+  salesReason: null,
+  salesTaxCodes: [{
+    qboId: 'SALES_TAX_CODE',
+    name: 'Standard sales tax',
+    active: true,
+    taxable: true,
+    combinedPurchaseRate: null,
+    combinedSalesRate: 5,
+  }],
 };
 
 describe('SplitEditor tax fields', () => {
@@ -133,6 +152,9 @@ describe('SplitEditor tax fields', () => {
           usingSalesTax: false,
           refreshedAt: null,
           taxCodes: [],
+          salesStatus: 'unsupported',
+          salesReason: 'Sales tax is disabled.',
+          salesTaxCodes: [],
         }}
         onClose={vi.fn()}
         onSave={vi.fn()}
@@ -144,12 +166,22 @@ describe('SplitEditor tax fields', () => {
     expect(screen.getByRole('button', { name: /save split/i })).toBeEnabled();
   });
 
-  it('allows taxable and explicit supported non-tax codes in the same split', async () => {
+  it('does not offer or accept an explicit non-tax code in taxed mode', async () => {
     const onSave = vi.fn();
     const user = userEvent.setup();
     render(
       <SplitEditor
-        txn={TXN}
+        txn={{
+          ...TXN,
+          splits: [
+            TXN.splits![0]!,
+            {
+              ...TXN.splits![1]!,
+              taxCode: 'Explicit non-tax treatment',
+              taxCodeQboId: 'TAX_CODE_EXPLICIT_NONE',
+            },
+          ],
+        }}
         tags={[]}
         catOpts={[{ group: 'Expenses', name: 'Generic expense' }]}
         taxReadiness={READY}
@@ -158,22 +190,17 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      'TAX_CODE_EXPLICIT_NONE',
-    );
+    expect(screen.queryByRole('option', { name: 'Explicit non-tax treatment' }))
+      .not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
-    expect(onSave).toHaveBeenCalledWith(
-      [
-        expect.objectContaining({ taxCodeQboId: 'TAX_CODE_STANDARD' }),
-        expect.objectContaining({ taxCodeQboId: 'TAX_CODE_EXPLICIT_NONE' }),
-      ],
-      'TaxInclusive',
+    expect(onSave).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      'Select a usable purchase tax code for every taxed split line.',
     );
   });
 
-  it('explains that blank No tax is valid only when every split line is blank', async () => {
+  it('explains that every split must be entirely taxable or entirely No tax', async () => {
     const onSave = vi.fn();
     const user = userEvent.setup();
     render(
@@ -195,7 +222,79 @@ describe('SplitEditor tax fields', () => {
 
     expect(onSave).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith(
-      'Blank No tax is valid only when every split line is No tax. Use an explicit supported non-tax code to mix treatments.',
+      'Use a supported taxable code on every split line, or choose No tax on every split line.',
+    );
+  });
+
+  it('uses sales tax labels and codes for a tax-ready Deposit while retaining line memo and tags', async () => {
+    const onSave = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SplitEditor
+        txn={{
+          ...TXN,
+          qboType: 'Deposit',
+          amount: 10.5,
+          splits: TXN.splits!.map((line) => ({
+            ...line,
+            amount: Math.abs(line.amount),
+            taxCode: null,
+            taxCodeQboId: null,
+            tagIds: ['TAG_GENERIC'],
+          })),
+        }}
+        tags={[{ id: 'TAG_GENERIC', companyId: 'COMPANY_GENERIC', name: 'Generic tag', color: '#667788' }]}
+        catOpts={[{ group: 'Income', name: 'Generic expense' }]}
+        taxReadiness={SALES_READY}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />,
+    );
+
+    expect(screen.getByLabelText('Sales tax for split line 1')).toHaveTextContent('Standard sales tax');
+    expect(screen.queryByLabelText('Purchase tax for split line 1')).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText('Sales tax for split line 1'), 'SALES_TAX_CODE');
+    await user.selectOptions(screen.getByLabelText('Sales tax for split line 2'), 'SALES_TAX_CODE');
+    await user.click(screen.getByRole('button', { name: /save split/i }));
+
+    expect(onSave).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ memo: 'First memo', tags: ['TAG_GENERIC'], taxCodeQboId: 'SALES_TAX_CODE' }),
+        expect.objectContaining({ memo: 'Second memo', tags: ['TAG_GENERIC'], taxCodeQboId: 'SALES_TAX_CODE' }),
+      ]),
+      'TaxInclusive',
+    );
+  });
+
+  it('does not save a sales-ready Deposit split with stale purchase tax IDs', async () => {
+    const onSave = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SplitEditor
+        txn={{
+          ...TXN,
+          qboType: 'Deposit',
+          amount: 10.5,
+          taxCalculation: 'TaxInclusive',
+          splits: TXN.splits!.map((line) => ({
+            ...line,
+            amount: Math.abs(line.amount),
+            taxCodeQboId: 'TAX_CODE_STANDARD',
+          })),
+        }}
+        tags={[]}
+        catOpts={[{ group: 'Income', name: 'Generic expense' }]}
+        taxReadiness={SALES_READY}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /save split/i }));
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      'Select a usable sales tax code for every taxed split line.',
     );
   });
 });

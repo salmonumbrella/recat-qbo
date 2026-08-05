@@ -68,13 +68,15 @@ interface FakeState {
     active: boolean;
     taxable: boolean | null;
     purchaseTaxRateList: unknown;
+    salesTaxRateList: unknown;
+    combinedSalesRate: number | string | null;
   }[];
   taxRates: {
     companyId: string;
     qboId: string;
     name: string;
     active: boolean;
-    rateValue: number;
+    rateValue: number | null;
   }[];
   companies: {
     id: string;
@@ -205,12 +207,21 @@ class FakeCategorizationDb implements CategorizationDb {
       );
     this.qboTaxCode.findMany = async ({ where }) =>
       this.state.taxCodes.filter(
-        (row) => row.companyId === where.companyId && matchesScalar(row.qboId, where.qboId),
+        (row) =>
+          row.companyId === where.companyId &&
+          (where.qboId === undefined || matchesScalar(row.qboId, where.qboId)),
       );
-    this.qboTaxRate.findMany = async ({ where }) =>
-      this.state.taxRates.filter(
-        (row) => row.companyId === where.companyId && row.active === where.active,
+    this.qboTaxRate.findMany = async ({ where }) => {
+      const rows = this.state.taxRates.filter(
+        (row) =>
+          row.companyId === where.companyId
+          && (where.active === undefined || row.active === where.active),
       );
+      if (rows.some((row) => row.rateValue === null) && where.rateValue?.not !== null) {
+        throw new Error('Prisma cannot decode a legacy null tax rate through a non-null model field.');
+      }
+      return rows.filter((row) => where.rateValue?.not !== null || row.rateValue !== null);
+    };
     this.qboMutationAttempt.findFirst = async ({ where }) => {
       const attempt = this.state.attempts.find(
         (row) =>
@@ -310,6 +321,11 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
         taxRateQboId: 'TAX_RATE_STANDARD',
         taxTypeApplicable: 'TaxOnAmount',
       }],
+      salesTaxRateList: [{
+        taxRateQboId: 'TAX_RATE_SALES',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+      combinedSalesRate: 7,
     }],
     taxRates: [{
       companyId: COMPANY_ID,
@@ -317,6 +333,12 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       name: 'Standard purchase rate',
       active: true,
       rateValue: 5,
+    }, {
+      companyId: COMPANY_ID,
+      qboId: 'TAX_RATE_SALES',
+      name: 'Standard sales rate',
+      active: true,
+      rateValue: 7,
     }],
     companies: [{
       id: COMPANY_ID,
@@ -692,7 +714,11 @@ describe('stageCategorization', () => {
     });
 
     expect(findMany).toHaveBeenCalledWith({
-      where: { companyId: COMPANY_ID, active: true },
+      where: {
+        companyId: COMPANY_ID,
+        active: true,
+        rateValue: { not: null },
+      },
     });
   });
 
@@ -793,11 +819,11 @@ describe('stageCategorization', () => {
     expect(db.state.splits.map((line) => line.amount)).toEqual([-10.5, -10.5]);
   });
 
-  it('calculates and stages TaxExcluded totals on the server', async () => {
+  it('reconstructs TaxExcluded Purchase totals from the fixed client line total', async () => {
     const staged = await stageCategorization(input({
       ...standardProposal,
       taxCalculation: 'TaxExcluded',
-      lines: [{ ...standardProposal.lines[0]!, grossCents: -1000 }],
+      lines: [{ ...standardProposal.lines[0]!, grossCents: -1050 }],
     }), testDeps(db));
 
     expect(staged.totals).toEqual({
@@ -873,6 +899,18 @@ describe('stageCategorization', () => {
     expect(db.transactionCalls).toBe(1);
   });
 
+  it('rejects an explicit non-tax code in taxed mode without inventing its treatment', async () => {
+    db.state.taxCodes[0]!.taxable = false;
+    db.state.taxCodes[0]!.purchaseTaxRateList = [];
+
+    await expectCode(
+      stageCategorization(input(), testDeps(db)),
+      'TAX_TREATMENT_AMBIGUOUS',
+    );
+
+    expect(db.transactionCalls).toBe(1);
+  });
+
   it('preserves the non-tax workflow for NotApplicable', async () => {
     const staged = await stageCategorization(input({
       taxCalculation: 'NotApplicable',
@@ -898,12 +936,195 @@ describe('stageCategorization', () => {
     expect(db.state.splits[0]).toMatchObject({ taxCode: null, taxCodeQboId: null });
   });
 
-  it('rejects tax selection for a non-Purchase transaction', async () => {
+  it('stages positive Deposit sales tax from sales rate references', async () => {
     db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.companies[0]!.taxSupportStatus = 'needs_setup';
+    db.state.taxCodes[0]!.name = 'Generic sales tax';
+
+    const staged = await stageCategorization(input({
+      ...standardProposal,
+      lines: [{
+        ...standardProposal.lines[0]!,
+        grossCents: 10_700,
+        memo: 'Generic deposit line',
+      }],
+    }), testDeps(db));
+
+    expect(staged.totals).toEqual({
+      subtotalCents: 10_000,
+      taxCents: 700,
+      totalCents: 10_700,
+    });
+    expect(staged.lines[0]).toMatchObject({
+      subtotalCents: 10_000,
+      taxCents: 700,
+      totalCents: 10_700,
+      taxCodeQboId: 'TAX_CODE_STANDARD',
+    });
+    expect(db.state.splits[0]).toMatchObject({
+      amount: 107,
+      taxCode: 'Generic sales tax',
+      taxCodeQboId: 'TAX_CODE_STANDARD',
+    });
+  });
+
+  it('ignores an inactive legacy tax-rate row with a null value when staging a Deposit', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.companies[0]!.taxSupportStatus = 'needs_setup';
+    db.state.taxRates.push({
+      companyId: COMPANY_ID,
+      qboId: 'LEGACY_NULL_RATE',
+      name: 'Legacy inactive rate',
+      active: false,
+      rateValue: null,
+    });
+
+    await expect(stageCategorization(input({
+      ...standardProposal,
+      lines: [{
+        ...standardProposal.lines[0]!,
+        grossCents: 10_700,
+      }],
+    }), testDeps(db))).resolves.toMatchObject({
+      totals: {
+        subtotalCents: 10_000,
+        taxCents: 700,
+        totalCents: 10_700,
+      },
+    });
+  });
+
+  it('rejects a negative Deposit amount even when every line has the same negative sign', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    const before = structuredClone(db.state);
+
+    await expectCode(stageCategorization(input(), testDeps(db)), 'UNBALANCED_TOTAL');
+
+    expect(db.state).toEqual(before);
+  });
+
+  it('rejects JournalEntry tax selection', async () => {
+    db.state.transactions[0]!.qboType = 'JournalEntry';
 
     await expectCode(stageCategorization(input(), testDeps(db)), 'TAX_REQUIRES_PURCHASE');
 
     expect(db.transactionCalls).toBe(1);
+  });
+
+  it('requires sales tax readiness for a Deposit', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.companies[0]!.taxSupportStatus = 'ready';
+    db.state.taxCodes[0]!.salesTaxRateList = [];
+
+    await expectCode(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db)), 'TAX_NOT_READY');
+  });
+
+  it.each([
+    ['missing', null],
+    ['malformed', 'not-a-rate'],
+  ] as const)('rejects a Deposit when cached combined sales rate is %s', async (_case, combinedSalesRate) => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.taxCodes[0]!.combinedSalesRate = combinedSalesRate;
+
+    await expectCode(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db)), 'TAX_NOT_READY');
+  });
+
+  it('rejects cached Deposit tax references after a recorded refresh failure', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.companies[0]!.taxSupportReason = 'Tax reference refresh failed.';
+
+    await expectCode(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db)), 'TAX_NOT_READY');
+  });
+
+  it('rejects a purchase-only tax code for a Deposit', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.taxCodes[0]!.salesTaxRateList = [];
+    db.state.taxCodes.push({
+      ...db.state.taxCodes[0]!,
+      qboId: 'TAX_CODE_SALES_READY',
+      purchaseTaxRateList: [],
+      salesTaxRateList: [{
+        taxRateQboId: 'TAX_RATE_SALES',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+    });
+
+    await expectCode(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db)), 'TAX_CODE_PURCHASE_ONLY');
+  });
+
+  it('reconstructs exact TaxExcluded Deposit splits from fixed client line totals', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 0.21;
+
+    const staged = await stageCategorization(input({
+      ...standardProposal,
+      taxCalculation: 'TaxExcluded',
+      lines: [
+        { ...standardProposal.lines[0]!, grossCents: 11 },
+        { ...standardProposal.lines[0]!, grossCents: 10 },
+      ],
+    }), testDeps(db));
+
+    expect(staged.totals).toEqual({
+      subtotalCents: 20,
+      taxCents: 1,
+      totalCents: 21,
+    });
+    expect(staged.lines).toEqual([
+      expect.objectContaining({ subtotalCents: 10, taxCents: 1, totalCents: 11 }),
+      expect.objectContaining({ subtotalCents: 10, taxCents: 0, totalCents: 10 }),
+    ]);
+    expect(db.state.splits.map((line) => line.amount)).toEqual([0.11, 0.1]);
+  });
+
+  it('rejects a TaxExcluded Deposit whose fixed line total has no unique exact reconstruction', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 0.08;
+    const before = structuredClone(db.state);
+
+    await expectCode(stageCategorization(input({
+      ...standardProposal,
+      taxCalculation: 'TaxExcluded',
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 8 }],
+    }), testDeps(db)), 'TAX_AMOUNT_INVALID');
+
+    expect(db.state).toEqual(before);
+  });
+
+  it('preserves NotApplicable Deposit staging', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+
+    const staged = await stageCategorization(input({
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: 10_700,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        memo: 'Generic deposit line',
+        tagIds: [LINE_TAG_ID],
+      } as CategorizationProposal['lines'][number]],
+      tagIds: [TAG_ID],
+    }), testDeps(db));
+
+    expect(staged.totals).toEqual({ subtotalCents: 10_700, taxCents: 0, totalCents: 10_700 });
   });
 
   it.each([

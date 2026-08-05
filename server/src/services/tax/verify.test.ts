@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalPurchaseLineHash, verifyPurchaseResult, type ExpectedPurchaseResult } from './verify.js';
+import {
+  canonicalDepositLineHash,
+  canonicalPurchaseLineHash,
+  verifyDepositResult,
+  verifyPreparedResult,
+  verifyPurchaseResult,
+  type ExpectedDepositResult,
+  type ExpectedPurchaseResult,
+} from './verify.js';
+import type {
+  QboDepositPreparedWrite,
+  QboDepositSnapshot,
+  QboPreparedWrite,
+  QboPurchasePreparedWrite,
+} from '../../lib/qbo/types.js';
 
 const targetLine = {
   id: null,
@@ -262,5 +276,269 @@ describe('verifyPurchaseResult', () => {
     };
 
     expect(canonicalPurchaseLineHash(reorderedLine)).toBe(canonicalPurchaseLineHash(untouchedLine));
+  });
+});
+
+const depositTargetLine = {
+  id: null,
+  amountCents: 10_700,
+  description: 'Generic sale',
+  accountQboId: 'income',
+  entityQboId: 'payer',
+  paymentMethodQboId: 'payment-method',
+  classQboId: 'class',
+  taxCodeQboId: 'sales-code',
+  taxApplicableOn: 'Sales',
+};
+
+const depositUntouchedLine = {
+  id: 'untouched',
+  amountCents: 5_000,
+  description: 'Generic untouched line',
+  accountQboId: 'other-income',
+  entityQboId: 'other-payer',
+  paymentMethodQboId: 'other-method',
+  classQboId: 'other-class',
+  taxCodeQboId: null,
+  taxApplicableOn: null,
+};
+
+const expectedDeposit: ExpectedDepositResult = {
+  qboId: 'deposit-generic',
+  totalCents: 15_700,
+  depositToAccountQboId: 'bank',
+  date: '2026-07-28',
+  globalTaxCalculation: 'TaxInclusive',
+  totalTaxCents: 700,
+  targetLines: [depositTargetLine],
+  untouchedLineHashes: [canonicalDepositLineHash(depositUntouchedLine)],
+};
+
+const actualDeposit: QboDepositSnapshot = {
+  qboId: 'deposit-generic',
+  syncToken: '8',
+  totalCents: 15_700,
+  depositToAccountQboId: 'bank',
+  date: '2026-07-28',
+  globalTaxCalculation: 'TaxInclusive',
+  totalTaxCents: 700,
+  lines: [
+    depositUntouchedLine,
+    { ...depositTargetLine, id: 'assigned-target' },
+  ],
+};
+
+describe('verifyDepositResult', () => {
+  it('accepts expected Deposit entity fields and target/untouched multisets', () => {
+    expect(verifyDepositResult(expectedDeposit, actualDeposit)).toEqual({ ok: true });
+    expect(verifyDepositResult(
+      {
+        ...expectedDeposit,
+        targetLines: [depositTargetLine, depositTargetLine],
+        untouchedLineHashes: [
+          canonicalDepositLineHash(depositUntouchedLine),
+          canonicalDepositLineHash(depositUntouchedLine),
+        ],
+      },
+      {
+        ...actualDeposit,
+        lines: [
+          depositUntouchedLine,
+          { ...depositTargetLine, id: 'assigned-target-1' },
+          depositUntouchedLine,
+          { ...depositTargetLine, id: 'assigned-target-2' },
+        ],
+      },
+    )).toEqual({ ok: true });
+  });
+
+  it.each([
+    ['Deposit ID', { qboId: 'other-deposit' }],
+    ['total', { totalCents: 15_699 }],
+    ['deposit account', { depositToAccountQboId: 'other-bank' }],
+    ['date', { date: '2026-07-29' }],
+    ['global tax mode', { globalTaxCalculation: 'TaxExcluded' }],
+    ['total tax', { totalTaxCents: 699 }],
+  ])('detects %s drift', (_name, changes) => {
+    expect(verifyDepositResult(expectedDeposit, { ...actualDeposit, ...changes })).toMatchObject({
+      ok: false,
+      code: 'QBO_STATE_DRIFT',
+    });
+  });
+
+  it.each([
+    ['amount', { amountCents: 10_699 }],
+    ['account', { accountQboId: 'other-income' }],
+    ['payer', { entityQboId: 'other-payer' }],
+    ['payment method', { paymentMethodQboId: 'other-method' }],
+    ['class', { classQboId: 'other-class' }],
+    ['tax code', { taxCodeQboId: 'other-code' }],
+    ['tax applicability', { taxApplicableOn: 'Purchase' }],
+  ])('detects changed target-line %s detail', (_field, changes) => {
+    expect(verifyDepositResult(expectedDeposit, {
+      ...actualDeposit,
+      lines: [actualDeposit.lines[0]!, { ...actualDeposit.lines[1]!, ...changes }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
+  it('requires a prepared existing Deposit line ID to survive readback', () => {
+    const expectedWithId = {
+      ...expectedDeposit,
+      targetLines: [{ ...depositTargetLine, id: 'holding-line' }],
+    };
+
+    expect(verifyDepositResult(expectedWithId, {
+      ...actualDeposit,
+      lines: [
+        actualDeposit.lines[0]!,
+        { ...actualDeposit.lines[1]!, id: 'different-line' },
+      ],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(expectedWithId, {
+      ...actualDeposit,
+      lines: [
+        actualDeposit.lines[0]!,
+        { ...actualDeposit.lines[1]!, id: 'holding-line' },
+      ],
+    })).toEqual({ ok: true });
+  });
+
+  it('detects changed, missing, and extra untouched Deposit lines', () => {
+    expect(verifyDepositResult(expectedDeposit, {
+      ...actualDeposit,
+      lines: [{ ...actualDeposit.lines[0]!, description: 'changed' }, actualDeposit.lines[1]!],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(expectedDeposit, {
+      ...actualDeposit,
+      lines: [actualDeposit.lines[1]!],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(expectedDeposit, {
+      ...actualDeposit,
+      lines: [...actualDeposit.lines, { ...depositUntouchedLine, id: 'extra' }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
+  it('detects drift in preserved Deposit entity and raw line metadata fingerprints', () => {
+    const actualWithFingerprints = {
+      ...actualDeposit,
+      preservedHash: 'entity-preserved',
+      lines: [
+        {
+          ...depositUntouchedLine,
+          rawHash: 'untouched-raw',
+          targetHash: 'untouched-target',
+        },
+        {
+          ...depositTargetLine,
+          id: 'assigned-target',
+          rawHash: 'assigned-target-raw',
+          targetHash: 'target-preserved',
+        },
+      ],
+    } as unknown as QboDepositSnapshot;
+    const expectedWithFingerprints = {
+      ...expectedDeposit,
+      preservedHash: 'entity-preserved',
+      targetLines: [{
+        ...depositTargetLine,
+        rawHash: 'target-raw',
+        targetHash: 'target-preserved',
+      }],
+      untouchedLineHashes: [
+        canonicalDepositLineHash(actualWithFingerprints.lines[0]!),
+      ],
+    } as unknown as ExpectedDepositResult;
+
+    expect(verifyDepositResult(
+      expectedWithFingerprints,
+      actualWithFingerprints,
+    )).toEqual({ ok: true });
+    expect(verifyDepositResult(
+      expectedWithFingerprints,
+      { ...actualWithFingerprints, preservedHash: 'entity-drifted' },
+    )).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(
+      expectedWithFingerprints,
+      {
+        ...actualWithFingerprints,
+        lines: [
+          { ...actualWithFingerprints.lines[0]!, rawHash: 'untouched-drifted' },
+          actualWithFingerprints.lines[1]!,
+        ],
+      },
+    )).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(
+      expectedWithFingerprints,
+      {
+        ...actualWithFingerprints,
+        lines: [
+          actualWithFingerprints.lines[0]!,
+          { ...actualWithFingerprints.lines[1]!, targetHash: 'target-drifted' },
+        ],
+      },
+    )).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
+  it('reserves ID-sensitive untouched lines before matching an ID-agnostic colliding target', () => {
+    const collidingTarget = { ...depositUntouchedLine, id: null };
+    const collisionExpected: ExpectedDepositResult = {
+      ...expectedDeposit,
+      targetLines: [collidingTarget],
+      untouchedLineHashes: [canonicalDepositLineHash(depositUntouchedLine)],
+    };
+    const assignedTarget = { ...collidingTarget, id: 'assigned-colliding-target' };
+    const collisionActual: QboDepositSnapshot = {
+      ...actualDeposit,
+      lines: [depositUntouchedLine, assignedTarget],
+    };
+
+    expect(verifyDepositResult(collisionExpected, collisionActual)).toEqual({ ok: true });
+    expect(verifyDepositResult(collisionExpected, {
+      ...collisionActual,
+      lines: [depositUntouchedLine],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyDepositResult(collisionExpected, {
+      ...collisionActual,
+      lines: [...collisionActual.lines, { ...depositUntouchedLine, id: 'extra' }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+});
+
+describe('verifyPreparedResult', () => {
+  const depositPrepared = {
+    qboType: 'Deposit',
+    expected: expectedDeposit,
+  } as QboDepositPreparedWrite;
+  const purchasePrepared = {
+    qboType: 'Purchase',
+    expected,
+  } as QboPurchasePreparedWrite;
+
+  it('dispatches each prepared union member to its matching verifier', () => {
+    expect(verifyPreparedResult(depositPrepared, actualDeposit)).toEqual({ ok: true });
+    expect(verifyPreparedResult(purchasePrepared, actual)).toEqual({ ok: true });
+  });
+
+  it('fails closed when the actual snapshot kind does not match the prepared union member', () => {
+    expect(verifyPreparedResult(depositPrepared, actual)).toMatchObject({
+      ok: false,
+      code: 'QBO_STATE_DRIFT',
+    });
+    expect(verifyPreparedResult(purchasePrepared, actualDeposit)).toMatchObject({
+      ok: false,
+      code: 'QBO_STATE_DRIFT',
+    });
+  });
+
+  it('fails closed on a malformed prepared-write discriminator', () => {
+    const malformed = {
+      ...depositPrepared,
+      qboType: 'JournalEntry',
+    } as unknown as QboPreparedWrite;
+
+    expect(verifyPreparedResult(malformed, actualDeposit)).toMatchObject({
+      ok: false,
+      code: 'QBO_STATE_DRIFT',
+    });
   });
 });

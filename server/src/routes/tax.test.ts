@@ -58,8 +58,13 @@ beforeEach(() => {
     usingSalesTax: true,
     refreshedAt: '2026-07-27T00:00:00.000Z',
     taxCodes: [
-      { qboId: 'GST5', name: 'GST 5%', active: true, taxable: true, combinedPurchaseRate: 5 },
-      { qboId: 'OOS', name: 'Out of scope', active: true, taxable: false, combinedPurchaseRate: null },
+      { qboId: 'PURCHASE_STANDARD', name: 'Purchase tax 5%', active: true, taxable: true, combinedPurchaseRate: 5, combinedSalesRate: null },
+      { qboId: 'OOS', name: 'Out of scope', active: true, taxable: false, combinedPurchaseRate: null, combinedSalesRate: null },
+    ],
+    salesStatus: 'ready',
+    salesReason: null,
+    salesTaxCodes: [
+      { qboId: 'SALES7', name: 'Sales tax 7%', active: true, taxable: true, combinedPurchaseRate: null, combinedSalesRate: 7 },
     ],
   });
   mocks.refreshTaxReference.mockImplementation(async () => ({
@@ -81,6 +86,7 @@ describe('tax reference routes', () => {
 
     expect(allowed.status).toBe(200);
     expect(allowed.body.taxCodes).toHaveLength(2);
+    expect(allowed.body).toMatchObject({ salesStatus: 'ready', salesTaxCodes: [{ qboId: 'SALES7', combinedSalesRate: 7 }] });
     expect(forbidden.status).toBe(403);
     expect(mocks.getTaxReadiness).toHaveBeenCalledWith('company-1');
   });
@@ -125,6 +131,17 @@ describe('tax reference routes', () => {
         active: true,
         taxable: true,
         combinedPurchaseRate: 5,
+        combinedSalesRate: null,
+      })),
+      salesStatus: 'ready' as const,
+      salesReason: null,
+      salesTaxCodes: Array.from({ length: 101 }, (_, index) => ({
+        qboId: `sales-${String(index).padStart(3, '0')}`,
+        name: `Sales tax ${index}`,
+        active: true,
+        taxable: true,
+        combinedPurchaseRate: null,
+        combinedSalesRate: 7,
       })),
     };
     mocks.getTaxReadiness.mockResolvedValue(readiness);
@@ -135,7 +152,11 @@ describe('tax reference routes', () => {
     expect(response.body.taxCodes).toHaveLength(100);
     expect(response.body.taxCodes[0].qboId).toBe('000');
     expect(response.body.taxCodes.at(-1).qboId).toBe('099');
+    expect(response.body.salesTaxCodes).toHaveLength(100);
+    expect(response.body.salesTaxCodes[0].qboId).toBe('sales-000');
+    expect(response.body.salesTaxCodes.at(-1).qboId).toBe('sales-099');
     expect(readiness.taxCodes).toHaveLength(101);
+    expect(readiness.salesTaxCodes).toHaveLength(101);
   });
 
   it('filters unsupported codes before applying the 100-code response cap', async () => {
@@ -145,6 +166,7 @@ describe('tax reference routes', () => {
       active: false,
       taxable: true,
       combinedPurchaseRate: 5,
+      combinedSalesRate: null,
     }));
     const usable = Array.from({ length: 101 }, (_, index) => ({
       qboId: `Z${String(index).padStart(3, '0')}`,
@@ -152,6 +174,7 @@ describe('tax reference routes', () => {
       active: true,
       taxable: true,
       combinedPurchaseRate: 0,
+      combinedSalesRate: null,
     }));
     mocks.getTaxReadiness.mockResolvedValue({
       status: 'ready',
@@ -159,6 +182,9 @@ describe('tax reference routes', () => {
       usingSalesTax: true,
       refreshedAt: '2026-07-27T00:00:00.000Z',
       taxCodes: [...unsupported, ...usable],
+      salesStatus: 'needs_setup',
+      salesReason: null,
+      salesTaxCodes: [],
     });
 
     const response = await request(testApp()).get('/api/companies/company-1/tax').set(sessionHeaders);
@@ -182,7 +208,11 @@ describe('tax reference routes', () => {
         active: true,
         taxable: true,
         combinedPurchaseRate: 5,
+        combinedSalesRate: null,
       })),
+      salesStatus: 'needs_setup' as const,
+      salesReason: null,
+      salesTaxCodes: [],
     };
     mocks.refreshTaxReference.mockResolvedValue({ readiness, refreshed: true });
 

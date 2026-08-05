@@ -4,6 +4,7 @@ import {
   PurchaseTaxError,
   calculatePurchaseLine,
   calculatePurchaseTransaction as calculatePurchaseTransactionRaw,
+  calculateSalesTransaction as calculateSalesTransactionRaw,
   preparePurchaseRecategorization,
   preparePurchaseRestore,
 } from './purchaseTax.js';
@@ -508,6 +509,112 @@ describe('calculatePurchaseTransaction', () => {
         { ...reference, companyId: referenceCompanyId } as never,
       ),
     ).toEqual({ eligible: false, reason: 'TAX_COMPANY_MISMATCH' });
+  });
+});
+
+describe('calculateSalesTransaction', () => {
+  const companyId = 'company-1';
+  const referenceWithPurchaseFiveAndSalesSeven = {
+    ...reference,
+    codes: [
+      {
+        ...reference.codes[0]!,
+        qboId: 'STANDARD',
+        purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+      },
+      {
+        ...reference.codes[4]!,
+        qboId: 'SALES_COMPONENT_ONLY',
+        purchaseRates: [],
+        salesRates: [{ taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' }],
+      },
+      {
+        ...reference.codes[0]!,
+        qboId: 'PURCHASE_COMPONENT_ONLY',
+        purchaseRates: [{ taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' }],
+        salesRates: [],
+      },
+    ],
+  };
+  const calculateSalesTransaction = (
+    input: Omit<Parameters<typeof calculateSalesTransactionRaw>[0], 'companyId'>,
+  ) => calculateSalesTransactionRaw(
+    { ...input, companyId },
+    { ...referenceWithPurchaseFiveAndSalesSeven, companyId },
+  );
+
+  it('uses the sales rate while Purchase continues using the purchase rate', () => {
+    const input = {
+      taxCalculation: 'TaxInclusive' as const,
+      lines: [{ grossCents: 10_700, taxCodeQboId: 'STANDARD' }],
+    };
+
+    expect(calculateSalesTransaction(input)).toMatchObject({
+      eligible: true,
+      grossCents: 10_700,
+      netCents: 10_000,
+      taxCents: 700,
+    });
+    expect(calculatePurchaseTransactionRaw(
+      { ...input, companyId },
+      { ...referenceWithPurchaseFiveAndSalesSeven, companyId },
+    )).toMatchObject({
+      eligible: true,
+      grossCents: 10_700,
+      netCents: 10_190,
+      taxCents: 510,
+    });
+  });
+
+  it('rejects tax codes that have no component in the requested direction', () => {
+    expect(calculatePurchaseTransactionRaw(
+      {
+        companyId,
+        taxCalculation: 'TaxInclusive',
+        lines: [{ grossCents: 10_700, taxCodeQboId: 'SALES_COMPONENT_ONLY' }],
+      },
+      { ...referenceWithPurchaseFiveAndSalesSeven, companyId },
+    )).toEqual({ eligible: false, reason: 'TAX_CODE_SALES_ONLY', lineIndex: 0 });
+    expect(calculateSalesTransaction({
+      taxCalculation: 'TaxInclusive',
+      lines: [{ grossCents: 10_700, taxCodeQboId: 'PURCHASE_COMPONENT_ONLY' }],
+    })).toEqual({ eligible: false, reason: 'TAX_CODE_PURCHASE_ONLY', lineIndex: 0 });
+  });
+
+  it('allocates positive exclusive rounding across sales lines', () => {
+    expect(calculateSalesTransaction({
+      taxCalculation: 'TaxExcluded',
+      lines: [
+        { grossCents: 10, taxCodeQboId: 'STANDARD' },
+        { grossCents: 10, taxCodeQboId: 'STANDARD' },
+      ],
+    })).toMatchObject({
+      eligible: true,
+      grossCents: 20,
+      netCents: 20,
+      taxCents: 1,
+      lines: [{ taxCents: 1 }, { taxCents: 0 }],
+    });
+  });
+
+  it('keeps positive inclusive sales rounding exactly balanced per line', () => {
+    expect(calculateSalesTransaction({
+      taxCalculation: 'TaxInclusive',
+      lines: [
+        { grossCents: 1, taxCodeQboId: 'STANDARD' },
+        { grossCents: 1, taxCodeQboId: 'STANDARD' },
+      ],
+    })).toMatchObject({
+      eligible: true,
+      grossCents: 2,
+      netCents: 2,
+      taxCents: 0,
+      lines: [
+        { grossCents: 1, netCents: 1, taxCents: 0 },
+        { grossCents: 1, netCents: 1, taxCents: 0 },
+      ],
+    });
   });
 });
 
@@ -1105,7 +1212,20 @@ describe('preparePurchaseRestore', () => {
       qboType: 'Purchase',
       qboId: 'PURCHASE_GENERIC',
       requestId: 'REQUEST_RESTORE_GENERIC',
-      before: original.before,
+      before: {
+        qboId: original.expected.qboId,
+        syncToken: '8',
+        totalCents: original.expected.totalCents,
+        accountQboId: original.expected.accountQboId,
+        date: original.expected.date,
+        direction: original.expected.direction,
+        globalTaxCalculation: original.expected.globalTaxCalculation,
+        totalTaxCents: -73,
+        lines: [
+          original.before.lines[1],
+          { ...original.expected.targetLines[0], id: 'LINE_QBO_ASSIGNED' },
+        ],
+      },
       expected: {
         globalTaxCalculation: 'TaxInclusive',
         totalTaxCents: -75,
