@@ -3,12 +3,14 @@
 // infra-as-code deployments stay authoritative (see CLAUDE.md).
 
 import type { InstanceSettingsDto, SuggestionProvider, SuggestionSetting } from '@recat/shared';
-import { env, redirectUri } from '../env.js';
+import { appUrlEnvManaged, env } from '../env.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { prisma } from '../lib/prisma.js';
 import { runSerializableTransaction } from '../lib/serializableTransaction.js';
 
 const SETTING_KEYS = [
+  'appUrl',
+  'previousAppUrl',
   'intuitClientId',
   'intuitClientSecret',
   'webhookVerifierToken',
@@ -63,6 +65,10 @@ export interface InstanceSettingsDb {
 
 /** Plaintext settings — server-internal only, never serialized to a client. */
 export interface InstanceSettings {
+  /** Public address users reach this deployment at; base for OAuth and links. */
+  appUrl: string;
+  /** The address before the last change, still accepted for origin checks. */
+  previousAppUrl: string;
   intuitClientId: string;
   intuitClientSecret: string;
   webhookVerifierToken: string;
@@ -86,6 +92,8 @@ export interface InstanceSettings {
 }
 
 export interface InstanceSettingsPatch {
+  appUrl?: string;
+  previousAppUrl?: string;
   intuitClientId?: string;
   intuitClientSecret?: string;
   webhookVerifierToken?: string;
@@ -151,6 +159,11 @@ export async function getInstanceSettings(
       : (stored.suggestionModel || 'gpt-4o-mini');
   return {
     // env vars take precedence over DB values
+    // APP_URL unset → the stored value wins, falling back to env's own default.
+    // Normalized here so the displayed redirect URI and the one sent to
+    // Intuit cannot differ by a trailing slash.
+    appUrl: (appUrlEnvManaged ? env.APP_URL : (stored.appUrl || env.APP_URL)).replace(/\/+$/, ''),  // stored wins unless APP_URL_LOCKED
+    previousAppUrl: (stored.previousAppUrl ?? '').replace(/\/+$/, ''),
     intuitClientId: env.QBO_CLIENT_ID !== '' ? env.QBO_CLIENT_ID : (stored.intuitClientId ?? ''),
     intuitClientSecret: env.QBO_CLIENT_SECRET !== '' ? env.QBO_CLIENT_SECRET : (stored.intuitClientSecret ?? ''),
     webhookVerifierToken:
@@ -199,9 +212,12 @@ export async function getInstanceSettingsDto(): Promise<InstanceSettingsDto> {
   const settings = await getInstanceSettings();
   const adminCount = await prisma.user.count({ where: { isInstanceAdmin: true } });
   return {
+    appUrl: settings.appUrl,
+    appUrlEnvManaged,
     intuitClientId: maskClientId(settings.intuitClientId),
     intuitClientSecretSet: settings.intuitClientSecret !== '',
-    redirectUri,
+    redirectUri: `${settings.appUrl}/auth/qbo/callback`,
+    webhookUrl: `${settings.appUrl}/webhooks/qbo`,
     webhookVerifierTokenSet: settings.webhookVerifierToken !== '',
     suggestionSource: settings.suggestionSource,
     suggestionProvider: settings.suggestionProvider,

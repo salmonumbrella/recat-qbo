@@ -946,9 +946,15 @@ export interface SyncLogDto {
 }
 
 export interface InstanceSettingsDto {
+  /** Public address users reach this deployment at; base for the redirect URI. */
+  appUrl: string;
+  /** True when APP_URL is set in the environment, which makes appUrl read-only. */
+  appUrlEnvManaged: boolean;
   intuitClientId: string; // masked when read
   intuitClientSecretSet: boolean;
   redirectUri: string;
+  /** Webhook endpoint derived from appUrl, not from the browser's location. */
+  webhookUrl: string;
   webhookVerifierTokenSet: boolean;
   suggestionSource: SuggestionSetting;
   suggestionProvider: SuggestionProvider;

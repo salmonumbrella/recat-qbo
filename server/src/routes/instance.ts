@@ -4,7 +4,7 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { attachmentPolicyEnvManaged, redirectUri, webhookUrl } from '../env.js';
+import { appUrlEnvManaged, attachmentPolicyEnvManaged } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { invalidateMailerCache, isSmtpConfigured, sendMail } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
@@ -28,12 +28,48 @@ import {
   getAttachmentStoragePolicyDefaults,
 } from '../services/attachments/policyStore.js';
 import { AttachmentError } from '../services/attachments/types.js';
+import { invalidatePublicUrl } from '../services/publicUrl.js';
 
 // ---------------------------------------------------------------------------
 // /api/instance/settings
 // ---------------------------------------------------------------------------
 
+/**
+ * Public address of this deployment. Rejects anything that cannot serve as an
+ * OAuth redirect base: a path, query or fragment would silently corrupt the
+ * callback URL, and plain http on a non-loopback host cannot be registered with
+ * Intuit for a production app — accepting it would recreate the problem this
+ * setting exists to solve.
+ */
+const appUrlValue = z.string().trim().min(1).max(2_048).superRefine((value, ctx) => {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    ctx.addIssue({ code: 'custom', message: 'Enter a full URL, for example https://recat.example.com' });
+    return;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    ctx.addIssue({ code: 'custom', message: 'Use http:// or https://' });
+    return;
+  }
+  if (url.search !== '' || url.hash !== '' || url.pathname.replace(/\/+$/, '') !== '') {
+    ctx.addIssue({ code: 'custom', message: 'Use the origin only, with no path, query or fragment' });
+    return;
+  }
+  const loopback = url.hostname === 'localhost'
+    || url.hostname === '127.0.0.1'
+    || url.hostname === '[::1]';
+  if (url.protocol === 'http:' && !loopback) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'QuickBooks requires https for any address other than localhost',
+    });
+  }
+});
+
 const settingsPatchBody = z.object({
+  appUrl: appUrlValue.optional(),
   intuitClientId: z.string().optional(),
   intuitClientSecret: z.string().optional(),
   webhookVerifierToken: z.string().optional(),
@@ -93,8 +129,23 @@ instanceRouter.patch(
   '/settings',
   asyncHandler(async (req, res) => {
     const body = validate(settingsPatchBody)(req.body);
+    if (body.appUrl !== undefined && appUrlEnvManaged) {
+      throw new HttpError(
+        409,
+        'The public URL is managed by the APP_URL environment variable.',
+        'APP_URL_ENV_MANAGED',
+      );
+    }
     const aiApiKey = body.aiApiKey ?? body.aiKey;
+    // Remember the address being replaced. originCheck keeps accepting it, so
+    // an operator who saves a typo while browsing on the old address can still
+    // send the request that corrects it.
+    const previousAppUrl = body.appUrl === undefined
+      ? undefined
+      : (await getInstanceSettings()).appUrl;
     await updateInstanceSettings({
+      ...(body.appUrl !== undefined ? { appUrl: body.appUrl.replace(/\/+$/, '') } : {}),
+      ...(previousAppUrl !== undefined ? { previousAppUrl } : {}),
       ...(body.intuitClientId !== undefined ? { intuitClientId: body.intuitClientId } : {}),
       ...(body.intuitClientSecret !== undefined ? { intuitClientSecret: body.intuitClientSecret } : {}),
       ...(body.webhookVerifierToken !== undefined ? { webhookVerifierToken: body.webhookVerifierToken } : {}),
@@ -116,6 +167,9 @@ instanceRouter.patch(
     });
     // The mailer caches its transport briefly — new SMTP values apply at once.
     invalidateMailerCache();
+    // Same for the public URL: origin checking and the OAuth redirect both
+    // read it through a short cache.
+    invalidatePublicUrl();
     res.json(await getInstanceSettingsDto());
   }),
 );
@@ -220,6 +274,11 @@ const credentialsBody = z.object({
   clientId: z.string().trim().min(1),
   clientSecret: z.string().trim().min(1),
   env: z.enum(['sandbox', 'production']),
+  // Optional, and accepted here rather than only in Settings: this is the step
+  // where an admin copies the callback to register with Intuit, and Settings is
+  // not reachable until a company exists. Without it, a first-run install behind
+  // a TLS front would register a redirect URI that can never work.
+  appUrl: appUrlValue.optional(),
 });
 
 export const setupRouter = Router();
@@ -236,8 +295,8 @@ setupRouter.get(
       // available (it's a per-connection choice in the wizard, not a mode).
       credentialsSet: settings.intuitClientId !== '',
       smtpConfigured: settings.smtpHost !== '',
-      redirectUri,
-      webhookUrl,
+      redirectUri: `${settings.appUrl}/auth/qbo/callback`,
+      webhookUrl: `${settings.appUrl}/webhooks/qbo`,
     });
   }),
 );
@@ -275,10 +334,23 @@ setupRouter.post(
   requireInstanceAdmin,
   asyncHandler(async (req, res) => {
     const body = validate(credentialsBody)(req.body);
+    if (body.appUrl !== undefined && appUrlEnvManaged) {
+      throw new HttpError(
+        409,
+        'The public URL is managed by the APP_URL environment variable.',
+        'APP_URL_ENV_MANAGED',
+      );
+    }
+    const previousAppUrl = body.appUrl === undefined
+      ? undefined
+      : (await getInstanceSettings()).appUrl;
     await updateInstanceSettings({
       intuitClientId: body.clientId,
       intuitClientSecret: body.clientSecret,
+      ...(body.appUrl !== undefined ? { appUrl: body.appUrl.replace(/\/+$/, '') } : {}),
+      ...(previousAppUrl !== undefined ? { previousAppUrl } : {}),
     });
+    invalidatePublicUrl();
     await prisma.appConfig.upsert({
       where: { key: 'qboEnvDefault' },
       update: { value: body.env, encrypted: false },
