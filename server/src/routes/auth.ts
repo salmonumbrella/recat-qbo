@@ -10,7 +10,8 @@ import { env } from '../env.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { isSmtpConfigured } from '../lib/mailer.js';
 import { prisma } from '../lib/prisma.js';
-import { devLoginAllowed } from '../services/devLogin.js';
+import { devLoginAllowed, localAdminLockdown } from '../services/devLogin.js';
+import { BoundedRateLimiter } from '../mcp/rateLimit.js';
 import {
   clearCookieOptions,
   createSession,
@@ -36,20 +37,55 @@ export function toUserDto(user: User & { memberships: Membership[] }): UserDto {
 
 const magicLinkBody = z.object({ email: z.string().trim().toLowerCase().email() });
 
+// Every request writes a token row and a mail (or log line), so issuance is
+// throttled — but keyed by EMAIL, never by req.ip. Behind a reverse proxy with
+// TRUSTED_PROXY_IPS unset (the Umbrel default) every caller shares one address,
+// so an IP key is a deployment-wide bucket that any anonymous client can hold
+// empty, blocking sign-in for everyone. Keyed by address, an attacker can only
+// affect the address they target, and the per-user token growth this exists to
+// bound is per-address anyway.
+//
+// BoundedRateLimiter rather than LocalLoginLimiter: this route is anonymously
+// reachable with a caller-chosen key, so the key space needs a hard cap and
+// O(1) admission. maxKeys evicts least-recently-used.
+//
+// Residual, accepted: an attacker can keep one known address throttled. On a
+// local-admin deployment the password path is unaffected; elsewhere it is a
+// bounded delay on one account, which is the normal cost of per-account limits.
+export const magicLinkLimiter = new BoundedRateLimiter({
+  limit: 5,
+  windowMs: 60 * 1_000,
+  maxKeys: 10_000,
+});
+
 export const authRouter = Router();
 
 // Always 200 {ok:true} — no user enumeration. First run (zero users in the
-// DB) creates the requester as admin on the fly.
+// DB) creates the requester as admin on the fly, EXCEPT on local-admin
+// deployments — see localAdminLockdown.
 authRouter.post(
   '/auth/magic-link',
   asyncHandler(async (req, res) => {
+    // Parsed first so the throttle can key on the address. A malformed body
+    // does no work — no lookup, no token, no mail — so it needs no slot.
     const { email } = validate(magicLinkBody)(req.body);
+
+    const limit = magicLinkLimiter.acquire(email);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      throw new HttpError(429, 'Too many requests — try again in a minute', 'RATE_LIMITED');
+    }
 
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
       const totalUsers = await prisma.user.count();
-      if (totalUsers === 0) {
-        // First-ever user bootstraps the instance as its instance admin.
+      // First-ever user bootstraps the instance as its instance admin — but
+      // never when a local admin password is configured. That password gates
+      // first-run via POST /api/setup/admin; letting this unauthenticated
+      // route create the account instead would hand the instance to whoever
+      // reached it first, or at minimum let them squat the first-admin slot
+      // so the owner's wizard 409s. (#53)
+      if (totalUsers === 0 && !localAdminLockdown()) {
         user = await prisma.user.create({
           data: { email, isInstanceAdmin: true, invitePending: false },
         });
@@ -63,9 +99,13 @@ authRouter.post(
     if (user) {
       const { link } = await issueMagicLink(user);
       // Dev convenience: no SMTP configured → let the UI offer "open the
-      // magic link →" directly. Auto-locked the moment a real (non-demo)
-      // company is connected, unless ALLOW_DEV_LOGIN=true forces it.
-      if (!smtp && (await devLoginAllowed())) devLink = link;
+      // magic link →" directly. Never on a local-admin deployment: this route
+      // is unauthenticated and the admin address is published (Umbrel's
+      // defaultUsername), so a response-body link is an admin session for the
+      // asking. The link still reaches the server log for the operator, which
+      // the login screen points to. Otherwise auto-locked the moment a real
+      // (non-demo) company is connected, unless ALLOW_DEV_LOGIN=true forces it.
+      if (!smtp && !localAdminLockdown() && (await devLoginAllowed())) devLink = link;
     }
 
     res.json(devLink !== undefined ? { ok: true, delivered: smtp, devLink } : { ok: true, delivered: smtp });
