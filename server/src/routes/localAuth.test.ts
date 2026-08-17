@@ -2,7 +2,12 @@ import express from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { errorMiddleware } from '../lib/http.js';
-import { LocalLoginLimiter } from '../services/localLoginLimiter.js';
+import {
+  LOCAL_LOGIN_MAX_FAILURES,
+  LOCAL_LOGIN_SHARED_WINDOW_MS,
+  LocalLoginLimiter,
+  loginLockoutWindowMs,
+} from '../services/localLoginLimiter.js';
 import { compileTrustedProxy } from '../services/trustedProxy.js';
 import { createLocalAuthRouter, type LocalAuthDependencies } from './localAuth.js';
 
@@ -199,6 +204,34 @@ describe('local auth routes', () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  // With a per-client key — which TRUSTED_PROXY_HOP gives the Umbrel package —
+  // a lockout only reaches the client that earned it. That is the actual fix
+  // for #57; the shorter shared window below is only damage limitation.
+  it('locks out the guessing client without touching another client', async () => {
+    const authenticate = vi.fn<LocalAuthDependencies['authenticate']>().mockResolvedValue(null);
+    const instance = app(dependencies({ authenticate }), TEST_PROXY_IPS);
+
+    for (let attempt = 0; attempt < LOCAL_LOGIN_MAX_FAILURES; attempt += 1) {
+      await request(instance)
+        .post('/auth/local')
+        .set('X-Forwarded-For', '198.51.100.9')
+        .send({ email: ADMIN.email, password: 'wrong' });
+    }
+    await request(instance)
+      .post('/auth/local')
+      .set('X-Forwarded-For', '198.51.100.9')
+      .send({ email: ADMIN.email, password: 'wrong' })
+      .expect(429);
+
+    // The owner, on a different address, is unaffected.
+    authenticate.mockResolvedValue(ADMIN);
+    await request(instance)
+      .post('/auth/local')
+      .set('X-Forwarded-For', '203.0.113.4')
+      .send({ email: ADMIN.email, password: 'correct horse battery staple' })
+      .expect(200);
   });
 
   it('blocks a direct untrusted peer that rotates X-Forwarded-For values', async () => {
