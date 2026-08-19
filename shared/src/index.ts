@@ -1137,11 +1137,11 @@ const HOLDING_ACCOUNT_TERM = /uncategori[sz]ed/i;
 const DEFAULT_HOLDING_ACCOUNT_TERM = /uncategori[sz]ed expense/i;
 const ASK_MY_ACCOUNTANT = /ask my accountant/i;
 
-// Anchored equivalents. QuickBooks' own holding accounts are named exactly
-// "Uncategorised Expense", "Uncategorized Income", "Ask My Accountant" and so
-// on, so the real ones always lead with the term.
-const HOLDING_ACCOUNT_LEAD = /^uncategori[sz]ed /i;
-const ASK_MY_ACCOUNTANT_EXACT = /^ask my accountant$/i;
+// QuickBooks' built-in holding accounts, enumerated. A prefix test would also
+// swallow a user's own "Uncategorised Travel" or "Uncategorised Software", and
+// this predicate is used where a match REMOVES a choice.
+const QBO_BUILTIN_HOLDING_ACCOUNT =
+  /^(uncategori[sz]ed (income|expense|asset)|ask my accountant)$/i;
 
 /**
  * Might this be a holding account? Deliberately broad, and only for building
@@ -1155,17 +1155,19 @@ export function isHoldingAccountName(name: string): boolean {
 }
 
 /**
- * Is this one of QuickBooks' own holding accounts? Anchored, and the one to use
- * where a match REMOVES an account from what the user can pick — the category
- * destinations in Queue and Rules.
+ * Is this one of QuickBooks' built-in holding accounts? Use it where a match
+ * REMOVES an account from what the user can pick — the category destinations in
+ * Queue and Rules, which already exclude the company's designated holding
+ * accounts by id and use this only to catch the built-ins on top.
  *
- * The distinction is the whole point. Matching loosely there hides a user's own
- * "Old Uncategorized Costs" or "Legal - ask my accountant first" from the
- * category picker, with nothing to explain where it went, and they can no
- * longer categorize into an account they created on purpose.
+ * Enumerated rather than pattern-matched, because the two ways of being wrong
+ * are not symmetric. Missing a built-in shows an account the operator can still
+ * designate in Settings, which uses the broad matcher above. Matching too much
+ * silently removes a category they created on purpose — "Old Uncategorized
+ * Costs", "Uncategorised Travel" — with nothing to explain where it went.
  */
 export function isQboHoldingAccountName(name: string): boolean {
-  return ASK_MY_ACCOUNTANT_EXACT.test(name) || HOLDING_ACCOUNT_LEAD.test(name);
+  return QBO_BUILTIN_HOLDING_ACCOUNT.test(name.trim());
 }
 
 /**

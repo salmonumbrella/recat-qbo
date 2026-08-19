@@ -40,6 +40,7 @@ describe('isQboHoldingAccountName — the anchored form used to hide accounts', 
     'Uncategorised Expense',
     'Uncategorised Income',
     'Uncategorized Asset',
+    '  Uncategorised Expense  ',
     'uNcAtEgOrIsEd ExPeNsE',
     'Ask My Accountant',
     'ask my accountant',
@@ -53,6 +54,10 @@ describe('isQboHoldingAccountName — the anchored form used to hide accounts', 
     'Legal - ask my accountant first',
     'Ask My Accountant Later',
     'Office Supplies',
+    // A localized company's own categories, which a prefix test would swallow.
+    'Uncategorised Travel',
+    'Uncategorised Software',
+    'Uncategorized Expenses Pending Review',
   ])('leaves the user account %s categorizable', (name) => {
     expect(isQboHoldingAccountName(name)).toBe(false);
   });
