@@ -63,6 +63,22 @@ vi.mock('../state/AppContext', () => ({
         classification: 'Expenses',
         active: true,
       },
+      {
+        id: 'ACCOUNT_LOCALIZED_HOLDING',
+        qboId: 'LOCALIZED_HOLDING',
+        name: 'Uncategorised Expense',
+        fullName: 'Expenses · Uncategorised Expense',
+        classification: 'Expenses',
+        active: true,
+      },
+      {
+        id: 'ACCOUNT_USER_NAMED',
+        qboId: 'USER_NAMED',
+        name: 'Old Uncategorized Costs',
+        fullName: 'Expenses · Old Uncategorized Costs',
+        classification: 'Expenses',
+        active: true,
+      },
     ],
     tags: mocks.tags,
     setPendingCount: mocks.setPendingCount,
@@ -109,6 +125,7 @@ vi.mock('../lib/api', () => {
 
 import Queue from './Queue';
 import { ApiError } from '../lib/api';
+import { installGlobalStyles } from '../test/globalStyles';
 
 const READY: TaxReadinessDto = {
   status: 'ready',
@@ -329,6 +346,43 @@ beforeEach(() => {
 });
 
 describe('tax-aware manual queue', () => {
+  it('shows a pointer cursor over clickable transaction rows', async () => {
+    const style = installGlobalStyles();
+    document.body.classList.add('rr');
+    try {
+      await renderQueue();
+      const row = screen.getByText('Generic supplier').closest('.interactive-surface');
+      expect(row).not.toBeNull();
+      expect(getComputedStyle(row!).cursor).toBe('pointer');
+    } finally {
+      document.body.classList.remove('rr');
+      style.remove();
+    }
+  });
+
+  it('excludes localized Uncategorised holding accounts from category destinations', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+
+    await user.click(screen.getByRole('button', {
+      name: 'Expenses · Generic expense',
+    }));
+
+    expect(screen.queryByRole('button', {
+      name: /Uncategorised Expense/,
+    })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: /Alternate expense/,
+    })).toBeInTheDocument();
+
+    // A user's own account that merely mentions the term is not QuickBooks'
+    // holding account, and hiding it would remove a destination they created
+    // on purpose with nothing to explain where it went.
+    expect(screen.getByRole('button', {
+      name: /Old Uncategorized Costs/,
+    })).toBeInTheDocument();
+  });
+
   it('stages exact cents at the current revision, previews server totals, and commits that revision', async () => {
     const user = userEvent.setup();
     await renderQueue();

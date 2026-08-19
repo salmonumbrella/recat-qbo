@@ -10,16 +10,30 @@ const mocks = vi.hoisted(() => ({
   dismiss: vi.fn(),
   toast: vi.fn(),
   activeCompanyId: 'COMPANY_GENERIC',
+  activeCompany: { id: 'COMPANY_GENERIC', holdingAccountIds: ['DESIGNATED_HOLDING'] } as never,
 }));
 
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({
     activeCompanyId: mocks.activeCompanyId,
-    accounts: [{
-      qboId: 'ACCOUNT_GENERIC',
-      name: 'Office expense',
-      classification: 'Expenses',
-    }],
+    activeCompany: mocks.activeCompany,
+    accounts: [
+      {
+        qboId: 'ACCOUNT_GENERIC',
+        name: 'Office expense',
+        classification: 'Expenses',
+      },
+      {
+        qboId: 'LOCALIZED_HOLDING',
+        name: 'Uncategorised Expense',
+        classification: 'Expenses',
+      },
+      {
+        qboId: 'DESIGNATED_HOLDING',
+        name: 'Uncategorized Expenses Pending Review',
+        classification: 'Expenses',
+      },
+    ],
     tags: [{
       id: '11111111-1111-4111-8111-111111111111',
       name: 'Reviewed',
@@ -57,6 +71,7 @@ import Rules from './Rules';
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.activeCompanyId = 'COMPANY_GENERIC';
+  mocks.activeCompany = { id: 'COMPANY_GENERIC', holdingAccountIds: ['DESIGNATED_HOLDING'] } as never;
 });
 
 function candidate(overrides: Partial<RuleCandidateDto> = {}): RuleCandidateDto {
@@ -108,6 +123,42 @@ function candidate(overrides: Partial<RuleCandidateDto> = {}): RuleCandidateDto 
 }
 
 describe('Rules candidate review', () => {
+  // The name test only knows QuickBooks' built-ins. An account the operator
+  // designated as a holding account under their own name must still never be a
+  // rule destination — an auto-post rule would file transactions straight back
+  // into the account Recat is watching.
+  it('excludes a designated holding account whatever the operator named it', async () => {
+    mocks.listRules.mockResolvedValue([]);
+    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
+
+    render(<Rules />);
+
+    await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
+    expect(screen.queryAllByRole('option', {
+      name: /Uncategorized Expenses Pending Review/,
+    })).toHaveLength(0);
+    // The ordinary account is still offered, so this is exclusion and not an
+    // empty list.
+    expect(screen.getAllByRole('option', {
+      name: 'Expenses · Office expense',
+    })).not.toHaveLength(0);
+  });
+
+  it('excludes localized Uncategorised holding accounts from category destinations', async () => {
+    mocks.listRules.mockResolvedValue([]);
+    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
+
+    render(<Rules />);
+
+    await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
+    expect(screen.queryAllByRole('option', {
+      name: /Uncategorised Expense/,
+    })).toHaveLength(0);
+    expect(screen.getAllByRole('option', {
+      name: 'Expenses · Office expense',
+    })).not.toHaveLength(0);
+  });
+
   it('explains verified provenance and activates an inert candidate explicitly', async () => {
     const ready = candidate();
     mocks.listRules.mockResolvedValue([]);

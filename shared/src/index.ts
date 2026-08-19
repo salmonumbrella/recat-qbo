@@ -1131,3 +1131,51 @@ export interface ApiError {
   error: string;
   code?: string;
 }
+
+// QuickBooks localizes these: a British company returns "Uncategorised".
+const HOLDING_ACCOUNT_TERM = /uncategori[sz]ed/i;
+const DEFAULT_HOLDING_ACCOUNT_TERM = /uncategori[sz]ed expense/i;
+const ASK_MY_ACCOUNTANT = /ask my accountant/i;
+
+// QuickBooks' built-in holding accounts, enumerated. A prefix test would also
+// swallow a user's own "Uncategorised Travel" or "Uncategorised Software", and
+// this predicate is used where a match REMOVES a choice.
+const QBO_BUILTIN_HOLDING_ACCOUNT =
+  /^(uncategori[sz]ed (income|expense|asset)|ask my accountant)$/i;
+
+/**
+ * Might this be a holding account? Deliberately broad, and only for building
+ * the list of accounts to OFFER as holding-account candidates — a near miss
+ * costs the operator one extra row to scan, and they choose from it.
+ *
+ * Do not use it to hide accounts. See isQboHoldingAccountName.
+ */
+export function isHoldingAccountName(name: string): boolean {
+  return ASK_MY_ACCOUNTANT.test(name) || HOLDING_ACCOUNT_TERM.test(name);
+}
+
+/**
+ * Is this one of QuickBooks' built-in holding accounts? Use it where a match
+ * REMOVES an account from what the user can pick — the category destinations in
+ * Queue and Rules, which already exclude the company's designated holding
+ * accounts by id and use this only to catch the built-ins on top.
+ *
+ * Enumerated rather than pattern-matched, because the two ways of being wrong
+ * are not symmetric. Missing a built-in shows an account the operator can still
+ * designate in Settings, which uses the broad matcher above. Matching too much
+ * silently removes a category they created on purpose — "Old Uncategorized
+ * Costs", "Uncategorised Travel" — with nothing to explain where it went.
+ */
+export function isQboHoldingAccountName(name: string): boolean {
+  return QBO_BUILTIN_HOLDING_ACCOUNT.test(name.trim());
+}
+
+/**
+ * Which accounts Setup preselects. Narrower than the candidate list — the
+ * expense holding account is the one nearly every company wants — but left
+ * unanchored, as it was before localization support, because preselection is a
+ * suggestion the operator can undo rather than something that removes a choice.
+ */
+export function isDefaultHoldingAccountName(name: string): boolean {
+  return ASK_MY_ACCOUNTANT.test(name) || DEFAULT_HOLDING_ACCOUNT_TERM.test(name);
+}

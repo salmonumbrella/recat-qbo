@@ -58,9 +58,9 @@ export default function ConfirmDialog({
       }}
     >
       <style>{`
-        .rr .cfm-cancel:hover { color: var(--ink); }
-        .rr .cfm-danger:hover { background: var(--erB); }
-        .rr .cfm-primary:hover { background: var(--accH); }
+        .rr .cfm-cancel:not(:disabled):not([aria-disabled="true"]):hover { color: var(--ink); }
+        .rr .cfm-danger:not(:disabled):not([aria-disabled="true"]):hover { background: var(--erB); }
+        .rr .cfm-primary:not(:disabled):not([aria-disabled="true"]):hover { background: var(--accH); }
       `}</style>
       <div
         onClick={(e) => e.stopPropagation()}

@@ -29,7 +29,7 @@ function initials(u: UserDto): string {
 // ellipsis via min-width:0 on the identity column.
 const ACCESS_CSS = `
 .rr .access-row{display:grid;grid-template-columns:34px minmax(0,1fr) auto 24px;gap:0 14px;align-items:center;padding:10px 0;border-bottom:1px solid var(--rowbd);font-size:14px;}
-.rr .access-del:hover{color:var(--erT);}
+.rr .access-del:not(:disabled):not([aria-disabled="true"]):hover{color:var(--erT);}
 .rr .access-summary{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--mut);margin-top:1px;}
 `;
 

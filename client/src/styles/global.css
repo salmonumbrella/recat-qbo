@@ -20,6 +20,8 @@ input, select, button { font-family:inherit; }
       --erT:#e0846f; --erB:#301b16; --erD:#5c2f26;
       --okT:#8fc3ae; --okB:#1d2a24; --okD:#33473d;
       --dark:#ede9dc; --darkInk:#14130f; --sh:0 10px 30px rgba(0,0,0,.45); }
+.rr { --interactive-hover-filter:brightness(.96); }
+.rr[data-theme="dark"] { --interactive-hover-filter:brightness(1.08); }
 .rr[data-density="compact"] { --rpv:7px; --rfs:13.5px; } .rr { --rpv:13px; --rfs:14.5px; }
 .rr ::selection { background:rgba(47,93,80,.2); }
 @keyframes rrspin { to { transform:rotate(360deg); } }
@@ -60,11 +62,11 @@ input, select, button { font-family:inherit; }
 
 /* solid accent button (wizard Continue, login submit, save actions) */
 .rr .btn-primary { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:10px 22px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }
-.rr .btn-primary:hover { background:var(--accH); }
+.rr .btn-primary:not(:disabled):not([aria-disabled="true"]):hover { background:var(--accH); }
 
 /* bordered neutral button (Sync now, Copy, Export CSV, …) */
 .rr .btn-ghost { border:1px solid var(--bd); background:var(--card); color:var(--ink); border-radius:7px; padding:8px 14px; font-size:14px; font-weight:500; cursor:pointer; font-family:inherit; }
-.rr .btn-ghost:hover { background:var(--hl); }
+.rr .btn-ghost:not(:disabled):not([aria-disabled="true"]):hover { background:var(--hl); }
 
 /* compact input (queue/audit search boxes, rule inputs) */
 .rr .input { border:1px solid var(--bd); border-radius:7px; padding:8px 13px; font-size:14px; background:var(--card); color:var(--ink); outline:none; font-family:inherit; }
@@ -93,21 +95,105 @@ input, select, button { font-family:inherit; }
  * ------------------------------------------------------------------------- */
 
 /* menu/dropdown rows, ghost-ish buttons → background:var(--hl) */
-.rr .hov-hl:hover { background:var(--hl) !important; }
+.rr .hov-hl:not(:disabled):not([aria-disabled="true"]):hover { background:var(--hl) !important; }
 /* solid accent buttons (Post, Invite, Create rule, Save split) → var(--accH) */
-.rr .hov-acc:hover { background:var(--accH) !important; }
+.rr .hov-acc:not(:disabled):not([aria-disabled="true"]):hover { background:var(--accH) !important; }
 /* muted-color buttons (theme toggle, undo ↩, Cancel, resize ⛶) → var(--ink) */
-.rr .hov-ink:hover { color:var(--ink) !important; }
+.rr .hov-ink:not(:disabled):not([aria-disabled="true"]):hover { color:var(--ink) !important; }
 /* delete × buttons → var(--erT) */
-.rr .hov-del:hover { color:var(--erT) !important; }
+.rr .hov-del:not(:disabled):not([aria-disabled="true"]):hover { color:var(--erT) !important; }
 /* dashed buttons (+ tag, ＋ Add line) and the queue Split button */
-.rr .hov-dash:hover { color:var(--ink) !important; border-color:var(--fnt) !important; }
+.rr .hov-dash:not(:disabled):not([aria-disabled="true"]):hover { color:var(--ink) !important; border-color:var(--fnt) !important; }
 /* queue category-picker trigger → border-color:var(--fnt) */
-.rr .hov-brd:hover { border-color:var(--fnt) !important; }
+.rr .hov-brd:not(:disabled):not([aria-disabled="true"]):hover { border-color:var(--fnt) !important; }
 /* dark-bar 'esc' / 'Dismiss' (base opacity .55) → opacity:1 */
-.rr .hov-full:hover { opacity:1 !important; }
+.rr .hov-full:not(:disabled):not([aria-disabled="true"]):hover { opacity:1 !important; }
 /* inputs whose focus state is border-color:var(--acc) */
 .rr .foc-acc:focus { border-color:var(--acc) !important; }
+
+/* Baseline affordances for native controls and explicit non-native surfaces. */
+.rr :is(
+  button,
+  a[href],
+  select,
+  input[type="checkbox"],
+  input[type="radio"],
+  [role="button"],
+  .interactive-surface
+):not(:disabled):not([aria-disabled="true"]),
+.rr label:has(input[type="checkbox"]:not(:disabled)),
+.rr label:has(input[type="radio"]:not(:disabled)) {
+  cursor:pointer;
+}
+
+.rr :is(
+  button,
+  select,
+  input[type="checkbox"],
+  input[type="radio"]
+):disabled,
+.rr :is(
+  button,
+  a[href],
+  select,
+  input[type="checkbox"],
+  input[type="radio"],
+  [role="button"],
+  .interactive-surface
+)[aria-disabled="true"],
+.rr label:has(input[type="checkbox"]:disabled),
+.rr label:has(input[type="radio"]:disabled) {
+  cursor:not-allowed !important;
+}
+
+.rr :is(
+  button,
+  select,
+  input[type="checkbox"],
+  input[type="radio"],
+  [role="button"],
+  .interactive-surface
+) {
+  transition:filter .15s ease, background-color .15s ease, border-color .15s ease;
+}
+
+@media (hover: hover) {
+  .rr :is(
+    button,
+    input[type="checkbox"],
+    input[type="radio"],
+    [role="button"]
+  ):not(:disabled):not([aria-disabled="true"]):hover {
+    filter:var(--interactive-hover-filter);
+  }
+  .rr select:not(:disabled):hover {
+    border-color:var(--fnt);
+  }
+  .rr .interactive-surface:not([aria-disabled="true"]):hover {
+    background:var(--hl) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rr :is(
+    button,
+    select,
+    input[type="checkbox"],
+    input[type="radio"],
+    [role="button"],
+    .interactive-surface
+  ),
+  .rr :is(
+    button,
+    select,
+    input[type="checkbox"],
+    input[type="radio"],
+    [role="button"],
+    .interactive-surface
+  ) * {
+    transition:none !important;
+  }
+}
 .rr .receipt-dropzone:focus-visible {
   outline:3px solid var(--acc);
   outline-offset:3px;
