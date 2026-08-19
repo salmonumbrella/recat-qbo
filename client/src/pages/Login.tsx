@@ -96,8 +96,8 @@ export default function Login() {
       }}
     >
       <style>{`
-        .rr .lg-primary:hover { background: var(--accH); }
-        .rr .lg-dashed:hover { color: var(--ink); border-color: var(--fnt); }
+        .rr .lg-primary:not(:disabled):not([aria-disabled="true"]):hover { background: var(--accH); }
+        .rr .lg-dashed:not(:disabled):not([aria-disabled="true"]):hover { color: var(--ink); border-color: var(--fnt); }
       `}</style>
       <div style={{ width: '100%', maxWidth: 420, display: 'flex', flexDirection: 'column', gap: 24 }}>
         <div

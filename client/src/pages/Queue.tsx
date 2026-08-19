@@ -7,16 +7,17 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type {
-  ActiveCategorizationAttemptDto,
-  CategorizationMutationOutcome,
-  CategorizationMutationResult,
-  SplitDto,
-  StageCategorizationBody,
-  StagedCategorization,
-  TaxCalculation,
-  TransactionDto,
-  TxnStatus,
+import {
+  isHoldingAccountName,
+  type ActiveCategorizationAttemptDto,
+  type CategorizationMutationOutcome,
+  type CategorizationMutationResult,
+  type SplitDto,
+  type StageCategorizationBody,
+  type StagedCategorization,
+  type TaxCalculation,
+  type TransactionDto,
+  type TxnStatus,
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
 import {
@@ -440,7 +441,7 @@ export default function Queue() {
         ['Income', 'COGS', 'Expenses'].includes(a.classification) &&
         !holding.has(a.qboId) &&
         !holding.has(a.id) &&
-        !/^uncategorized |^ask my accountant$/i.test(a.name),
+        !isHoldingAccountName(a.name),
     );
   }, [accounts, activeCompany]);
 
@@ -2257,6 +2258,7 @@ export default function Queue() {
               return (
                 <Fragment key={t.id}>
                 <div
+                  className="interactive-surface"
                   onClick={() => onRowClick(t)}
                   style={{
                     position: 'relative',
@@ -2525,6 +2527,7 @@ export default function Queue() {
             return (
               <div
                 key={t.id}
+                className="interactive-surface"
                 onClick={() => onRowClick(t)}
                 style={{
                   border: '1px solid var(--bd2)',

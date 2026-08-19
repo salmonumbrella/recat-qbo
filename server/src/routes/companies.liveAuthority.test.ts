@@ -40,7 +40,8 @@ const mocks = vi.hoisted(() => {
   const rootCompanyUpdate = vi.fn();
   const transaction = vi.fn();
   const revoke = vi.fn();
-  return { company, config, rootCompanyUpdate, transaction, revoke };
+  const qboForCompany = vi.fn();
+  return { company, config, rootCompanyUpdate, transaction, revoke, qboForCompany };
 });
 
 vi.mock('../lib/prisma.js', () => {
@@ -84,7 +85,7 @@ vi.mock('../lib/qbo/factory.js', () => ({
   hasIntuitCredentials: vi.fn().mockResolvedValue(true),
   qboFactory: {
     authorizeUrl: vi.fn(),
-    forCompany: vi.fn(),
+    forCompany: mocks.qboForCompany,
   },
   revokeCapturedQboToken: mocks.revoke,
   testCompanyConnection: vi.fn(),
@@ -142,6 +143,35 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.revoke.mockResolvedValue(undefined);
   vi.setSystemTime(NOW);
+});
+
+describe('holding account options', () => {
+  it('returns and counts a localized Uncategorised holding account', async () => {
+    const listAccounts = vi.fn().mockResolvedValue([
+      {
+        qboId: 'localized-expense',
+        name: 'Localized expense | Uncategorised Expense',
+        fullName: 'Localized expense | Uncategorised Expense',
+        classification: 'Expenses',
+        active: true,
+      },
+    ]);
+    const listTxnsInAccounts = vi.fn().mockResolvedValue([
+      { lines: [{ accountQboId: 'localized-expense' }] },
+    ]);
+    mocks.qboForCompany.mockResolvedValue({ listAccounts, listTxnsInAccounts });
+
+    const response = await request(app())
+      .get('/api/companies/company-1/holding-account-options')
+      .set('x-test-admin', 'true');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([{
+      qboId: 'localized-expense',
+      name: 'Localized expense | Uncategorised Expense',
+      count: 1,
+    }]);
+  });
 });
 
 describe('company routes preserve live authority invariants', () => {

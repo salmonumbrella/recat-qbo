@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
 import type { RuleCandidateDto, RuleDto, RuleTestResult } from '@recat/shared';
-import { isUsableTaxCodeDto } from '@recat/shared';
+import { isHoldingAccountName, isUsableTaxCodeDto } from '@recat/shared';
 import { ruleCandidates as ruleCandidatesApi, rules as rulesApi } from '../lib/api';
 import type { RuleBody } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
@@ -27,14 +27,14 @@ const RULES_CSS = `
 .rr .rules-row{display:grid;grid-template-columns:18px minmax(150px,1fr) 240px minmax(180px,1fr) 80px 36px;gap:8px 16px;align-items:center;padding:11px 20px;border-bottom:1px solid var(--rowbd);}
 .rr .rules-add{display:grid;grid-template-columns:minmax(150px,1fr) 240px 1fr auto 130px;gap:8px 16px;align-items:center;padding:14px 20px;background:var(--hl);border-radius:0 0 10px 10px;}
 .rr .rules-inline-input{font-size:14px;font-weight:500;border:1px solid transparent;border-radius:6px;padding:5px 8px;margin-left:-9px;background:transparent;color:var(--ink);outline:none;font-family:inherit;width:100%;box-sizing:border-box;}
-.rr .rules-inline-input:hover{border-color:var(--bd);}
+.rr .rules-inline-input:not(:disabled):not([aria-disabled="true"]):hover{border-color:var(--bd);}
 .rr .rules-inline-input:focus{border-color:var(--acc);background:var(--card);}
 .rr .rules-add-input{font-size:14px;border:1px solid var(--bd);border-radius:7px;padding:8px 12px;background:var(--card);color:var(--ink);outline:none;font-family:inherit;width:100%;box-sizing:border-box;}
 .rr .rules-add-input:focus{border-color:var(--acc);}
 .rr .rules-add-btn{background:var(--acc);color:#fff;border:none;border-radius:7px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer;font:inherit;justify-self:end;}
-.rr .rules-add-btn:hover{background:var(--accH);}
-.rr .rules-tagopt:hover{background:var(--hl);}
-.rr .rules-del:hover{color:var(--erT);}
+.rr .rules-add-btn:not(:disabled):not([aria-disabled="true"]):hover{background:var(--accH);}
+.rr .rules-tagopt:not(:disabled):not([aria-disabled="true"]):hover{background:var(--hl);}
+.rr .rules-del:not(:disabled):not([aria-disabled="true"]):hover{color:var(--erT);}
 .rr .rules-drag{font-size:16px;color:var(--fnt);cursor:grab;user-select:none;line-height:1;}
 .rr .rules-actions{display:contents;}
 .rr .rules-auto-label{display:none;}
@@ -129,7 +129,7 @@ export default function Rules() {
         .filter(
           (a) =>
             (a.classification === 'Income' || a.classification === 'COGS' || a.classification === 'Expenses') &&
-            !/^uncategorized |^ask my accountant$/i.test(a.name),
+            !isHoldingAccountName(a.name),
         )
         .map((a) => ({ v: a.name, label: `${a.classification} · ${a.name}`, qboId: a.qboId })),
     [accounts],

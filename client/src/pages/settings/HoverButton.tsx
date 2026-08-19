@@ -12,12 +12,16 @@ export default function HoverButton({
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & { hoverStyle?: CSSProperties }) {
   const [hover, setHover] = useState(false);
+  const unavailable =
+    rest.disabled || rest['aria-disabled'] === true || rest['aria-disabled'] === 'true';
   return (
     <button
       {...rest}
-      onMouseEnter={() => setHover(true)}
+      onMouseEnter={() => {
+        if (!unavailable) setHover(true);
+      }}
       onMouseLeave={() => setHover(false)}
-      style={hover && hoverStyle ? { ...style, ...hoverStyle } : style}
+      style={hover && !unavailable && hoverStyle ? { ...style, ...hoverStyle } : style}
     />
   );
 }

@@ -1131,3 +1131,15 @@ export interface ApiError {
   error: string;
   code?: string;
 }
+
+const HOLDING_ACCOUNT_TERM = /uncategori[sz]ed/i;
+const DEFAULT_HOLDING_ACCOUNT_TERM = /uncategori[sz]ed expense/i;
+const ASK_MY_ACCOUNTANT = /ask my accountant/i;
+
+export function isHoldingAccountName(name: string): boolean {
+  return ASK_MY_ACCOUNTANT.test(name) || HOLDING_ACCOUNT_TERM.test(name);
+}
+
+export function isDefaultHoldingAccountName(name: string): boolean {
+  return ASK_MY_ACCOUNTANT.test(name) || DEFAULT_HOLDING_ACCOUNT_TERM.test(name);
+}

@@ -6,12 +6,13 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { Company } from '@prisma/client';
-import type {
-  CompanyDto,
-  PollInterval,
-  QboAccountDto,
-  QboDiagnosticCode,
-  SyncLogDto,
+import {
+  isHoldingAccountName,
+  type CompanyDto,
+  type PollInterval,
+  type QboAccountDto,
+  type QboDiagnosticCode,
+  type SyncLogDto,
 } from '@recat/shared';
 import { parseConnectRequest } from '../lib/connectRequest.js';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
@@ -290,7 +291,9 @@ companiesRouter.get(
     const accounts = await client.listAccounts();
     const currentIds = jsonStringArray(company.holdingAccountIds);
     const candidates = accounts.filter(
-      (a) => a.active && (/ask my accountant|uncategorized/i.test(a.name) || currentIds.includes(a.qboId)),
+      (account) => account.active && (
+        isHoldingAccountName(account.name) || currentIds.includes(account.qboId)
+      ),
     );
     const candidateIds = new Set(candidates.map((c) => c.qboId));
 

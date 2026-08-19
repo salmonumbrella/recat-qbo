@@ -25,13 +25,13 @@ const TAGS_CSS = `
 .rr .tags-row{display:grid;grid-template-columns:240px 1fr 140px 40px;gap:8px 16px;align-items:center;padding:12px 20px;border-bottom:1px solid var(--rowbd);}
 .rr .tags-add{display:grid;grid-template-columns:240px 1fr 130px;gap:8px 16px;align-items:center;padding:14px 20px;background:var(--hl);border-radius:0 0 10px 10px;}
 .rr .tags-inline-input{font-size:14.5px;font-weight:500;border:1px solid transparent;border-radius:6px;padding:5px 8px;margin-left:-9px;background:transparent;color:var(--ink);outline:none;font-family:inherit;width:100%;box-sizing:border-box;}
-.rr .tags-inline-input:hover{border-color:var(--bd);}
+.rr .tags-inline-input:not(:disabled):not([aria-disabled="true"]):hover{border-color:var(--bd);}
 .rr .tags-inline-input:focus{border-color:var(--acc);background:var(--card);}
 .rr .tags-add-input{font-size:14.5px;border:1px solid var(--bd);border-radius:7px;padding:8px 12px;background:var(--card);color:var(--ink);outline:none;font-family:inherit;width:100%;box-sizing:border-box;}
 .rr .tags-add-input:focus{border-color:var(--acc);}
 .rr .tags-add-btn{background:var(--acc);color:#fff;border:none;border-radius:7px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer;font:inherit;justify-self:end;}
-.rr .tags-add-btn:hover{background:var(--accH);}
-.rr .tags-del:hover{color:var(--erT);}
+.rr .tags-add-btn:not(:disabled):not([aria-disabled="true"]):hover{background:var(--accH);}
+.rr .tags-del:not(:disabled):not([aria-disabled="true"]):hover{color:var(--erT);}
 .rr .tags-meta{display:contents;}
 @media (max-width:640px){
 .rr .tags-head{display:none;}

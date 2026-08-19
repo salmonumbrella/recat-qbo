@@ -19,7 +19,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import type { QboEnv, QboPreflightDto, SyncMode } from '@recat/shared';
+import {
+  isDefaultHoldingAccountName,
+  type QboEnv,
+  type QboPreflightDto,
+  type SyncMode,
+} from '@recat/shared';
 import {
   api,
   ApiError,
@@ -219,14 +224,14 @@ function ModeCards({
     }) as const;
   return (
     <div style={{ display: 'flex', gap: 10 }}>
-      <label onClick={() => onSelect('demo')} style={cardStyle('demo')}>
+      <label className="interactive-surface" onClick={() => onSelect('demo')} style={cardStyle('demo')}>
         <div style={{ fontSize: 14.5, fontWeight: 600 }}>Try the demo</div>
         <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
           A built-in fake QuickBooks with sample companies. No Intuit account, nothing to
           configure — explore every feature safely.
         </div>
       </label>
-      <label onClick={() => onSelect('real')} style={cardStyle('real')}>
+      <label className="interactive-surface" onClick={() => onSelect('real')} style={cardStyle('real')}>
         <div style={{ fontSize: 14.5, fontWeight: 600 }}>Connect my real QuickBooks</div>
         <div style={{ fontSize: 13, color: 'var(--fnt)', marginTop: 2, lineHeight: 1.45 }}>
           Bring your own free Intuit API keys. Demo data stays available on the side.
@@ -469,7 +474,7 @@ export default function Setup() {
           sel[o.id] =
             preset.length > 0
               ? preset.includes(o.id)
-              : /ask my accountant|uncategorized expense/i.test(o.name);
+              : isDefaultHoldingAccountName(o.name);
         }
         setSelected(sel);
       })
@@ -867,10 +872,10 @@ export default function Setup() {
       }}
     >
       <style>{`
-        .rr .sw-primary:hover { background: var(--accH); }
-        .rr .sw-back:hover { color: var(--ink); }
-        .rr .sw-copy:hover { background: var(--hl); }
-        .rr .sw-dashed:hover { color: var(--ink); border-color: var(--fnt); }
+        .rr .sw-primary:not(:disabled):not([aria-disabled="true"]):hover { background: var(--accH); }
+        .rr .sw-back:not(:disabled):not([aria-disabled="true"]):hover { color: var(--ink); }
+        .rr .sw-copy:not(:disabled):not([aria-disabled="true"]):hover { background: var(--hl); }
+        .rr .sw-dashed:not(:disabled):not([aria-disabled="true"]):hover { color: var(--ink); border-color: var(--fnt); }
         @media (max-width: 640px) { .rr .sw-step-label { display: none; } }
       `}</style>
       <div style={{ width: '100%', maxWidth: 660, display: 'flex', flexDirection: 'column', gap: 22 }}>
@@ -1456,6 +1461,7 @@ export default function Setup() {
               {mode === 'real' && (
                 <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
                   <label
+                    className="interactive-surface"
                     onClick={() => setEnv('sandbox')}
                     style={{
                       flex: 1,
@@ -1472,6 +1478,7 @@ export default function Setup() {
                     </div>
                   </label>
                   <label
+                    className="interactive-surface"
                     onClick={() => setEnv('production')}
                     style={{
                       flex: 1,
@@ -1648,6 +1655,7 @@ export default function Setup() {
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <label
+                  className="interactive-surface"
                   onClick={() => setSyncMode('polling')}
                   style={{
                     border: `1.5px solid ${syncMode === 'polling' ? 'var(--acc)' : 'var(--bd2)'}`,
@@ -1678,6 +1686,7 @@ export default function Setup() {
                   </div>
                 </label>
                 <label
+                  className="interactive-surface"
                   onClick={() => setSyncMode('webhook')}
                   style={{
                     border: `1.5px solid ${syncMode === 'webhook' ? 'var(--acc)' : 'var(--bd2)'}`,

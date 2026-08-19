@@ -15,11 +15,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({
     activeCompanyId: mocks.activeCompanyId,
-    accounts: [{
-      qboId: 'ACCOUNT_GENERIC',
-      name: 'Office expense',
-      classification: 'Expenses',
-    }],
+    accounts: [
+      {
+        qboId: 'ACCOUNT_GENERIC',
+        name: 'Office expense',
+        classification: 'Expenses',
+      },
+      {
+        qboId: 'LOCALIZED_HOLDING',
+        name: 'Localized expense | Uncategorised Expense',
+        classification: 'Expenses',
+      },
+    ],
     tags: [{
       id: '11111111-1111-4111-8111-111111111111',
       name: 'Reviewed',
@@ -108,6 +115,21 @@ function candidate(overrides: Partial<RuleCandidateDto> = {}): RuleCandidateDto 
 }
 
 describe('Rules candidate review', () => {
+  it('excludes localized Uncategorised holding accounts from category destinations', async () => {
+    mocks.listRules.mockResolvedValue([]);
+    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
+
+    render(<Rules />);
+
+    await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
+    expect(screen.queryAllByRole('option', {
+      name: /Localized expense \| Uncategorised Expense/,
+    })).toHaveLength(0);
+    expect(screen.getAllByRole('option', {
+      name: 'Expenses · Office expense',
+    })).not.toHaveLength(0);
+  });
+
   it('explains verified provenance and activates an inert candidate explicitly', async () => {
     const ready = candidate();
     mocks.listRules.mockResolvedValue([]);
