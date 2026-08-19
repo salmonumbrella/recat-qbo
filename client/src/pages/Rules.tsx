@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
 import type { RuleCandidateDto, RuleDto, RuleTestResult } from '@recat/shared';
-import { isHoldingAccountName, isUsableTaxCodeDto } from '@recat/shared';
+import { isQboHoldingAccountName, isUsableTaxCodeDto } from '@recat/shared';
 import { ruleCandidates as ruleCandidatesApi, rules as rulesApi } from '../lib/api';
 import type { RuleBody } from '../lib/api';
 import { fmtDate, fmtMoney } from '../lib/format';
@@ -129,7 +129,7 @@ export default function Rules() {
         .filter(
           (a) =>
             (a.classification === 'Income' || a.classification === 'COGS' || a.classification === 'Expenses') &&
-            !isHoldingAccountName(a.name),
+            !isQboHoldingAccountName(a.name),
         )
         .map((a) => ({ v: a.name, label: `${a.classification} · ${a.name}`, qboId: a.qboId })),
     [accounts],

@@ -66,8 +66,16 @@ vi.mock('../state/AppContext', () => ({
       {
         id: 'ACCOUNT_LOCALIZED_HOLDING',
         qboId: 'LOCALIZED_HOLDING',
-        name: 'Localized expense | Uncategorised Expense',
-        fullName: 'Expenses · Localized expense | Uncategorised Expense',
+        name: 'Uncategorised Expense',
+        fullName: 'Expenses · Uncategorised Expense',
+        classification: 'Expenses',
+        active: true,
+      },
+      {
+        id: 'ACCOUNT_USER_NAMED',
+        qboId: 'USER_NAMED',
+        name: 'Old Uncategorized Costs',
+        fullName: 'Expenses · Old Uncategorized Costs',
         classification: 'Expenses',
         active: true,
       },
@@ -361,10 +369,17 @@ describe('tax-aware manual queue', () => {
     }));
 
     expect(screen.queryByRole('button', {
-      name: /Localized expense \| Uncategorised Expense/,
+      name: /Uncategorised Expense/,
     })).not.toBeInTheDocument();
     expect(screen.getByRole('button', {
       name: /Alternate expense/,
+    })).toBeInTheDocument();
+
+    // A user's own account that merely mentions the term is not QuickBooks'
+    // holding account, and hiding it would remove a destination they created
+    // on purpose with nothing to explain where it went.
+    expect(screen.getByRole('button', {
+      name: /Old Uncategorized Costs/,
     })).toBeInTheDocument();
   });
 

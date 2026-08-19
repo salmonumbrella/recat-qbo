@@ -8,7 +8,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  isHoldingAccountName,
+  isQboHoldingAccountName,
   type ActiveCategorizationAttemptDto,
   type CategorizationMutationOutcome,
   type CategorizationMutationResult,
@@ -441,7 +441,7 @@ export default function Queue() {
         ['Income', 'COGS', 'Expenses'].includes(a.classification) &&
         !holding.has(a.qboId) &&
         !holding.has(a.id) &&
-        !isHoldingAccountName(a.name),
+        !isQboHoldingAccountName(a.name),
     );
   }, [accounts, activeCompany]);
 

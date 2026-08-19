@@ -1132,14 +1132,48 @@ export interface ApiError {
   code?: string;
 }
 
+// QuickBooks localizes these: a British company returns "Uncategorised".
 const HOLDING_ACCOUNT_TERM = /uncategori[sz]ed/i;
 const DEFAULT_HOLDING_ACCOUNT_TERM = /uncategori[sz]ed expense/i;
 const ASK_MY_ACCOUNTANT = /ask my accountant/i;
 
+// Anchored equivalents. QuickBooks' own holding accounts are named exactly
+// "Uncategorised Expense", "Uncategorized Income", "Ask My Accountant" and so
+// on, so the real ones always lead with the term.
+const HOLDING_ACCOUNT_LEAD = /^uncategori[sz]ed /i;
+const ASK_MY_ACCOUNTANT_EXACT = /^ask my accountant$/i;
+
+/**
+ * Might this be a holding account? Deliberately broad, and only for building
+ * the list of accounts to OFFER as holding-account candidates — a near miss
+ * costs the operator one extra row to scan, and they choose from it.
+ *
+ * Do not use it to hide accounts. See isQboHoldingAccountName.
+ */
 export function isHoldingAccountName(name: string): boolean {
   return ASK_MY_ACCOUNTANT.test(name) || HOLDING_ACCOUNT_TERM.test(name);
 }
 
+/**
+ * Is this one of QuickBooks' own holding accounts? Anchored, and the one to use
+ * where a match REMOVES an account from what the user can pick — the category
+ * destinations in Queue and Rules.
+ *
+ * The distinction is the whole point. Matching loosely there hides a user's own
+ * "Old Uncategorized Costs" or "Legal - ask my accountant first" from the
+ * category picker, with nothing to explain where it went, and they can no
+ * longer categorize into an account they created on purpose.
+ */
+export function isQboHoldingAccountName(name: string): boolean {
+  return ASK_MY_ACCOUNTANT_EXACT.test(name) || HOLDING_ACCOUNT_LEAD.test(name);
+}
+
+/**
+ * Which accounts Setup preselects. Narrower than the candidate list — the
+ * expense holding account is the one nearly every company wants — but left
+ * unanchored, as it was before localization support, because preselection is a
+ * suggestion the operator can undo rather than something that removes a choice.
+ */
 export function isDefaultHoldingAccountName(name: string): boolean {
   return ASK_MY_ACCOUNTANT.test(name) || DEFAULT_HOLDING_ACCOUNT_TERM.test(name);
 }

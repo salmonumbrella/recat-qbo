@@ -23,7 +23,7 @@ vi.mock('../state/AppContext', () => ({
       },
       {
         qboId: 'LOCALIZED_HOLDING',
-        name: 'Localized expense | Uncategorised Expense',
+        name: 'Uncategorised Expense',
         classification: 'Expenses',
       },
     ],
@@ -123,7 +123,7 @@ describe('Rules candidate review', () => {
 
     await waitFor(() => expect(mocks.listRules).toHaveBeenCalled());
     expect(screen.queryAllByRole('option', {
-      name: /Localized expense \| Uncategorised Expense/,
+      name: /Uncategorised Expense/,
     })).toHaveLength(0);
     expect(screen.getAllByRole('option', {
       name: 'Expenses · Office expense',
