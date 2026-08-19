@@ -88,7 +88,7 @@ const delStyle: CSSProperties = {
 const MATCH_DEBOUNCE_MS = 500;
 
 export default function Rules() {
-  const { activeCompanyId, accounts, tags, taxReadiness, toast } = useApp();
+  const { activeCompanyId, activeCompany, accounts, tags, taxReadiness, toast } = useApp();
 
   const [ruleList, setRuleList] = useState<RuleDto[]>([]);
   const [candidateList, setCandidateList] = useState<RuleCandidateDto[]>([]);
@@ -123,17 +123,24 @@ export default function Rules() {
 
   // Category options: 'Group · Name' from Income/COGS/Expenses accounts
   // (prototype catOpts — value is the account name, label prefixed with group).
-  const catOpts = useMemo(
-    () =>
-      accounts
-        .filter(
-          (a) =>
-            (a.classification === 'Income' || a.classification === 'COGS' || a.classification === 'Expenses') &&
-            !isQboHoldingAccountName(a.name),
-        )
-        .map((a) => ({ v: a.name, label: `${a.classification} · ${a.name}`, qboId: a.qboId })),
-    [accounts],
-  );
+  const catOpts = useMemo(() => {
+    // Exclude this company's designated holding accounts by id, as Queue does.
+    // The name test only knows QuickBooks' built-ins, so an account the
+    // operator designated under a name of their own — "Uncategorized Expenses
+    // Pending Review" — would otherwise be offered as a rule destination, and
+    // an auto-post rule could file transactions back into the very account
+    // Recat is watching.
+    const holding = new Set((activeCompany?.holdingAccountIds ?? []).map(String));
+    return accounts
+      .filter(
+        (a) =>
+          (a.classification === 'Income' || a.classification === 'COGS' || a.classification === 'Expenses') &&
+          !holding.has(a.qboId) &&
+          !holding.has(a.id) &&
+          !isQboHoldingAccountName(a.name),
+      )
+      .map((a) => ({ v: a.name, label: `${a.classification} · ${a.name}`, qboId: a.qboId }));
+  }, [accounts, activeCompany]);
 
   const tagById = useMemo(() => new Map(tags.map((t) => [t.id, t])), [tags]);
 
