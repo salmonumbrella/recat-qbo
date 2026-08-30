@@ -262,8 +262,30 @@ export interface RawReportRow {
 }
 
 export interface RawReport {
-  Columns?: { Column?: { ColTitle?: string; ColType?: string }[] };
+  Columns?: {
+    Column?: {
+      ColTitle?: string;
+      ColType?: string;
+      MetaData?: { Name?: string; Value?: string }[];
+    }[];
+  };
   Rows?: { Row?: RawReportRow[] };
+}
+
+function reportColumnIndex(
+  columns: NonNullable<NonNullable<RawReport['Columns']>['Column']>,
+  key: string,
+  titleWord: string,
+): number {
+  const byKey = columns.findIndex((column) =>
+    column.MetaData?.some((entry) => entry.Name === 'ColKey' && entry.Value === key),
+  );
+  if (byKey >= 0) return byKey;
+  const byType = columns.findIndex((column) => column.ColType === key);
+  if (byType >= 0) return byType;
+  return columns.findIndex((column) =>
+    (column.ColTitle ?? '').toLowerCase().includes(titleWord),
+  );
 }
 
 /** '1,234.56' / '-45.00' / '' / undefined → number (0 on anything unparsable). */
@@ -346,16 +368,11 @@ const TXN_LIST_COLUMNS = 'tx_date,txn_type,name,memo,subt_nat_amount';
  */
 export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
   const cols = raw.Columns?.Column ?? [];
-  const colIndex = (type: string, titleWord: string): number => {
-    const byType = cols.findIndex((c) => c.ColType === type);
-    if (byType >= 0) return byType;
-    return cols.findIndex((c) => (c.ColTitle ?? '').toLowerCase().includes(titleWord));
-  };
-  const iDate = colIndex('tx_date', 'date');
-  const iType = colIndex('txn_type', 'transaction type');
-  const iName = colIndex('name', 'name');
-  const iMemo = colIndex('memo', 'memo');
-  const iAmount = colIndex('subt_nat_amount', 'amount');
+  const iDate = reportColumnIndex(cols, 'tx_date', 'date');
+  const iType = reportColumnIndex(cols, 'txn_type', 'transaction type');
+  const iName = reportColumnIndex(cols, 'name', 'name');
+  const iMemo = reportColumnIndex(cols, 'memo', 'memo');
+  const iAmount = reportColumnIndex(cols, 'subt_nat_amount', 'amount');
   const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
     i >= 0 ? colData[i] : undefined;
 
@@ -374,7 +391,7 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
         ...(memo !== undefined && memo !== '' ? { memo } : {}),
         amount: reportNumber(at(colData, iAmount)?.value),
         txnType: at(colData, iType)?.value ?? '',
-        qboId: at(colData, iDate)?.id ?? colData[0]?.id ?? '',
+        qboId: at(colData, iDate)?.id ?? at(colData, iType)?.id ?? colData[0]?.id ?? '',
       });
     }
   };
@@ -398,8 +415,8 @@ function canonicalSafetyReportType(value: string | undefined): 'Purchase' | 'Dep
 
 function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget): boolean {
   const columns = raw.Columns?.Column ?? [];
-  const dateIndex = columns.findIndex((column) => column.ColType === 'tx_date');
-  const typeIndex = columns.findIndex((column) => column.ColType === 'txn_type');
+  const dateIndex = reportColumnIndex(columns, 'tx_date', 'date');
+  const typeIndex = reportColumnIndex(columns, 'txn_type', 'transaction type');
   if (dateIndex < 0 || typeIndex < 0) {
     throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
   }
@@ -411,7 +428,7 @@ function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget
       const date = row.ColData[dateIndex];
       if (date?.value !== target.txnDate) continue;
       const type = canonicalSafetyReportType(row.ColData[typeIndex]?.value);
-      const id = date.id ?? row.ColData[0]?.id;
+      const id = date.id ?? row.ColData[typeIndex]?.id ?? row.ColData[0]?.id;
       if (id === target.qboId) {
         if (type !== target.qboType) {
           throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');

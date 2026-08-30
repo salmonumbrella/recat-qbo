@@ -658,6 +658,53 @@ describe('RealQboClient purchase-tax HTTP seam', () => {
     })).resolves.toMatchObject({ cleared: true, reconciled: true });
   });
 
+  it('reads safety identity from Intuit ColKey metadata and the transaction-type cell', async () => {
+    const report: RawReport = {
+      Columns: {
+        Column: [
+          {
+            ColTitle: 'Date',
+            ColType: 'Date',
+            MetaData: [{ Name: 'ColKey', Value: 'tx_date' }],
+          },
+          {
+            ColTitle: 'Transaction Type',
+            ColType: 'String',
+            MetaData: [{ Name: 'ColKey', Value: 'txn_type' }],
+          },
+        ],
+      },
+      Rows: {
+        Row: [{
+          ColData: [
+            { value: '2025-01-21' },
+            { value: 'Expense', id: '6477' },
+          ],
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...report,
+        Rows: { Row: [] },
+      }))));
+
+    await expect(realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: '6477',
+      txnDate: '2025-01-21',
+      bankAccountQboId: '74',
+    })).resolves.toEqual({
+      bookCloseDate: null,
+      cleared: true,
+      reconciled: false,
+    });
+  });
+
   it('fails closed when the exact provider identity has an unknown report type', async () => {
     const unknownType: RawReport = {
       Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },
