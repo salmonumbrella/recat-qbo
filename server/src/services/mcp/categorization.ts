@@ -46,11 +46,17 @@ export interface PreparedMcpCategorizationDto {
   preview: {
     transactionId: string;
     revision: number;
+    taxDisposition: NonNullable<StagedCategorization['taxDisposition']>;
     taxCalculation: StagedCategorization['taxCalculation'];
     totals: StagedCategorization['totals'];
     lines: Array<Pick<
       StagedCategorization['lines'][number],
-      'idx' | 'subtotalCents' | 'taxCents' | 'totalCents'
+      | 'idx'
+      | 'subtotalCents'
+      | 'taxCents'
+      | 'totalCents'
+      | 'categoryQboId'
+      | 'taxCodeQboId'
     >>;
     transactionTagCount: number;
     lineTagCount: number;
@@ -363,6 +369,7 @@ function toPreparedDto(operation: McpOperationRecord): PreparedMcpCategorization
     preview: {
       transactionId: staged.transactionId,
       revision: staged.revision,
+      taxDisposition: staged.taxDisposition ?? 'set',
       taxCalculation: staged.taxCalculation,
       totals: staged.totals,
       lines: staged.lines.map((line) => ({
@@ -370,6 +377,8 @@ function toPreparedDto(operation: McpOperationRecord): PreparedMcpCategorization
         subtotalCents: line.subtotalCents,
         taxCents: line.taxCents,
         totalCents: line.totalCents,
+        categoryQboId: line.categoryQboId,
+        taxCodeQboId: line.taxCodeQboId,
       })),
       transactionTagCount: staged.tagIds.length,
       lineTagCount: staged.lines.reduce(

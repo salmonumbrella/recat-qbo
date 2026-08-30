@@ -31,6 +31,7 @@ const preparedCategorization = {
   preview: {
     transactionId,
     revision: 3,
+    taxDisposition: 'set' as const,
     taxCalculation: 'TaxInclusive' as const,
     totals: {
       subtotalCents: -1_000,
@@ -42,6 +43,8 @@ const preparedCategorization = {
       subtotalCents: -1_000,
       taxCents: -50,
       totalCents: -1_050,
+      categoryQboId: 'expense-account',
+      taxCodeQboId: 'tax-code',
     }],
     transactionTagCount: 1,
     lineTagCount: 1,

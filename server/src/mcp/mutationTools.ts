@@ -267,8 +267,8 @@ const previewLine = z.strictObject({
   subtotalCents: safeInteger,
   taxCents: safeInteger,
   totalCents: safeInteger,
-  categoryQboId: qboReference.optional(),
-  taxCodeQboId: qboReference.nullable().optional(),
+  categoryQboId: qboReference,
+  taxCodeQboId: qboReference.nullable(),
 });
 const preparedCategorizationOutput = z.strictObject({
   operationId: uuid,
@@ -278,7 +278,7 @@ const preparedCategorizationOutput = z.strictObject({
   preview: z.strictObject({
     transactionId: uuid,
     revision: z.number().int().min(1).max(MAX_REVISION),
-    taxDisposition: z.enum(['set', 'preserve_current']).optional(),
+    taxDisposition: z.enum(['set', 'preserve_current']),
     taxCalculation: z.enum([
       'TaxInclusive',
       'TaxExcluded',
