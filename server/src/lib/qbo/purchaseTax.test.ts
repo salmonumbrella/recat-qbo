@@ -8,6 +8,7 @@ import {
   mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization,
   preparePurchaseRestore,
+  purchaseTargetLineMatches,
 } from './purchaseTax.js';
 import { QboSyncTokenConflict, type QboPurchaseSnapshot, type RawPurchase } from './types.js';
 import type { StagedCategorization } from '@recat/shared';
@@ -865,6 +866,17 @@ describe('preparePurchaseRecategorization', () => {
         },
       },
     });
+    const normalizedReadback = structuredClone(prepared.body);
+    normalizedReadback.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef!.name = 'Bank Charges';
+    const actual = mapPurchaseTaxSnapshot(normalizedReadback);
+    expect(purchaseTargetLineMatches(
+      prepared.expected.globalTaxCalculation,
+      prepared.expected.totalTaxCents,
+      actual.totalTaxCents,
+      prepared.expected.targetLines[0]!,
+      actual.lines[0]!,
+      'preserve_current',
+    )).toBe(true);
     expect(prepared.expected).toMatchObject({
       qboId: '6477',
       totalCents: -75_000,
@@ -1348,6 +1360,18 @@ describe('preparePurchaseRestore', () => {
       .toBe('NotBillable');
     expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef)
       .toEqual({ value: '2', name: 'Uncategorized Expense' });
+    const normalizedReadback = structuredClone(restore.body);
+    normalizedReadback.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef!.name =
+      'Uncategorized Expense (normalized)';
+    const actual = mapPurchaseTaxSnapshot(normalizedReadback);
+    expect(purchaseTargetLineMatches(
+      restore.expected.globalTaxCalculation,
+      restore.expected.totalTaxCents,
+      actual.totalTaxCents,
+      restore.expected.targetLines[0]!,
+      actual.lines[0]!,
+      'preserve_current',
+    )).toBe(true);
   });
 
   it('prepares restore after QBO normalizes a non-taxable write to null/default fields', () => {

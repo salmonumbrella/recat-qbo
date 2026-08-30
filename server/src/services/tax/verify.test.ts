@@ -136,7 +136,7 @@ describe('verifyPurchaseResult', () => {
       globalTaxCalculation: 'NotApplicable',
       totalTaxCents: null,
       preservedHash: 'preserved-top-level',
-      lines: [preservedTarget],
+      lines: [{ ...preservedTarget, rawHash: 'provider-normalized-reference-name' }],
     };
 
     expect(verifyPurchaseResult(preservedExpected, preservedActual)).toEqual({ ok: true });
@@ -153,7 +153,11 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
     expect(verifyPurchaseResult(preservedExpected, {
       ...preservedActual,
-      lines: [{ ...preservedTarget, rawHash: 'changed-custom-field' }],
+      lines: [{
+        ...preservedTarget,
+        rawHash: 'changed-custom-field',
+        categoryOnlyHash: 'changed-non-category-field',
+      }],
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 

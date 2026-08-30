@@ -832,7 +832,10 @@ function preservedPurchaseEntity(raw: RawPurchase): Record<string, unknown> {
 function categoryOnlyLine(raw: RawPurchaseLine): RawPurchaseLine {
   const line = normalizedClone(raw);
   const accountRef = line.AccountBasedExpenseLineDetail?.AccountRef;
-  if (accountRef !== undefined) accountRef.value = '__CATEGORY_ACCOUNT__';
+  if (accountRef !== undefined) {
+    accountRef.value = '__CATEGORY_ACCOUNT__';
+    delete accountRef.name;
+  }
   return line;
 }
 
@@ -1005,8 +1008,6 @@ export function purchaseTargetLineMatches(
     || (
       expected.id !== null
       && expected.id === actual.id
-      && typeof expected.rawHash === 'string'
-      && expected.rawHash === actual.rawHash
       && typeof expected.categoryOnlyHash === 'string'
       && expected.categoryOnlyHash === actual.categoryOnlyHash
     );
