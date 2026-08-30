@@ -1125,6 +1125,76 @@ export function preparePurchaseRecategorization(args: {
   }
   assertStagedAmounts(args.staged, current, holdingLineIndexes);
 
+  if (args.staged.taxDisposition === 'preserve_current') {
+    if (
+      args.staged.taxCalculation !== 'NotApplicable'
+      || current.globalTaxCalculation !== 'NotApplicable'
+      || holdingLineIndexes.length !== 1
+      || args.staged.lines.length !== 1
+      || args.staged.tagIds.length !== 0
+    ) {
+      preparationError(
+        'QBO_PURCHASE_UNSUPPORTED',
+        'Preserve-current requires one NotApplicable Purchase holding line.',
+      );
+    }
+    const targetIndex = holdingLineIndexes[0]!;
+    const sourceRawLine = args.current.Line![targetIndex]!;
+    const sourceSnapshotLine = current.lines[targetIndex]!;
+    const stagedLine = args.staged.lines[0]!;
+    const targetAccountQboId = requiredIdentity(
+      stagedLine.categoryQboId,
+      'category account reference',
+    );
+    const expectedTaxCodeQboId = requiredIdentity(
+      stagedLine.taxCodeQboId,
+      'source tax code reference',
+    );
+    requiredIdentity(sourceRawLine.Id, 'holding line identity');
+    if (
+      sourceRawLine.DetailType !== 'AccountBasedExpenseLineDetail'
+      || sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef === undefined
+      || sourceSnapshotLine.taxCodeQboId !== expectedTaxCodeQboId
+      || sourceSnapshotLine.amountCents !== stagedLine.totalCents
+      || stagedLine.memo !== null
+      || (stagedLine.tagIds?.length ?? 0) !== 0
+    ) {
+      preparationError(
+        'QBO_STATE_DRIFT',
+        'Preserve-current Purchase source facts do not match the staged precondition.',
+      );
+    }
+
+    const body = normalizedClone(args.current);
+    const targetDetail = body.Line![targetIndex]!.AccountBasedExpenseLineDetail!;
+    targetDetail.AccountRef = {
+      ...targetDetail.AccountRef!,
+      value: targetAccountQboId,
+    };
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: current.qboId,
+      requestId: args.requestId,
+      requestHash: requestHash(body),
+      body,
+      before: normalizedClone(args.before),
+      expected: {
+        ...expectedBase(
+          current,
+          current.globalTaxCalculation,
+          current.totalTaxCents,
+        ),
+        targetLines: [{
+          ...sourceSnapshotLine,
+          accountQboId: targetAccountQboId,
+        }],
+        untouchedLineHashes: keptSnapshotLines.map(canonicalSnapshotLine),
+      },
+    };
+    return deepFreeze(prepared);
+  }
+
   const keptTaxBearing = keptSnapshotLines.some(
     (line) =>
       line.taxCodeQboId !== null ||
