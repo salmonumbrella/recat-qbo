@@ -288,6 +288,39 @@ function reportColumnIndex(
   );
 }
 
+interface ReportTransactionIdentity {
+  id?: string;
+  conflict: boolean;
+}
+
+/**
+ * Intuit places a transaction id on either the date or transaction-type cell,
+ * depending on the report shape. Treat both semantic cells as authority
+ * carriers and fail closed when they disagree. The first-cell fallback is
+ * retained only for legacy reports where neither semantic column resolves.
+ */
+function reportTransactionIdentity(
+  colData: RawReportColData[],
+  dateIndex: number,
+  typeIndex: number,
+): ReportTransactionIdentity {
+  const carrierIndexes = [...new Set([dateIndex, typeIndex].filter((index) => index >= 0))];
+  const ids = carrierIndexes
+    .map((index) => colData[index]?.id?.trim())
+    .filter((id): id is string => id !== undefined && id !== '');
+  const distinct = [...new Set(ids)];
+  if (distinct.length > 1) return { conflict: true };
+  if (distinct.length === 1) return { id: distinct[0], conflict: false };
+
+  if (carrierIndexes.length === 0) {
+    const legacyId = colData[0]?.id?.trim();
+    if (legacyId !== undefined && legacyId !== '') {
+      return { id: legacyId, conflict: false };
+    }
+  }
+  return { conflict: false };
+}
+
 /** '1,234.56' / '-45.00' / '' / undefined → number (0 on anything unparsable). */
 function reportNumber(v: string | undefined): number {
   if (v === undefined || v.trim() === '') return 0;
@@ -385,13 +418,17 @@ export function parseTransactionListReport(raw: RawReport): QboAccountTxn[] {
       const date = at(colData, iDate)?.value ?? '';
       if (date === '') continue; // summary/blank row
       const memo = at(colData, iMemo)?.value;
+      const identity = reportTransactionIdentity(colData, iDate, iType);
+      if (identity.conflict) {
+        throw new Error('Conflicting QuickBooks report transaction identities');
+      }
       out.push({
         date,
         payee: at(colData, iName)?.value ?? '',
         ...(memo !== undefined && memo !== '' ? { memo } : {}),
         amount: reportNumber(at(colData, iAmount)?.value),
         txnType: at(colData, iType)?.value ?? '',
-        qboId: at(colData, iDate)?.id ?? at(colData, iType)?.id ?? colData[0]?.id ?? '',
+        qboId: identity.id ?? '',
       });
     }
   };
@@ -428,7 +465,11 @@ function reportContainsSafetyTarget(raw: RawReport, target: QboWriteSafetyTarget
       const date = row.ColData[dateIndex];
       if (date?.value !== target.txnDate) continue;
       const type = canonicalSafetyReportType(row.ColData[typeIndex]?.value);
-      const id = date.id ?? row.ColData[typeIndex]?.id ?? row.ColData[0]?.id;
+      const identity = reportTransactionIdentity(row.ColData, dateIndex, typeIndex);
+      if (identity.conflict) {
+        throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+      }
+      const id = identity.id;
       if (id === target.qboId) {
         if (type !== target.qboType) {
           throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
@@ -473,19 +514,14 @@ const TXN_LOG_COLUMNS = 'tx_date,txn_type,doc_num,name,memo,account_name,other_a
  */
 export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
   const cols = raw.Columns?.Column ?? [];
-  const colIndex = (type: string, titleWord: string): number => {
-    const byType = cols.findIndex((c) => c.ColType === type);
-    if (byType >= 0) return byType;
-    return cols.findIndex((c) => (c.ColTitle ?? '').toLowerCase().includes(titleWord));
-  };
-  const iDate = colIndex('tx_date', 'date');
-  const iType = colIndex('txn_type', 'transaction type');
-  const iDocNum = colIndex('doc_num', 'num');
-  const iName = colIndex('name', 'name');
-  const iMemo = colIndex('memo', 'memo');
-  const iAccount = colIndex('account_name', 'account');
-  const iCategory = colIndex('other_account', 'split');
-  const iAmount = colIndex('subt_nat_amount', 'amount');
+  const iDate = reportColumnIndex(cols, 'tx_date', 'date');
+  const iType = reportColumnIndex(cols, 'txn_type', 'transaction type');
+  const iDocNum = reportColumnIndex(cols, 'doc_num', 'num');
+  const iName = reportColumnIndex(cols, 'name', 'name');
+  const iMemo = reportColumnIndex(cols, 'memo', 'memo');
+  const iAccount = reportColumnIndex(cols, 'account_name', 'account');
+  const iCategory = reportColumnIndex(cols, 'other_account', 'split');
+  const iAmount = reportColumnIndex(cols, 'subt_nat_amount', 'amount');
   const at = (colData: RawReportColData[], i: number): RawReportColData | undefined =>
     i >= 0 ? colData[i] : undefined;
 
@@ -499,6 +535,10 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
       if (date === '') continue; // summary/blank row
       const memo = at(colData, iMemo)?.value;
       const docNum = at(colData, iDocNum)?.value;
+      const identity = reportTransactionIdentity(colData, iDate, iType);
+      if (identity.conflict) {
+        throw new Error('Conflicting QuickBooks report transaction identities');
+      }
       out.push({
         date,
         txnType: at(colData, iType)?.value ?? '',
@@ -508,10 +548,7 @@ export function parseTransactionLogReport(raw: RawReport): QboLogTxn[] {
         account: at(colData, iAccount)?.value ?? '',
         category: at(colData, iCategory)?.value ?? '',
         amount: reportNumber(at(colData, iAmount)?.value),
-        ...((): { qboId?: string } => {
-          const id = at(colData, iDate)?.id ?? colData[0]?.id;
-          return id !== undefined && id !== '' ? { qboId: id } : {};
-        })(),
+        ...(identity.id !== undefined ? { qboId: identity.id } : {}),
       });
     }
   };
