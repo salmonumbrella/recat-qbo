@@ -112,6 +112,38 @@ describe('verifyPurchaseResult', () => {
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 
+  it('requires the exact literal tax code for preserve-current Purchase verification', () => {
+    const preservedTarget = {
+      ...targetLine,
+      taxCodeQboId: 'NON',
+      taxAmountCents: null,
+      taxInclusiveCents: null,
+    };
+    const preservedExpected: ExpectedPurchaseResult = {
+      ...expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      targetLines: [preservedTarget],
+      untouchedLineHashes: [],
+    };
+    const preservedActual = {
+      ...actual,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: null,
+      lines: [{ ...preservedTarget, id: 'preserved-target' }],
+    };
+
+    expect(verifyPurchaseResult(preservedExpected, preservedActual)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{
+        ...preservedActual.lines[0]!,
+        taxCodeQboId: 'PROVIDER_DEFAULT_NON_TAX',
+      }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
   it('accepts omitted redundant tax fields when the inclusive amount proves the exact tax', () => {
     const expectedTarget = {
       ...targetLine,

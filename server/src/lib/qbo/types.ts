@@ -5,7 +5,7 @@
 // the exact same sync/write-back paths as production. Which implementation a
 // company gets is decided per company by its realmId (lib/qbo/factory.ts).
 
-import type { QboDiagnosticCode, StagedCategorization } from '@recat/shared';
+import type { QboDiagnosticCode, StagedCategorization, TaxDisposition } from '@recat/shared';
 import type { AttachmentBlobReader } from '../../services/attachments/types.js';
 import type { QboWriteSafetyEvidence, QboWriteSafetyTarget } from './writeSafety.js';
 
@@ -230,6 +230,7 @@ export interface QboDepositSnapshot {
 
 export interface QboPurchaseExpectedState {
   qboId: string;
+  taxDisposition?: TaxDisposition;
   totalCents: number;
   accountQboId: string | null;
   date: string;

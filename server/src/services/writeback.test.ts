@@ -120,6 +120,10 @@ describe('hashStagedCategorization', () => {
       }],
       tagIds: ['tag-c', 'tag-d'],
     }));
+    expect(hashStagedCategorization(staged)).toBe(hashStagedCategorization({
+      ...staged,
+      taxDisposition: 'set',
+    }));
   });
 });
 
@@ -1791,6 +1795,61 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.getClient).not.toHaveBeenCalled();
     expect(fixture.preparePurchaseRecategorization).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
+  it('reconstructs and durably replays an exact preserve-current Purchase stage', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const input = {
+      ...commitInput('request-preserve-current'),
+      expectedTaxDisposition: 'preserve_current' as const,
+      expectedStageHash: hashStagedCategorization(preserved),
+    };
+
+    const first = await commitStagedCategorization(input, fixture.deps);
+    const persistedBody = structuredClone(fixture.db.attempts[0]!.requestPayload);
+    const replay = await commitStagedCategorization(input, fixture.deps);
+
+    expect(first).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(replay).toEqual(first);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      preserved,
+      expect.anything(),
+      'request-preserve-current',
+    );
+    expect(fixture.db.attempts[0]!.requestPayload).toEqual(persistedBody);
+    expect(fixture.prepareRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a mismatched expected stage hash before QBO access on PREPARED resume', async () => {

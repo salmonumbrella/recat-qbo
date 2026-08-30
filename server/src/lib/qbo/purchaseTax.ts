@@ -939,9 +939,11 @@ export function purchaseTargetLineMatches(
   actualTotalTaxCents: number | null,
   expected: QboPurchaseSnapshot['lines'][number],
   actual: QboPurchaseSnapshot['lines'][number],
+  taxDisposition: QboPurchaseExpectedState['taxDisposition'] = 'set',
 ): boolean {
   const providerDefaultNonTaxCode =
-    globalTaxCalculation === 'NotApplicable'
+    taxDisposition !== 'preserve_current'
+    && globalTaxCalculation === 'NotApplicable'
     && zeroOrUnspecifiedTax(expectedTotalTaxCents)
     && zeroOrUnspecifiedTax(actualTotalTaxCents)
     && expected.taxCodeQboId === null
@@ -1185,6 +1187,7 @@ export function preparePurchaseRecategorization(args: {
           current.globalTaxCalculation,
           current.totalTaxCents,
         ),
+        taxDisposition: 'preserve_current',
         targetLines: [{
           ...sourceSnapshotLine,
           accountQboId: targetAccountQboId,
@@ -1312,6 +1315,7 @@ function assertExpectedCurrent(
         actual.totalTaxCents,
         target,
         line,
+        expected.taxDisposition,
       ));
     if (index === -1) {
       return preparationError('QBO_STATE_DRIFT', 'Prepared Purchase target line drifted before restore.');

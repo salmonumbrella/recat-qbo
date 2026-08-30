@@ -140,6 +140,7 @@ export function verifyPurchaseResult(
         actual.totalTaxCents,
         targetLine,
         line,
+        expected.taxDisposition,
       ) || targetLineHash(line) === targetLineHash(targetLine));
     if (targetIndex === -1) return drift('Expected target Purchase line is missing or changed.');
     remainingLines.splice(targetIndex, 1);

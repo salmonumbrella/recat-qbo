@@ -137,6 +137,7 @@ const boundedTagIds = z.array(z.string().uuid()).max(MAX_TAGS)
 const previewSchema = z.object({
   transactionId: z.string().uuid(),
   revision: z.number().int().min(1).max(MAX_PRISMA_INT),
+  taxDisposition: z.enum(['set', 'preserve_current']).optional(),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   totals: z.object({
     subtotalCents: safeCents,
