@@ -11,6 +11,7 @@ import {
   createRecatMcpServer,
   type CompanyReadOperations,
 } from './readTools.js';
+import type { WriteSafetyReadOperations } from '../services/writeSafetyReads.js';
 
 const principal = Object.freeze({
   tokenId: 'token-a',
@@ -69,6 +70,25 @@ function reads(): CompanyReadOperations {
     listTags: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     listRules: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     listTransferCandidates: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+  };
+}
+
+function safetyReads(): WriteSafetyReadOperations {
+  return {
+    getWriteSafety: vi.fn().mockResolvedValue({
+      transactionId: 'transaction-a',
+      revision: 1,
+      qboId: 'qbo-a',
+      qboType: 'Purchase',
+      qboSyncToken: '0',
+      txnDate: '2026-01-01',
+      bankAccountQboId: 'bank-a',
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+      writable: true,
+      blockCode: null,
+    }),
   };
 }
 
@@ -187,7 +207,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly nine core reads and twenty conservatively annotated action tools', async () => {
+  it('registers exactly ten core reads and twenty conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -218,7 +238,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(29);
+    expect(tools).toHaveLength(30);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -400,6 +420,36 @@ describe('Recat MCP read tools', () => {
     expect(listTransactions.inputSchema.properties.cursor.maxLength).toBe(2048);
     expect(listTransactions.outputSchema.additionalProperties).toBe(false);
     expect(tools.every((tool) => tool.outputSchema.additionalProperties === false)).toBe(true);
+  });
+
+  it('routes the read-only write-safety preflight with the fresh principal', async () => {
+    const operations = safetyReads();
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal,
+        era: 'legacy',
+        reads: reads(),
+        writeSafetyReads: operations,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'get_write_safety',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.writeSafety).toMatchObject({
+      transactionId: 'transaction-a',
+      writable: true,
+      blockCode: null,
+    });
+    expect(operations.getWriteSafety).toHaveBeenCalledWith(
+      'user-a',
+      'company-a',
+      'transaction-a',
+    );
   });
 
   it('routes reads with the fresh principal and rejects unknown fields', async () => {
