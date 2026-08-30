@@ -96,14 +96,24 @@ describe('Recat MCP read tools', () => {
       reason: null,
       usingSalesTax: true,
       refreshedAt: '2026-08-30T20:00:00.000Z',
-      items: [{
-        qboId: 'NON',
-        name: 'Non-taxable',
-        active: true,
-        taxable: false,
-        combinedPurchaseRate: null,
-        combinedSalesRate: null,
-      }],
+      items: [
+        {
+          qboId: 'NON',
+          name: 'Non-taxable',
+          active: true,
+          taxable: false,
+          combinedPurchaseRate: null,
+          combinedSalesRate: null,
+        },
+        {
+          qboId: 'SALES7',
+          name: 'Sales tax 7%',
+          active: true,
+          taxable: true,
+          combinedPurchaseRate: null,
+          combinedSalesRate: 7,
+        },
+      ],
       nextCursor: null,
     });
     const handler = createMcpHandler(
@@ -117,14 +127,24 @@ describe('Recat MCP read tools', () => {
     });
 
     expect(response.result.isError).not.toBe(true);
-    expect(response.result.structuredContent.items).toEqual([{
-      qboId: 'NON',
-      name: 'Non-taxable',
-      active: true,
-      taxable: false,
-      combinedPurchaseRate: null,
-      combinedSalesRate: null,
-    }]);
+    expect(response.result.structuredContent.items).toEqual([
+      {
+        qboId: 'NON',
+        name: 'Non-taxable',
+        active: true,
+        taxable: false,
+        combinedPurchaseRate: null,
+        combinedSalesRate: null,
+      },
+      {
+        qboId: 'SALES7',
+        name: 'Sales tax 7%',
+        active: true,
+        taxable: true,
+        combinedPurchaseRate: null,
+        combinedSalesRate: 7,
+      },
+    ]);
   });
 
   it('does not rerun static schema deadline checks for concurrent fresh servers', async () => {
