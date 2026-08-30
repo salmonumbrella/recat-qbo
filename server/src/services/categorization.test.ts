@@ -55,6 +55,7 @@ interface TransactionRow {
   taxCalculation: string | null;
   taxCode: string | null;
   taxCodeQboId: string | null;
+  rawData: unknown;
 }
 
 interface SplitRow {
@@ -311,6 +312,7 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       taxCalculation: null,
       taxCode: null,
       taxCodeQboId: null,
+      rawData: null,
     }],
     accounts: [{
       companyId: COMPANY_ID,
@@ -954,16 +956,48 @@ describe('stageCategorization', () => {
 
   it('stages one Purchase category change with its literal current tax code intact', async () => {
     db.state.transactions[0]!.amount = -750;
-    db.state.transactions[0]!.categoryQboId = '2';
+    db.state.transactions[0]!.categoryQboId = 'STALE_LOCAL_CATEGORY';
     db.state.transactions[0]!.taxCalculation = 'NotApplicable';
-    db.state.transactions[0]!.taxCode = 'Non-taxable';
-    db.state.transactions[0]!.taxCodeQboId = 'NON';
+    db.state.transactions[0]!.taxCode = 'Stale local tax';
+    db.state.transactions[0]!.taxCodeQboId = 'STALE_LOCAL_TAX';
+    db.state.transactions[0]!.rawData = {
+      Id: 'QBO_PURCHASE_30',
+      SyncToken: '7',
+      TotalAmt: 750,
+      GlobalTaxCalculation: 'NotApplicable',
+      Line: [{
+        Id: '1',
+        Amount: 750,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: 'NON' },
+        },
+      }],
+    };
     db.state.accounts.push({
       companyId: COMPANY_ID,
       qboId: '42',
       name: 'Bank Charges',
       fullName: 'Expenses · Bank Charges',
       active: true,
+    });
+    db.state.accounts.push({
+      companyId: COMPANY_ID,
+      qboId: '2',
+      name: 'Uncategorized Expense',
+      fullName: 'Expenses · Uncategorized Expense',
+      active: true,
+    });
+    db.state.taxCodes.push({
+      companyId: COMPANY_ID,
+      qboId: 'NON',
+      name: 'Non-taxable',
+      active: true,
+      taxable: false,
+      purchaseTaxRateList: [],
+      salesTaxRateList: [],
+      combinedSalesRate: null,
     });
 
     const staged = await stageCategorization(

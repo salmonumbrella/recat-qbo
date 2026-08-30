@@ -208,8 +208,44 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         taxCalculation: 'NotApplicable',
         taxCode: 'Non-taxable',
         taxCodeQboId: 'NON',
+        rawData: {
+          Id: fixture.key.qboId,
+          SyncToken: '0',
+          TotalAmt: 750,
+          GlobalTaxCalculation: 'NotApplicable',
+          Line: [{
+            Id: '1',
+            Amount: 750,
+            DetailType: 'AccountBasedExpenseLineDetail',
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: '2' },
+              TaxCodeRef: { value: 'NON' },
+            },
+          }],
+        },
       },
     });
+    await Promise.all([
+      stageClient.qboAccount.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: '2',
+          name: 'Uncategorized Expense',
+          fullName: 'Expenses · Uncategorized Expense',
+          classification: 'Expenses',
+        },
+      }),
+      stageClient.qboTaxCode.create({
+        data: {
+          companyId: fixture.companyId,
+          qboId: 'NON',
+          name: 'Non-taxable',
+          taxable: false,
+          purchaseTaxRateList: [],
+          salesTaxRateList: [],
+        },
+      }),
+    ]);
     return {
       ...fixture,
       input: {
@@ -283,7 +319,7 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     }
   });
 
-  it('persists an exact preserve-current Purchase intent with no tax reference row', async () => {
+  it('persists an exact preserve-current Purchase intent from synchronized QBO references', async () => {
     const fixture = await seedPreserveCurrentPurchase();
 
     try {

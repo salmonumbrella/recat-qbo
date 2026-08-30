@@ -807,6 +807,47 @@ function requestHash(body: RawPurchase): string {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
+function fingerprint(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function preservedPurchaseEntity(raw: RawPurchase): Record<string, unknown> {
+  const {
+    Id: _id,
+    SyncToken: _syncToken,
+    TotalAmt: _total,
+    Line: _lines,
+    GlobalTaxCalculation: _taxMode,
+    TxnTaxDetail: _taxDetail,
+    HomeTotalAmt: _homeTotal,
+    MetaData: _metadata,
+    status: _status,
+    sparse: _sparse,
+    domain: _domain,
+    ...preserved
+  } = raw;
+  return preserved;
+}
+
+function categoryOnlyLine(raw: RawPurchaseLine): RawPurchaseLine {
+  const line = normalizedClone(raw);
+  const accountRef = line.AccountBasedExpenseLineDetail?.AccountRef;
+  if (accountRef !== undefined) accountRef.value = '__CATEGORY_ACCOUNT__';
+  return line;
+}
+
+export function purchasePreservedHash(raw: RawPurchase): string {
+  return fingerprint(preservedPurchaseEntity(raw));
+}
+
+export function purchaseRawLineHash(raw: RawPurchaseLine): string {
+  return fingerprint(raw);
+}
+
+export function purchaseCategoryOnlyLineHash(raw: RawPurchaseLine): string {
+  return fingerprint(categoryOnlyLine(raw));
+}
+
 function purchaseSign(raw: RawPurchase): 1 | -1 {
   return raw.Credit === true ? 1 : -1;
 }
@@ -842,10 +883,12 @@ function snapshotLine(
     taxCodeQboId: detail?.TaxCodeRef?.value ?? null,
     taxAmountCents,
     taxInclusiveCents,
+    rawHash: purchaseRawLineHash(raw),
+    categoryOnlyHash: purchaseCategoryOnlyLineHash(raw),
   };
 }
 
-function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
+export function mapPurchaseTaxSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
   if (
     typeof raw !== 'object' ||
     raw === null ||
@@ -898,12 +941,16 @@ function snapshotFromRaw(raw: RawPurchase): QboPurchaseSnapshot {
           ? null
           : derivedTotalTaxCents
         : directionalCents(raw.TxnTaxDetail.TotalTax, sign),
+    preservedHash: purchasePreservedHash(raw),
     lines: raw.Line.map((line) => snapshotLine(line, sign, raw.GlobalTaxCalculation)),
   };
 }
 
+const snapshotFromRaw = mapPurchaseTaxSnapshot;
+
 function canonicalSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
   return JSON.stringify([
+    line.rawHash,
     line.id,
     line.amountCents,
     line.description,
@@ -953,7 +1000,18 @@ export function purchaseTargetLineMatches(
     && actual.taxAmountCents === null
     && expected.taxInclusiveCents === null
     && actual.taxInclusiveCents === null;
-  return expected.amountCents === actual.amountCents
+  const exactCategoryOnlyLine =
+    taxDisposition !== 'preserve_current'
+    || (
+      expected.id !== null
+      && expected.id === actual.id
+      && typeof expected.rawHash === 'string'
+      && expected.rawHash === actual.rawHash
+      && typeof expected.categoryOnlyHash === 'string'
+      && expected.categoryOnlyHash === actual.categoryOnlyHash
+    );
+  return exactCategoryOnlyLine
+    && expected.amountCents === actual.amountCents
     && expected.description === actual.description
     && expected.accountQboId === actual.accountQboId
     && expected.customerQboId === actual.customerQboId
@@ -968,8 +1026,15 @@ export function purchaseTargetLineMatches(
 
 function assertSnapshotEqualsBefore(actual: QboPurchaseSnapshot, before: QboPurchaseSnapshot): void {
   if (actual.syncToken !== before.syncToken) throw new QboSyncTokenConflict();
-  const comparableActual = { ...actual, syncToken: undefined };
-  const comparableBefore = { ...before, syncToken: undefined };
+  const comparableActual = normalizedClone({ ...actual, syncToken: undefined });
+  const comparableBefore = normalizedClone({ ...before, syncToken: undefined });
+  if (before.preservedHash === undefined) delete comparableActual.preservedHash;
+  for (const [index, line] of before.lines.entries()) {
+    if (line.rawHash === undefined) delete comparableActual.lines[index]!.rawHash;
+    if (line.categoryOnlyHash === undefined) {
+      delete comparableActual.lines[index]!.categoryOnlyHash;
+    }
+  }
   if (canonicalJson(comparableActual) !== canonicalJson(comparableBefore)) {
     preparationError('QBO_STATE_DRIFT', 'Purchase changed after its before snapshot was stored.');
   }
@@ -988,6 +1053,7 @@ function expectedBase(
     direction: snapshot.direction,
     globalTaxCalculation,
     totalTaxCents,
+    preservedHash: snapshot.preservedHash,
   };
 }
 
@@ -1134,6 +1200,10 @@ export function preparePurchaseRecategorization(args: {
       || holdingLineIndexes.length !== 1
       || args.staged.lines.length !== 1
       || args.staged.tagIds.length !== 0
+      || typeof args.before.preservedHash !== 'string'
+      || args.before.lines.some(
+        (line) => typeof line.rawHash !== 'string' || typeof line.categoryOnlyHash !== 'string',
+      )
     ) {
       preparationError(
         'QBO_PURCHASE_UNSUPPORTED',
@@ -1173,6 +1243,11 @@ export function preparePurchaseRecategorization(args: {
       ...targetDetail.AccountRef!,
       value: targetAccountQboId,
     };
+    const targetSnapshotLine = snapshotLine(
+      body.Line![targetIndex]!,
+      purchaseSign(body),
+      body.GlobalTaxCalculation,
+    );
     const prepared: QboPurchasePreparedWrite = {
       operation: 'recategorize',
       qboType: 'Purchase',
@@ -1180,7 +1255,7 @@ export function preparePurchaseRecategorization(args: {
       requestId: args.requestId,
       requestHash: requestHash(body),
       body,
-      before: normalizedClone(args.before),
+      before: normalizedClone(current),
       expected: {
         ...expectedBase(
           current,
@@ -1188,10 +1263,7 @@ export function preparePurchaseRecategorization(args: {
           current.totalTaxCents,
         ),
         taxDisposition: 'preserve_current',
-        targetLines: [{
-          ...sourceSnapshotLine,
-          accountQboId: targetAccountQboId,
-        }],
+        targetLines: [targetSnapshotLine],
         untouchedLineHashes: keptSnapshotLines.map(canonicalSnapshotLine),
       },
     };
@@ -1267,7 +1339,7 @@ export function preparePurchaseRecategorization(args: {
     requestId: args.requestId,
     requestHash: requestHash(body),
     body,
-    before: normalizedClone(args.before),
+    before: normalizedClone(current),
     expected: {
       ...expectedBase(current, args.staged.taxCalculation, totalTaxCents),
       targetLines: newSnapshotLines,
@@ -1292,6 +1364,13 @@ function assertExpectedCurrent(
       expected.globalTaxCalculation,
       expected.totalTaxCents,
       actual.totalTaxCents,
+    )
+    || (
+      expected.taxDisposition === 'preserve_current'
+      && (
+        typeof expected.preservedHash !== 'string'
+        || expected.preservedHash !== actual.preservedHash
+      )
     )
   ) {
     return preparationError('QBO_STATE_DRIFT', 'Purchase fields drifted before restore preparation.');
@@ -1395,6 +1474,51 @@ export function preparePurchaseRestore(args: {
   const current = snapshotFromRaw(args.current);
   const targetIndexes = new Set(assertExpectedCurrent(args.prepared.expected, current));
   const targetsBefore = beforeTargetLines(args.prepared);
+  if (args.prepared.expected.taxDisposition === 'preserve_current') {
+    if (targetIndexes.size !== 1 || targetsBefore.length !== 1) {
+      preparationError(
+        'QBO_PURCHASE_UNSUPPORTED',
+        'Preserve-current restore requires exactly one identified target line.',
+      );
+    }
+    const [targetIndex] = targetIndexes;
+    const sourceAccountQboId = requiredIdentity(
+      targetsBefore[0]!.accountQboId,
+      'restore account reference',
+    );
+    const body = normalizedClone(args.current);
+    const targetDetail = body.Line![targetIndex!]!.AccountBasedExpenseLineDetail;
+    if (targetDetail?.AccountRef === undefined) {
+      preparationError('QBO_STATE_DRIFT', 'Restore target lost its category account reference.');
+    }
+    targetDetail.AccountRef = {
+      ...targetDetail.AccountRef,
+      value: sourceAccountQboId,
+    };
+    const restored = snapshotFromRaw(body);
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'restore',
+      qboType: 'Purchase',
+      qboId: current.qboId,
+      requestId: args.requestId,
+      requestHash: requestHash(body),
+      body,
+      before: normalizedClone(current),
+      expected: {
+        ...expectedBase(
+          args.prepared.before,
+          args.prepared.before.globalTaxCalculation,
+          args.prepared.before.totalTaxCents,
+        ),
+        taxDisposition: 'preserve_current',
+        targetLines: [restored.lines[targetIndex!]!],
+        untouchedLineHashes: current.lines
+          .filter((_line, index) => index !== targetIndex)
+          .map(canonicalSnapshotLine),
+      },
+    };
+    return deepFreeze(prepared);
+  }
   const keptRaw = args.current.Line!.filter((_line, index) => !targetIndexes.has(index));
   const keptSnapshot = current.lines.filter((_line, index) => !targetIndexes.has(index));
   const restoredLines = restoreLinesInBeforeOrder(args.prepared.before, keptRaw, keptSnapshot);

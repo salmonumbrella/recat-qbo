@@ -5,6 +5,7 @@ import {
   calculatePurchaseLine,
   calculatePurchaseTransaction as calculatePurchaseTransactionRaw,
   calculateSalesTransaction as calculateSalesTransactionRaw,
+  mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization,
   preparePurchaseRestore,
 } from './purchaseTax.js';
@@ -786,8 +787,7 @@ function preserveCurrentFixture(): {
   before: QboPurchaseSnapshot;
   preserved: StagedCategorization;
 } {
-  return {
-    raw: {
+  const raw: RawPurchase = {
       Id: '6477',
       SyncToken: '0',
       TxnDate: '2025-01-21',
@@ -815,28 +815,10 @@ function preserveCurrentFixture(): {
         },
         CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
       }],
-    },
-    before: {
-      qboId: '6477',
-      syncToken: '0',
-      totalCents: -75_000,
-      accountQboId: '74',
-      date: '2025-01-21',
-      direction: 'purchase',
-      globalTaxCalculation: 'NotApplicable',
-      totalTaxCents: 0,
-      lines: [{
-        id: '1',
-        amountCents: -75_000,
-        description: 'bank charge',
-        accountQboId: '2',
-        customerQboId: 'customer-1',
-        classQboId: 'class-1',
-        taxCodeQboId: 'NON',
-        taxAmountCents: null,
-        taxInclusiveCents: null,
-      }],
-    },
+    };
+  return {
+    raw,
+    before: mapPurchaseTaxSnapshot(raw),
     preserved: {
       transactionId: '00000000-0000-4000-8000-000000000001',
       revision: 1,
@@ -925,11 +907,7 @@ describe('preparePurchaseRecategorization', () => {
         Id: '2',
         Amount: 0,
       });
-      fixture.before.lines.push({
-        ...structuredClone(fixture.before.lines[0]!),
-        id: '2',
-        amountCents: 0,
-      });
+      fixture.before = mapPurchaseTaxSnapshot(fixture.raw);
       return { ...fixture, code: 'QBO_PURCHASE_UNSUPPORTED' };
     }],
     ['a changed line identity', () => {
@@ -1342,6 +1320,36 @@ describe('preparePurchaseRecategorization', () => {
 });
 
 describe('preparePurchaseRestore', () => {
+  it('undoes preserve-current by changing only the category reference on the fresh raw line', () => {
+    const { raw, before, preserved } = preserveCurrentFixture();
+    const original = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: preserved,
+      before,
+      requestId: 'REQUEST_6477_FORWARD',
+    });
+    const current: RawPurchase = {
+      ...structuredClone(original.body),
+      SyncToken: '1',
+    };
+
+    const restore = preparePurchaseRestore({
+      current,
+      prepared: original,
+      requestId: 'REQUEST_6477_UNDO',
+    });
+
+    expect(changedPaths(restore.body, current)).toEqual([
+      'Line[0].AccountBasedExpenseLineDetail.AccountRef.value',
+    ]);
+    expect(restore.body.Line![0]!.CustomField).toEqual(raw.Line![0]!.CustomField);
+    expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.BillableStatus)
+      .toBe('NotBillable');
+    expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.AccountRef)
+      .toEqual({ value: '2', name: 'Uncategorized Expense' });
+  });
+
   it('prepares restore after QBO normalizes a non-taxable write to null/default fields', () => {
     const originalRaw = completePurchase({
       TotalAmt: 10,

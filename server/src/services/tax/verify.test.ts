@@ -115,15 +115,19 @@ describe('verifyPurchaseResult', () => {
   it('requires the exact literal tax code for preserve-current Purchase verification', () => {
     const preservedTarget = {
       ...targetLine,
+      id: 'preserved-target',
       taxCodeQboId: 'NON',
       taxAmountCents: null,
       taxInclusiveCents: null,
+      rawHash: 'exact-target-line',
+      categoryOnlyHash: 'category-only-line',
     };
     const preservedExpected: ExpectedPurchaseResult = {
       ...expected,
       taxDisposition: 'preserve_current',
       globalTaxCalculation: 'NotApplicable',
       totalTaxCents: 0,
+      preservedHash: 'preserved-top-level',
       targetLines: [preservedTarget],
       untouchedLineHashes: [],
     };
@@ -131,7 +135,8 @@ describe('verifyPurchaseResult', () => {
       ...actual,
       globalTaxCalculation: 'NotApplicable',
       totalTaxCents: null,
-      lines: [{ ...preservedTarget, id: 'preserved-target' }],
+      preservedHash: 'preserved-top-level',
+      lines: [preservedTarget],
     };
 
     expect(verifyPurchaseResult(preservedExpected, preservedActual)).toEqual({ ok: true });
@@ -141,6 +146,14 @@ describe('verifyPurchaseResult', () => {
         ...preservedActual.lines[0]!,
         taxCodeQboId: 'PROVIDER_DEFAULT_NON_TAX',
       }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      preservedHash: 'changed-top-level',
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(preservedExpected, {
+      ...preservedActual,
+      lines: [{ ...preservedTarget, rawHash: 'changed-custom-field' }],
     })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
   });
 

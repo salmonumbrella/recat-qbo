@@ -103,6 +103,8 @@ export interface QboPurchaseSnapshot {
   direction: 'purchase' | 'refund';
   globalTaxCalculation: string | null;
   totalTaxCents: number | null;
+  /** Canonical fingerprint of writable entity fields a category-only write cannot change. */
+  preservedHash?: string;
   lines: {
     id: string | null;
     amountCents: number;
@@ -113,6 +115,10 @@ export interface QboPurchaseSnapshot {
     taxCodeQboId: string | null;
     taxAmountCents: number | null;
     taxInclusiveCents: number | null;
+    /** Full canonical raw-line fingerprint. Always populated by live QBO mapping. */
+    rawHash?: string;
+    /** Raw-line fingerprint with only AccountRef.value replaced by a stable sentinel. */
+    categoryOnlyHash?: string;
   }[];
 }
 
@@ -237,6 +243,7 @@ export interface QboPurchaseExpectedState {
   direction: QboPurchaseSnapshot['direction'];
   globalTaxCalculation: string | null;
   totalTaxCents: number | null;
+  preservedHash?: string;
   targetLines: QboPurchaseSnapshot['lines'];
   untouchedLineHashes: string[];
 }
