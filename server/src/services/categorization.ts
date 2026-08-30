@@ -3,6 +3,7 @@ import type {
   StageCategorizationInput,
   StagedCategorization,
   TaxCalculation,
+  TaxDisposition,
   TaxReadinessDto,
 } from '@recat/shared';
 import { randomUUID } from 'node:crypto';
@@ -37,6 +38,8 @@ interface TransactionRow {
   amount: number | string | { toString(): string };
   status: string;
   revision: number;
+  categoryQboId: string | null;
+  taxCode: string | null;
 }
 
 interface AccountRow {
@@ -267,11 +270,60 @@ const proposalLineSchema = z.object({
 }).strict();
 
 const proposalSchema = z.object({
+  taxDisposition: z.enum(['set', 'preserve_current']).default('set'),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   lines: z.array(proposalLineSchema).min(1).max(20),
   tagIds: z.array(z.string().uuid()).max(50)
     .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.'),
 }).strict().superRefine((proposal, context) => {
+  if (proposal.taxDisposition === 'preserve_current') {
+    if (proposal.taxCalculation !== 'NotApplicable') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Preserve-current requires NotApplicable tax calculation.',
+        path: ['taxCalculation'],
+      });
+    }
+    if (proposal.lines.length !== 1) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Preserve-current requires exactly one line.',
+        path: ['lines'],
+      });
+    }
+    if (proposal.tagIds.length !== 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Preserve-current cannot change transaction tags.',
+        path: ['tagIds'],
+      });
+    }
+    for (const [lineIndex, line] of proposal.lines.entries()) {
+      if (line.taxCodeQboId == null) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Preserve-current requires an explicit source tax code.',
+          path: ['lines', lineIndex, 'taxCodeQboId'],
+        });
+      }
+      if (line.memo !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Preserve-current cannot change line memos.',
+          path: ['lines', lineIndex, 'memo'],
+        });
+      }
+      if (line.tagIds.length !== 0) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Preserve-current cannot change line tags.',
+          path: ['lines', lineIndex, 'tagIds'],
+        });
+      }
+    }
+    return;
+  }
+
   if (proposal.taxCalculation !== 'NotApplicable') return;
   for (const [lineIndex, line] of proposal.lines.entries()) {
     if (line.taxCodeQboId == null) continue;
@@ -296,8 +348,14 @@ interface CalculatedLine {
   totalCents: number;
 }
 
+type NormalizedCategorizationProposal = CategorizationProposal & {
+  taxDisposition: TaxDisposition;
+};
+
 interface ValidatedStage {
-  input: StageCategorizationInput;
+  input: Omit<StageCategorizationInput, 'proposal'> & {
+    proposal: NormalizedCategorizationProposal;
+  };
   transaction: TransactionRow;
   accountsById: Map<string, AccountRow>;
   taxCodesById: Map<string, TaxCodeRow>;
@@ -398,6 +456,23 @@ async function validateStage(
   }
   const transactionCents = decimalToCents(transaction.amount);
   assertSignedLines(transactionCents, proposal, transaction.qboType);
+  if (proposal.taxDisposition === 'preserve_current') {
+    if (transaction.qboType !== 'Purchase') {
+      throw new CategorizationError(
+        'INVALID_INPUT',
+        'Preserve-current is supported only for Purchases.',
+      );
+    }
+    if (
+      transaction.categoryQboId == null
+      || transaction.categoryQboId === proposal.lines[0]!.categoryQboId
+    ) {
+      throw new CategorizationError(
+        'INVALID_INPUT',
+        'Preserve-current requires a different known source category.',
+      );
+    }
+  }
 
   const accountIds = unique(proposal.lines.map((line) => line.categoryQboId));
   const tagIds = unique([
@@ -713,12 +788,16 @@ async function stageWithOwner<T>(
       proposal.lines.flatMap((line) => line.taxCodeQboId ?? []),
     );
     const transactionTaxCodeId =
-      proposal.taxCalculation !== 'NotApplicable' && selectedTaxCodeIds.length === 1
+      proposal.taxDisposition === 'preserve_current'
+        ? selectedTaxCodeIds[0]!
+        : proposal.taxCalculation !== 'NotApplicable' && selectedTaxCodeIds.length === 1
         ? selectedTaxCodeIds[0]!
         : null;
-    const transactionTaxCode = transactionTaxCodeId === null
-      ? null
-      : validated.taxCodesById.get(transactionTaxCodeId)?.name ?? null;
+    const transactionTaxCode = proposal.taxDisposition === 'preserve_current'
+      ? validated.transaction.taxCode
+      : transactionTaxCodeId === null
+        ? null
+        : validated.taxCodesById.get(transactionTaxCodeId)?.name ?? null;
 
     const activeAttempt = await tx.qboMutationAttempt.findFirst({
       where: {
@@ -777,9 +856,12 @@ async function stageWithOwner<T>(
           amount: validated.calculatedLines[idx]!.totalCents / 100,
           category: account.fullName,
           categoryQboId: account.qboId,
-          taxCode: proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.name ?? null,
-          taxCodeQboId:
-            proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.qboId ?? null,
+          taxCode: proposal.taxDisposition === 'preserve_current'
+            ? validated.transaction.taxCode
+            : proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.name ?? null,
+          taxCodeQboId: proposal.taxDisposition === 'preserve_current'
+            ? line.taxCodeQboId!
+            : proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.qboId ?? null,
           memo: line.memo ?? null,
         };
       }),
@@ -824,6 +906,7 @@ async function stageWithOwner<T>(
     const staged: StagedCategorization = {
       transactionId: reloaded.id,
       revision: reloaded.revision,
+      taxDisposition: proposal.taxDisposition,
       taxCalculation: proposal.taxCalculation,
       totals: validated.totals,
       lines: reloaded.splitLines.map((line) => ({

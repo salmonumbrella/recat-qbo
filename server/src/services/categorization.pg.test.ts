@@ -188,6 +188,47 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     };
   }
 
+  async function seedPreserveCurrentPurchase(): Promise<Fixture> {
+    const fixture = await seed();
+    const target = await stageClient.qboAccount.create({
+      data: {
+        companyId: fixture.companyId,
+        qboId: '42',
+        name: 'Bank Charges',
+        fullName: 'Expenses · Bank Charges',
+        classification: 'Expenses',
+      },
+    });
+    await stageClient.transaction.update({
+      where: { id: fixture.transactionId },
+      data: {
+        amount: '-750.00',
+        category: 'Uncategorized Expense',
+        categoryQboId: '2',
+        taxCalculation: 'NotApplicable',
+        taxCode: 'Non-taxable',
+        taxCodeQboId: 'NON',
+      },
+    });
+    return {
+      ...fixture,
+      input: {
+        ...fixture.input,
+        proposal: {
+          taxDisposition: 'preserve_current',
+          taxCalculation: 'NotApplicable',
+          lines: [{
+            grossCents: -75_000,
+            categoryQboId: target.qboId,
+            taxCodeQboId: 'NON',
+            tagIds: [],
+          }],
+          tagIds: [],
+        },
+      },
+    };
+  }
+
   async function cleanup(fixture: Fixture): Promise<void> {
     await stageClient.qboEntityLease.deleteMany({
       where: fixture.key,
@@ -236,6 +277,43 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
         revision: 1,
         totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
         lines: [{ subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 }],
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
+  it('persists an exact preserve-current Purchase intent with no tax reference row', async () => {
+    const fixture = await seedPreserveCurrentPurchase();
+
+    try {
+      await expect(
+        stageCategorization(fixture.input, realStageDeps(stageClient)),
+      ).resolves.toMatchObject({
+        transactionId: fixture.transactionId,
+        revision: 1,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        totals: { subtotalCents: -75_000, taxCents: 0, totalCents: -75_000 },
+        lines: [{
+          categoryQboId: '42',
+          taxCodeQboId: 'NON',
+          totalCents: -75_000,
+        }],
+      });
+      await expect(stageClient.transaction.findUniqueOrThrow({
+        where: { id: fixture.transactionId },
+        select: {
+          taxCalculation: true,
+          taxCodeQboId: true,
+          splitLines: {
+            select: { categoryQboId: true, taxCodeQboId: true },
+          },
+        },
+      })).resolves.toEqual({
+        taxCalculation: 'NotApplicable',
+        taxCodeQboId: 'NON',
+        splitLines: [{ categoryQboId: '42', taxCodeQboId: 'NON' }],
       });
     } finally {
       await cleanup(fixture);

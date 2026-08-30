@@ -29,6 +29,18 @@ const standardProposal: CategorizationProposal = {
   tagIds: ['00000000-0000-4000-8000-000000000001'],
 };
 
+const preserveCurrentProposal: CategorizationProposal = {
+  taxDisposition: 'preserve_current',
+  taxCalculation: 'NotApplicable',
+  lines: [{
+    grossCents: -75_000,
+    categoryQboId: '42',
+    taxCodeQboId: 'NON',
+    tagIds: [],
+  }],
+  tagIds: [],
+};
+
 interface TransactionRow {
   id: string;
   companyId: string;
@@ -549,7 +561,10 @@ describe('stageCategorization', () => {
       {
         beforeValidation: async (transaction, normalizedInput) => {
           expect(transaction).toBe(db);
-          expect(normalizedInput).toEqual(input());
+          expect(normalizedInput).toEqual(input({
+            ...standardProposal,
+            taxDisposition: 'set',
+          }));
           events.push('before-validation');
           return { kind: 'return', value: 'exact-replay' };
         },
@@ -643,6 +658,7 @@ describe('stageCategorization', () => {
     expect(staged).toEqual({
       transactionId: TRANSACTION_ID,
       revision: 1,
+      taxDisposition: 'set',
       taxCalculation: 'TaxInclusive',
       totals: { subtotalCents: -1000, taxCents: -50, totalCents: -1050 },
       lines: [{
@@ -934,6 +950,112 @@ describe('stageCategorization', () => {
       taxCodeQboId: null,
     });
     expect(db.state.splits[0]).toMatchObject({ taxCode: null, taxCodeQboId: null });
+  });
+
+  it('stages one Purchase category change with its literal current tax code intact', async () => {
+    db.state.transactions[0]!.amount = -750;
+    db.state.transactions[0]!.categoryQboId = '2';
+    db.state.transactions[0]!.taxCalculation = 'NotApplicable';
+    db.state.transactions[0]!.taxCode = 'Non-taxable';
+    db.state.transactions[0]!.taxCodeQboId = 'NON';
+    db.state.accounts.push({
+      companyId: COMPANY_ID,
+      qboId: '42',
+      name: 'Bank Charges',
+      fullName: 'Expenses · Bank Charges',
+      active: true,
+    });
+
+    const staged = await stageCategorization(
+      input(preserveCurrentProposal),
+      testDeps(db),
+    );
+
+    expect(staged).toMatchObject({
+      transactionId: TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      totals: {
+        subtotalCents: -75_000,
+        taxCents: 0,
+        totalCents: -75_000,
+      },
+      lines: [{
+        idx: 0,
+        subtotalCents: -75_000,
+        taxCents: 0,
+        totalCents: -75_000,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      revision: 1,
+      taxCalculation: 'NotApplicable',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+    });
+    expect(db.state.splits[0]).toMatchObject({
+      amount: -750,
+      categoryQboId: '42',
+      taxCodeQboId: 'NON',
+    });
+  });
+
+  it.each([
+    ['a non-Purchase transaction', () => {
+      db.state.transactions[0]!.qboType = 'Deposit';
+      db.state.transactions[0]!.amount = 750;
+      return {
+        ...preserveCurrentProposal,
+        lines: [{ ...preserveCurrentProposal.lines[0]!, grossCents: 75_000 }],
+      };
+    }],
+    ['an unchanged target category', () => {
+      db.state.transactions[0]!.categoryQboId = '42';
+      return preserveCurrentProposal;
+    }],
+    ['a split proposal', () => ({
+      ...preserveCurrentProposal,
+      lines: [
+        { ...preserveCurrentProposal.lines[0]!, grossCents: -37_500 },
+        { ...preserveCurrentProposal.lines[0]!, grossCents: -37_500 },
+      ],
+    })],
+    ['a memo edit', () => ({
+      ...preserveCurrentProposal,
+      lines: [{ ...preserveCurrentProposal.lines[0]!, memo: 'changed' }],
+    })],
+    ['a transaction tag edit', () => ({
+      ...preserveCurrentProposal,
+      tagIds: [TAG_ID],
+    })],
+    ['a line tag edit', () => ({
+      ...preserveCurrentProposal,
+      lines: [{ ...preserveCurrentProposal.lines[0]!, tagIds: [LINE_TAG_ID] }],
+    })],
+  ])('rejects preserve-current with %s before replacing staged rows', async (_name, proposal) => {
+    db.state.transactions[0]!.amount = -750;
+    db.state.accounts.push({
+      companyId: COMPANY_ID,
+      qboId: '42',
+      name: 'Bank Charges',
+      fullName: 'Expenses · Bank Charges',
+      active: true,
+    });
+    const proposed = proposal();
+    const before = structuredClone(db.state);
+
+    await expectCode(
+      stageCategorization(input(proposed), testDeps(db)),
+      'INVALID_INPUT',
+    );
+
+    expect(db.state).toEqual(before);
   });
 
   it('stages positive Deposit sales tax from sales rate references', async () => {
