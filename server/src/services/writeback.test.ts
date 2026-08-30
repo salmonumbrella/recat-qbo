@@ -3259,6 +3259,64 @@ describe('prepareCategorizationUndo', () => {
     expect(fixture.audit).not.toHaveBeenCalled();
   });
 
+  it('prepares undo from the exact verified preserve-current stage binding', async () => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Bank Charges',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Non-taxable',
+      taxCodeQboId: 'NON',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.body.GlobalTaxCalculation = 'NotApplicable';
+    sourcePrepared.body.Line![0]!.AccountBasedExpenseLineDetail = {
+      AccountRef: { value: 'expense-generic' },
+      TaxCodeRef: { value: 'NON' },
+    };
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1050,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+        rawHash: 'preserved-target',
+        categoryOnlyHash: 'preserved-category-only',
+      }],
+      untouchedLineHashes: [],
+    };
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    const preservedResponse: QboPurchaseSnapshot = {
+      ...verifiedPurchase,
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      preservedHash: 'preserved-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    };
+    fixture.source.responseSnapshot = structuredClone(preservedResponse);
+    fixture.fetchPurchaseSnapshot.mockResolvedValue(structuredClone(preservedResponse));
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+  });
+
   it('hashes the complete source and restore bindings while excluding only the throwaway request ID', async () => {
     expect(hashPreparedWriteBinding(preparedWrite('request-a')))
       .toBe(hashPreparedWriteBinding(preparedWrite('request-b')));

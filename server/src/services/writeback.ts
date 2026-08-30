@@ -3984,6 +3984,38 @@ export async function prepareCategorizationUndo(
     ) {
       lifecycleError('VERIFIED_POST_REQUIRED', 'The verified source write does not match this operation.');
     }
+    const sourceTaxDisposition = sourcePrepared.expected.taxDisposition ?? 'set';
+    let sourceStageHash: string | undefined;
+    if (sourceTaxDisposition === 'preserve_current') {
+      const target = sourcePrepared.expected.targetLines[0];
+      if (
+        sourcePrepared.expected.targetLines.length !== 1
+        || target === undefined
+        || target.accountQboId === null
+        || target.taxCodeQboId === null
+      ) {
+        lifecycleError('ATTEMPT_CORRUPT', 'Verified preserved Purchase source is incomplete.');
+      }
+      const totalCents = target.amountCents;
+      sourceStageHash = hashStagedCategorization({
+        transactionId: input.transactionId,
+        revision: input.expectedRevision,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        totals: { subtotalCents: totalCents, taxCents: 0, totalCents },
+        lines: [{
+          idx: 0,
+          subtotalCents: totalCents,
+          taxCents: 0,
+          totalCents,
+          categoryQboId: target.accountQboId,
+          taxCodeQboId: target.taxCodeQboId,
+          memo: null,
+          tagIds: [],
+        }],
+        tagIds: [],
+      });
+    }
 
     const { txn: initialTxn } = await loadAuthorizedStage(
       input.transactionId,
@@ -3993,6 +4025,9 @@ export async function prepareCategorizationUndo(
       d,
       ['POSTED'],
       input.authorization,
+      sourceStageHash,
+      undefined,
+      sourceTaxDisposition,
     );
     if (
       initialTxn.qboType !== input.expectedQboBinding.qboType
@@ -4033,6 +4068,9 @@ export async function prepareCategorizationUndo(
       d,
       ['POSTED'],
       input.authorization,
+      sourceStageHash,
+      undefined,
+      sourceTaxDisposition,
     );
     if (
       txn.qboType !== input.expectedQboBinding.qboType

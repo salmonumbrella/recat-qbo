@@ -382,6 +382,60 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
   };
 }
 
+function configureValidPreserveSource(db: FakeCategorizationDb): void {
+  db.state.splits = [];
+  db.state.splitTags = [];
+  db.state.txnTags = [];
+  Object.assign(db.state.transactions[0]!, {
+    amount: -750,
+    categoryQboId: 'STALE_LOCAL_CATEGORY',
+    taxCalculation: 'NotApplicable',
+    taxCode: 'Stale local tax',
+    taxCodeQboId: 'STALE_LOCAL_TAX',
+    rawData: {
+      Id: 'QBO_PURCHASE_30',
+      SyncToken: '7',
+      TotalAmt: 750,
+      GlobalTaxCalculation: 'NotApplicable',
+      Line: [{
+        Id: '1',
+        Amount: 750,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: 'NON' },
+        },
+      }],
+    },
+  });
+  db.state.accounts.push(
+    {
+      companyId: COMPANY_ID,
+      qboId: '42',
+      name: 'Bank Charges',
+      fullName: 'Expenses · Bank Charges',
+      active: true,
+    },
+    {
+      companyId: COMPANY_ID,
+      qboId: '2',
+      name: 'Uncategorized Expense',
+      fullName: 'Expenses · Uncategorized Expense',
+      active: true,
+    },
+  );
+  db.state.taxCodes.push({
+    companyId: COMPANY_ID,
+    qboId: 'NON',
+    name: 'Non-taxable',
+    active: true,
+    taxable: false,
+    purchaseTaxRateList: [],
+    salesTaxRateList: [],
+    combinedSalesRate: null,
+  });
+}
+
 function input(proposal: CategorizationProposal = standardProposal): StageCategorizationInput {
   return {
     transactionId: TRANSACTION_ID,
@@ -955,50 +1009,7 @@ describe('stageCategorization', () => {
   });
 
   it('stages one Purchase category change with its literal current tax code intact', async () => {
-    db.state.transactions[0]!.amount = -750;
-    db.state.transactions[0]!.categoryQboId = 'STALE_LOCAL_CATEGORY';
-    db.state.transactions[0]!.taxCalculation = 'NotApplicable';
-    db.state.transactions[0]!.taxCode = 'Stale local tax';
-    db.state.transactions[0]!.taxCodeQboId = 'STALE_LOCAL_TAX';
-    db.state.transactions[0]!.rawData = {
-      Id: 'QBO_PURCHASE_30',
-      SyncToken: '7',
-      TotalAmt: 750,
-      GlobalTaxCalculation: 'NotApplicable',
-      Line: [{
-        Id: '1',
-        Amount: 750,
-        DetailType: 'AccountBasedExpenseLineDetail',
-        AccountBasedExpenseLineDetail: {
-          AccountRef: { value: '2' },
-          TaxCodeRef: { value: 'NON' },
-        },
-      }],
-    };
-    db.state.accounts.push({
-      companyId: COMPANY_ID,
-      qboId: '42',
-      name: 'Bank Charges',
-      fullName: 'Expenses · Bank Charges',
-      active: true,
-    });
-    db.state.accounts.push({
-      companyId: COMPANY_ID,
-      qboId: '2',
-      name: 'Uncategorized Expense',
-      fullName: 'Expenses · Uncategorized Expense',
-      active: true,
-    });
-    db.state.taxCodes.push({
-      companyId: COMPANY_ID,
-      qboId: 'NON',
-      name: 'Non-taxable',
-      active: true,
-      taxable: false,
-      purchaseTaxRateList: [],
-      salesTaxRateList: [],
-      combinedSalesRate: null,
-    });
+    configureValidPreserveSource(db);
 
     const staged = await stageCategorization(
       input(preserveCurrentProposal),
@@ -1038,6 +1049,19 @@ describe('stageCategorization', () => {
       categoryQboId: '42',
       taxCodeQboId: 'NON',
     });
+  });
+
+  it('rejects preserve-current before mutation when existing Recat tags would be lost', async () => {
+    configureValidPreserveSource(db);
+    db.state.txnTags.push({ txnId: TRANSACTION_ID, tagId: TAG_ID });
+    const before = structuredClone(db.state);
+
+    await expectCode(
+      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
+      'INVALID_INPUT',
+    );
+
+    expect(db.state).toEqual(before);
   });
 
   it.each([

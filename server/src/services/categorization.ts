@@ -884,6 +884,24 @@ async function stageWithOwner<T>(
       throw new EntityLeaseError();
     }
     const { proposal } = validated.input;
+    if (proposal.taxDisposition === 'preserve_current') {
+      const currentGraph = await tx.transaction.findUniqueOrThrow({
+        where: { id: validated.input.transactionId },
+        include: {
+          splitLines: { orderBy: { idx: 'asc' }, include: { tags: true } },
+          txnTags: true,
+        },
+      });
+      if (
+        currentGraph.txnTags.length !== 0
+        || currentGraph.splitLines.some((line) => line.tags.length !== 0)
+      ) {
+        throw new CategorizationError(
+          'INVALID_INPUT',
+          'Preserve-current cannot replace a transaction that already has tags.',
+        );
+      }
+    }
     const selectedTaxCodeIds = unique(
       proposal.lines.flatMap((line) => line.taxCodeQboId ?? []),
     );
