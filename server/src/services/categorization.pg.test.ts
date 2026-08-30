@@ -356,6 +356,43 @@ describePostgres('stageCategorization PostgreSQL entity-lease races', () => {
     }
   });
 
+  it('persists synchronized NON when QBO tax-code inventory omits the sentinel', async () => {
+    const fixture = await seedPreserveCurrentPurchase();
+    await stageClient.qboTaxCode.deleteMany({
+      where: { companyId: fixture.companyId, qboId: 'NON' },
+    });
+
+    try {
+      await expect(
+        stageCategorization(fixture.input, realStageDeps(stageClient)),
+      ).resolves.toMatchObject({
+        transactionId: fixture.transactionId,
+        revision: 1,
+        taxDisposition: 'preserve_current',
+        taxCalculation: 'NotApplicable',
+        lines: [{
+          categoryQboId: '42',
+          taxCodeQboId: 'NON',
+          totalCents: -75_000,
+        }],
+      });
+      await expect(stageClient.transaction.findUniqueOrThrow({
+        where: { id: fixture.transactionId },
+        select: {
+          taxCode: true,
+          taxCodeQboId: true,
+          splitLines: { select: { taxCode: true, taxCodeQboId: true } },
+        },
+      })).resolves.toEqual({
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        splitLines: [{ taxCode: 'NON', taxCodeQboId: 'NON' }],
+      });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
   it('makes stage lose without mutation while a leased PREPARED insert commits', async () => {
     const fixture = await seed();
     const inserted = deferred();

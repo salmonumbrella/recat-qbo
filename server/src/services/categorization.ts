@@ -95,6 +95,7 @@ interface ReloadedTransaction {
 
 type WhereIn<T> = { in: T[] };
 const ACTIVE_ATTEMPT_STATUSES = ['PREPARED', 'COMMITTING', 'UNCERTAIN'] as const;
+const QBO_NOT_APPLICABLE_TAX_CODE = 'NON';
 
 /** The complete external persistence seam used by staging. */
 export interface CategorizationDb {
@@ -593,17 +594,32 @@ async function validateStage(
           qboId: { in: [preservedSource.taxCodeQboId] },
         },
       });
+      const preservedTaxCode = taxCodes[0] ?? (
+        preservedSource.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
+          ? {
+              qboId: QBO_NOT_APPLICABLE_TAX_CODE,
+              name: QBO_NOT_APPLICABLE_TAX_CODE,
+              active: true,
+              taxable: false,
+              purchaseTaxRateList: [],
+              salesTaxRateList: [],
+              combinedPurchaseRate: 0,
+              combinedSalesRate: 0,
+            }
+          : null
+      );
       if (
-        taxCodes.length !== 1
-        || taxCodes[0]!.qboId !== preservedSource.taxCodeQboId
-        || taxCodes[0]!.active !== true
+        taxCodes.length > 1
+        || preservedTaxCode === null
+        || preservedTaxCode.qboId !== preservedSource.taxCodeQboId
+        || preservedTaxCode.active !== true
       ) {
         throw new CategorizationError(
           'INVALID_TAX_CODE',
           'The literal synchronized Purchase tax code must be active and belong to the company.',
         );
       }
-      taxCodesById = new Map(taxCodes.map((code) => [code.qboId, code]));
+      taxCodesById = new Map([[preservedTaxCode.qboId, preservedTaxCode]]);
     }
     calculatedLines = proposal.lines.map((line) => ({
       subtotalCents: line.grossCents,

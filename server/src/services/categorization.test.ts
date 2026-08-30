@@ -1051,6 +1051,68 @@ describe('stageCategorization', () => {
     });
   });
 
+  it('preserves the authoritative NON sentinel when QBO omits it from tax-code inventory', async () => {
+    configureValidPreserveSource(db);
+    db.state.taxCodes = [];
+
+    const staged = await stageCategorization(
+      input(preserveCurrentProposal),
+      testDeps(db),
+    );
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        totalCents: -75_000,
+        categoryQboId: '42',
+        taxCodeQboId: 'NON',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      taxCode: 'NON',
+      taxCodeQboId: 'NON',
+    });
+    expect(db.state.splits[0]).toMatchObject({
+      taxCode: 'NON',
+      taxCodeQboId: 'NON',
+    });
+  });
+
+  it('still rejects an unlisted preserved tax code other than NON', async () => {
+    configureValidPreserveSource(db);
+    db.state.taxCodes = [];
+    const raw = db.state.transactions[0]!.rawData as {
+      Line: Array<{
+        AccountBasedExpenseLineDetail: { TaxCodeRef: { value: string } };
+      }>;
+    };
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxCodeRef.value = 'UNLISTED';
+    const proposal = {
+      ...preserveCurrentProposal,
+      lines: [{
+        ...preserveCurrentProposal.lines[0]!,
+        taxCodeQboId: 'UNLISTED',
+      }],
+    };
+
+    await expectCode(
+      stageCategorization(input(proposal), testDeps(db)),
+      'INVALID_TAX_CODE',
+    );
+  });
+
+  it('does not bypass an existing inactive NON inventory row', async () => {
+    configureValidPreserveSource(db);
+    const non = db.state.taxCodes.find((code) => code.qboId === 'NON')!;
+    non.active = false;
+
+    await expectCode(
+      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
+      'INVALID_TAX_CODE',
+    );
+  });
+
   it('rejects preserve-current before mutation when existing Recat tags would be lost', async () => {
     configureValidPreserveSource(db);
     db.state.txnTags.push({ txnId: TRANSACTION_ID, tagId: TAG_ID });
