@@ -260,6 +260,46 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
     });
   });
 
+  it('rejects a previously active semantic generation after a reviewed vendor merge', async () => {
+    const owner = await company('Vendor Merge Revision Company');
+    const [source, target] = await Promise.all([
+      db.vendorIdentity.create({
+        data: {
+          companyId: owner.id,
+          displayName: 'Historical Merge Source',
+          normalizedName: 'historical merge source',
+        },
+      }),
+      db.vendorIdentity.create({
+        data: {
+          companyId: owner.id,
+          displayName: 'Reviewed Merge Target',
+          normalizedName: 'reviewed merge target',
+        },
+      }),
+    ]);
+    const store = new PgClassificationVectorStore(db);
+    await store.ensureAvailable();
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: 'vendor-merge-revision',
+    });
+    await publishEmptyGeneration(store, owner.id, generation);
+    const before = await latestRevision(owner.id);
+
+    await db.vendorIdentityMerge.create({
+      data: {
+        companyId: owner.id,
+        sourceVendorIdentityId: source.id,
+        targetVendorIdentityId: target.id,
+        mergedBy: 'reviewer-vector',
+        reason: 'Reviewed duplicate invalidates the previous semantic corpus.',
+      },
+    });
+
+    expect(await latestRevision(owner.id)).toBeGreaterThan(before);
+    await expectSemanticGuardRejectsStale(store, owner.id, generation);
+  });
+
   it.each(ownerMoveScenarios)(
     '$name advances both owner revisions and invalidates active semantic indexes',
     async ({ name, arrange }) => {

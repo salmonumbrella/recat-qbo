@@ -5,6 +5,10 @@ import {
   PrismaClassificationSearchRepository,
   searchClassificationMemory,
 } from './search.js';
+import {
+  findVendorIdentityByValue,
+  mergeVendorIdentities,
+} from './vendorIdentity.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -264,6 +268,134 @@ describePostgres('classification search on PostgreSQL', () => {
     ]));
     expect(activeOnly.some((candidate) => candidate.hit.vendorName === 'Coach retired old rule')).toBe(false);
     expect(activeOnly.some((candidate) => candidate.hit.vendorName === 'Coach gathering hidden')).toBe(false);
+  });
+
+  it('keeps reviewed source names and aliases searchable while mapping hits to the final identity', async () => {
+    const data = await fixtures();
+    const source = await db.vendorIdentity.findFirstOrThrow({
+      where: { companyId: data.current.id, normalizedName: 'coach canada' },
+    });
+    const target = await db.vendorIdentity.create({
+      data: {
+        companyId: data.current.id,
+        displayName: 'Tapestry Canada Canonical',
+        normalizedName: 'tapestry canada canonical',
+      },
+    });
+    await mergeVendorIdentities({
+      companyId: data.current.id,
+      sourceVendorIdentityId: source.id,
+      targetVendorIdentityId: target.id,
+      mergedBy: 'reviewer-search',
+      reason: 'Reviewed duplicate Coach and Tapestry vendor identities.',
+    }, db);
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    const exactSource = await searchClassificationMemory({
+      query: 'Coach Canada',
+      companyId: data.current.id,
+      scope: 'current_company',
+      mode: 'exact',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    expect(exactSource.hits).toContainEqual(expect.objectContaining({
+      id: `vendor_identity:${target.id}`,
+      sourceId: target.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      action: null,
+      provenance: expect.objectContaining({ sourceId: target.id }),
+    }));
+    expect(exactSource.hits.filter((hit) => hit.kind === 'vendor_identity')).toHaveLength(1);
+
+    const exactTarget = await searchClassificationMemory({
+      query: target.displayName,
+      companyId: data.current.id,
+      scope: 'current_company',
+      mode: 'exact',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    expect(exactTarget.hits.filter((hit) => hit.kind === 'vendor_identity')).toEqual([
+      expect.objectContaining({
+        id: `vendor_identity:${target.id}`,
+        sourceId: target.id,
+        vendorIdentityId: target.id,
+        vendorName: target.displayName,
+      }),
+    ]);
+
+    const exactAlias = await searchClassificationMemory({
+      query: data.alias.value,
+      companyId: data.current.id,
+      scope: 'current_company',
+      mode: 'exact',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    expect(exactAlias.hits).toContainEqual(expect.objectContaining({
+      id: `vendor_alias:${data.alias.id}`,
+      sourceId: data.alias.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      action: null,
+      provenance: expect.objectContaining({ sourceId: data.alias.id }),
+    }));
+
+    const lexical = await repository.search([data.current.id], 'Coach Canada', 20);
+    expect(lexical.map((record) => record.hit)).toContainEqual(expect.objectContaining({
+      id: `vendor_identity:${target.id}`,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+    }));
+
+    const corpus = await repository.documents(data.current.id);
+    const identityDocuments = corpus.documents.filter((document) => (
+      document.kind === 'vendor_identity'
+      && (document.sourceId === source.id || document.sourceId === target.id)
+    ));
+    expect(identityDocuments).toHaveLength(1);
+    expect(identityDocuments[0]).toMatchObject({
+      id: `vendor_identity:${target.id}`,
+      sourceId: target.id,
+    });
+    expect(identityDocuments[0]?.text).toContain(source.displayName);
+    expect(corpus.documents.find((document) => document.id === `vendor_alias:${data.alias.id}`)?.text)
+      .toContain(target.displayName);
+  });
+
+  it('bounds reviewed merge resolution to the Task 2 twenty-hop contract', async () => {
+    const owner = await company('Bounded Merge Search');
+    const chain = await Promise.all(Array.from({ length: 21 }, (_unused, index) => (
+      db.vendorIdentity.create({
+        data: {
+          companyId: owner.id,
+          displayName: `Merge Chain ${String(index).padStart(2, '0')}`,
+          normalizedName: `merge chain ${String(index).padStart(2, '0')}`,
+        },
+      })
+    )));
+    for (let index = 0; index < chain.length - 1; index += 1) {
+      await db.vendorIdentityMerge.create({
+        data: {
+          companyId: owner.id,
+          sourceVendorIdentityId: chain[index]!.id,
+          targetVendorIdentityId: chain[index + 1]!.id,
+          mergedBy: 'reviewer-depth',
+          reason: `Reviewed bounded merge hop ${index}.`,
+        },
+      });
+    }
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    await expect(findVendorIdentityByValue(owner.id, chain[0]!.displayName, db))
+      .rejects.toMatchObject({ code: 'IDENTITY_CONFLICT' });
+    const overDepth = await repository.exact([owner.id], chain[0]!.displayName, 20);
+    expect(overDepth.filter((record) => record.hit.kind === 'vendor_identity')).toEqual([]);
+    const withinBound = await repository.exact([owner.id], chain[1]!.displayName, 20);
+    expect(withinBound.map((record) => record.hit)).toContainEqual(expect.objectContaining({
+      id: `vendor_identity:${chain.at(-1)!.id}`,
+      vendorIdentityId: chain.at(-1)!.id,
+      vendorName: chain.at(-1)!.displayName,
+    }));
   });
 
   it('reflects writes immediately and rehydration drops invalidated canonical records', async () => {

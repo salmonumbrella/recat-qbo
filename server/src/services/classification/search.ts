@@ -37,6 +37,8 @@ const MAX_ACCESSIBLE_COMPANIES = 100;
 const SEARCH_FETCH_MULTIPLIER = 5;
 const MAX_FETCH = 500;
 const COSINE_FLOOR = 0.72;
+const MAX_VENDOR_MERGE_HOPS = 20;
+const MAX_VENDOR_IDENTITY_SUPPORT_CODE_POINTS = 24_000;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
 
 export interface ClassificationSearchRecord {
@@ -549,21 +551,22 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     const afterFilter = afterDocumentId === null
       ? Prisma.empty
       : Prisma.sql`WHERE concat(document_kind, ':', source_id) > ${afterDocumentId}`;
+    const aliasResolution = resolvedVendorAliasCte([companyId], null);
     const rows = await this.db.$queryRaw<Array<{ documentId: string }>>(Prisma.sql`
-      WITH canonical_documents AS (
+      WITH RECURSIVE ${aliasResolution},
+      canonical_documents AS (
         SELECT 'vendor_identity'::text AS document_kind, identity."id"::text AS source_id
         FROM "VendorIdentity" identity
-        LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
-          AND merge."sourceVendorIdentityId" = identity."id"
-        WHERE identity."companyId" = ${companyId} AND merge."id" IS NULL
+        WHERE identity."companyId" = ${companyId}
+          AND NOT EXISTS (
+            SELECT 1 FROM "VendorIdentityMerge" pending
+            WHERE pending."companyId" = identity."companyId"
+              AND pending."sourceVendorIdentityId" = identity."id"
+          )
         UNION ALL
-        SELECT 'vendor_alias'::text, alias."id"::text
-        FROM "VendorAlias" alias
-        JOIN "VendorIdentity" identity ON identity."companyId" = alias."companyId"
-          AND identity."id" = alias."vendorIdentityId"
-        LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
-          AND merge."sourceVendorIdentityId" = identity."id"
-        WHERE alias."companyId" = ${companyId} AND merge."id" IS NULL
+        SELECT 'vendor_alias'::text, resolution."aliasId"::text
+        FROM resolved_vendor_alias resolution
+        WHERE resolution."companyId" = ${companyId}
         UNION ALL
         SELECT 'classification_case'::text, memory."id"::text
         FROM "ClassificationCase" memory
@@ -647,39 +650,66 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     if (ids !== null && ids.length === 0) return Promise.resolve([] as VendorIdentitySearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND identity."id" IN (${Prisma.join(ids)})`;
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
-    const queryFilter = query === null ? Prisma.empty : exactOnly ? Prisma.sql`
-      AND identity."normalizedName" = ${exactKey}
-    ` : Prisma.sql`
-      AND (
-        identity."normalizedName" = ${exactKey}
-        OR to_tsvector('simple', concat_ws(' ', identity."displayName", aliases."values"))
-           @@ plainto_tsquery('simple', ${query})
-      )
-    `;
-    const score = query === null ? Prisma.sql`0::double precision` : Prisma.sql`
-      ts_rank_cd(
-        to_tsvector('simple', concat_ws(' ', identity."displayName", aliases."values")),
-        plainto_tsquery('simple', ${query})
-      )::double precision
-    `;
+    const matched = query === null
+      ? Prisma.sql`true`
+      : exactOnly
+        ? Prisma.sql`bool_or(source_support."normalizedName" = ${exactKey})`
+        : Prisma.sql`bool_or(
+            source_support."normalizedName" = ${exactKey}
+            OR to_tsvector('simple', source_support."searchText")
+               @@ plainto_tsquery('simple', ${query})
+          )`;
+    const score = query === null || exactOnly
+      ? Prisma.sql`0::double precision`
+      : Prisma.sql`COALESCE(max(ts_rank_cd(
+          to_tsvector('simple', source_support."searchText"),
+          plainto_tsquery('simple', ${query})
+        )), 0)::double precision`;
+    const vendorResolution = resolvedVendorIdentityCte(companyIds, ids);
     return this.db.$queryRaw<VendorIdentitySearchRow[]>(Prisma.sql`
+      WITH RECURSIVE ${vendorResolution},
+      source_vendor_support AS (
+        SELECT resolution."companyId", resolution."targetId", source."id",
+               source."normalizedName",
+               concat_ws(' ', source."displayName",
+                 string_agg(alias."value", ' '
+                            ORDER BY alias."normalizedValue" ASC, alias."id" ASC)) AS "searchText"
+        FROM resolved_vendor_identity resolution
+        JOIN "VendorIdentity" source
+          ON source."companyId" = resolution."companyId"
+         AND source."id" = resolution."sourceId"
+        LEFT JOIN "VendorAlias" alias
+          ON alias."companyId" = source."companyId"
+         AND alias."vendorIdentityId" = source."id"
+        GROUP BY resolution."companyId", resolution."targetId", source."id",
+                 source."normalizedName", source."displayName"
+      ),
+      vendor_identity_support AS (
+        SELECT source_support."companyId", source_support."targetId",
+               left(string_agg(source_support."searchText", ' '
+                               ORDER BY source_support."normalizedName" ASC,
+                                        source_support."id" ASC),
+                    ${MAX_VENDOR_IDENTITY_SUPPORT_CODE_POINTS}::int) AS "values",
+               ${matched} AS "matched", ${score} AS "lexicalScore"
+        FROM source_vendor_support source_support
+        GROUP BY source_support."companyId", source_support."targetId"
+      )
       SELECT identity."id", identity."companyId", company."nickname" AS "companyName",
              identity."displayName", identity."normalizedName", identity."updatedAt" AS "revisedAt",
-             COALESCE(aliases."values", '') AS "aliases", ${score} AS "lexicalScore"
+             support."values" AS "aliases", support."lexicalScore"
       FROM "VendorIdentity" identity
       JOIN "Company" company ON company."id" = identity."companyId"
-      LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
-        AND merge."sourceVendorIdentityId" = identity."id"
-      LEFT JOIN LATERAL (
-        SELECT string_agg(alias."value", ' ' ORDER BY alias."normalizedValue" ASC, alias."id" ASC) AS "values"
-        FROM "VendorAlias" alias
-        WHERE alias."companyId" = identity."companyId"
-          AND alias."vendorIdentityId" = identity."id"
-      ) aliases ON true
+      JOIN resolved_vendor_identity canonical
+        ON canonical."companyId" = identity."companyId"
+       AND canonical."sourceId" = identity."id"
+       AND canonical."targetId" = identity."id"
+      JOIN vendor_identity_support support
+        ON support."companyId" = identity."companyId"
+       AND support."targetId" = identity."id"
       WHERE identity."companyId" IN (${Prisma.join(companyIds)})
-        AND merge."id" IS NULL
-        ${idFilter} ${queryFilter}
-      ORDER BY "lexicalScore" DESC, identity."updatedAt" DESC, identity."id" ASC
+        AND support."matched"
+        ${idFilter}
+      ORDER BY support."lexicalScore" DESC, identity."updatedAt" DESC, identity."id" ASC
       LIMIT ${limit}
     `);
   }
@@ -709,19 +739,22 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
         plainto_tsquery('simple', ${query})
       )::double precision
     `;
+    const vendorResolution = resolvedVendorAliasCte(companyIds, ids);
     return this.db.$queryRaw<VendorAliasSearchRow[]>(Prisma.sql`
+      WITH RECURSIVE ${vendorResolution}
       SELECT alias."id", alias."companyId", company."nickname" AS "companyName",
-             alias."vendorIdentityId", alias."value", alias."normalizedValue", alias."source",
+             identity."id" AS "vendorIdentityId", alias."value", alias."normalizedValue", alias."source",
              alias."createdAt" AS "revisedAt", identity."displayName" AS "vendorName",
              ${score} AS "lexicalScore"
       FROM "VendorAlias" alias
       JOIN "Company" company ON company."id" = alias."companyId"
-      JOIN "VendorIdentity" identity ON identity."companyId" = alias."companyId"
-        AND identity."id" = alias."vendorIdentityId"
-      LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
-        AND merge."sourceVendorIdentityId" = identity."id"
+      JOIN resolved_vendor_alias resolution
+        ON resolution."companyId" = alias."companyId"
+       AND resolution."aliasId" = alias."id"
+      JOIN "VendorIdentity" identity
+        ON identity."companyId" = resolution."companyId"
+       AND identity."id" = resolution."targetId"
       WHERE alias."companyId" IN (${Prisma.join(companyIds)})
-        AND merge."id" IS NULL
         ${idFilter} ${queryFilter}
       ORDER BY "lexicalScore" DESC, alias."createdAt" DESC, alias."id" ASC
       LIMIT ${limit}
@@ -1001,6 +1034,84 @@ function checkedCompanyList(companyIds: readonly string[]): string[] {
   return [...new Set(companyIds.map((id) => (
     checkedText(id, CLASSIFICATION_CONTRACT_LIMITS.identifier)
   )))];
+}
+
+function resolvedVendorIdentityCte(
+  companyIds: readonly string[],
+  targetIds: readonly string[] | null,
+): Prisma.Sql {
+  const targetFilter = targetIds === null
+    ? Prisma.empty
+    : Prisma.sql`AND target."id" IN (${Prisma.join(targetIds)})`;
+  return Prisma.sql`
+    vendor_identity_walk ("companyId", "sourceId", "targetId", "path", "depth") AS (
+      SELECT target."companyId", target."id", target."id",
+             ARRAY[target."id"]::text[], 0
+      FROM "VendorIdentity" target
+      WHERE target."companyId" IN (${Prisma.join(companyIds)})
+        ${targetFilter}
+        AND NOT EXISTS (
+          SELECT 1 FROM "VendorIdentityMerge" pending
+          WHERE pending."companyId" = target."companyId"
+            AND pending."sourceVendorIdentityId" = target."id"
+        )
+      UNION ALL
+      SELECT walk."companyId", merge."sourceVendorIdentityId", walk."targetId",
+             walk."path" || merge."sourceVendorIdentityId", walk."depth" + 1
+      FROM vendor_identity_walk walk
+      JOIN "VendorIdentityMerge" merge
+        ON merge."companyId" = walk."companyId"
+       AND merge."targetVendorIdentityId" = walk."sourceId"
+      JOIN "VendorIdentity" source
+        ON source."companyId" = merge."companyId"
+       AND source."id" = merge."sourceVendorIdentityId"
+      WHERE walk."depth" < ${MAX_VENDOR_MERGE_HOPS - 1}
+        AND NOT merge."sourceVendorIdentityId" = ANY(walk."path")
+    ),
+    resolved_vendor_identity ("companyId", "sourceId", "targetId") AS (
+      SELECT walk."companyId", walk."sourceId", walk."targetId"
+      FROM vendor_identity_walk walk
+    )
+  `;
+}
+
+function resolvedVendorAliasCte(
+  companyIds: readonly string[],
+  aliasIds: readonly string[] | null,
+): Prisma.Sql {
+  const aliasFilter = aliasIds === null
+    ? Prisma.empty
+    : Prisma.sql`AND alias."id" IN (${Prisma.join(aliasIds)})`;
+  return Prisma.sql`
+    vendor_alias_walk ("companyId", "aliasId", "currentId", "path", "depth") AS (
+      SELECT alias."companyId", alias."id", alias."vendorIdentityId",
+             ARRAY[alias."vendorIdentityId"]::text[], 0
+      FROM "VendorAlias" alias
+      WHERE alias."companyId" IN (${Prisma.join(companyIds)})
+        ${aliasFilter}
+      UNION ALL
+      SELECT walk."companyId", walk."aliasId", merge."targetVendorIdentityId",
+             walk."path" || merge."targetVendorIdentityId", walk."depth" + 1
+      FROM vendor_alias_walk walk
+      JOIN "VendorIdentityMerge" merge
+        ON merge."companyId" = walk."companyId"
+       AND merge."sourceVendorIdentityId" = walk."currentId"
+      JOIN "VendorIdentity" target
+        ON target."companyId" = merge."companyId"
+       AND target."id" = merge."targetVendorIdentityId"
+      WHERE walk."depth" < ${MAX_VENDOR_MERGE_HOPS - 1}
+        AND NOT merge."targetVendorIdentityId" = ANY(walk."path")
+    ),
+    resolved_vendor_alias ("companyId", "aliasId", "targetId") AS (
+      SELECT walk."companyId", walk."aliasId", walk."currentId"
+      FROM vendor_alias_walk walk
+      WHERE NOT EXISTS (
+        SELECT 1 FROM "VendorIdentityMerge" pending
+        WHERE pending."companyId" = walk."companyId"
+          AND pending."sourceVendorIdentityId" = walk."currentId"
+      )
+    )
+  `;
 }
 
 function splitDocumentIds(documentIds: readonly string[] | null): Record<
