@@ -3,6 +3,8 @@ import type { ClassificationAction } from '@recat/shared';
 import { prisma } from '../../lib/prisma.js';
 import type { QboPreparedWrite } from '../../lib/qbo/types.js';
 import {
+  CLASSIFICATION_ENVELOPE_VERSION,
+  classificationEnvelopeHashForPreparedWrite,
   persistedClassificationDecision,
   persistedClassificationEvidenceBinding,
   persistedEvidenceProposal,
@@ -34,6 +36,7 @@ export interface ClassificationOutcomeRecorderDeps {
 
 const defaultDeps: ClassificationOutcomeRecorderDeps = { db: prisma };
 const REPAIR_BATCH_SIZE = 25;
+const ACTIVATION_REPAIR_LIMIT = 100;
 const RULE_REVIEW_ACTOR = 'system:classification-outcome';
 
 interface ExpectedOutcomeIdentity {
@@ -174,12 +177,14 @@ async function completedReceiptExists(
       operation: true,
       status: true,
       expectedRevision: true,
+      classificationEnvelopeVersion: true,
       ruleCandidateFoldedAt: true,
     },
   });
   if (
     attempt === null
     || attempt.status !== 'VERIFIED'
+    || attempt.classificationEnvelopeVersion !== CLASSIFICATION_ENVELOPE_VERSION
     || attempt.ruleCandidateFoldedAt === null
     || (attempt.operation !== 'recategorize' && attempt.operation !== 'restore')
     || (identity.transactionId !== undefined && identity.transactionId !== attempt.transactionId)
@@ -217,7 +222,7 @@ async function stampAttemptFolded(
         AND "status" = 'VERIFIED'
         AND "expectedRevision" = ${attempt.expectedRevision}
         AND "ruleCandidateFoldedAt" IS NULL
-        AND "requestPayload"->'ruleCandidateFold'->>'version' = '1'
+        AND "classificationEnvelopeVersion" = ${CLASSIFICATION_ENVELOPE_VERSION}
     `,
   );
 }
@@ -304,6 +309,23 @@ async function recordInTransaction(
     || (expected.operation !== undefined && expected.operation !== operation)
   ) return false;
 
+  const payload = runtimeRecord(attempt.requestPayload);
+  const foldVersion = runtimeRecord(payload?.ruleCandidateFold)?.version;
+  const legacyFormat =
+    attempt.classificationEnvelopeVersion === null
+    && attempt.classificationEnvelopeHash === null
+    && foldVersion === 1
+    && payload?.classificationEvidenceBinding === undefined;
+  if (legacyFormat) return false;
+  const declaredBoundFormat =
+    attempt.classificationEnvelopeVersion === CLASSIFICATION_ENVELOPE_VERSION
+    && typeof attempt.classificationEnvelopeHash === 'string';
+  if (!declaredBoundFormat) return false;
+  if (foldVersion !== CLASSIFICATION_ENVELOPE_VERSION) {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
+    return false;
+  }
+
   const repairedExistingFold = await repairExistingFoldMarker(
     tx,
     attempt,
@@ -343,8 +365,7 @@ async function recordInTransaction(
     return false;
   }
 
-  const payload = runtimeRecord(attempt.requestPayload);
-  if (payload === null || runtimeRecord(payload.ruleCandidateFold)?.version !== 1) return false;
+  if (payload === null) return false;
   const proposal = operation === 'posted'
     ? persistedEvidenceProposal(attempt.requestPayload)
     : null;
@@ -368,16 +389,24 @@ async function recordInTransaction(
         candidateContext.configVersion,
         candidateContext.source,
       );
+  const evidenceBinding = operation === 'posted'
+    ? persistedClassificationEvidenceBinding(
+        attempt.requestPayload,
+        proposal!,
+        candidateContext,
+        hashClassificationPreparedWrite(prepared),
+      )
+    : null;
   if (
     hasDecisionEnvelope && decision === null
     || operation === 'posted' && !proposalMatchesPrepared(proposal!, prepared)
     || !exactJson(candidateContext, expectedCandidateContext)
-    || operation === 'posted' && persistedClassificationEvidenceBinding(
-      attempt.requestPayload,
-      proposal!,
-      candidateContext,
+    || operation === 'posted' && evidenceBinding === null
+    || attempt.classificationEnvelopeHash !== classificationEnvelopeHashForPreparedWrite(
       hashClassificationPreparedWrite(prepared),
-    ) === null
+      decision,
+      evidenceBinding,
+    )
   ) {
     await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
     return false;
@@ -471,7 +500,7 @@ async function recordInTransaction(
     tx,
     durableOutcome,
     now,
-    { markAffectedRules: false },
+    { markAffectedRules: false, attemptFormat: 'bound' },
   );
   if (!folded.processed) return false;
   await markAffectedRulesReviewRequired(
@@ -518,6 +547,66 @@ export function recordVerifiedClassificationOutcome(
 }
 
 /**
+ * Folds bound VERIFIED attempts relevant to one candidate before activation.
+ * The caller already owns the company mutation transaction, so this path must
+ * use the same transaction and the full modern recorder validation rather than
+ * opening a nested fence or falling back to legacy candidate-only repair.
+ */
+export async function reconcileBoundClassificationOutcomesBeforeActivation(
+  tx: OutcomeTransaction,
+  candidate: {
+    id: string;
+    companyId: string;
+    conditionFingerprint: string;
+    configVersion: string;
+  },
+  now = new Date(),
+): Promise<{ saturated: boolean }> {
+  const rows = await tx.$queryRaw<{ requestId: string }[]>(
+    Prisma.sql`
+      SELECT attempt."requestId"
+      FROM "QboMutationAttempt" attempt
+      JOIN "Transaction" transaction ON transaction."id" = attempt."transactionId"
+      WHERE transaction."companyId" = ${candidate.companyId}
+        AND attempt."status" = 'VERIFIED'
+        AND attempt."operation" IN ('recategorize', 'restore')
+        AND attempt."ruleCandidateFoldedAt" IS NULL
+        AND attempt."classificationEnvelopeVersion" = ${CLASSIFICATION_ENVELOPE_VERSION}
+        AND (
+          (
+            attempt."operation" = 'recategorize'
+            AND attempt."requestPayload"->'ruleCandidateEvidence'->>'conditionFingerprint'
+              = ${candidate.conditionFingerprint}
+            AND attempt."requestPayload"->'ruleCandidateEvidence'->>'configVersion'
+              = ${candidate.configVersion}
+          )
+          OR (
+            attempt."operation" = 'restore'
+            AND EXISTS (
+              SELECT 1
+              FROM "AutopilotRuleCandidateEvidence" evidence
+              WHERE evidence."candidateId" = ${candidate.id}
+                AND evidence."transactionId" = attempt."transactionId"
+                AND evidence."active" = true
+            )
+          )
+        )
+      ORDER BY attempt."createdAt" DESC, attempt."id" DESC
+      LIMIT ${ACTIVATION_REPAIR_LIMIT + 1}
+    `,
+  );
+  if (rows.length > ACTIVATION_REPAIR_LIMIT) return { saturated: true };
+  for (const row of rows) {
+    await recordInTransaction(
+      tx,
+      { companyId: candidate.companyId, requestId: row.requestId },
+      now,
+    );
+  }
+  return { saturated: false };
+}
+
+/**
  * Bounded local-only repair for VERIFIED attempts whose durable fold marker is
  * still absent. It is safe to race across workers because every fold is
  * company-fenced and request-key idempotent.
@@ -532,10 +621,7 @@ export async function reconcileVerifiedClassificationOutcomes(
       operation: { in: ['recategorize', 'restore'] },
       ruleCandidateFoldedAt: null,
       transaction: { companyId },
-      requestPayload: {
-        path: ['ruleCandidateFold', 'version'],
-        equals: 1,
-      },
+      classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
     },
     select: { requestId: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],

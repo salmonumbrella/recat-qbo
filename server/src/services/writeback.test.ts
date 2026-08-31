@@ -1817,6 +1817,26 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it('anchors the bound outcome format even when decision context is omitted', async () => {
+    const fixture = durableDeps();
+
+    await commitStagedCategorization(commitInput('request-bound-without-decision'), fixture.deps);
+
+    const attempt = fixture.db.attempts[0]! as unknown as Record<string, unknown>;
+    expect(attempt).toMatchObject({
+      classificationEnvelopeVersion: 2,
+      classificationEnvelopeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      requestPayload: {
+        ruleCandidateFold: { version: 2 },
+        classificationEvidenceBinding: {
+          version: 1,
+          preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      },
+    });
+    expect((attempt.requestPayload as Record<string, unknown>).classificationDecision).toBeUndefined();
+  });
+
   it('persists and replay-binds normalized decision context for dry runs without provider access', async () => {
     const fixture = durableDeps();
     fixture.db.transactionRow.company.dryRun = true;

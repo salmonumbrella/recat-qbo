@@ -57,7 +57,9 @@ import { pauseLiveCompanyInTransaction } from './agent/circuitBreaker.js';
 import { isCanonicalLiveCheckpoint } from './agent/liveCheckpoint.js';
 import { candidateContextFor } from './agent/ruleCandidates.js';
 import {
+  CLASSIFICATION_ENVELOPE_VERSION,
   categorizationDecisionContextHash,
+  classificationEnvelopeHashForPreparedWrite,
   classificationDecisionForPreparedWrite,
   classificationEvidenceBindingForPreparedWrite,
   normalizeCategorizationDecisionContext,
@@ -774,6 +776,8 @@ export interface DurableAttempt {
   verification: unknown;
   errorCode: string | null;
   errorMessage: string | null;
+  classificationEnvelopeVersion?: number | null;
+  classificationEnvelopeHash?: string | null;
 }
 
 interface DurableTransaction {
@@ -888,6 +892,8 @@ export interface DurableWritebackDb {
         verification?: unknown;
         errorCode?: string | null;
         errorMessage?: string | null;
+        classificationEnvelopeVersion?: number | null;
+        classificationEnvelopeHash?: string | null;
       };
     }): Promise<DurableAttempt>;
     update(args: {
@@ -2744,6 +2750,18 @@ async function persistPrepared(
             config?.configVersion ?? 'verified-writeback-v1',
             candidateInput.source,
           );
+      const preparedWriteHash = hashClassificationPreparedWrite(prepared);
+      const classificationDecision = decisionContext === undefined || decisionContext === null
+        ? null
+        : classificationDecisionForPreparedWrite(decisionContext, preparedWriteHash);
+      const proposal = staged === undefined ? null : evidenceProposal(staged);
+      const classificationEvidenceBinding = proposal === null
+        ? null
+        : classificationEvidenceBindingForPreparedWrite(
+            proposal,
+            candidateContext,
+            preparedWriteHash,
+          );
       return tx.qboMutationAttempt.create({
         data: {
           transactionId,
@@ -2753,28 +2771,25 @@ async function persistPrepared(
           expectedRevision,
           expectedSyncToken: prepared.body.SyncToken,
           requestHash: prepared.requestHash,
+          classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+          classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+            preparedWriteHash,
+            classificationDecision,
+            classificationEvidenceBinding,
+          ),
           requestPayload: {
             ...prepared,
-            ...(decisionContext === undefined || decisionContext === null
+            ...(classificationDecision === null
+              ? {}
+              : { classificationDecision }),
+            ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+            ...(proposal === null
               ? {}
               : {
-                  classificationDecision: classificationDecisionForPreparedWrite(
-                    decisionContext,
-                    hashClassificationPreparedWrite(prepared),
-                  ),
-                }),
-            ruleCandidateFold: { version: 1 },
-            ...(staged === undefined
-              ? {}
-              : {
-                classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
-                  evidenceProposal(staged),
-                  candidateContext,
-                  hashClassificationPreparedWrite(prepared),
-                ),
+                classificationEvidenceBinding,
                 categorizationEvidence: {
                   version: 1,
-                  proposal: evidenceProposal(staged),
+                  proposal,
                 },
                 ...(candidateContext === null
                   ? {}

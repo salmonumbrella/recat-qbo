@@ -173,7 +173,9 @@ export async function recordVerifiedRuleCandidateOutcome(
 ): Promise<void> {
   const now = deps.now?.() ?? new Date();
   await runCompanyMutationTransaction(deps.db, outcome.companyId, async (tx) => {
-    await foldVerifiedRuleCandidateOutcomeInTransaction(tx, outcome, now);
+    await foldVerifiedRuleCandidateOutcomeInTransaction(tx, outcome, now, {
+      attemptFormat: 'legacy',
+    });
   });
 }
 
@@ -186,7 +188,10 @@ export async function foldVerifiedRuleCandidateOutcomeInTransaction(
   tx: CandidateTransaction,
   outcome: VerifiedCategorizationOutcome,
   now: Date,
-  options: { markAffectedRules?: boolean } = {},
+  options: {
+    markAffectedRules?: boolean;
+    attemptFormat?: 'bound' | 'legacy';
+  } = {},
 ): Promise<{ processed: boolean; affectedCandidateIds: string[] }> {
   const transaction = await tx.transaction.findUnique({
     where: { id: outcome.transactionId },
@@ -200,7 +205,14 @@ export async function foldVerifiedRuleCandidateOutcomeInTransaction(
   });
   if (transaction === null) return { processed: false, affectedCandidateIds: [] };
   const affected = new Set<string>();
-  const processed = await foldOutcome(tx, outcome, transaction, now, affected);
+  const processed = await foldOutcome(
+    tx,
+    outcome,
+    transaction,
+    now,
+    affected,
+    options.attemptFormat ?? 'legacy',
+  );
   for (const candidateId of affected) {
     await recomputeCandidate(
       tx,
@@ -224,13 +236,14 @@ async function foldOutcome(
   },
   now: Date,
   affected: Set<string>,
+  attemptFormat: 'bound' | 'legacy',
 ): Promise<boolean> {
   const folded = await tx.autopilotRuleCandidateFold.findUnique({
     where: { requestId: outcome.requestId },
     select: { requestId: true },
   });
   if (folded !== null) {
-    await markAttemptFolded(tx, outcome, now);
+    await markAttemptFolded(tx, outcome, now, attemptFormat);
     return false;
   }
 
@@ -350,7 +363,7 @@ async function foldOutcome(
       processedAt: now,
     },
   });
-  const marked = await markAttemptFolded(tx, outcome, now);
+  const marked = await markAttemptFolded(tx, outcome, now, attemptFormat);
   if (marked !== 1) {
     throw new Error('Verified rule-candidate outcome is not backed by one durable attempt.');
   }
@@ -361,6 +374,7 @@ async function markAttemptFolded(
   tx: CandidateTransaction,
   outcome: VerifiedCategorizationOutcome,
   now: Date,
+  attemptFormat: 'bound' | 'legacy',
 ): Promise<number> {
   const durableOperation = outcome.operation === 'posted' ? 'recategorize' : 'restore';
   // Prisma's normal update path also advances @updatedAt. Other agent evidence
@@ -376,7 +390,17 @@ async function markAttemptFolded(
         AND "status" = 'VERIFIED'
         AND "expectedRevision" = ${outcome.inputRevision}
         AND "ruleCandidateFoldedAt" IS NULL
-        AND "requestPayload"->'ruleCandidateFold'->>'version' = '1'
+        AND ${attemptFormat === 'bound'
+          ? Prisma.sql`
+              "classificationEnvelopeVersion" = 2
+              AND "requestPayload"->'ruleCandidateFold'->>'version' = '2'
+            `
+          : Prisma.sql`
+              "classificationEnvelopeVersion" IS NULL
+              AND "classificationEnvelopeHash" IS NULL
+              AND "requestPayload"->'ruleCandidateFold'->>'version' = '1'
+              AND "requestPayload"->'classificationEvidenceBinding' IS NULL
+            `}
     `,
   );
 }
@@ -407,7 +431,7 @@ async function repairRows(
       revision: row.revision,
       status: row.status,
       payee: row.payee,
-    }, now, affected);
+    }, now, affected, 'legacy');
   }
   for (const candidateId of affected) {
     await recomputeCandidate(tx, candidateId, now);
@@ -438,11 +462,13 @@ function missingRepairRows(
         AND attempt."status" = 'VERIFIED'
         AND attempt."operation" IN ('recategorize', 'restore')
         AND attempt."ruleCandidateFoldedAt" IS NULL
+        AND attempt."classificationEnvelopeVersion" IS NULL
+        AND attempt."classificationEnvelopeHash" IS NULL
         AND attempt."requestPayload"->'ruleCandidateFold'->>'version' = '1'
-        -- Approved classification decisions are folded only by the atomic
-        -- case + candidate recorder. This legacy repair path remains for
-        -- attempts that predate case recording.
-        AND attempt."requestPayload"->'classificationDecision' IS NULL
+        AND attempt."requestPayload"->'classificationEvidenceBinding' IS NULL
+        -- A v1 attempt predates bound case recording. Its optional decision
+        -- envelope must never create a case, but its historically supported
+        -- VERIFIED candidate fold remains repairable here.
         ${extraPredicate}
       ORDER BY attempt."createdAt" DESC, attempt."id" DESC
       LIMIT ${limit}
@@ -480,6 +506,15 @@ export async function reconcileRuleCandidateBeforeActivation(
   },
   now = new Date(),
 ): Promise<{ saturated: boolean }> {
+  const { reconcileBoundClassificationOutcomesBeforeActivation } = await import(
+    '../classification/outcomeRecorder.js'
+  );
+  const bound = await reconcileBoundClassificationOutcomesBeforeActivation(
+    tx,
+    candidate,
+    now,
+  );
+  if (bound.saturated) return bound;
   const rows = await missingRepairRows(
     tx,
     candidate.companyId,

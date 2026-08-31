@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type {
   VerifiedCategorizationOutcome,
@@ -11,11 +11,17 @@ import {
 } from './ruleCandidatePersistence.js';
 import { candidateContextFor } from './ruleCandidates.js';
 import {
+  CLASSIFICATION_ENVELOPE_VERSION,
+  classificationEnvelopeHashForPreparedWrite,
+  classificationEvidenceBindingForPreparedWrite,
+} from '../categorizationEvidence.js';
+import {
   activateRuleCandidate,
   dismissRuleCandidate,
   getRuleCandidate,
 } from '../ruleCandidates.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
+import { hashClassificationPreparedWrite } from '../writeback.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -72,6 +78,163 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
           action: 'rule-candidate-dismissed',
         },
       })).resolves.toBe(1);
+    } finally {
+      await db.company.delete({ where: { id: company.id } });
+    }
+  });
+
+  it('routes a bound no-decision attempt through validated recording before activation', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({
+      data: {
+        realmId: `candidate-bound-repair-${suffix}`,
+        legalName: 'Bound candidate repair fixture',
+        nickname: `bound-${suffix.slice(0, 8)}`,
+      },
+    });
+    const account = await db.qboAccount.create({
+      data: {
+        companyId: company.id,
+        qboId: `account-${suffix}`,
+        name: 'Verified category',
+        fullName: 'Expenses · Verified category',
+        classification: 'Expenses',
+      },
+    });
+    const transactions = await Promise.all([0, 1, 2].map((index) => db.transaction.create({
+      data: {
+        companyId: company.id,
+        qboId: `purchase-${index}-${suffix}`,
+        qboType: 'Purchase',
+        qboSyncToken: '1',
+        date: NOW,
+        payee: 'Bound Repair Vendor',
+        amount: '-10.00',
+        bankAccount: 'Fixture bank',
+        status: 'POSTED',
+        revision: 1,
+      },
+    })));
+    const candidateContext = candidateContextFor(
+      'Bound Repair Vendor',
+      `config-${suffix}`,
+      'user',
+    );
+    if (candidateContext === null) throw new Error('Fixture candidate context is invalid.');
+    const proposal: VerifiedCategorizationProposal = {
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        idx: 0,
+        subtotalCents: -1000,
+        taxCents: 0,
+        totalCents: -1000,
+        categoryQboId: account.qboId,
+        taxCodeQboId: null,
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const outcome = (index: number, requestId = randomUUID()): VerifiedCategorizationOutcome => ({
+      companyId: company.id,
+      transactionId: transactions[index]!.id,
+      inputRevision: 1,
+      requestId,
+      operation: 'posted',
+      proposal,
+      candidateContext,
+    });
+
+    try {
+      for (const index of [0, 1]) {
+        const current = outcome(index);
+        await db.qboMutationAttempt.create({
+          data: {
+            transactionId: current.transactionId,
+            requestId: current.requestId,
+            operation: 'recategorize',
+            status: 'VERIFIED',
+            expectedRevision: 1,
+            expectedSyncToken: '0',
+            requestHash: `legacy-${current.requestId}`,
+            requestPayload: { ruleCandidateFold: { version: 1 } },
+            beforeSnapshot: {},
+          },
+        });
+        await recordVerifiedRuleCandidateOutcome(current, { db, now: () => NOW });
+      }
+      const candidate = await db.autopilotRuleCandidate.findFirstOrThrow({
+        where: { companyId: company.id },
+      });
+      expect(candidate).toMatchObject({ state: 'gathering', evidenceCount: 2 });
+
+      const third = outcome(2);
+      const prepared = {
+        operation: 'recategorize',
+        qboType: 'Purchase',
+        qboId: transactions[2]!.qboId,
+        requestId: third.requestId,
+        requestHash: `provider-${third.requestId}`,
+        body: { Id: transactions[2]!.qboId, SyncToken: '0' },
+        before: { qboId: transactions[2]!.qboId, syncToken: '0' },
+        expected: {
+          qboId: transactions[2]!.qboId,
+          targetLines: [{ accountQboId: `different-provider-action-${suffix}` }],
+        },
+      } as unknown as Parameters<typeof hashClassificationPreparedWrite>[0];
+      const binding = classificationEvidenceBindingForPreparedWrite(
+        proposal,
+        candidateContext,
+        hashClassificationPreparedWrite(prepared),
+      );
+      await db.qboMutationAttempt.create({
+        data: {
+          transactionId: third.transactionId,
+          requestId: third.requestId,
+          operation: 'recategorize',
+          status: 'VERIFIED',
+          expectedRevision: 1,
+          expectedSyncToken: '0',
+          requestHash: prepared.requestHash,
+          classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+          classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+            hashClassificationPreparedWrite(prepared),
+            null,
+            binding,
+          ),
+          requestPayload: {
+            ...prepared,
+            ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+            classificationEvidenceBinding: binding,
+            categorizationEvidence: { version: 1, proposal },
+            ruleCandidateEvidence: { version: 1, ...candidateContext },
+          } as unknown as Prisma.InputJsonValue,
+          beforeSnapshot: {},
+        },
+      });
+
+      await expect(activateRuleCandidate(
+        company.id,
+        candidate.id,
+        { id: randomUUID(), label: 'Fixture reviewer' },
+        db,
+      )).rejects.toMatchObject({ code: 'CANDIDATE_NOT_READY' });
+      await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: candidate.id },
+      })).resolves.toMatchObject({ state: 'gathering', evidenceCount: 2 });
+      await expect(db.autopilotRuleCandidateEvidence.count({
+        where: { candidateId: candidate.id, active: true },
+      })).resolves.toBe(2);
+      await expect(db.classificationCase.count({
+        where: { companyId: company.id },
+      })).resolves.toBe(0);
+      await expect(db.autopilotRuleCandidateFold.count({
+        where: { requestId: third.requestId },
+      })).resolves.toBe(1);
+      await expect(db.qboMutationAttempt.findUniqueOrThrow({
+        where: { requestId: third.requestId },
+        select: { ruleCandidateFoldedAt: true },
+      })).resolves.toEqual({ ruleCandidateFoldedAt: expect.any(Date) });
     } finally {
       await db.company.delete({ where: { id: company.id } });
     }
@@ -304,6 +467,9 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         evidenceCount: 4,
         conflictingEvidenceCount: 0,
       });
+      await expect(db.classificationCase.count({
+        where: { companyId: company.id },
+      })).resolves.toBe(0);
 
       const conflicting = outcome(3, accountB.qboId);
       await db.qboMutationAttempt.create({

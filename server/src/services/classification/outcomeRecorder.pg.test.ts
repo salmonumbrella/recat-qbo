@@ -5,12 +5,17 @@ import type { StagedCategorization } from '@recat/shared';
 import { preparePurchaseRecategorization } from '../../lib/qbo/purchaseTax.js';
 import type { QboPurchaseSnapshot, RawPurchase } from '../../lib/qbo/types.js';
 import {
+  CLASSIFICATION_ENVELOPE_VERSION,
+  classificationEnvelopeHashForPreparedWrite,
   classificationDecisionForPreparedWrite,
   classificationEvidenceBindingForPreparedWrite,
   normalizeCategorizationDecisionContext,
 } from '../categorizationEvidence.js';
 import { candidateContextFor } from '../agent/ruleCandidates.js';
-import { foldVerifiedRuleCandidateOutcomeInTransaction } from '../agent/ruleCandidatePersistence.js';
+import {
+  foldVerifiedRuleCandidateOutcomeInTransaction,
+  rebuildRuleCandidates,
+} from '../agent/ruleCandidatePersistence.js';
 import {
   hashClassificationPreparedWrite,
   hashPreparedWriteBody,
@@ -191,6 +196,16 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
       }],
       tagIds: [],
     };
+    const preparedWriteHash = hashClassificationPreparedWrite(prepared);
+    const classificationDecision = classificationDecisionForPreparedWrite(
+      decisionContext,
+      preparedWriteHash,
+    );
+    const classificationEvidenceBinding = classificationEvidenceBindingForPreparedWrite(
+      proposal,
+      candidateContext,
+      preparedWriteHash,
+    );
     const attempt = await db.qboMutationAttempt.create({
       data: {
         transactionId: transaction.id,
@@ -200,18 +215,17 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
         expectedRevision: 1,
         expectedSyncToken: '0',
         requestHash: prepared.requestHash,
+        classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          preparedWriteHash,
+          classificationDecision,
+          classificationEvidenceBinding,
+        ),
         requestPayload: {
           ...prepared,
-          classificationDecision: classificationDecisionForPreparedWrite(
-            decisionContext,
-            hashClassificationPreparedWrite(prepared),
-          ),
-          ruleCandidateFold: { version: 1 },
-          classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
-            proposal,
-            candidateContext,
-            hashClassificationPreparedWrite(prepared),
-          ),
+          classificationDecision,
+          ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+          classificationEvidenceBinding,
           categorizationEvidence: { version: 1, proposal },
           ruleCandidateEvidence: { version: 1, ...candidateContext },
         } as unknown as Prisma.InputJsonValue,
@@ -285,7 +299,99 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     }))).not.toContain('must-not-leak');
   });
 
-  it('rejects a persisted proposal that does not match the provider-verified prepared action', async () => {
+  it('folds a bound no-decision VERIFIED attempt without inventing a case', async () => {
+    const value = await fixture();
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    delete payload.classificationDecision;
+    const prepared = payload as unknown as ReturnType<typeof preparePurchaseRecategorization>;
+    const evidenceBinding = payload.classificationEvidenceBinding as ReturnType<
+      typeof classificationEvidenceBindingForPreparedWrite
+    >;
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: {
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          hashClassificationPreparedWrite(prepared),
+          null,
+          evidenceBinding,
+        ),
+        requestPayload: payload as Prisma.InputJsonValue,
+      },
+    });
+
+    await recordVerifiedClassificationOutcome({
+      ...value.outcome,
+      decisionContext: undefined,
+    }, { db, now: () => NOW });
+
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { requestId: value.attempt.requestId, polarity: 'positive' },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { status: true, ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ status: 'VERIFIED', ruleCandidateFoldedAt: NOW });
+  });
+
+  it('terminalizes rehashed no-decision proposal tampering during modern reconciliation', async () => {
+    const value = await fixture();
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    const tamperedProposal = {
+      ...value.outcome.proposal!,
+      lines: [{
+        ...value.outcome.proposal!.lines[0]!,
+        categoryQboId: `unverified-rebuild-${randomUUID()}`,
+      }],
+    };
+    delete payload.classificationDecision;
+    payload.categorizationEvidence = { version: 1, proposal: tamperedProposal };
+    const prepared = payload as unknown as ReturnType<typeof preparePurchaseRecategorization>;
+    const tamperedBinding = classificationEvidenceBindingForPreparedWrite(
+      tamperedProposal,
+      value.outcome.candidateContext,
+      hashClassificationPreparedWrite(prepared),
+    );
+    payload.classificationEvidenceBinding = tamperedBinding;
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: {
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          hashClassificationPreparedWrite(prepared),
+          null,
+          tamperedBinding,
+        ),
+        requestPayload: payload as Prisma.InputJsonValue,
+      },
+    });
+
+    await expect(reconcileVerifiedClassificationOutcomes(
+      value.company.id,
+      { db, now: () => NOW },
+    )).resolves.toBe(0);
+
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateFold.count({
+      where: { requestId: value.attempt.requestId },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { status: true, ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ status: 'VERIFIED', ruleCandidateFoldedAt: NOW });
+  });
+
+  it('rejects a self-consistent rehashed proposal that mismatches the prepared action', async () => {
     const value = await fixture();
     const payload = structuredClone(
       value.attempt.requestPayload,
@@ -301,9 +407,23 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
       version: 1,
       proposal: tamperedProposal,
     };
+    const prepared = payload as unknown as ReturnType<typeof preparePurchaseRecategorization>;
+    const tamperedBinding = classificationEvidenceBindingForPreparedWrite(
+      tamperedProposal,
+      value.outcome.candidateContext,
+      hashClassificationPreparedWrite(prepared),
+    );
+    payload.classificationEvidenceBinding = tamperedBinding;
     await db.qboMutationAttempt.update({
       where: { id: value.attempt.id },
-      data: { requestPayload: payload as Prisma.InputJsonValue },
+      data: {
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          hashClassificationPreparedWrite(prepared),
+          payload.classificationDecision as ReturnType<typeof classificationDecisionForPreparedWrite>,
+          tamperedBinding,
+        ),
+        requestPayload: payload as Prisma.InputJsonValue,
+      },
     });
 
     await recordVerifiedClassificationOutcome({
@@ -317,9 +437,16 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     await expect(db.autopilotRuleCandidateEvidence.count({
       where: { companyId: value.company.id },
     })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateFold.count({
+      where: { requestId: value.attempt.requestId },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ ruleCandidateFoldedAt: NOW });
   });
 
-  it('rejects self-consistent stored and callback candidate config/source tampering for the same payee', async () => {
+  it('rejects a rehashed evidence binding when the durable envelope anchor is unchanged', async () => {
     const value = await fixture();
     const tamperedContext = candidateContextFor(
       value.transaction.payee,
@@ -334,6 +461,20 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
       version: 1,
       ...tamperedContext,
     };
+    const prepared = payload as unknown as ReturnType<typeof preparePurchaseRecategorization>;
+    const tamperedBinding = classificationEvidenceBindingForPreparedWrite(
+      value.outcome.proposal!,
+      tamperedContext,
+      hashClassificationPreparedWrite(prepared),
+    );
+    payload.classificationEvidenceBinding = tamperedBinding;
+    expect(value.attempt.classificationEnvelopeHash).not.toBe(
+      classificationEnvelopeHashForPreparedWrite(
+        hashClassificationPreparedWrite(prepared),
+        payload.classificationDecision as ReturnType<typeof classificationDecisionForPreparedWrite>,
+        tamperedBinding,
+      ),
+    );
     await db.qboMutationAttempt.update({
       where: { id: value.attempt.id },
       data: { requestPayload: payload as Prisma.InputJsonValue },
@@ -350,6 +491,101 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     await expect(db.autopilotRuleCandidateEvidence.count({
       where: { companyId: value.company.id },
     })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateFold.count({
+      where: { requestId: value.attempt.requestId },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ ruleCandidateFoldedAt: NOW });
+  });
+
+  it('keeps a bound no-decision attempt out of the unvalidated legacy rebuild path', async () => {
+    const value = await fixture();
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    const tamperedProposal = {
+      ...value.outcome.proposal!,
+      lines: [{
+        ...value.outcome.proposal!.lines[0]!,
+        categoryQboId: `unverified-rebuild-${randomUUID()}`,
+      }],
+    };
+    const prepared = payload as unknown as ReturnType<typeof preparePurchaseRecategorization>;
+    const tamperedBinding = classificationEvidenceBindingForPreparedWrite(
+      tamperedProposal,
+      value.outcome.candidateContext,
+      hashClassificationPreparedWrite(prepared),
+    );
+    delete payload.classificationDecision;
+    payload.ruleCandidateFold = { version: 1 };
+    payload.classificationEvidenceBinding = tamperedBinding;
+    payload.categorizationEvidence = { version: 1, proposal: tamperedProposal };
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: {
+        classificationEnvelopeVersion: null,
+        classificationEnvelopeHash: null,
+        requestPayload: payload as Prisma.InputJsonValue,
+      },
+    });
+
+    await expect(rebuildRuleCandidates(
+      value.company.id,
+      { db, now: () => NOW },
+    )).resolves.toBeUndefined();
+
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ ruleCandidateFoldedAt: null });
+  });
+
+  it('leaves a valid pre-fix VERIFIED decision attempt for candidate-only legacy repair', async () => {
+    const value = await fixture();
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    payload.ruleCandidateFold = { version: 1 };
+    delete payload.classificationEvidenceBinding;
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: {
+        classificationEnvelopeVersion: null,
+        classificationEnvelopeHash: null,
+        requestPayload: payload as Prisma.InputJsonValue,
+      },
+    });
+
+    await expect(reconcileVerifiedClassificationOutcomes(
+      value.company.id,
+      { db, now: () => NOW },
+    )).resolves.toBe(0);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ ruleCandidateFoldedAt: null });
+
+    await rebuildRuleCandidates(value.company.id, { db, now: () => NOW });
+    await rebuildRuleCandidates(value.company.id, { db, now: () => NOW });
+
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { requestId: value.attempt.requestId, polarity: 'positive' },
+    })).resolves.toBe(1);
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { status: true, ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ status: 'VERIFIED', ruleCandidateFoldedAt: NOW });
   });
 
   it('returns the same non-disclosing result for foreign-company and unknown request identities', async () => {
@@ -513,7 +749,7 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
         tx,
         value.outcome,
         NOW,
-        { markAffectedRules: false },
+        { markAffectedRules: false, attemptFormat: 'bound' },
       );
       signalCompetingReady();
       await competingCanCommit;
@@ -575,7 +811,13 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
           expectedRevision: 1,
           expectedSyncToken: '0',
           requestHash: `corrupt-${requestId}`,
-          requestPayload: { ruleCandidateFold: { version: 1 } },
+          classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+          classificationEnvelopeHash: '0'.repeat(64),
+          requestPayload: {
+            ruleCandidateFold: {
+              version: index === 0 ? 1 : CLASSIFICATION_ENVELOPE_VERSION,
+            },
+          },
           beforeSnapshot: {},
           responseSnapshot: {},
           verification: { outcome: 'VERIFIED', status: 'POSTED', newSyncToken: '1' },
@@ -778,6 +1020,16 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
         categoryQboId: correctedCategory,
       }],
     };
+    const correctionPreparedHash = hashClassificationPreparedWrite(correctionPrepared);
+    const correctionDecisionEnvelope = classificationDecisionForPreparedWrite(
+      correctionDecision,
+      correctionPreparedHash,
+    );
+    const correctionEvidenceBinding = classificationEvidenceBindingForPreparedWrite(
+      correctionProposal,
+      first.outcome.candidateContext,
+      correctionPreparedHash,
+    );
     await db.transaction.update({
       where: { id: first.transaction.id },
       data: { revision: 2, qboSyncToken: '2', status: 'POSTED' },
@@ -791,18 +1043,17 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
         expectedRevision: 2,
         expectedSyncToken: '1',
         requestHash: correctionPrepared.requestHash,
+        classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          correctionPreparedHash,
+          correctionDecisionEnvelope,
+          correctionEvidenceBinding,
+        ),
         requestPayload: {
           ...correctionPrepared,
-          classificationDecision: classificationDecisionForPreparedWrite(
-            correctionDecision,
-            hashClassificationPreparedWrite(correctionPrepared),
-          ),
-          ruleCandidateFold: { version: 1 },
-          classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
-            correctionProposal,
-            first.outcome.candidateContext,
-            hashClassificationPreparedWrite(correctionPrepared),
-          ),
+          classificationDecision: correctionDecisionEnvelope,
+          ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+          classificationEvidenceBinding: correctionEvidenceBinding,
           categorizationEvidence: { version: 1, proposal: correctionProposal },
           ruleCandidateEvidence: { version: 1, ...first.outcome.candidateContext! },
         } as unknown as Prisma.InputJsonValue,
@@ -876,6 +1127,7 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
       },
     };
     const undoResponse: QboPurchaseSnapshot = { ...originalBefore, syncToken: '3' };
+    const undoPreparedHash = hashClassificationPreparedWrite(undoPrepared);
     await db.transaction.update({
       where: { id: first.transaction.id },
       data: { revision: 3, qboSyncToken: '3', status: 'REVERTED' },
@@ -889,9 +1141,15 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
         expectedRevision: 3,
         expectedSyncToken: '2',
         requestHash: undoPrepared.requestHash,
+        classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+        classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+          undoPreparedHash,
+          null,
+          null,
+        ),
         requestPayload: {
           ...undoPrepared,
-          ruleCandidateFold: { version: 1 },
+          ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
         } as unknown as Prisma.InputJsonValue,
         beforeSnapshot: correctionResponse as unknown as Prisma.InputJsonValue,
         responseSnapshot: undoResponse as unknown as Prisma.InputJsonValue,

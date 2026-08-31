@@ -56,6 +56,8 @@ export interface PersistedClassificationEvidenceBinding {
   preparedBindingHash: string;
 }
 
+export const CLASSIFICATION_ENVELOPE_VERSION = 2 as const;
+
 function boundedText(maximum: number) {
   return z.string().superRefine((value, context) => {
     const normalized = value.normalize('NFC').trim();
@@ -219,6 +221,24 @@ export function persistedClassificationEvidenceBinding(
     && stored.candidateContextHash === canonical.candidateContextHash
     && stored.preparedBindingHash === canonical.preparedBindingHash
   ) ? canonical : null;
+}
+
+export function classificationEnvelopeHashForPreparedWrite(
+  preparedWriteHash: string,
+  decision: PersistedClassificationDecision | null,
+  evidence: PersistedClassificationEvidenceBinding | null,
+): string {
+  return sha256({
+    version: CLASSIFICATION_ENVELOPE_VERSION,
+    preparedWriteHash,
+    decision: decision === null
+      ? null
+      : {
+          contextHash: decision.contextHash,
+          preparedBindingHash: decision.preparedBindingHash,
+        },
+    evidence,
+  });
 }
 
 export function persistedClassificationDecision(

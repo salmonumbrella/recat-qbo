@@ -1016,6 +1016,8 @@ model QboMutationAttempt {
   verification          Json?
   errorCode             String?
   errorMessage          String?
+  classificationEnvelopeVersion Int?
+  classificationEnvelopeHash    String?     @db.VarChar(64)
   ruleCandidateFoldedAt DateTime?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
