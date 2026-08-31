@@ -1,6 +1,7 @@
--- Append-only tenant-local revision events fence semantic generations from
--- canonical writes without serializing all same-company mutation transactions
--- on one shared state row. pgvector and its derived tables remain optional.
+-- Tenant-local revision events fence semantic generations from canonical
+-- writes without serializing writers on one shared state row. Events append
+-- between cutovers; successful publication compacts them to its fenced event.
+-- pgvector and its derived tables remain optional.
 CREATE TABLE "ClassificationCorpusRevision" (
     "revision" BIGSERIAL NOT NULL,
     "companyId" TEXT NOT NULL,
@@ -34,9 +35,17 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   old_company_id TEXT;
   new_company_id TEXT;
+  lock_company_id TEXT;
 BEGIN
   IF TG_OP <> 'INSERT' THEN old_company_id := OLD."companyId"; END IF;
   IF TG_OP <> 'DELETE' THEN new_company_id := NEW."companyId"; END IF;
+
+  FOR lock_company_id IN
+    SELECT DISTINCT candidate FROM unnest(ARRAY[old_company_id, new_company_id]) candidate
+    WHERE candidate IS NOT NULL ORDER BY candidate
+  LOOP
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(lock_company_id, 1481988));
+  END LOOP;
 
   IF old_company_id IS NOT NULL THEN
     INSERT INTO "ClassificationCorpusRevision" ("companyId")
@@ -58,6 +67,7 @@ $$;
 CREATE OR REPLACE FUNCTION classification_corpus_append_company_nickname()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended(NEW."id", 1481988));
   INSERT INTO "ClassificationCorpusRevision" ("companyId") VALUES (NEW."id");
   RETURN NEW;
 END;
@@ -72,13 +82,13 @@ EXECUTE FUNCTION classification_corpus_append_company_nickname();
 -- affect the bounded corpus. Database triggers cover every writer, including
 -- rolling or legacy application processes.
 CREATE TRIGGER classification_corpus_vendor_identity
-AFTER INSERT OR UPDATE OR DELETE ON "VendorIdentity"
+AFTER INSERT OR DELETE OR UPDATE OF "displayName", "normalizedName" ON "VendorIdentity"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_alias
-AFTER INSERT OR UPDATE OR DELETE ON "VendorAlias"
+AFTER INSERT OR DELETE OR UPDATE OF "vendorIdentityId", "value", "normalizedValue", "source" ON "VendorAlias"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_merge
-AFTER INSERT OR UPDATE OR DELETE ON "VendorIdentityMerge"
+AFTER INSERT OR DELETE OR UPDATE OF "sourceVendorIdentityId", "targetVendorIdentityId" ON "VendorIdentityMerge"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_case
 AFTER INSERT OR UPDATE OR DELETE ON "ClassificationCase"
@@ -99,16 +109,16 @@ CREATE TRIGGER classification_corpus_candidate_evidence
 AFTER INSERT OR UPDATE OR DELETE ON "AutopilotRuleCandidateEvidence"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tag
-AFTER INSERT OR UPDATE OR DELETE ON "Tag"
+AFTER UPDATE OF "name" ON "Tag"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_account
-AFTER INSERT OR UPDATE OR DELETE ON "QboAccount"
+AFTER INSERT OR DELETE OR UPDATE OF "name", "fullName" ON "QboAccount"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tax_code
-AFTER INSERT OR UPDATE OR DELETE ON "QboTaxCode"
+AFTER INSERT OR DELETE OR UPDATE OF "name" ON "QboTaxCode"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_transaction
-AFTER INSERT OR UPDATE OR DELETE ON "Transaction"
+AFTER UPDATE OF "payee", "memo" ON "Transaction"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 
 -- RuleTag has no companyId column. Resolve the owning rule; a cascade after
@@ -117,17 +127,24 @@ FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE OR REPLACE FUNCTION classification_corpus_append_rule_tag()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-  owner_company_id TEXT;
-  owner_rule_id TEXT;
+  old_owner_company_id TEXT;
+  new_owner_company_id TEXT;
+  lock_company_id TEXT;
 BEGIN
-  IF TG_OP = 'DELETE' THEN owner_rule_id := OLD."ruleId";
-  ELSE owner_rule_id := NEW."ruleId";
+  IF TG_OP <> 'INSERT' THEN
+    SELECT "companyId" INTO old_owner_company_id FROM "Rule" WHERE "id" = OLD."ruleId";
   END IF;
-  SELECT "companyId" INTO owner_company_id
-    FROM "Rule" WHERE "id" = owner_rule_id;
-  IF owner_company_id IS NOT NULL THEN
-    INSERT INTO "ClassificationCorpusRevision" ("companyId") VALUES (owner_company_id);
+  IF TG_OP <> 'DELETE' THEN
+    SELECT "companyId" INTO new_owner_company_id FROM "Rule" WHERE "id" = NEW."ruleId";
   END IF;
+  FOR lock_company_id IN
+    SELECT DISTINCT candidate
+    FROM unnest(ARRAY[old_owner_company_id, new_owner_company_id]) candidate
+    WHERE candidate IS NOT NULL ORDER BY candidate
+  LOOP
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(lock_company_id, 1481988));
+    INSERT INTO "ClassificationCorpusRevision" ("companyId") VALUES (lock_company_id);
+  END LOOP;
   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
   RETURN NEW;
 END;

@@ -77,8 +77,10 @@ export async function reconcileClassificationEmbeddings(input: {
   client: VoyageEmbeddingClient;
   store: ClassificationEmbeddingStore;
   targetRevision?: string;
+  attemptToken?: string;
 }): Promise<ClassificationEmbeddingReconcileResult> {
   const targetRevision = input.targetRevision ?? '0';
+  const attemptToken = input.attemptToken ?? 'legacy-test-attempt';
   const totalDocuments = input.totalDocuments ?? input.documents.length;
   const skippedDocuments = input.skippedDocuments ?? 0;
   if (
@@ -93,6 +95,7 @@ export async function reconcileClassificationEmbeddings(input: {
       skippedDocuments: 0,
       errorCode: 'semantic_error',
       targetRevision,
+      attemptToken,
     }).catch(() => undefined);
     return {
       status: 'failed',
@@ -196,6 +199,7 @@ export async function reconcileClassificationEmbeddings(input: {
       embeddedDocuments: embeddedDocumentCount(),
       skippedDocuments,
       targetRevision,
+      attemptToken,
     });
     for (let offset = 0; offset < changed.length; offset += PROVIDER_CALL_INPUT_LIMIT) {
       const batch = changed.slice(offset, offset + PROVIDER_CALL_INPUT_LIMIT);
@@ -222,6 +226,7 @@ export async function reconcileClassificationEmbeddings(input: {
         embeddedDocuments: embeddedDocumentCount(),
         skippedDocuments,
         targetRevision,
+        attemptToken,
       });
     }
     await input.store.publishGeneration({
@@ -231,6 +236,7 @@ export async function reconcileClassificationEmbeddings(input: {
       totalDocuments,
       skippedDocuments,
       targetRevision,
+      attemptToken,
     });
     return {
       status: 'published',
@@ -248,6 +254,7 @@ export async function reconcileClassificationEmbeddings(input: {
       skippedDocuments,
       errorCode: 'semantic_error',
       targetRevision,
+      attemptToken,
     }).catch(() => undefined);
     return {
       status: 'failed',
@@ -303,20 +310,39 @@ export async function runClassificationEmbeddingTick(
   for (const companyId of companyIds) {
     result.processed += 1;
     let targetRevision: string | null = null;
+    let attemptToken: string | null = null;
     try {
       const capability = await store.ensureAvailable();
       if (!capability.available) {
         result.unavailable += 1;
         continue;
       }
+      if (store.health !== undefined) {
+        const health = await store.health(companyId, generation.fingerprint);
+        if (
+          health.activeGeneration === generation.fingerprint
+          && health.expectedGeneration === generation.fingerprint
+          && health.expectedState === 'succeeded'
+          && health.backlog === 0
+          && health.progress === 1
+          && health.lastError === null
+          && health.currentCorpusRevision !== null
+          && health.indexedCorpusRevision === health.currentCorpusRevision
+          && health.expectedCorpusRevision === health.currentCorpusRevision
+        ) {
+          continue;
+        }
+      }
       if (store.beginAttempt === undefined) {
         result.failed += 1;
         continue;
       }
-      targetRevision = await store.beginAttempt({
+      const attempt = await store.beginAttempt({
         companyId,
         fingerprint: generation.fingerprint,
       });
+      targetRevision = attempt.targetRevision;
+      attemptToken = attempt.token;
       const corpus = await dependencies.documents(companyId, targetRevision);
       if (corpus.revision !== targetRevision) {
         throw new Error('classification-corpus-revision-changed');
@@ -330,12 +356,13 @@ export async function runClassificationEmbeddingTick(
         client,
         store,
         targetRevision,
+        attemptToken,
       });
       if (outcome.status === 'published') result.published += 1;
       else if (outcome.status === 'unavailable') result.unavailable += 1;
       else result.failed += 1;
     } catch {
-      if (targetRevision !== null) {
+      if (targetRevision !== null && attemptToken !== null) {
         await store.recordFailure({
           companyId,
           fingerprint: generation.fingerprint,
@@ -344,6 +371,7 @@ export async function runClassificationEmbeddingTick(
           skippedDocuments: 0,
           errorCode: 'semantic_error',
           targetRevision,
+          attemptToken,
         }).catch(() => undefined);
       }
       result.failed += 1;

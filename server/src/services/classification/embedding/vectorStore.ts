@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { ClassificationKnowledgeKind } from '@recat/shared';
 import { VOYAGE_EMBEDDING_DIMENSIONS } from './client.js';
@@ -50,12 +51,18 @@ export interface VectorGenerationHealth {
   latestAttemptCorpusRevision: string | null;
 }
 
+export interface ClassificationEmbeddingAttempt {
+  targetRevision: string;
+  token: string;
+}
+
 export interface ClassificationEmbeddingStore {
   ensureAvailable(): Promise<VectorCapability>;
+  health?(companyId: string, expectedFingerprint: string): Promise<VectorGenerationHealth>;
   beginAttempt?(input: {
     companyId: string;
     fingerprint: string;
-  }): Promise<string>;
+  }): Promise<ClassificationEmbeddingAttempt>;
   recordProgress(input: {
     companyId: string;
     fingerprint: string;
@@ -63,6 +70,7 @@ export interface ClassificationEmbeddingStore {
     embeddedDocuments: number;
     skippedDocuments: number;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void>;
   publishGeneration(input: {
     companyId: string;
@@ -71,6 +79,7 @@ export interface ClassificationEmbeddingStore {
     totalDocuments: number;
     skippedDocuments: number;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void>;
   recordFailure(input: {
     companyId: string;
@@ -80,6 +89,7 @@ export interface ClassificationEmbeddingStore {
     skippedDocuments: number;
     errorCode: string;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void>;
   currentChunks?(
     companyId: string,
@@ -153,6 +163,10 @@ function checkedCorpusRevision(value: string): string {
   return value;
 }
 
+const PUBLICATION_BATCH_SIZE = 100;
+const MAX_PUBLICATION_CHUNKS = 50_000;
+const PUBLICATION_TRANSACTION_TIMEOUT_MS = 120_000;
+
 const INSTALL_SQL = [
   Prisma.sql`
     CREATE TABLE IF NOT EXISTS "ClassificationEmbeddingGeneration" (
@@ -169,6 +183,7 @@ const INSTALL_SQL = [
       "attemptedAt" timestamptz,
       "indexedCorpusRevision" bigint,
       "attemptCorpusRevision" bigint,
+      "attemptToken" varchar(64),
       "createdAt" timestamptz NOT NULL DEFAULT now(),
       "activatedAt" timestamptz,
       PRIMARY KEY ("companyId", "fingerprint"),
@@ -190,6 +205,10 @@ const INSTALL_SQL = [
   Prisma.sql`
     ALTER TABLE "ClassificationEmbeddingGeneration"
       ADD COLUMN IF NOT EXISTS "attemptCorpusRevision" bigint
+  `,
+  Prisma.sql`
+    ALTER TABLE "ClassificationEmbeddingGeneration"
+      ADD COLUMN IF NOT EXISTS "attemptToken" varchar(64)
   `,
   Prisma.sql`
     CREATE UNIQUE INDEX IF NOT EXISTS "ClassificationEmbeddingGeneration_one_active"
@@ -242,13 +261,18 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
   async beginAttempt(input: {
     companyId: string;
     fingerprint: string;
-  }): Promise<string> {
+  }): Promise<ClassificationEmbeddingAttempt> {
     const companyId = checkedIdentifier(input.companyId);
     const fingerprint = checkedIdentifier(input.fingerprint);
+    const attemptToken = randomUUID();
     if (!/^[0-9a-f]{64}$/u.test(fingerprint)) {
       throw new VectorStoreError('GENERATION_CONFLICT');
     }
-    const begin = async (tx: RawDb): Promise<string> => {
+    const begin = async (tx: RawDb): Promise<ClassificationEmbeddingAttempt> => {
+      await tx.$queryRaw(Prisma.sql`
+        SELECT 1 AS locked
+        FROM pg_advisory_xact_lock(hashtextextended(${companyId}, 1481988))
+      `);
       const rows = await tx.$queryRaw<Array<{ revision: bigint }>>(Prisma.sql`
         SELECT "revision" FROM "ClassificationCorpusRevision"
         WHERE "companyId" = ${companyId}
@@ -260,11 +284,11 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
       await tx.$executeRaw(Prisma.sql`
         INSERT INTO "ClassificationEmbeddingGeneration" (
           "companyId", "fingerprint", "state", "attemptState", "attemptedAt",
-          "attemptCorpusRevision", "totalDocuments", "embeddedDocuments",
+          "attemptCorpusRevision", "attemptToken", "totalDocuments", "embeddedDocuments",
           "skippedDocuments", "backlogDocuments", "lastErrorCode"
         ) VALUES (
           ${companyId}, ${fingerprint}, 'building', 'building', now(),
-          ${revision}, 0, 0, 0, 0, NULL
+          ${revision}, ${attemptToken}, 0, 0, 0, 0, NULL
         )
         ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
           "state" = CASE
@@ -274,13 +298,14 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
           "attemptState" = 'building',
           "attemptedAt" = now(),
           "attemptCorpusRevision" = EXCLUDED."attemptCorpusRevision",
+          "attemptToken" = EXCLUDED."attemptToken",
           "totalDocuments" = 0,
           "embeddedDocuments" = 0,
           "skippedDocuments" = 0,
           "backlogDocuments" = 0,
           "lastErrorCode" = NULL
       `);
-      return revision.toString();
+      return { targetRevision: revision.toString(), token: attemptToken };
     };
     try {
       return typeof this.db.$transaction === 'function'
@@ -299,6 +324,7 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     embeddedDocuments: number;
     skippedDocuments: number;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void> {
     const companyId = checkedIdentifier(input.companyId);
     const fingerprint = checkedIdentifier(input.fingerprint);
@@ -306,38 +332,30 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     const embeddedDocuments = boundedCount(input.embeddedDocuments);
     const skippedDocuments = boundedCount(input.skippedDocuments);
     const targetRevision = checkedCorpusRevision(input.targetRevision);
+    const attemptToken = checkedIdentifier(input.attemptToken);
     const backlogDocuments = Math.max(0, totalDocuments - embeddedDocuments - skippedDocuments);
     try {
       const changed = await this.db.$executeRaw(Prisma.sql`
-        INSERT INTO "ClassificationEmbeddingGeneration" (
-          "companyId", "fingerprint", "state", "attemptState", "attemptedAt",
-          "attemptCorpusRevision",
-          "totalDocuments", "embeddedDocuments", "skippedDocuments",
-          "backlogDocuments", "lastErrorCode"
-        ) SELECT
-          ${companyId}, ${fingerprint}, 'building', 'building', now(), ${targetRevision}::bigint,
-          ${totalDocuments}, ${embeddedDocuments}, ${skippedDocuments},
-          ${backlogDocuments}, NULL
+        UPDATE "ClassificationEmbeddingGeneration" generation SET
+          "state" = CASE WHEN generation."state" = 'active' THEN 'active' ELSE 'building' END,
+          "attemptState" = 'building',
+          "attemptedAt" = now(),
+          "totalDocuments" = ${totalDocuments},
+          "embeddedDocuments" = ${embeddedDocuments},
+          "skippedDocuments" = ${skippedDocuments},
+          "backlogDocuments" = ${backlogDocuments},
+          "lastErrorCode" = NULL
         FROM LATERAL (
           SELECT "revision" FROM "ClassificationCorpusRevision"
           WHERE "companyId" = ${companyId}
           ORDER BY "revision" DESC
           LIMIT 1
         ) corpus
-        WHERE corpus."revision" = ${targetRevision}::bigint
-        ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
-          "state" = CASE
-            WHEN "ClassificationEmbeddingGeneration"."state" = 'active' THEN 'active'
-            ELSE 'building'
-          END,
-          "attemptState" = 'building',
-          "attemptedAt" = now(),
-          "attemptCorpusRevision" = EXCLUDED."attemptCorpusRevision",
-          "totalDocuments" = EXCLUDED."totalDocuments",
-          "embeddedDocuments" = EXCLUDED."embeddedDocuments",
-          "skippedDocuments" = EXCLUDED."skippedDocuments",
-          "backlogDocuments" = EXCLUDED."backlogDocuments",
-          "lastErrorCode" = NULL
+        WHERE generation."companyId" = ${companyId}
+          AND generation."fingerprint" = ${fingerprint}
+          AND generation."attemptCorpusRevision" = ${targetRevision}::bigint
+          AND generation."attemptToken" = ${attemptToken}
+          AND corpus."revision" = ${targetRevision}::bigint
       `);
       if (changed !== 1) throw new VectorStoreError('GENERATION_CONFLICT');
     } catch (error) {
@@ -353,6 +371,7 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     totalDocuments: number;
     skippedDocuments: number;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void> {
     const companyId = checkedIdentifier(input.companyId);
     const fingerprint = checkedIdentifier(input.generation.fingerprint);
@@ -362,6 +381,10 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     const totalDocuments = boundedCount(input.totalDocuments);
     const skippedDocuments = boundedCount(input.skippedDocuments);
     const targetRevision = checkedCorpusRevision(input.targetRevision);
+    const attemptToken = checkedIdentifier(input.attemptToken);
+    if (input.chunks.length > MAX_PUBLICATION_CHUNKS) {
+      throw new VectorStoreError('GENERATION_CONFLICT');
+    }
     const documentIds = new Set(input.chunks.map((chunk) => chunk.documentId));
     const embeddedDocuments = documentIds.size;
     const backlogDocuments = Math.max(0, totalDocuments - embeddedDocuments - skippedDocuments);
@@ -381,11 +404,16 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     }
 
     const publish = async (tx: RawDb) => {
+      await tx.$queryRaw(Prisma.sql`
+        SELECT 1 AS locked
+        FROM pg_advisory_xact_lock(hashtextextended(${companyId}, 1481988))
+      `);
       const fence = await tx.$queryRaw<Array<{
         revision: bigint;
         attemptCorpusRevision: bigint | null;
+        attemptToken: string | null;
       }>>(Prisma.sql`
-        SELECT corpus."revision", generation."attemptCorpusRevision"
+        SELECT corpus."revision", generation."attemptCorpusRevision", generation."attemptToken"
         FROM LATERAL (
           SELECT "revision" FROM "ClassificationCorpusRevision"
           WHERE "companyId" = ${companyId}
@@ -399,6 +427,7 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
       if (
         fence[0]?.revision.toString() !== targetRevision
         || fence[0]?.attemptCorpusRevision?.toString() !== targetRevision
+        || fence[0]?.attemptToken !== attemptToken
       ) {
         throw new VectorStoreError('GENERATION_CONFLICT');
       }
@@ -407,11 +436,11 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
           "companyId", "fingerprint", "state", "totalDocuments",
           "embeddedDocuments", "skippedDocuments", "backlogDocuments",
           "lastErrorCode", "attemptState", "attemptedAt",
-          "indexedCorpusRevision", "attemptCorpusRevision"
+          "indexedCorpusRevision", "attemptCorpusRevision", "attemptToken"
         ) VALUES (
           ${companyId}, ${fingerprint}, 'building', ${totalDocuments},
           ${embeddedDocuments}, ${skippedDocuments}, ${backlogDocuments}, NULL,
-          'succeeded', now(), ${targetRevision}::bigint, ${targetRevision}::bigint
+          'succeeded', now(), ${targetRevision}::bigint, ${targetRevision}::bigint, ${attemptToken}
         )
         ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
           "state" = CASE
@@ -426,22 +455,24 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
           "attemptState" = 'succeeded',
           "attemptedAt" = now(),
           "indexedCorpusRevision" = EXCLUDED."indexedCorpusRevision",
-          "attemptCorpusRevision" = EXCLUDED."attemptCorpusRevision"
+          "attemptCorpusRevision" = EXCLUDED."attemptCorpusRevision",
+          "attemptToken" = EXCLUDED."attemptToken"
       `);
       await tx.$executeRaw(Prisma.sql`
         DELETE FROM "ClassificationEmbeddingChunk"
         WHERE "companyId" = ${companyId} AND "fingerprint" = ${fingerprint}
       `);
-      for (const chunk of input.chunks) {
+      for (let offset = 0; offset < input.chunks.length; offset += PUBLICATION_BATCH_SIZE) {
+        const batch = input.chunks.slice(offset, offset + PUBLICATION_BATCH_SIZE);
         await tx.$executeRaw(Prisma.sql`
           INSERT INTO "ClassificationEmbeddingChunk" (
             "companyId", "fingerprint", "documentId", "kind", "sourceId",
             "revisedAt", "chunkIndex", "contentHash", "embedding"
-          ) VALUES (
+          ) VALUES ${Prisma.join(batch.map((chunk) => Prisma.sql`(
             ${companyId}, ${fingerprint}, ${chunk.documentId}, ${chunk.kind}, ${chunk.sourceId},
             ${asDate(chunk.revisedAt)}, ${chunk.chunkIndex}, ${chunk.contentHash},
             ${vectorLiteral(chunk.embedding)}::vector
-          )
+          )`))}
         `);
       }
       await tx.$executeRaw(Prisma.sql`
@@ -456,14 +487,26 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
         SET "state" = 'active', "activatedAt" = now(), "lastSuccessAt" = now(),
             "lastErrorCode" = NULL, "attemptState" = 'succeeded', "attemptedAt" = now(),
             "indexedCorpusRevision" = ${targetRevision}::bigint,
-            "attemptCorpusRevision" = ${targetRevision}::bigint
+            "attemptCorpusRevision" = ${targetRevision}::bigint,
+            "attemptToken" = ${attemptToken}
         WHERE "companyId" = ${companyId} AND "fingerprint" = ${fingerprint}
+      `);
+      await tx.$executeRaw(Prisma.sql`
+        DELETE FROM "ClassificationEmbeddingGeneration"
+        WHERE "companyId" = ${companyId} AND "fingerprint" <> ${fingerprint}
+      `);
+      await tx.$executeRaw(Prisma.sql`
+        DELETE FROM "ClassificationCorpusRevision"
+        WHERE "companyId" = ${companyId} AND "revision" <> ${targetRevision}::bigint
       `);
     };
 
     try {
       if (typeof this.db.$transaction === 'function') {
-        await this.db.$transaction(async (tx) => publish(tx as unknown as RawDb));
+        await this.db.$transaction(
+          async (tx) => publish(tx as unknown as RawDb),
+          { maxWait: 10_000, timeout: PUBLICATION_TRANSACTION_TIMEOUT_MS },
+        );
       } else {
         await publish(this.db);
       }
@@ -481,36 +524,28 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     skippedDocuments: number;
     errorCode: string;
     targetRevision: string;
+    attemptToken: string;
   }): Promise<void> {
     const companyId = checkedIdentifier(input.companyId);
     const fingerprint = checkedIdentifier(input.fingerprint);
     const errorCode = checkedIdentifier(input.errorCode);
     const targetRevision = checkedCorpusRevision(input.targetRevision);
+    const attemptToken = checkedIdentifier(input.attemptToken);
     try {
       await this.db.$executeRaw(Prisma.sql`
-        INSERT INTO "ClassificationEmbeddingGeneration" (
-          "companyId", "fingerprint", "state", "totalDocuments", "embeddedDocuments",
-          "skippedDocuments", "backlogDocuments", "lastErrorCode", "attemptState", "attemptedAt",
-          "attemptCorpusRevision"
-        ) VALUES (
-          ${companyId}, ${fingerprint}, 'failed', ${boundedCount(input.totalDocuments)},
-          ${boundedCount(input.embeddedDocuments)}, ${boundedCount(input.skippedDocuments)},
-          ${Math.max(0, boundedCount(input.totalDocuments) - boundedCount(input.embeddedDocuments) - boundedCount(input.skippedDocuments))},
-          ${errorCode}, 'failed', now(), ${targetRevision}::bigint
-        )
-        ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
-          "state" = CASE
-            WHEN "ClassificationEmbeddingGeneration"."state" = 'active' THEN 'active'
-            ELSE 'failed'
-          END,
-          "totalDocuments" = EXCLUDED."totalDocuments",
-          "embeddedDocuments" = EXCLUDED."embeddedDocuments",
-          "skippedDocuments" = EXCLUDED."skippedDocuments",
-          "backlogDocuments" = EXCLUDED."backlogDocuments",
-          "lastErrorCode" = EXCLUDED."lastErrorCode",
+        UPDATE "ClassificationEmbeddingGeneration" SET
+          "state" = CASE WHEN "state" = 'active' THEN 'active' ELSE 'failed' END,
+          "totalDocuments" = ${boundedCount(input.totalDocuments)},
+          "embeddedDocuments" = ${boundedCount(input.embeddedDocuments)},
+          "skippedDocuments" = ${boundedCount(input.skippedDocuments)},
+          "backlogDocuments" = ${Math.max(0, boundedCount(input.totalDocuments) - boundedCount(input.embeddedDocuments) - boundedCount(input.skippedDocuments))},
+          "lastErrorCode" = ${errorCode},
           "attemptState" = 'failed',
-          "attemptedAt" = now(),
-          "attemptCorpusRevision" = EXCLUDED."attemptCorpusRevision"
+          "attemptedAt" = now()
+        WHERE "companyId" = ${companyId}
+          AND "fingerprint" = ${fingerprint}
+          AND "attemptCorpusRevision" = ${targetRevision}::bigint
+          AND "attemptToken" = ${attemptToken}
       `);
     } catch {
       throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');

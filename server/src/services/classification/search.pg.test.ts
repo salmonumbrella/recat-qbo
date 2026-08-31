@@ -510,6 +510,66 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(after.revision).toBeGreaterThan(before.revision);
   });
 
+  it('invalidates both old and new rule owners on a cross-company RuleTag update', async () => {
+    const data = await fixtures();
+    const tag = await db.tag.create({
+      data: { companyId: data.current.id, name: 'Movable tag', color: '#123456' },
+    });
+    const foreignRule = await db.rule.create({
+      data: {
+        companyId: data.foreign.id,
+        matchText: 'Foreign movable rule',
+        category: 'Foreign category',
+      },
+    });
+    await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: tag.id } });
+    const revision = async (companyId: string) => (
+      await db.classificationCorpusRevision.findFirstOrThrow({
+        where: { companyId }, orderBy: { revision: 'desc' },
+      })
+    ).revision;
+    const beforeCurrent = await revision(data.current.id);
+    const beforeForeign = await revision(data.foreign.id);
+
+    await db.ruleTag.update({
+      where: { ruleId_tagId: { ruleId: data.rule.id, tagId: tag.id } },
+      data: { ruleId: foreignRule.id },
+    });
+
+    expect(await revision(data.current.id)).toBeGreaterThan(beforeCurrent);
+    expect(await revision(data.foreign.id)).toBeGreaterThan(beforeForeign);
+  });
+
+  it('does not dirty the corpus for high-churn columns that cannot affect documents', async () => {
+    const data = await fixtures();
+    const latest = async () => (
+      await db.classificationCorpusRevision.findFirstOrThrow({
+        where: { companyId: data.current.id }, orderBy: { revision: 'desc' },
+      })
+    ).revision;
+    const initial = await latest();
+
+    await db.transaction.update({
+      where: { id: data.transaction.id },
+      data: { status: 'POSTING' },
+    });
+    expect(await latest()).toBe(initial);
+    await db.transaction.update({
+      where: { id: data.transaction.id },
+      data: { payee: 'Corpus-affecting payee' },
+    });
+    const afterPayee = await latest();
+    expect(afterPayee).toBeGreaterThan(initial);
+
+    const account = await db.qboAccount.findFirstOrThrow({
+      where: { companyId: data.current.id },
+    });
+    await db.qboAccount.update({ where: { id: account.id }, data: { active: false } });
+    expect(await latest()).toBe(afterPayee);
+    await db.qboAccount.update({ where: { id: account.id }, data: { name: 'Renamed corpus account' } });
+    expect(await latest()).toBeGreaterThan(afterPayee);
+  });
+
   it('bounds oversized candidate evidence without dropping the lexical hit', async () => {
     const data = await fixtures();
     await db.autopilotRuleCandidateEvidence.create({

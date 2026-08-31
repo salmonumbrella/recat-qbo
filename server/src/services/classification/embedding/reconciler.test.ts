@@ -333,7 +333,7 @@ describe('classification embedding reconciliation', () => {
       createStore() {
         return {
           async ensureAvailable() { return { available: true, reason: null }; },
-          async beginAttempt() { return '1'; },
+          async beginAttempt() { return { targetRevision: '1', token: 'attempt-1' }; },
           async recordProgress() {},
           async publishGeneration() {},
           async recordFailure() {},
@@ -378,7 +378,10 @@ describe('classification embedding reconciliation', () => {
       createStore() {
         return {
           async ensureAvailable() { events.push('available'); return { available: true, reason: null }; },
-          async beginAttempt() { events.push('begin:7'); return '7'; },
+          async beginAttempt() {
+            events.push('begin:7');
+            return { targetRevision: '7', token: 'attempt-7' };
+          },
           async recordProgress() {},
           async publishGeneration() {},
           async recordFailure() {},
@@ -412,7 +415,7 @@ describe('classification embedding reconciliation', () => {
       createStore() {
         return {
           async ensureAvailable() { return { available: true, reason: null }; },
-          async beginAttempt() { return '9'; },
+          async beginAttempt() { return { targetRevision: '9', token: 'attempt-9' }; },
           async recordProgress() {},
           async publishGeneration() {},
           async recordFailure(input) { failures.push(input); },
@@ -425,5 +428,62 @@ describe('classification embedding reconciliation', () => {
     expect(failures).toEqual([expect.objectContaining({
       companyId: 'company-a', targetRevision: '9', errorCode: 'semantic_error',
     })]);
+  });
+
+  it('skips an atomically current succeeded generation without beginning or scanning', async () => {
+    const events: string[] = [];
+    const healthy = {
+      activeGeneration: generation.fingerprint,
+      expectedGeneration: generation.fingerprint,
+      expectedState: 'succeeded',
+      currentCorpusRevision: '14',
+      indexedCorpusRevision: '14',
+      expectedCorpusRevision: '14',
+      latestAttemptCorpusRevision: '14',
+      embedded: 9,
+      skipped: 1,
+      backlog: 0,
+      progress: 1,
+      lastSuccessAt: '2026-08-31T00:00:00.000Z',
+      lastError: null,
+      latestAttemptGeneration: generation.fingerprint,
+      latestAttemptState: 'succeeded',
+      latestAttemptAt: '2026-08-31T00:00:00.000Z',
+      latestAttemptError: null,
+    };
+    const result = await runClassificationEmbeddingTick({
+      runtimeConfig: () => ({
+        apiKey: 'synthetic-key', baseUrl: 'https://api.voyageai.com/v1',
+        timeoutMs: 1_000, batchSize: 2,
+        fingerprintSalt: 'synthetic-current-generation',
+      }),
+      async listCompanyIds() { return ['company-a']; },
+      async documents() { events.push('documents'); throw new Error('must not scan'); },
+      createClient() {
+        return {
+          async embedDocuments() { events.push('provider'); return []; },
+          async embedQuery() { return vector(0); },
+        };
+      },
+      createStore() {
+        return {
+          async ensureAvailable() { events.push('available'); return { available: true, reason: null }; },
+          async health() { events.push('health'); return healthy; },
+          async beginAttempt() { events.push('begin'); throw new Error('must not begin'); },
+          async recordProgress() {},
+          async publishGeneration() { events.push('publish'); },
+          async recordFailure() {},
+        };
+      },
+      async reconcile() { events.push('reconcile'); throw new Error('must not reconcile'); },
+    } as never);
+
+    expect(result).toEqual({
+      configured: true, processed: 1, published: 0, failed: 0, unavailable: 0,
+    });
+    expect(events).toEqual(['available', 'health']);
+    expect(healthy).toMatchObject({
+      expectedState: 'succeeded', currentCorpusRevision: '14', indexedCorpusRevision: '14',
+    });
   });
 });
