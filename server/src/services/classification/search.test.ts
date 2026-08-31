@@ -391,6 +391,115 @@ describe('classification memory search', () => {
     expect(result.hits[0]?.matchedIn).toEqual(expect.arrayContaining(['lexical', 'semantic']));
   });
 
+  it('keeps query-specific exact provenance when hybrid rehydration returns the canonical record', async () => {
+    const sourceProvenance = {
+      source: 'user' as const,
+      sourceId: 'vendor-source',
+      actorId: null,
+      recordedAt: '2026-08-30T00:00:00.000Z',
+    };
+    const canonicalProvenance = {
+      ...sourceProvenance,
+      sourceId: 'vendor-target',
+      recordedAt: '2026-08-31T00:00:00.000Z',
+    };
+    const lexical = record({
+      hit: {
+        id: 'vendor_identity:vendor-target',
+        sourceId: 'vendor-target',
+        kind: 'vendor_identity',
+        vendorIdentityId: 'vendor-target',
+        vendorName: 'Canonical Target Vendor',
+        provenance: sourceProvenance,
+      },
+      exactReasons: ['alias'],
+      lexicalScore: 1,
+    });
+    const canonical = record({
+      hit: {
+        id: 'vendor_identity:vendor-target',
+        sourceId: 'vendor-target',
+        kind: 'vendor_identity',
+        vendorIdentityId: 'vendor-target',
+        vendorName: 'Canonical Target Vendor',
+        provenance: canonicalProvenance,
+      },
+      exactReasons: [],
+      lexicalScore: 0,
+    });
+    const repo: ClassificationSearchRepository = {
+      async exact() { return [lexical]; },
+      async search() { return [lexical]; },
+      async rehydrate() { return [canonical]; },
+      async documents() {
+        return { documents: [], totalDocuments: 0, skippedDocuments: 0, revision: '1' };
+      },
+    };
+
+    const result = await searchClassificationMemory({
+      query: 'Legacy Exact Provenance Needle',
+      companyId: 'company-a',
+      scope: 'current_company',
+      mode: 'hybrid',
+      limit: 10,
+      accessibleCompanyIds: ['company-a'],
+    }, {
+      repository: repo,
+      semantic: {
+        generation,
+        client: {
+          async embedDocuments() { throw new Error('not used'); },
+          async embedQuery() { return Array.from({ length: 1024 }, () => 0); },
+        },
+        store: {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          async health() {
+            return {
+              activeGeneration: generation.fingerprint,
+              expectedGeneration: generation.fingerprint,
+              expectedState: 'succeeded',
+              embedded: 1,
+              skipped: 0,
+              backlog: 0,
+              progress: 1,
+              lastSuccessAt: '2026-08-31T00:00:00.000Z',
+              lastError: null,
+              latestAttemptGeneration: generation.fingerprint,
+              latestAttemptState: 'succeeded',
+              latestAttemptAt: '2026-08-31T00:00:00.000Z',
+              latestAttemptError: null,
+              currentCorpusRevision: '1',
+              indexedCorpusRevision: '1',
+              expectedCorpusRevision: '1',
+              latestAttemptCorpusRevision: '1',
+            };
+          },
+          async search() {
+            return [{
+              documentId: canonical.hit.id,
+              companyId: 'company-a',
+              kind: 'vendor_identity' as const,
+              sourceId: 'vendor-target',
+              revisedAt: canonical.revisedAt,
+              similarity: 0.95,
+            }];
+          },
+        },
+      },
+    });
+
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0]).toMatchObject({
+      id: canonical.hit.id,
+      sourceId: 'vendor-target',
+      vendorIdentityId: 'vendor-target',
+      vendorName: 'Canonical Target Vendor',
+      matchedIn: expect.arrayContaining(['alias', 'lexical', 'semantic']),
+      score: 3 / 61,
+      provenance: sourceProvenance,
+    });
+  });
+
   it('bounds database failures without exposing connection or tenant details', async () => {
     const secret = 'postgresql://private-host/tenant-a';
     const repo: ClassificationSearchRepository = {

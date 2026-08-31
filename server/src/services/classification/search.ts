@@ -418,8 +418,10 @@ export async function searchClassificationMemory(
   const rehydrated = await boundedRepositoryRead(() => (
     repository.rehydrate(companyIds, rolled.map((hit) => hit.id))
   ));
+  // Lexical rows carry query-specific exact-source provenance; queryless
+  // semantic rehydration may fill only IDs that the lexical leg did not find.
   const records = [...new Map(
-    [...lexical, ...rehydrated].map((record) => [record.hit.id, record]),
+    [...rehydrated, ...lexical].map((record) => [record.hit.id, record]),
   ).values()];
   return finalResult({
     query,
@@ -665,12 +667,31 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
           to_tsvector('simple', source_support."searchText"),
           plainto_tsquery('simple', ${query})
         )), 0)::double precision`;
+    const exactSourceCte = query === null
+      ? Prisma.sql`
+        exact_vendor_support ("companyId", "targetId", "exactSourceId", "exactSourceRevisedAt") AS (
+          SELECT NULL::text, NULL::text, NULL::text, NULL::timestamptz
+          WHERE false
+        )
+      `
+      : Prisma.sql`
+        exact_vendor_support AS (
+          SELECT DISTINCT ON (source_support."companyId", source_support."targetId")
+                 source_support."companyId", source_support."targetId",
+                 source_support."id" AS "exactSourceId",
+                 source_support."updatedAt" AS "exactSourceRevisedAt"
+          FROM source_vendor_support source_support
+          WHERE source_support."normalizedName" = ${exactKey}
+          ORDER BY source_support."companyId", source_support."targetId",
+                   source_support."normalizedName", source_support."id"
+        )
+      `;
     const vendorResolution = resolvedVendorIdentityCte(companyIds, ids);
     return this.db.$queryRaw<VendorIdentitySearchRow[]>(Prisma.sql`
       WITH RECURSIVE ${vendorResolution},
       source_vendor_support AS (
         SELECT resolution."companyId", resolution."targetId", source."id",
-               source."normalizedName",
+               source."normalizedName", source."updatedAt",
                concat_ws(' ', source."displayName",
                  string_agg(alias."value", ' '
                             ORDER BY alias."normalizedValue" ASC, alias."id" ASC)) AS "searchText"
@@ -682,7 +703,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
           ON alias."companyId" = source."companyId"
          AND alias."vendorIdentityId" = source."id"
         GROUP BY resolution."companyId", resolution."targetId", source."id",
-                 source."normalizedName", source."displayName"
+                 source."normalizedName", source."displayName", source."updatedAt"
       ),
       vendor_identity_support AS (
         SELECT source_support."companyId", source_support."targetId",
@@ -693,10 +714,12 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                ${matched} AS "matched", ${score} AS "lexicalScore"
         FROM source_vendor_support source_support
         GROUP BY source_support."companyId", source_support."targetId"
-      )
+      ),
+      ${exactSourceCte}
       SELECT identity."id", identity."companyId", company."nickname" AS "companyName",
              identity."displayName", identity."normalizedName", identity."updatedAt" AS "revisedAt",
-             support."values" AS "aliases", support."lexicalScore"
+             support."values" AS "aliases", support."lexicalScore",
+             exact_match."exactSourceId", exact_match."exactSourceRevisedAt"
       FROM "VendorIdentity" identity
       JOIN "Company" company ON company."id" = identity."companyId"
       JOIN resolved_vendor_identity canonical
@@ -706,6 +729,9 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       JOIN vendor_identity_support support
         ON support."companyId" = identity."companyId"
        AND support."targetId" = identity."id"
+      LEFT JOIN exact_vendor_support exact_match
+        ON exact_match."companyId" = identity."companyId"
+       AND exact_match."targetId" = identity."id"
       WHERE identity."companyId" IN (${Prisma.join(companyIds)})
         AND support."matched"
         ${idFilter}
@@ -951,6 +977,8 @@ type VendorIdentitySearchRow = BaseSearchRow & {
   displayName: string;
   normalizedName: string;
   aliases: string;
+  exactSourceId: string | null;
+  exactSourceRevisedAt: Date | null;
 };
 
 type VendorAliasSearchRow = BaseSearchRow & {
@@ -1278,12 +1306,18 @@ function identityRecord(row: VendorIdentitySearchRow): () => ClassificationSearc
       row, kind: 'vendor_identity', vendorIdentityId: row.id, vendorName: row.displayName,
       action: null, summary: null, executable: false, advisory: true, originIntent: null,
       evidenceCount: 0, conflictingEvidenceCount: 0,
-      provenance: { source: 'user', sourceId: row.id, actorId: null, recordedAt: revisedAt },
+      provenance: {
+        source: 'user',
+        sourceId: row.exactSourceId ?? row.id,
+        actorId: null,
+        recordedAt: row.exactSourceRevisedAt?.toISOString() ?? revisedAt,
+      },
     });
     const searchText = `${row.displayName} ${row.aliases}`.trim();
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore),
-      exactReasons: [], document: optionalDocumentFor(hit, revisedAt, searchText), lookupValue: row.displayName,
+      exactReasons: row.exactSourceId === null ? [] : ['alias'],
+      document: optionalDocumentFor(hit, revisedAt, searchText),
     };
   };
 }

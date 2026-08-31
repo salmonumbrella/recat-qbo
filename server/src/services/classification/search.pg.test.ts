@@ -9,6 +9,7 @@ import {
   findVendorIdentityByValue,
   mergeVendorIdentities,
 } from './vendorIdentity.js';
+import { classificationEmbeddingGeneration } from './embedding/recipe.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -304,7 +305,7 @@ describePostgres('classification search on PostgreSQL', () => {
       vendorIdentityId: target.id,
       vendorName: target.displayName,
       action: null,
-      provenance: expect.objectContaining({ sourceId: target.id }),
+      provenance: expect.objectContaining({ sourceId: source.id }),
     }));
     expect(exactSource.hits.filter((hit) => hit.kind === 'vendor_identity')).toHaveLength(1);
 
@@ -360,6 +361,177 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(identityDocuments[0]?.text).toContain(source.displayName);
     expect(corpus.documents.find((document) => document.id === `vendor_alias:${data.alias.id}`)?.text)
       .toContain(target.displayName);
+  });
+
+  it('preserves a merged source exact leg and provenance across exact, lexical, and hybrid search', async () => {
+    const owner = await company('Merged Source Provenance');
+    const source = await db.vendorIdentity.create({
+      data: {
+        companyId: owner.id,
+        displayName: 'Legacy Exact Provenance Needle',
+        normalizedName: 'legacy exact provenance needle',
+      },
+    });
+    const alias = await db.vendorAlias.create({
+      data: {
+        companyId: owner.id,
+        vendorIdentityId: source.id,
+        value: 'Historical Billing Key',
+        normalizedValue: 'historical billing key',
+        source: 'user',
+      },
+    });
+    const target = await db.vendorIdentity.create({
+      data: {
+        companyId: owner.id,
+        displayName: 'Canonical Target Vendor',
+        normalizedName: 'canonical target vendor',
+      },
+    });
+    await mergeVendorIdentities({
+      companyId: owner.id,
+      sourceVendorIdentityId: source.id,
+      targetVendorIdentityId: target.id,
+      mergedBy: 'reviewer-provenance',
+      reason: 'Reviewed source provenance regression fixture.',
+    }, db);
+    const repository = new PrismaClassificationSearchRepository(db);
+    const query = source.displayName;
+
+    const lexicalRecords = await repository.search([owner.id], query, 20);
+    const identityRecord = lexicalRecords.find((record) => (
+      record.hit.id === `vendor_identity:${target.id}`
+    ));
+    expect(identityRecord).toMatchObject({
+      exactReasons: ['alias'],
+      hit: {
+        sourceId: target.id,
+        vendorIdentityId: target.id,
+        vendorName: target.displayName,
+        provenance: { sourceId: source.id },
+      },
+    });
+
+    const search = async (mode: 'exact' | 'lexical') => searchClassificationMemory({
+      query,
+      companyId: owner.id,
+      scope: 'current_company',
+      mode,
+      accessibleCompanyIds: [owner.id],
+    }, { repository, semantic: null });
+    const exact = await search('exact');
+    const lexical = await search('lexical');
+    const exactHit = exact.hits.find((hit) => hit.id === `vendor_identity:${target.id}`);
+    const lexicalHit = lexical.hits.find((hit) => hit.id === `vendor_identity:${target.id}`);
+    expect(exactHit).toMatchObject({
+      sourceId: target.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      matchedIn: expect.arrayContaining(['alias']),
+      provenance: { sourceId: source.id },
+    });
+    expect(lexicalHit).toMatchObject({
+      sourceId: target.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      matchedIn: expect.arrayContaining(['alias', 'lexical']),
+      provenance: { sourceId: source.id },
+    });
+    expect(lexicalHit?.score).toBeCloseTo(2 / 61, 10);
+
+    const revision = (await db.classificationCorpusRevision.findFirstOrThrow({
+      where: { companyId: owner.id },
+      orderBy: { revision: 'desc' },
+    })).revision.toString();
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1',
+      fingerprintSalt: 'merged-source-provenance-test',
+    });
+    const hybrid = await searchClassificationMemory({
+      query,
+      companyId: owner.id,
+      scope: 'current_company',
+      mode: 'hybrid',
+      accessibleCompanyIds: [owner.id],
+    }, {
+      repository,
+      semantic: {
+        generation,
+        client: {
+          async embedDocuments() { throw new Error('not used'); },
+          async embedQuery() { return Array.from({ length: 1024 }, () => 0); },
+        },
+        store: {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          async health() {
+            return {
+              activeGeneration: generation.fingerprint,
+              expectedGeneration: generation.fingerprint,
+              expectedState: 'succeeded',
+              embedded: 1,
+              skipped: 0,
+              backlog: 0,
+              progress: 1,
+              lastSuccessAt: '2026-08-31T00:00:00.000Z',
+              lastError: null,
+              latestAttemptGeneration: generation.fingerprint,
+              latestAttemptState: 'succeeded',
+              latestAttemptAt: '2026-08-31T00:00:00.000Z',
+              latestAttemptError: null,
+              currentCorpusRevision: revision,
+              indexedCorpusRevision: revision,
+              expectedCorpusRevision: revision,
+              latestAttemptCorpusRevision: revision,
+            };
+          },
+          async search() {
+            return [{
+              documentId: `vendor_identity:${target.id}`,
+              companyId: owner.id,
+              kind: 'vendor_identity' as const,
+              sourceId: target.id,
+              revisedAt: target.updatedAt.toISOString(),
+              similarity: 0.95,
+            }];
+          },
+        },
+      },
+    });
+    const hybridHit = hybrid.hits.find((hit) => hit.id === `vendor_identity:${target.id}`);
+    expect(hybridHit).toMatchObject({
+      sourceId: target.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      matchedIn: expect.arrayContaining(['alias', 'lexical', 'semantic']),
+      provenance: { sourceId: source.id },
+    });
+    expect(hybridHit?.score).toBeCloseTo(3 / 61, 10);
+
+    const nonExact = await searchClassificationMemory({
+      query: 'Legacy Provenance',
+      companyId: owner.id,
+      scope: 'current_company',
+      mode: 'lexical',
+      accessibleCompanyIds: [owner.id],
+    }, { repository, semantic: null });
+    expect(nonExact.hits.find((hit) => hit.id === `vendor_identity:${target.id}`)).toMatchObject({
+      score: 1 / 61,
+      provenance: { sourceId: target.id },
+    });
+
+    const exactAlias = await searchClassificationMemory({
+      query: alias.value,
+      companyId: owner.id,
+      scope: 'current_company',
+      mode: 'exact',
+      accessibleCompanyIds: [owner.id],
+    }, { repository, semantic: null });
+    expect(exactAlias.hits.find((hit) => hit.id === `vendor_alias:${alias.id}`)).toMatchObject({
+      sourceId: alias.id,
+      vendorIdentityId: target.id,
+      vendorName: target.displayName,
+      provenance: { sourceId: alias.id },
+    });
   });
 
   it('bounds reviewed merge resolution to the Task 2 twenty-hop contract', async () => {
