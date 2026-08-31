@@ -619,6 +619,166 @@ BEGIN
 END;
 $$;
 
+-- A deferred insert trigger is the compatibility fence for an older binary
+-- running during a rolling migration. Current writers append revision zero
+-- explicitly, but an old writer knows only the legacy Rule columns. Deferral
+-- lets nested RuleTag inserts finish before the fallback snapshot is built.
+CREATE OR REPLACE FUNCTION "capture_initial_rule_revision"()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO "RuleRevision" (
+        "id", "ruleId", "companyId", "revision", "state", "matchField",
+        "matchText", "category", "categoryQboId", "taxCalculation", "taxCode",
+        "taxCodeQboId", "tagIds", "priority", "autoPost", "originIntent",
+        "sourceCaseId", "sourceCandidateId", "changedBy", "createdAt", "retiredAt"
+    )
+    SELECT
+        'rule-revision-' || NEW."id",
+        NEW."id",
+        NEW."companyId",
+        0,
+        CASE
+            WHEN NEW."retiredAt" IS NOT NULL THEN 'retired'
+            WHEN NEW."enabled" THEN 'enabled'
+            ELSE 'disabled'
+        END,
+        NEW."matchField",
+        NEW."matchText",
+        NEW."category",
+        NEW."categoryQboId",
+        NEW."taxCalculation",
+        NEW."taxCode",
+        NEW."taxCodeQboId",
+        COALESCE((
+            SELECT jsonb_agg(tag."tagId" ORDER BY tag."tagId")
+            FROM "RuleTag" tag
+            WHERE tag."ruleId" = NEW."id"
+        ), '[]'::jsonb),
+        NEW."priority",
+        NEW."autoPost",
+        NEW."originIntent",
+        NEW."sourceCaseId",
+        NEW."sourceCandidateId",
+        COALESCE(NEW."updatedById", NEW."createdById"),
+        NEW."createdAt",
+        NEW."retiredAt"
+    WHERE NOT EXISTS (
+        SELECT 1 FROM "RuleRevision" revision
+        WHERE revision."companyId" = NEW."companyId"
+          AND revision."ruleId" = NEW."id"
+          AND revision."revision" = 0
+    )
+    ON CONFLICT ("companyId", "ruleId", "revision") DO NOTHING;
+    RETURN NEW;
+END;
+$$;
+
+-- Canonical names and aliases occupy one exact-key namespace. Separate table
+-- indexes cannot enforce this cross-table invariant, so both trigger paths
+-- take the same transaction-scoped key lock before checking the other table.
+CREATE OR REPLACE FUNCTION "enforce_vendor_exact_key_namespace"()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    exact_key TEXT;
+BEGIN
+    IF TG_TABLE_NAME = 'VendorIdentity' THEN
+        exact_key := NEW."normalizedName";
+    ELSE
+        exact_key := NEW."normalizedValue";
+    END IF;
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(NEW."companyId" || chr(31) || exact_key, 880218)
+    );
+    IF TG_TABLE_NAME = 'VendorIdentity' AND EXISTS (
+        SELECT 1 FROM "VendorAlias" alias
+        WHERE alias."companyId" = NEW."companyId"
+          AND alias."normalizedValue" = exact_key
+    ) THEN
+        RAISE EXCEPTION 'Vendor exact key is already claimed by an alias'
+            USING ERRCODE = '23505', CONSTRAINT = 'Vendor_exact_key_namespace_key';
+    END IF;
+    IF TG_TABLE_NAME = 'VendorAlias' AND EXISTS (
+        SELECT 1 FROM "VendorIdentity" identity
+        WHERE identity."companyId" = NEW."companyId"
+          AND identity."normalizedName" = exact_key
+    ) THEN
+        RAISE EXCEPTION 'Vendor exact key is already claimed by an identity'
+            USING ERRCODE = '23505', CONSTRAINT = 'Vendor_exact_key_namespace_key';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- Merge writers share the normal company mutation fence. The recursive check
+-- is also a database backstop for direct SQL so reciprocal concurrent inserts
+-- cannot commit a cycle even when they bypass the service.
+CREATE OR REPLACE FUNCTION "enforce_vendor_merge_acyclic"()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(NEW."companyId", 880217));
+    IF NEW."sourceVendorIdentityId" = NEW."targetVendorIdentityId" OR EXISTS (
+        WITH RECURSIVE targets("id") AS (
+            SELECT NEW."targetVendorIdentityId"
+            UNION
+            SELECT merge."targetVendorIdentityId"
+            FROM "VendorIdentityMerge" merge
+            JOIN targets ON targets."id" = merge."sourceVendorIdentityId"
+            WHERE merge."companyId" = NEW."companyId"
+        )
+        SELECT 1 FROM targets WHERE "id" = NEW."sourceVendorIdentityId"
+    ) THEN
+        RAISE EXCEPTION 'Vendor identity merge would create a cycle'
+            USING ERRCODE = '23514', CONSTRAINT = 'VendorIdentityMerge_acyclic_check';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM "VendorIdentity" identity
+        JOIN "VendorAlias" alias
+          ON alias."companyId" = identity."companyId"
+         AND alias."normalizedValue" = identity."normalizedName"
+    ) THEN
+        RAISE EXCEPTION 'Existing vendor canonical and alias keys overlap';
+    END IF;
+END
+$$;
+
+DROP TRIGGER IF EXISTS "VendorIdentity_exact_key_namespace" ON "VendorIdentity";
+CREATE TRIGGER "VendorIdentity_exact_key_namespace"
+    BEFORE INSERT OR UPDATE ON "VendorIdentity"
+    FOR EACH ROW
+    EXECUTE FUNCTION "enforce_vendor_exact_key_namespace"();
+
+DROP TRIGGER IF EXISTS "VendorAlias_exact_key_namespace" ON "VendorAlias";
+CREATE TRIGGER "VendorAlias_exact_key_namespace"
+    BEFORE INSERT OR UPDATE ON "VendorAlias"
+    FOR EACH ROW
+    EXECUTE FUNCTION "enforce_vendor_exact_key_namespace"();
+
+DROP TRIGGER IF EXISTS "VendorIdentityMerge_acyclic" ON "VendorIdentityMerge";
+CREATE TRIGGER "VendorIdentityMerge_acyclic"
+    BEFORE INSERT OR UPDATE ON "VendorIdentityMerge"
+    FOR EACH ROW
+    EXECUTE FUNCTION "enforce_vendor_merge_acyclic"();
+
+DROP TRIGGER IF EXISTS "Rule_capture_initial_revision" ON "Rule";
+CREATE CONSTRAINT TRIGGER "Rule_capture_initial_revision"
+    AFTER INSERT ON "Rule"
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION "capture_initial_rule_revision"();
+
 DROP TRIGGER IF EXISTS "VendorIdentity_no_delete" ON "VendorIdentity";
 CREATE TRIGGER "VendorIdentity_no_delete"
     BEFORE DELETE ON "VendorIdentity"

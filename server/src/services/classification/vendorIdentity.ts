@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { VendorAlias, VendorIdentity } from '@recat/shared';
 import { prisma } from '../../lib/prisma.js';
+import { runCompanyMutationTransaction } from '../companyMutationScope.js';
 
 const MAX_VENDOR_TEXT_CODE_POINTS = 500;
 const MAX_QBO_REFERENCE_CODE_POINTS = 120;
@@ -14,6 +15,7 @@ export interface VendorIdentityDb {
   vendorIdentity: PrismaClient['vendorIdentity'];
   vendorAlias: PrismaClient['vendorAlias'];
   vendorIdentityMerge: PrismaClient['vendorIdentityMerge'];
+  $transaction?: PrismaClient['$transaction'];
 }
 
 export interface CreateVendorIdentityInput {
@@ -73,12 +75,11 @@ function boundedRawValue(value: string, field: string): string {
   if (typeof value !== 'string' || CONTROL_CHARACTER.test(value)) {
     throw new VendorIdentityError('INVALID_INPUT', `${field} is not valid text.`);
   }
-  const raw = value.normalize('NFC').trim();
-  const length = Array.from(raw).length;
+  const length = Array.from(value).length;
   if (length === 0 || length > MAX_VENDOR_TEXT_CODE_POINTS) {
     throw new VendorIdentityError('INVALID_INPUT', `${field} must be 1–500 characters.`);
   }
-  return raw;
+  return value;
 }
 
 /**
@@ -89,7 +90,15 @@ function boundedRawValue(value: string, field: string): string {
  */
 export function normalizeVendorLookupKey(value: string): string {
   const raw = boundedRawValue(value, 'Vendor value');
-  return raw.replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
+  const normalized = raw
+    .normalize('NFC')
+    .trim()
+    .replace(/\s+/gu, ' ')
+    .toLocaleLowerCase('en-US');
+  if (normalized.length === 0) {
+    throw new VendorIdentityError('INVALID_INPUT', 'Vendor value must contain visible text.');
+  }
+  return normalized;
 }
 
 export const vendorLookupKey = normalizeVendorLookupKey;
@@ -122,6 +131,19 @@ function boundedMergeText(value: string, field: string, maximum: number): string
 
 function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+function vendorMutationTransaction<T>(
+  db: VendorIdentityDb,
+  companyId: string,
+  callback: (tx: VendorIdentityDb) => Promise<T>,
+): Promise<T> {
+  if (typeof db.$transaction !== 'function') return callback(db);
+  return runCompanyMutationTransaction(
+    db as unknown as Parameters<typeof runCompanyMutationTransaction>[0],
+    companyId,
+    (tx) => callback(tx as VendorIdentityDb),
+  );
 }
 
 function aliasRow(row: {
@@ -301,6 +323,15 @@ export async function createVendorIdentity(
   const displayName = boundedRawValue(input.displayName, 'Vendor display name');
   const normalizedName = normalizeVendorLookupKey(displayName);
   const qboVendorId = normalizeQboVendorId(input.qboVendorId);
+  const claimedAlias = await db.vendorAlias.findUnique({
+    where: { companyId_normalizedValue: { companyId: input.companyId, normalizedValue: normalizedName } },
+  });
+  if (claimedAlias !== null) {
+    throw new VendorIdentityError(
+      'IDENTITY_CONFLICT',
+      'This exact company-scoped key is already a vendor alias.',
+    );
+  }
   try {
     const row = await db.vendorIdentity.create({
       data: {
@@ -321,6 +352,48 @@ export async function createVendorIdentity(
   }
 }
 
+async function ensureQboBinding(
+  identity: VendorIdentity,
+  qboVendorId: string | null,
+  db: VendorIdentityDb,
+): Promise<VendorIdentity> {
+  if (qboVendorId === null) return identity;
+  if (identity.qboVendorId !== null) {
+    if (identity.qboVendorId !== qboVendorId) {
+      throw new VendorIdentityError(
+        'IDENTITY_CONFLICT',
+        'The exact vendor key is already bound to a different QBO vendor.',
+      );
+    }
+    return identity;
+  }
+  try {
+    const claimed = await db.vendorIdentity.updateMany({
+      where: {
+        companyId: identity.companyId,
+        id: identity.id,
+        qboVendorId: null,
+      },
+      data: { qboVendorId },
+    });
+    if (claimed.count === 1) {
+      const updated = await loadVendorIdentity(identity.companyId, identity.id, db);
+      if (updated === null) {
+        throw new VendorIdentityError('NOT_FOUND', 'The vendor identity no longer exists.');
+      }
+      return updated;
+    }
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+  }
+  const raced = await loadVendorIdentity(identity.companyId, identity.id, db);
+  if (raced?.qboVendorId === qboVendorId) return raced;
+  throw new VendorIdentityError(
+    'IDENTITY_CONFLICT',
+    'The exact vendor key is already bound to a different QBO vendor.',
+  );
+}
+
 /**
  * Idempotently ensures the exact normalized identity exists. An existing
  * identity keeps its first raw display value; a previously unbound identity
@@ -337,35 +410,7 @@ export async function ensureVendorIdentity(
   const matched = await findIdentityByKey(input.companyId, normalizedName, db);
   if (matched !== null) {
     const existing = await resolveMergedIdentity(matched, db);
-    if (
-      qboVendorId !== null
-      && existing.qboVendorId !== null
-      && existing.qboVendorId !== qboVendorId
-    ) {
-      throw new VendorIdentityError(
-        'IDENTITY_CONFLICT',
-        'The exact vendor key is already bound to a different QBO vendor.',
-      );
-    }
-    if (qboVendorId !== null && existing.qboVendorId === null) {
-      try {
-        const row = await db.vendorIdentity.update({
-          where: { companyId_id: { companyId: input.companyId, id: existing.id } },
-          data: { qboVendorId },
-          include: identityInclude,
-        });
-        return identityRow(row as IdentityRow);
-      } catch (error) {
-        if (isUniqueViolation(error)) {
-          throw new VendorIdentityError(
-            'IDENTITY_CONFLICT',
-            'The QBO vendor identifier is already bound to another identity.',
-          );
-        }
-        throw error;
-      }
-    }
-    return existing;
+    return ensureQboBinding(existing, qboVendorId, db);
   }
   try {
     return await createVendorIdentity({
@@ -378,7 +423,9 @@ export async function ensureVendorIdentity(
     // remains a hard conflict and is not converted into a merge.
     if (error instanceof VendorIdentityError && error.code === 'IDENTITY_CONFLICT') {
       const raced = await findIdentityByKey(input.companyId, normalizedName, db);
-      if (raced !== null) return raced;
+      if (raced !== null) {
+        return ensureQboBinding(await resolveMergedIdentity(raced, db), qboVendorId, db);
+      }
     }
     throw error;
   }
@@ -501,37 +548,37 @@ export async function mergeVendorIdentities(
   }
   const mergedBy = boundedMergeText(input.mergedBy, 'Merge reviewer', 128);
   const reason = boundedMergeText(input.reason, 'Merge reason', 500);
-  const [source, target] = await Promise.all([
-    loadVendorIdentity(input.companyId, sourceVendorIdentityId, db),
-    loadVendorIdentity(input.companyId, targetVendorIdentityId, db),
-  ]);
-  if (source === null || target === null) {
-    throw new VendorIdentityError('NOT_FOUND', 'Both vendor identities must belong to this company.');
-  }
-  const existing = await db.vendorIdentityMerge.findUnique({
-    where: {
-      companyId_sourceVendorIdentityId: {
-        companyId: input.companyId,
-        sourceVendorIdentityId,
-      },
-    },
-  });
-  if (existing !== null) {
-    if (
-      existing.targetVendorIdentityId === targetVendorIdentityId
-      && existing.mergedBy === mergedBy
-      && existing.reason === reason
-    ) {
-      return mergeRow(existing as MergeRow);
+  return vendorMutationTransaction(db, input.companyId, async (tx) => {
+    const [source, target] = await Promise.all([
+      loadVendorIdentity(input.companyId, sourceVendorIdentityId, tx),
+      loadVendorIdentity(input.companyId, targetVendorIdentityId, tx),
+    ]);
+    if (source === null || target === null) {
+      throw new VendorIdentityError('NOT_FOUND', 'Both vendor identities must belong to this company.');
     }
-    throw new VendorIdentityError('IDENTITY_CONFLICT', 'The source identity was already merged.');
-  }
-  const canonicalTarget = await resolveMergedIdentity(target, db);
-  if (canonicalTarget.id === sourceVendorIdentityId) {
-    throw new VendorIdentityError('IDENTITY_CONFLICT', 'The vendor merge would create a cycle.');
-  }
-  try {
-    const row = await db.vendorIdentityMerge.create({
+    const existing = await tx.vendorIdentityMerge.findUnique({
+      where: {
+        companyId_sourceVendorIdentityId: {
+          companyId: input.companyId,
+          sourceVendorIdentityId,
+        },
+      },
+    });
+    if (existing !== null) {
+      if (
+        existing.targetVendorIdentityId === targetVendorIdentityId
+        && existing.mergedBy === mergedBy
+        && existing.reason === reason
+      ) {
+        return mergeRow(existing as MergeRow);
+      }
+      throw new VendorIdentityError('IDENTITY_CONFLICT', 'The source identity was already merged.');
+    }
+    const canonicalTarget = await resolveMergedIdentity(target, tx);
+    if (canonicalTarget.id === sourceVendorIdentityId) {
+      throw new VendorIdentityError('IDENTITY_CONFLICT', 'The vendor merge would create a cycle.');
+    }
+    const row = await tx.vendorIdentityMerge.create({
       data: {
         companyId: input.companyId,
         sourceVendorIdentityId,
@@ -541,26 +588,7 @@ export async function mergeVendorIdentities(
       },
     });
     return mergeRow(row as MergeRow);
-  } catch (error) {
-    if (!isUniqueViolation(error)) throw error;
-    const raced = await db.vendorIdentityMerge.findUnique({
-      where: {
-        companyId_sourceVendorIdentityId: {
-          companyId: input.companyId,
-          sourceVendorIdentityId,
-        },
-      },
-    });
-    if (
-      raced !== null
-      && raced.targetVendorIdentityId === canonicalTarget.id
-      && raced.mergedBy === mergedBy
-      && raced.reason === reason
-    ) {
-      return mergeRow(raced as MergeRow);
-    }
-    throw new VendorIdentityError('IDENTITY_CONFLICT', 'The source identity was already merged.');
-  }
+  });
 }
 
 export async function listVendorIdentities(

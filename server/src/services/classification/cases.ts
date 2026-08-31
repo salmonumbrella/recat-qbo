@@ -552,79 +552,81 @@ export async function recordVerifiedClassificationCase(
   db: ClassificationCaseDb = prisma,
 ): Promise<ClassificationCase> {
   const checked = validateInput(input);
-  return dbTransaction(db, async (tx) => {
-    const attempt = await findAttempt(input, tx);
-    const existing = await findCaseByAttempt(input.companyId, attempt.id, tx);
-    if (existing !== null) {
-      if (
-        existing.transactionId !== attempt.transactionId
-        || existing.actionFingerprint !== checked.actionFingerprint
-      ) {
-        throw new ClassificationCaseError(
-          'CONFLICT',
-          'The verified attempt already has a different immutable classification case.',
-        );
+  let recoveryAttemptId: string | null = null;
+  try {
+    return await dbTransaction(db, async (tx) => {
+      const attempt = await findAttempt(input, tx);
+      recoveryAttemptId = attempt.id;
+      const existing = await findCaseByAttempt(input.companyId, attempt.id, tx);
+      if (existing !== null) {
+        if (
+          existing.transactionId !== attempt.transactionId
+          || existing.actionFingerprint !== checked.actionFingerprint
+        ) {
+          throw new ClassificationCaseError(
+            'CONFLICT',
+            'The verified attempt already has a different immutable classification case.',
+          );
+        }
+        return caseRow(existing);
       }
-      return caseRow(existing);
-    }
-    const vendorIdentityId = input.vendorIdentityId ?? null;
-    if (vendorIdentityId !== null) {
-      const identity = await tx.vendorIdentity.findUnique({
-        where: { companyId_id: { companyId: input.companyId, id: vendorIdentityId } },
-        select: { id: true },
-      });
-      if (identity === null) {
-        throw new ClassificationCaseError('NOT_FOUND', 'The vendor identity was not found in this company.');
+      const vendorIdentityId = input.vendorIdentityId ?? null;
+      if (vendorIdentityId !== null) {
+        const identity = await tx.vendorIdentity.findUnique({
+          where: { companyId_id: { companyId: input.companyId, id: vendorIdentityId } },
+          select: { id: true },
+        });
+        if (identity === null) {
+          throw new ClassificationCaseError('NOT_FOUND', 'The vendor identity was not found in this company.');
+        }
       }
-    }
-    const built = await buildTransactionSnapshot(input, attempt, tx, checked.currency);
-    const verifiedAt = attempt.updatedAt;
-    const provenance = {
-      ...checked.provenance,
-      sourceId: attempt.id,
-      recordedAt: verifiedAt.toISOString(),
-    };
-    const reviewer = checked.reviewer;
-    const created = {
-      companyId: input.companyId,
-      transactionId: built.transactionId,
-      vendorIdentityId,
-      qboMutationAttemptId: attempt.id,
-      action: asJson(checked.action),
-      actionFingerprint: checked.actionFingerprint,
-      originIntent: checked.originIntent,
-      rationale: checked.rationale,
-      requiredEvidence: asJson(checked.requiredEvidence),
-      examples: asJson(checked.examples),
-      counterexamples: asJson(checked.counterexamples),
-      citations: asJson(checked.citations),
-      reviewer: asJson(reviewer),
-      jurisdiction: checked.jurisdiction,
-      currency: checked.currency,
-      context: asJson(checked.context),
-      provenance: asJson(provenance),
-      transactionSnapshot: built.snapshot,
-      verifiedAt,
-    } satisfies Prisma.ClassificationCaseUncheckedCreateInput;
-    try {
+      const built = await buildTransactionSnapshot(input, attempt, tx, checked.currency);
+      const verifiedAt = attempt.updatedAt;
+      const provenance = {
+        ...checked.provenance,
+        sourceId: attempt.id,
+        recordedAt: verifiedAt.toISOString(),
+      };
+      const reviewer = checked.reviewer;
+      const created = {
+        companyId: input.companyId,
+        transactionId: built.transactionId,
+        vendorIdentityId,
+        qboMutationAttemptId: attempt.id,
+        action: asJson(checked.action),
+        actionFingerprint: checked.actionFingerprint,
+        originIntent: checked.originIntent,
+        rationale: checked.rationale,
+        requiredEvidence: asJson(checked.requiredEvidence),
+        examples: asJson(checked.examples),
+        counterexamples: asJson(checked.counterexamples),
+        citations: asJson(checked.citations),
+        reviewer: asJson(reviewer),
+        jurisdiction: checked.jurisdiction,
+        currency: checked.currency,
+        context: asJson(checked.context),
+        provenance: asJson(provenance),
+        transactionSnapshot: built.snapshot,
+        verifiedAt,
+      } satisfies Prisma.ClassificationCaseUncheckedCreateInput;
       const row = await tx.classificationCase.create({
         data: created,
         include: caseInclude,
       });
       return caseRow(row as CaseRow);
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
-      const raced = await findCaseByAttempt(input.companyId, attempt.id, tx);
-      if (raced === null) throw error;
-      if (raced.actionFingerprint !== checked.actionFingerprint) {
-        throw new ClassificationCaseError(
-          'CONFLICT',
-          'The verified attempt already has a different immutable classification case.',
-        );
-      }
-      return caseRow(raced);
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error) || recoveryAttemptId === null) throw error;
+    const raced = await findCaseByAttempt(input.companyId, recoveryAttemptId, db);
+    if (raced === null) throw error;
+    if (raced.actionFingerprint !== checked.actionFingerprint) {
+      throw new ClassificationCaseError(
+        'CONFLICT',
+        'The verified attempt already has a different immutable classification case.',
+      );
     }
-  });
+    return caseRow(raced);
+  }
 }
 
 export const createClassificationCase = recordVerifiedClassificationCase;
@@ -652,20 +654,21 @@ export async function invalidateClassificationCase(
   invalidatedAt = new Date(),
 ): Promise<ClassificationCase> {
   assertCompanyId(companyId);
+  const checkedCaseId = assertIdentifier(caseId, 'Case identifier');
   const normalizedReason = boundedText(reason, 'Invalidation reason', 500);
-  return dbTransaction(db, async (tx) => {
-    const current = await findCaseById(companyId, assertIdentifier(caseId, 'Case identifier'), tx);
-    if (current === null) {
-      throw new ClassificationCaseError('NOT_FOUND', 'The classification case was not found in this company.');
-    }
-    const existing = current.invalidation;
-    if (existing !== undefined && existing !== null) {
-      if (existing.reason !== normalizedReason) {
-        throw new ClassificationCaseError('CONFLICT', 'The case already has a different invalidation event.');
+  try {
+    return await dbTransaction(db, async (tx) => {
+      const current = await findCaseById(companyId, checkedCaseId, tx);
+      if (current === null) {
+        throw new ClassificationCaseError('NOT_FOUND', 'The classification case was not found in this company.');
       }
-      return caseRow(current);
-    }
-    try {
+      const existing = current.invalidation;
+      if (existing !== undefined && existing !== null) {
+        if (existing.reason !== normalizedReason) {
+          throw new ClassificationCaseError('CONFLICT', 'The case already has a different invalidation event.');
+        }
+        return caseRow(current);
+      }
       await tx.classificationCaseInvalidation.create({
         data: {
           companyId,
@@ -674,17 +677,17 @@ export async function invalidateClassificationCase(
           invalidatedAt,
         },
       });
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
-      const raced = await findCaseById(companyId, current.id, tx);
-      if (raced?.invalidation === undefined || raced.invalidation === null) throw error;
-      if (raced.invalidation.reason !== normalizedReason) {
-        throw new ClassificationCaseError('CONFLICT', 'The case already has a different invalidation event.');
-      }
-      return caseRow(raced);
+      const updated = await findCaseById(companyId, current.id, tx);
+      if (updated === null) throw new ClassificationCaseError('NOT_FOUND', 'The classification case was not found.');
+      return caseRow(updated);
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const raced = await findCaseById(companyId, checkedCaseId, db);
+    if (raced?.invalidation === undefined || raced.invalidation === null) throw error;
+    if (raced.invalidation.reason !== normalizedReason) {
+      throw new ClassificationCaseError('CONFLICT', 'The case already has a different invalidation event.');
     }
-    const updated = await findCaseById(companyId, current.id, tx);
-    if (updated === null) throw new ClassificationCaseError('NOT_FOUND', 'The classification case was not found.');
-    return caseRow(updated);
-  });
+    return caseRow(raced);
+  }
 }

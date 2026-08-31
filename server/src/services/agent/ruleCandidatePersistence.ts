@@ -5,6 +5,7 @@ import {
   persistedRuleCandidateContext,
 } from '../categorizationEvidence.js';
 import { runCompanyMutationTransaction } from '../companyMutationScope.js';
+import { appendRuleRevision } from '../ruleRevisionHistory.js';
 import type { VerifiedCategorizationOutcome } from './evaluation.js';
 import {
   candidatePatternFor,
@@ -26,6 +27,7 @@ const defaultDeps: RuleCandidatePersistenceDeps = {
 
 const RULE_CANDIDATE_REPAIR_BATCH_SIZE = 25;
 const RULE_CANDIDATE_ACTIVATION_REPAIR_LIMIT = 100;
+const RULE_CANDIDATE_EVIDENCE_ACTOR = 'system:rule-candidate-evidence';
 
 interface RepairRow {
   requestId: string;
@@ -128,16 +130,20 @@ async function recomputeCandidate(
       || pattern?.actionFingerprint !== candidate.activationActionFingerprint
     )
   ) {
-    await tx.rule.update({
+    const updated = await tx.rule.update({
       where: { id: candidate.activatedRuleId },
       data: {
         autoPost: false,
+        revision: { increment: 1 },
+        updatedById: RULE_CANDIDATE_EVIDENCE_ACTOR,
         reviewRequiredAt: now,
         reviewReason: state === 'conflict'
           ? 'Verified outcomes now conflict with this learned rule.'
           : 'This learned rule no longer has enough current verified evidence.',
       },
+      include: { ruleTags: true },
     });
+    await appendRuleRevision(tx, updated, RULE_CANDIDATE_EVIDENCE_ACTOR);
   }
 }
 

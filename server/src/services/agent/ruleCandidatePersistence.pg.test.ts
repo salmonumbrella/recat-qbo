@@ -418,10 +418,11 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         data: { enabled: false, retiredAt: NOW },
       });
 
+      const activationActor = { id: randomUUID(), label: 'Fixture reviewer' };
       const activated = await activateRuleCandidate(
         company.id,
         ready.id,
-        { id: randomUUID(), label: 'Fixture reviewer' },
+        activationActor,
         db,
       );
       expect(activated).toMatchObject({
@@ -440,15 +441,62 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         taxCalculation: 'NotApplicable',
         taxCodeQboId: null,
         autoPost: false,
+        revision: 0,
+        originIntent: 'auto_candidate',
+        sourceCandidateId: ready.id,
+        updatedById: activationActor.id,
         reviewRequiredAt: null,
       });
       expect(rule.ruleTags.map((row) => row.tagId)).toEqual([tag.id]);
+      await expect(db.ruleRevision.findMany({
+        where: { companyId: company.id, ruleId: rule.id },
+        orderBy: { revision: 'asc' },
+      })).resolves.toEqual([
+        expect.objectContaining({
+          revision: 0,
+          state: 'enabled',
+          sourceCandidateId: ready.id,
+          changedBy: activationActor.id,
+          autoPost: false,
+          tagIds: [tag.id],
+        }),
+      ]);
       const activationSnapshot = await db.autopilotRuleCandidate.findUniqueOrThrow({
         where: { id: ready.id },
       });
       expect(activationSnapshot).toMatchObject({
         activationEvidenceCount: 3,
         activationActionFingerprint: ready.winningActionFingerprint,
+      });
+
+      await db.rule.update({
+        where: { id: rule.id },
+        data: {
+          autoPost: true,
+          revision: 1,
+          updatedById: 'fixture-manual-enabler',
+        },
+      });
+      await db.ruleRevision.create({
+        data: {
+          ruleId: rule.id,
+          companyId: company.id,
+          revision: 1,
+          state: 'enabled',
+          matchField: rule.matchField,
+          matchText: rule.matchText,
+          category: rule.category,
+          categoryQboId: rule.categoryQboId,
+          taxCalculation: rule.taxCalculation,
+          taxCode: rule.taxCode,
+          taxCodeQboId: rule.taxCodeQboId,
+          tagIds: [tag.id],
+          priority: rule.priority,
+          autoPost: true,
+          originIntent: 'auto_candidate',
+          sourceCandidateId: ready.id,
+          changedBy: 'fixture-manual-enabler',
+        },
       });
 
       await db.transaction.update({
@@ -481,8 +529,25 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         where: { id: rule.id },
       })).resolves.toMatchObject({
         autoPost: false,
+        revision: 2,
+        updatedById: 'system:rule-candidate-evidence',
         reviewRequiredAt: NOW,
         reviewReason: 'Verified outcomes now conflict with this learned rule.',
+      });
+      await expect(db.ruleRevision.findUniqueOrThrow({
+        where: {
+          companyId_ruleId_revision: {
+            companyId: company.id,
+            ruleId: rule.id,
+            revision: 2,
+          },
+        },
+      })).resolves.toMatchObject({
+        state: 'enabled',
+        autoPost: false,
+        sourceCandidateId: ready.id,
+        changedBy: 'system:rule-candidate-evidence',
+        tagIds: [tag.id],
       });
       await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
         where: { id: ready.id },

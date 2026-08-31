@@ -12,6 +12,7 @@ import {
   reconcileRuleCandidateBeforeActivation,
 } from './agent/ruleCandidatePersistence.js';
 import { runCompanyMutationTransaction } from './companyMutationScope.js';
+import { appendRuleRevision } from './ruleRevisionHistory.js';
 
 type CandidateDb = PrismaClient | Prisma.TransactionClient;
 
@@ -508,12 +509,17 @@ export async function activateRuleCandidate(
           taxCode: checked.taxCode,
           taxCodeQboId: candidate.taxCodeQboId,
           autoPost: false,
+          originIntent: 'auto_candidate',
+          sourceCandidateId: candidate.id,
           createdById: actor.id,
+          updatedById: actor.id,
           ruleTags: {
             create: checked.tagIds.map((tagId) => ({ tagId })),
           },
         },
+        include: { ruleTags: true },
       });
+      await appendRuleRevision(tx, rule, actor.id);
       await tx.autopilotRuleCandidate.update({
         where: { id: candidate.id },
         data: {

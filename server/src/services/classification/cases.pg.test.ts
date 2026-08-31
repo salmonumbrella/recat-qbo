@@ -5,6 +5,7 @@ import {
   getClassificationCaseByRequestId,
   invalidateClassificationCase,
   recordVerifiedClassificationCase,
+  type ClassificationCaseDb,
   type RecordClassificationCaseInput,
 } from './cases.js';
 
@@ -119,6 +120,60 @@ describePostgres('classification cases on PostgreSQL', () => {
     return { company, transaction, attempt, identity, input };
   }
 
+  function racingDb(
+    delegate: 'classificationCase' | 'classificationCaseInvalidation',
+  ): ClassificationCaseDb {
+    let arrivals = 0;
+    let release!: () => void;
+    const bothAtInsert = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const waitForBoth = async () => {
+      arrivals += 1;
+      if (arrivals === 2) release();
+      await bothAtInsert;
+    };
+    return {
+      classificationCase: db.classificationCase,
+      classificationCaseInvalidation: db.classificationCaseInvalidation,
+      qboMutationAttempt: db.qboMutationAttempt,
+      transaction: db.transaction,
+      vendorIdentity: db.vendorIdentity,
+      $transaction: async (callback: (tx: ClassificationCaseDb) => Promise<unknown>) =>
+        db.$transaction(async (tx) => {
+          const classificationCase = delegate === 'classificationCase'
+            ? new Proxy(tx.classificationCase, {
+                get(target, property, receiver) {
+                  if (property !== 'create') return Reflect.get(target, property, receiver);
+                  return async (args: Parameters<typeof tx.classificationCase.create>[0]) => {
+                    await waitForBoth();
+                    return tx.classificationCase.create(args);
+                  };
+                },
+              })
+            : tx.classificationCase;
+          const classificationCaseInvalidation = delegate === 'classificationCaseInvalidation'
+            ? new Proxy(tx.classificationCaseInvalidation, {
+                get(target, property, receiver) {
+                  if (property !== 'create') return Reflect.get(target, property, receiver);
+                  return async (args: Parameters<typeof tx.classificationCaseInvalidation.create>[0]) => {
+                    await waitForBoth();
+                    return tx.classificationCaseInvalidation.create(args);
+                  };
+                },
+              })
+            : tx.classificationCaseInvalidation;
+          return callback({
+            classificationCase,
+            classificationCaseInvalidation,
+            qboMutationAttempt: tx.qboMutationAttempt,
+            transaction: tx.transaction,
+            vendorIdentity: tx.vendorIdentity,
+          });
+        }),
+    } as ClassificationCaseDb;
+  }
+
   it('records an allow-listed bounded snapshot and replays by QBO request id', async () => {
     const value = await fixture();
     const first = await recordVerifiedClassificationCase(value.input, db);
@@ -146,6 +201,42 @@ describePostgres('classification cases on PostgreSQL', () => {
     expect(JSON.stringify(stored.transactionSnapshot)).not.toContain('privateProviderPayload');
     expect(JSON.stringify(stored.transactionSnapshot)).not.toContain('privateRequest');
     expect(JSON.stringify(stored.transactionSnapshot)).not.toContain('privateResponse');
+  });
+
+  it('returns the winning case and invalidation when two PostgreSQL transactions race', async () => {
+    const value = await fixture();
+    const caseRaceDb = racingDb('classificationCase');
+    const [first, second] = await Promise.all([
+      recordVerifiedClassificationCase(value.input, caseRaceDb),
+      recordVerifiedClassificationCase(value.input, caseRaceDb),
+    ]);
+    expect(second.id).toBe(first.id);
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id, qboMutationAttemptId: value.attempt.id },
+    })).resolves.toBe(1);
+
+    const invalidationRaceDb = racingDb('classificationCaseInvalidation');
+    const invalidatedAt = new Date('2026-08-31T00:00:00.000Z');
+    const [invalidatedFirst, invalidatedSecond] = await Promise.all([
+      invalidateClassificationCase(
+        value.company.id,
+        first.id,
+        'Synthetic concurrent correction',
+        invalidationRaceDb,
+        invalidatedAt,
+      ),
+      invalidateClassificationCase(
+        value.company.id,
+        first.id,
+        'Synthetic concurrent correction',
+        invalidationRaceDb,
+        invalidatedAt,
+      ),
+    ]);
+    expect(invalidatedSecond).toEqual(invalidatedFirst);
+    await expect(db.classificationCaseInvalidation.count({
+      where: { companyId: value.company.id, classificationCaseId: first.id },
+    })).resolves.toBe(1);
   });
 
   it('requires a verified attempt and rejects a vendor identity from another company', async () => {
@@ -438,18 +529,38 @@ describePostgres('classification cases on PostgreSQL', () => {
     });
     companyIds.add(company.id);
     const ruleId = `legacy-writer-rule-${randomUUID()}`;
+    const tag = await db.tag.create({
+      data: {
+        companyId: company.id,
+        name: 'Synthetic legacy tag',
+        color: '#123456',
+      },
+    });
 
-    await expect(db.$executeRaw`
-      INSERT INTO "Rule" (
-        "id", "companyId", "priority", "matchField", "matchText",
-        "category", "autoPost", "createdAt"
-      ) VALUES (
-        ${ruleId}, ${company.id}, 0, 'payee', 'Synthetic Legacy Vendor',
-        'Synthetic expense', false, CURRENT_TIMESTAMP
-      )
-    `).resolves.toBe(1);
+    await db.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO "Rule" (
+          "id", "companyId", "priority", "matchField", "matchText",
+          "category", "autoPost", "createdAt"
+        ) VALUES (
+          ${ruleId}, ${company.id}, 0, 'payee', 'Synthetic Legacy Vendor',
+          'Synthetic expense', false, CURRENT_TIMESTAMP
+        )
+      `;
+      await tx.ruleTag.create({ data: { ruleId, tagId: tag.id } });
+    });
     await expect(db.rule.findUniqueOrThrow({ where: { id: ruleId } }))
       .resolves.toMatchObject({ enabled: true, revision: 0 });
+    await expect(db.ruleRevision.findMany({
+      where: { companyId: company.id, ruleId },
+    })).resolves.toEqual([
+      expect.objectContaining({
+        revision: 0,
+        state: 'enabled',
+        autoPost: false,
+        tagIds: [tag.id],
+      }),
+    ]);
   });
 
   it('allows immutable memory to leave only through a whole-company cascade', async () => {

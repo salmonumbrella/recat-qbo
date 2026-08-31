@@ -129,11 +129,12 @@ describe('company-scoped vendor identities', () => {
     expect(normalizeVendorLookupKey('Acme, Inc.')).not.toBe(normalizeVendorLookupKey('Acme Inc.'));
   });
 
-  it('keeps the raw display value while ensuring an exact key is idempotent', async () => {
+  it('preserves decomposed Unicode and surrounding whitespace in raw names and aliases', async () => {
     const db = fakeDb();
+    const rawDisplayName = '  Cafe\u0301   North  ';
     const first = await createVendorIdentity({
       companyId: COMPANY,
-      displayName: '  Café   North  ',
+      displayName: rawDisplayName,
       qboVendorId: 'qbo-1',
     }, db);
     const second = await ensureVendorIdentity({
@@ -141,10 +142,21 @@ describe('company-scoped vendor identities', () => {
       displayName: 'Café North',
       qboVendorId: 'qbo-1',
     }, db);
+    const rawAlias = '  Cafe\u0301 North POS  ';
+    const alias = await createVendorAlias({
+      companyId: COMPANY,
+      vendorIdentityId: first.id,
+      value: rawAlias,
+      source: 'user',
+    }, db);
     expect(first).toMatchObject({
-      displayName: 'Café   North',
+      displayName: rawDisplayName,
       normalizedName: 'café north',
       qboVendorId: 'qbo-1',
+    });
+    expect(alias).toMatchObject({
+      value: rawAlias,
+      normalizedValue: 'café north pos',
     });
     expect(second.id).toBe(first.id);
   });

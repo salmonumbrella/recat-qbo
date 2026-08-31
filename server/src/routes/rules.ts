@@ -11,6 +11,7 @@ import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import { runCompanyMutationTransaction } from '../services/companyMutationScope.js';
+import { appendRuleRevision } from '../services/ruleRevisionHistory.js';
 import { ruleSuggestion, type RuleLike } from '../services/suggestions.js';
 
 type RuleRow = Prisma.RuleGetPayload<{ include: { ruleTags: true } }>;
@@ -22,34 +23,6 @@ type RuleCandidateOrigin = {
   schemaVersion: string;
   configVersion: string;
 };
-
-function ruleRevisionSnapshot(
-  rule: RuleRow,
-  state: 'enabled' | 'disabled' | 'retired',
-  changedBy: string | null,
-): Prisma.RuleRevisionUncheckedCreateInput {
-  return {
-    ruleId: rule.id,
-    companyId: rule.companyId,
-    revision: rule.revision,
-    state,
-    matchField: rule.matchField,
-    matchText: rule.matchText,
-    category: rule.category,
-    categoryQboId: rule.categoryQboId,
-    taxCalculation: rule.taxCalculation,
-    taxCode: rule.taxCode,
-    taxCodeQboId: rule.taxCodeQboId,
-    tagIds: [...rule.ruleTags.map((ruleTag) => ruleTag.tagId)].sort(),
-    priority: rule.priority,
-    autoPost: rule.autoPost,
-    originIntent: rule.originIntent,
-    sourceCaseId: rule.sourceCaseId,
-    sourceCandidateId: rule.sourceCandidateId,
-    changedBy,
-    retiredAt: rule.retiredAt,
-  };
-}
 
 const createBody = z.object({
   matchText: z.string().trim().min(1).max(200),
@@ -196,7 +169,8 @@ rulesRouter.post(
           _min: { priority: true },
         });
         const priority = agg._min.priority === null ? 0 : agg._min.priority - 1;
-        return tx.rule.create({
+        const changedBy = user?.id ?? null;
+        const created = await tx.rule.create({
           data: {
             companyId: company.id,
             matchField: 'payee',
@@ -211,10 +185,13 @@ rulesRouter.post(
             autoPost: body.autoPost ?? false,
             priority,
             createdById: user?.id ?? null,
+            updatedById: changedBy,
             ruleTags: { create: tagIds.map((tagId) => ({ tagId })) },
           },
           include: { ruleTags: true, candidateOrigin: true },
         });
+        await appendRuleRevision(tx, created, changedBy);
+        return created;
       },
     );
     res.status(201).json(toRuleDto(rule));
@@ -303,7 +280,7 @@ rulesRouter.put(
       async (tx) => {
         const existing = await tx.rule.findMany({
           where: { companyId: company.id, enabled: true, retiredAt: null },
-          select: { id: true },
+          include: { ruleTags: true },
         });
         const existingIds = new Set(existing.map((rule) => rule.id));
         if (
@@ -316,8 +293,21 @@ rulesRouter.put(
             'BAD_ORDER',
           );
         }
-        await Promise.all(ids.map((id, index) =>
-          tx.rule.update({ where: { id }, data: { priority: index } })));
+        const changedBy = req.user?.id ?? null;
+        for (const [index, id] of ids.entries()) {
+          const current = existing.find((rule) => rule.id === id)!;
+          if (current.priority === index) continue;
+          const updated = await tx.rule.update({
+            where: { id },
+            data: {
+              priority: index,
+              revision: { increment: 1 },
+              updatedById: changedBy,
+            },
+            include: { ruleTags: true },
+          });
+          await appendRuleRevision(tx, updated, changedBy);
+        }
         return tx.rule.findMany({
           where: { companyId: company.id, enabled: true, retiredAt: null },
           include: { ruleTags: true, candidateOrigin: true },
@@ -359,7 +349,8 @@ rulesRouter.patch(
             tx.ruleTag.create({ data: { ruleId: rule.id, tagId } })));
         }
 
-        return tx.rule.update({
+        const changedBy = req.user?.id ?? null;
+        const result = await tx.rule.update({
           where: { id: rule.id },
           data: {
             ...(patch.matchText !== undefined ? { matchText: patch.matchText } : {}),
@@ -367,9 +358,13 @@ rulesRouter.patch(
             categoryQboId,
             ...(patch.autoPost !== undefined ? { autoPost: patch.autoPost } : {}),
             ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
+            revision: { increment: 1 },
+            updatedById: changedBy,
           },
           include: { ruleTags: true, candidateOrigin: true },
         });
+        await appendRuleRevision(tx, result, changedBy);
+        return result;
       },
     );
     res.json(toRuleDto(updated));
@@ -393,9 +388,7 @@ rulesRouter.delete(
         },
         include: { ruleTags: true, candidateOrigin: true },
       });
-      await tx.ruleRevision.create({
-        data: ruleRevisionSnapshot(retired, 'retired', changedBy),
-      });
+      await appendRuleRevision(tx, retired, changedBy);
     });
     res.json({ ok: true });
   }),
