@@ -39,7 +39,10 @@ import {
   assertTransactionProviderActionability,
   effectiveProviderActionabilityCounts,
 } from '../services/providerActionability.js';
-import { refreshProviderActionability } from '../services/providerActionabilityRefresh.js';
+import {
+  MAX_ACTIONABILITY_REFRESH_LIMIT,
+  refreshProviderActionability,
+} from '../services/providerActionabilityRefresh.js';
 
 export { transactionDtos } from '../services/companyReads.js';
 import { stageCategorization } from '../services/categorization.js';
@@ -134,7 +137,7 @@ const listQuery = z.object({
 
 const actionabilityRefreshQuery = z.object({
   cursor: z.string().min(1).max(128).optional(),
-  limit: z.coerce.number().int().min(1).max(25).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_ACTIONABILITY_REFRESH_LIMIT).optional(),
 });
 
 export const companyTransactionsRouter = Router({ mergeParams: true });

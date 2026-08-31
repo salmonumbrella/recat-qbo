@@ -10,6 +10,7 @@ import {
   type CategorizationDb,
   type CategorizationDeps,
 } from './categorization.js';
+import { persistProviderActionability } from './providerActionability.js';
 
 const COMPANY_ID = '00000000-0000-4000-8000-000000000010';
 const OTHER_COMPANY_ID = '00000000-0000-4000-8000-000000000020';
@@ -47,6 +48,7 @@ interface TransactionRow {
   qboType: string;
   qboId: string;
   qboSyncToken: string;
+  date: Date;
   amount: number;
   status: string;
   revision: number;
@@ -304,6 +306,7 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       qboType: 'Purchase',
       qboId: 'QBO_PURCHASE_30',
       qboSyncToken: '7',
+      date: new Date('2026-07-29T00:00:00.000Z'),
       amount: -10.5,
       status: 'PENDING',
       revision: 0,
@@ -470,6 +473,64 @@ describe('stageCategorization', () => {
 
   beforeEach(() => {
     db = new FakeCategorizationDb(initialState()).initialize();
+  });
+
+  it('atomically rebinds actionability after staging so the next safety refresh can persist', async () => {
+    const checkedAt = new Date('2026-08-30T18:00:00.000Z');
+    let actionability = {
+      companyId: COMPANY_ID,
+      transactionId: TRANSACTION_ID,
+      disposition: 'WRITABLE',
+      checkedAt,
+      revision: 0,
+      qboSyncToken: '7',
+      qboType: 'Purchase',
+      qboId: 'QBO_PURCHASE_30',
+      txnDate: new Date('2026-07-29T00:00:00.000Z'),
+      bankAccountQboId: 'bank-1',
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+      unavailableCode: null,
+      unavailableReason: null,
+    };
+    const actionabilityModel = {
+      findUnique: vi.fn(async () => actionability),
+      findMany: vi.fn(async () => [actionability]),
+      count: vi.fn(async () => 1),
+      updateMany: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+        actionability = { ...actionability, ...data } as typeof actionability;
+        return { count: 1 };
+      }),
+      upsert: vi.fn(async () => actionability),
+      create: vi.fn(async () => actionability),
+    };
+    Object.assign(db, { transactionActionability: actionabilityModel });
+
+    await stageCategorization(input(), testDeps(db));
+
+    expect(db.state.transactions[0]?.revision).toBe(1);
+    expect(actionability).toMatchObject({
+      disposition: 'UNKNOWN',
+      checkedAt: null,
+      revision: 1,
+      qboSyncToken: '7',
+      qboId: 'QBO_PURCHASE_30',
+    });
+    await expect(persistProviderActionability({
+      id: TRANSACTION_ID,
+      companyId: COMPANY_ID,
+      revision: 1,
+      qboSyncToken: '7',
+      qboType: 'Purchase',
+      qboId: 'QBO_PURCHASE_30',
+      date: new Date('2026-07-29T00:00:00.000Z'),
+      checkedAt,
+      bankAccountQboId: 'bank-1',
+      evidence: { bookCloseDate: null, cleared: false, reconciled: false },
+    }, db as never)).resolves.toBe(true);
+    expect(actionability).toMatchObject({ disposition: 'WRITABLE', revision: 1 });
+    expect(actionabilityModel.updateMany).toHaveBeenCalledTimes(2);
   });
 
   it('participates in the common entity lease for the full staging transaction', async () => {

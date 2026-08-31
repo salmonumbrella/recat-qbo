@@ -254,30 +254,6 @@ export async function ensureUnknownProviderActionability(
   }
 }
 
-/** Invalidate an existing row after a local revision or provider SyncToken
- * changes.  The conditional update is the bounded CAS fence. */
-export async function invalidateProviderActionability(
-  txn: ActionabilityTransactionIdentity,
-  db: ProviderActionabilityDb = defaultDb,
-): Promise<boolean> {
-  if (!db.transactionActionability) return false;
-  const result = await db.transactionActionability.updateMany({
-    where: {
-      transactionId: txn.id,
-      companyId: txn.companyId,
-      OR: [
-        { revision: { not: txn.revision } },
-        { qboSyncToken: { not: txn.qboSyncToken } },
-        { qboId: { not: txn.qboId } },
-        { qboType: { not: txn.qboType } },
-        { txnDate: { not: toDateOnlyValue(txn.date) } },
-      ],
-    },
-    data: unknownData(txn),
-  });
-  return result.count === 1;
-}
-
 export interface PersistProviderActionabilityInput extends ActionabilityTransactionIdentity {
   checkedAt?: Date;
   evidence?: QboWriteSafetyEvidence;
