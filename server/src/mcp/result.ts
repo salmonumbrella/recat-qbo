@@ -1,5 +1,6 @@
 import type { CallToolResult, JSONObject } from '@modelcontextprotocol/server';
 import { HttpError } from '../lib/http.js';
+import { QboRateLimitError } from '../lib/qbo/types.js';
 import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
@@ -26,6 +27,14 @@ export type SafeToolErrorCode =
   | 'QBO_TRANSACTION_LOCKED'
   | 'QBO_WRITE_SAFETY_UNAVAILABLE'
   | 'RATE_LIMITED';
+
+export interface SafeToolError {
+  code: SafeToolErrorCode;
+  message: string;
+  requestId: string;
+  /** Present only when the provider supplied a bounded retry hint. */
+  retryAfterSeconds?: number;
+}
 
 const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   FORBIDDEN: 'This token does not have access to the requested data. Check its company role and try again.',
@@ -217,6 +226,7 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
 
 function safeCode(error: unknown): SafeToolErrorCode {
   if (error instanceof McpSchemaBoundsError) return 'INVALID_INPUT';
+  if (error instanceof QboRateLimitError) return 'RATE_LIMITED';
   if (error instanceof QboWriteSafetyError) return error.code;
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;
@@ -242,18 +252,26 @@ export function safeToolFailure(
   requestId: string,
 ): CallToolResult {
   const code = safeCode(error);
-  const value = {
-    error: {
-      code,
-      message: SAFE_MESSAGES[code],
-      requestId: requestId.slice(0, MAX_REQUEST_ID_LENGTH),
-    },
+  const retryAfterSeconds = error instanceof QboRateLimitError
+    ? safeRetryAfterSeconds(error.retryAfterSeconds)
+    : undefined;
+  const safeError: SafeToolError = {
+    code,
+    message: SAFE_MESSAGES[code],
+    requestId: requestId.slice(0, MAX_REQUEST_ID_LENGTH),
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
   };
+  const value = { error: safeError };
   return {
     isError: true,
     content: [{ type: 'text', text: JSON.stringify(value) }],
     structuredContent: value,
   };
+}
+
+function safeRetryAfterSeconds(value: number): number | undefined {
+  if (!Number.isFinite(value) || !Number.isInteger(value)) return undefined;
+  return Math.min(60, Math.max(1, value));
 }
 
 export function safeInvalidToolFailure(requestId: string): CallToolResult {

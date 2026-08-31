@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { HttpError } from '../lib/http.js';
+import { QboRateLimitError } from '../lib/qbo/types.js';
 import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
@@ -92,6 +93,31 @@ describe('MCP tool results', () => {
       },
     });
     expect(JSON.stringify(result)).not.toContain(error.message);
+  });
+
+  it('maps a typed QuickBooks rate limit and preserves only its bounded retry hint', () => {
+    const result = safeToolFailure(
+      new QboRateLimitError(7, 'PRIVATE_QBO_RATE_DETAIL'),
+      'request-rate',
+    );
+
+    expect(result.structuredContent).toEqual({
+      error: {
+        code: 'RATE_LIMITED',
+        message: 'Too many requests were made. Wait briefly and try again.',
+        requestId: 'request-rate',
+        retryAfterSeconds: 7,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_QBO_RATE_DETAIL');
+
+    const bounded = safeToolFailure(
+      new QboRateLimitError(Number.POSITIVE_INFINITY, 'PRIVATE_QBO_RATE_DETAIL'),
+      'request-rate-bounded',
+    );
+    expect(bounded.structuredContent).toMatchObject({
+      error: { code: 'RATE_LIMITED', retryAfterSeconds: 5 },
+    });
   });
 
   it('maps unexpected details to the approved company-unavailable fallback', () => {

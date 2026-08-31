@@ -453,6 +453,28 @@ export class QboRequestTimeout extends Error {
   }
 }
 
+/**
+ * QuickBooks rejected a request because the provider rate limit was reached.
+ * The delay is deliberately bounded before it reaches callers, so an
+ * untrusted Retry-After header cannot create an unbounded server-side wait or
+ * an unbounded client-facing value.
+ */
+export class QboRateLimitError extends Error {
+  code = 'QBO_RATE_LIMITED' as const;
+  readonly retryAfterSeconds: number;
+
+  constructor(
+    retryAfterSeconds = 5,
+    message = 'QuickBooks rate limit reached.',
+  ) {
+    super(message);
+    this.name = 'QboRateLimitError';
+    this.retryAfterSeconds = Number.isFinite(retryAfterSeconds)
+      ? Math.min(60, Math.max(1, Math.ceil(retryAfterSeconds)))
+      : 5;
+  }
+}
+
 export class QboAttachmentNotFoundError extends Error {
   code = 'QBO_ATTACHMENT_NOT_FOUND' as const;
 

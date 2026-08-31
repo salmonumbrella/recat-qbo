@@ -2,10 +2,11 @@
 // with amount = the holding-line sum, and the write-side rebuild replaces only
 // those lines — everything else on the entity survives verbatim.
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   QboAttachmentNotFoundError,
   QboAuthError,
+  QboRateLimitError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboDepositPreparedWrite,
@@ -32,6 +33,7 @@ import {
   rebuildJournalEntryLines,
   rebuildPurchaseLines,
   revokeIntuitToken,
+  resetQboGetGatesForTest,
   sumLinesPostingTo,
   type RawDeposit,
   type RawJournalEntry,
@@ -44,6 +46,13 @@ import { QboWriteSafetyError } from './writeSafety.js';
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  // GET throttling is intentionally process-wide in production.  Each test
+  // starts from a fresh gate so unrelated HTTP-seam fixtures remain
+  // deterministic and cannot inherit another test's cooldown.
+  resetQboGetGatesForTest();
 });
 
 describe('OAuth token errors', () => {
@@ -606,6 +615,35 @@ describe('RealQboClient attachment HTTP seam', () => {
 });
 
 describe('RealQboClient purchase-tax HTTP seam', () => {
+  it('preserves a typed QBO 429 through the write-safety read', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-30T00:00:00.000Z'));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('', {
+        status: 429,
+        headers: { 'Retry-After': '2' },
+      }))
+      .mockResolvedValue(new Response(JSON.stringify({
+        QueryResponse: { Preferences: [{ AccountingInfoPrefs: {} }] },
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const reading = realClient().client.fetchWriteSafety({
+      qboType: 'Purchase',
+      qboId: 'purchase-rate-limited',
+      txnDate: '2026-08-01',
+      bankAccountQboId: 'bank-1',
+    });
+
+    const assertion = expect(reading).rejects.toMatchObject({
+      code: 'QBO_RATE_LIMITED',
+      retryAfterSeconds: 2,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await assertion;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('GET');
+  });
+
   it('reads the close date and exact cleared/reconciled transaction identity', async () => {
     const report = (id: string, type: string): RawReport => ({
       Columns: { Column: [{ ColType: 'tx_date' }, { ColType: 'txn_type' }] },

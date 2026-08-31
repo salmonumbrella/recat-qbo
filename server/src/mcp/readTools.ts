@@ -541,7 +541,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     }));
   register(
     'get_write_safety',
-    'Read current QuickBooks book-close, cleared, and reconciled safety before preparing a transaction write.',
+    'Read current QuickBooks book-close, cleared, and reconciled safety before preparing a transaction write. Provider rate limits are returned explicitly with a bounded retry hint.',
     getTransactionInput,
     writeSafetyOutput,
     async (input) => ({

@@ -18,6 +18,7 @@ import { Readable } from 'node:stream';
 import {
   QboAttachmentNotFoundError,
   QboAuthError,
+  QboRateLimitError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboAccountInfo,
@@ -54,6 +55,12 @@ import {
   type QboTxnLine,
   type QboWriteResult,
 } from './types.js';
+import {
+  noteQboRateLimit,
+  qboGetGateKey,
+  retryAfterSecondsFromHeader,
+  withQboGetGate,
+} from './getGate.js';
 import type { StagedCategorization } from '@recat/shared';
 import { classifyIntuitOAuthBody } from './diagnostics.js';
 import { moneyToCents } from '../../services/tax/model.js';
@@ -107,6 +114,18 @@ export type {
 } from './types.js';
 export type QboWriteLine = QboLineWriteSplit;
 
+export {
+  QBO_GET_MIN_START_SPACING_MS,
+  QBO_RATE_LIMIT_FALLBACK_SECONDS,
+  QBO_RATE_LIMIT_MAX_RETRY_SECONDS,
+  QBO_RATE_LIMIT_MIN_RETRY_SECONDS,
+  qboGetGateKey,
+  resetQboGetGatesForTest,
+  retryAfterSecondsFromHeader,
+  withQboGetGate,
+} from './getGate.js';
+export { QboRateLimitError } from './types.js';
+
 const OAUTH_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const OAUTH_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 // Revoke lives on the developer host, not the oauth host.
@@ -133,6 +152,14 @@ class QboObjectNotFoundError extends Error {
   constructor(message = 'QuickBooks object was not found.') {
     super(message);
     this.name = 'QboObjectNotFoundError';
+  }
+}
+
+/** Internal marker used to retry a 401 only after the current GET gate turn. */
+class QboUnauthorizedError extends Error {
+  constructor() {
+    super('QuickBooks authentication expired.');
+    this.name = 'QboUnauthorizedError';
   }
 }
 
@@ -1043,6 +1070,7 @@ export interface RealQboClientOptions {
 export class RealQboClient implements QboClient {
   readonly realmId: string;
   private readonly base: string;
+  private readonly getGateKey: string;
   private readonly clientId: string;
   private readonly clientSecret: string;
   private readonly holdingIds: ReadonlySet<string>;
@@ -1053,6 +1081,7 @@ export class RealQboClient implements QboClient {
   constructor(opts: RealQboClientOptions) {
     this.realmId = opts.realmId;
     this.base = `${apiBase(opts.environment)}/v3/company/${encodeURIComponent(opts.realmId)}`;
+    this.getGateKey = qboGetGateKey(opts.environment, opts.realmId);
     this.clientId = opts.clientId;
     this.clientSecret = opts.clientSecret;
     this.holdingIds = new Set(opts.holdingAccountQboIds);
@@ -1097,6 +1126,34 @@ export class RealQboClient implements QboClient {
     retried = false,
     signal?: AbortSignal,
   ): Promise<T> {
+    if (method === 'GET') {
+      try {
+        return await withQboGetGate(
+          this.getGateKey,
+          () => this.requestUngated<T>(method, path, body, retried, signal),
+          signal,
+        );
+      } catch (error) {
+        // A 401 retry must leave the gate before refreshing and entering a new
+        // gated turn.  Retrying from inside the gate would deadlock behind
+        // the turn that is still waiting for the recursive request.
+        if (error instanceof QboUnauthorizedError && !retried) {
+          await this.refresh();
+          return this.request<T>(method, path, body, true, signal);
+        }
+        throw error;
+      }
+    }
+    return this.requestUngated<T>(method, path, body, retried, signal);
+  }
+
+  private async requestUngated<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    retried = false,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const accessToken = await this.ensureFreshToken();
     if (signal?.aborted) throw abortedRequest();
     const controller = new AbortController();
@@ -1130,9 +1187,15 @@ export class RealQboClient implements QboClient {
         throw error;
       }
       if (res.status === 401 && !retried) {
+        if (method === 'GET') {
+          // The outer request wrapper refreshes only after this gated turn
+          // releases, then starts the retry as a fresh gated GET.
+          await res.body?.cancel().catch(() => undefined);
+          throw new QboUnauthorizedError();
+        }
         // Access token invalidated server-side: refresh once and retry.
         await this.refresh();
-        return this.request<T>(method, path, body, true, signal);
+        return this.requestUngated<T>(method, path, body, true, signal);
       }
       let text: string;
       try {
@@ -1148,7 +1211,7 @@ export class RealQboClient implements QboClient {
         if (method === 'POST' && res.status >= 500) {
           throw new QboRequestTimeout('QuickBooks did not confirm the request.');
         }
-        throw this.toError(res.status, text);
+        throw this.toError(res.status, text, res.headers);
       }
       try {
         return (text ? JSON.parse(text) : {}) as T;
@@ -1197,7 +1260,7 @@ export class RealQboClient implements QboClient {
         },
       );
       const text = await res.text();
-      if (!res.ok) throw this.toError(res.status, text);
+      if (!res.ok) throw this.toError(res.status, text, res.headers);
       const parsed: unknown = text ? JSON.parse(text) : {};
       return typeof parsed === 'object' &&
         parsed !== null &&
@@ -1290,7 +1353,7 @@ export class RealQboClient implements QboClient {
       }
       if (!response.ok) {
         if (response.status >= 400 && response.status < 500) {
-          throw this.toError(response.status, text);
+          throw this.toError(response.status, text, response.headers);
         }
         throw new QboRequestTimeout(
           'QuickBooks did not confirm the attachment upload.',
@@ -1322,7 +1385,16 @@ export class RealQboClient implements QboClient {
     ) as Promise<{ Purchase?: RawPurchase; Deposit?: RawDeposit }>;
   }
 
-  private toError(status: number, bodyText: string): Error {
+  private toError(status: number, bodyText: string, headers?: Headers): Error {
+    if (status === 429) {
+      const error = new QboRateLimitError(
+        retryAfterSecondsFromHeader(headers?.get('retry-after')),
+      );
+      // A rejected POST also cools down subsequent GETs for this realm.  The
+      // rejected request itself is never retried here.
+      noteQboRateLimit(this.getGateKey, error);
+      return error;
+    }
     let fault: QboFaultBody = {};
     try {
       fault = JSON.parse(bodyText) as QboFaultBody;
@@ -1419,11 +1491,13 @@ export class RealQboClient implements QboClient {
         });
         return this.request<RawReport>('GET', `/reports/TransactionList?${params.toString()}`);
       };
-      const [preferences, cleared, reconciled] = await Promise.all([
-        this.queryAll('select * from Preferences', 'Preferences'),
-        query('Cleared'),
-        query('Reconciled'),
-      ]);
+      // Keep the three provider reads in one explicit sequence.  The
+      // process-wide GET gate serializes them anyway; doing so here also
+      // prevents two already-queued report calls from continuing after a
+      // rate-limit failure has made this safety result unusable.
+      const preferences = await this.queryAll('select * from Preferences', 'Preferences');
+      const cleared = await query('Cleared');
+      const reconciled = await query('Reconciled');
       if (preferences.length !== 1) {
         throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
       }
@@ -1433,7 +1507,13 @@ export class RealQboClient implements QboClient {
         reconciled: reportContainsSafetyTarget(reconciled, target),
       };
     } catch (error) {
-      if (error instanceof QboWriteSafetyError) throw error;
+      // Preserve the provider's typed rate-limit signal and retry hint.  The
+      // generic safety-unavailable wrapper would otherwise erase the reason
+      // and make callers repeat the same throttled probe blindly.
+      if (
+        error instanceof QboWriteSafetyError
+        || error instanceof QboRateLimitError
+      ) throw error;
       throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
     }
   }
@@ -1533,7 +1613,7 @@ export class RealQboClient implements QboClient {
       if (response.status === 404) {
         throw new QboAttachmentNotFoundError();
       }
-      throw this.toError(response.status, text);
+      throw this.toError(response.status, text, response.headers);
     }
     if (!response.body) {
       clearTimeout(timeout);
