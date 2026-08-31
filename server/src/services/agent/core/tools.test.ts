@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildAgentSnapshot, type AgentSnapshotSource } from './snapshot.js';
 import {
   AgentToolError,
@@ -107,11 +107,82 @@ describe('createSnapshotTools', () => {
       'list_tax_codes',
       'list_rules',
       'find_similar_transactions',
+      'search_classification_knowledge',
     ]);
 
     for (const definition of tools.definitions) {
       expectStrictFunctionDefinition(definition);
     }
+  });
+
+  it('routes both similarity names through canonical evidence search with bounded transaction context', async () => {
+    const snapshot = buildAgentSnapshot(sourceWithTaxCodes());
+    const classificationSearch = vi.fn(async (request) => ({
+      query: request.query,
+      companyId: 'company-a',
+      scope: 'current_company' as const,
+      mode: request.mode === 'auto' ? 'lexical' as const : request.mode,
+      requestedMode: request.mode,
+      degraded: request.mode === 'auto',
+      degradedReason: request.mode === 'auto' ? 'embedding_not_configured' as const : null,
+      status: 'no_match' as const,
+      noMatch: true,
+      hits: [],
+      total: 0,
+    }));
+    const tools = createSnapshotTools(snapshot, { classificationSearch });
+
+    const legacy = await tools.call('find_similar_transactions', { query: 'Coffee', limit: 5 });
+    const explicit = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'lexical', limit: 5,
+    });
+
+    expect(legacy).toMatchObject({
+      items: [],
+      search: { requestedMode: 'auto', mode: 'lexical', degraded: true, noMatch: true },
+    });
+    expect(explicit).toMatchObject({
+      items: [],
+      search: { requestedMode: 'lexical', mode: 'lexical', degraded: false, noMatch: true },
+    });
+    expect(classificationSearch).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      query: 'Coffee', mode: 'auto', limit: 5,
+      transaction: {
+        transactionId: TRANSACTION_ID,
+        date: '2026-07-20',
+        signedAmountCents: -10000,
+        currency: 'CAD',
+        sourceAccountName: 'Operating account',
+        payee: 'Example merchant',
+        memo: 'Generic fixture',
+      },
+    }));
+  });
+
+  it('rejects schema-invalid canonical search output without exposing its contents', async () => {
+    const secret = 'PRIVATE_CANONICAL_OUTPUT_SENTINEL';
+    const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => ({ secret }) as never,
+    });
+
+    const error = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'lexical', limit: 5,
+    }).catch((failure: unknown) => failure);
+
+    expectSafeToolError(error, 'AGENT_TOOL_INVALID_OUTPUT', secret);
+  });
+
+  it('reports an unavailable canonical search dependency without relabelling it invalid output', async () => {
+    const secret = 'PRIVATE_CANONICAL_FAILURE_SENTINEL';
+    const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => { throw new Error(secret); },
+    });
+
+    const error = await tools.call('search_classification_knowledge', {
+      query: 'Coffee', mode: 'semantic', limit: 5,
+    }).catch((failure: unknown) => failure);
+
+    expectSafeToolError(error, 'AGENT_TOOL_UNAVAILABLE', secret);
   });
 
   it('searches categories case-insensitively and caps a caller-requested limit above twenty', async () => {

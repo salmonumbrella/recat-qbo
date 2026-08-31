@@ -12,24 +12,35 @@ import {
   DEFAULT_READ_LIMIT,
   MAX_READ_LIMIT,
   getTransaction,
+  getClassificationCase,
+  getRule,
+  getRuleCandidate,
   listCategories,
   listCompanies,
   listRules,
+  listRuleCandidates,
   listTags,
   listTaxCodes,
   listTransactions,
   listTransferCandidates,
+  searchClassificationKnowledge,
+  testRule,
 } from '../services/companyReads.js';
 import type {
   CompanyReadRuleDto,
+  CompanyRuleReadDto,
   CompanyReadTransactionDto,
+  ClassificationSearchPage,
   CompanyReadDto,
   Page,
   TaxCodePage,
   TransactionListInput,
   TransactionPage,
   TransferCandidateDto,
+  RuleCandidateReadDto,
+  RuleTestReadDto,
 } from '../services/companyReads.js';
+import type { ClassificationCase } from '@recat/shared';
 import type { QboAccountDto, TagDto } from '@recat/shared';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
@@ -40,6 +51,7 @@ import {
 } from './result.js';
 import {
   MCP_AUTHORED_SCHEMA_BOUNDS,
+  assertBoundedMcpOutput,
   toBoundedJsonSchema,
 } from './schemaBounds.js';
 import { extractMcpTraceContext, type McpTraceContext } from './trace.js';
@@ -58,6 +70,12 @@ export const READ_TOOL_NAMES = [
   'list_tax_codes',
   'list_tags',
   'list_rules',
+  'get_rule',
+  'test_rule',
+  'list_rule_candidates',
+  'get_rule_candidate',
+  'get_classification_case',
+  'search_classification_knowledge',
   'list_transfer_candidates',
 ] as const;
 
@@ -93,6 +111,38 @@ export interface CompanyReadOperations {
     companyId: string,
     input?: { limit?: number; cursor?: string },
   ): Promise<Page<CompanyReadRuleDto>>;
+  getRule(userId: string, companyId: string, ruleId: string): Promise<CompanyRuleReadDto>;
+  testRule(
+    userId: string,
+    companyId: string,
+    input: { matchText: string; priorityTop?: boolean; limit?: number; cursor?: string },
+  ): Promise<RuleTestReadDto>;
+  listRuleCandidates(
+    userId: string,
+    companyId: string,
+    input?: { limit?: number; cursor?: string },
+  ): Promise<Page<RuleCandidateReadDto>>;
+  getRuleCandidate(
+    userId: string,
+    companyId: string,
+    candidateId: string,
+  ): Promise<RuleCandidateReadDto>;
+  getClassificationCase(
+    userId: string,
+    companyId: string,
+    caseId: string,
+  ): Promise<ClassificationCase>;
+  searchClassificationKnowledge(
+    userId: string,
+    companyId: string,
+    input: {
+      query: string;
+      scope?: 'current_company' | 'accessible_companies';
+      mode: 'auto' | 'exact' | 'lexical' | 'hybrid' | 'semantic';
+      limit?: number;
+      cursor?: string;
+    },
+  ): Promise<ClassificationSearchPage>;
   listTransferCandidates(
     userId: string,
     companyId: string,
@@ -108,6 +158,12 @@ export const companyReads: CompanyReadOperations = Object.freeze({
   listTaxCodes,
   listTags,
   listRules,
+  getRule,
+  testRule,
+  listRuleCandidates,
+  getRuleCandidate,
+  getClassificationCase,
+  searchClassificationKnowledge,
   listTransferCandidates,
 });
 
@@ -193,11 +249,100 @@ const getTransactionInput = z.strictObject({
   companyId: id,
   transactionId: id,
 });
+const getRuleInput = z.strictObject({ companyId: id, ruleId: id });
+const testRuleInput = z.strictObject({
+  companyId: id,
+  matchText: z.string().min(1).max(200),
+  priorityTop: z.boolean().optional(),
+  ...pageInput,
+});
+const getRuleCandidateInput = z.strictObject({ companyId: id, candidateId: id });
+const getClassificationCaseInput = z.strictObject({ companyId: id, caseId: id });
+const searchClassificationInput = z.strictObject({
+  companyId: id,
+  query: z.string().min(1).max(256),
+  scope: z.enum(['current_company', 'accessible_companies']).default('current_company').optional(),
+  mode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  ...pageInput,
+});
 
 const text = z.string().max(2_048);
 const isoDate = z.string().max(64);
 const nullableText = text.nullable();
 const nullableIsoDate = isoDate.nullable();
+const taxCalculation = z.enum([
+  'TaxInclusive',
+  'TaxExcluded',
+  'NotApplicable',
+]);
+const action = z.strictObject({
+  categoryQboId: z.string().min(1).max(120),
+  taxCalculation,
+  taxCodeQboId: z.string().min(1).max(120).nullable(),
+  tagIds: z.array(id).max(50),
+  memo: nullableText.optional(),
+});
+const actionSummary = z.strictObject({
+  categoryName: text,
+  taxCalculation,
+  taxCodeName: nullableText,
+  tagNames: z.array(text).max(50),
+});
+const provenance = z.strictObject({
+  source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate']),
+  sourceId: id,
+  actorId: id.nullable(),
+  recordedAt: isoDate,
+});
+const conflict = z.strictObject({
+  id,
+  companyId: id,
+  sourceId: id,
+  kind: z.enum(['case', 'candidate', 'rule', 'jurisdiction', 'tax']),
+  reason: text,
+  action: action.nullable(),
+  actionSummary: actionSummary.nullable(),
+  evidenceCount: z.number().int().nonnegative().max(10_000),
+});
+const evidenceCard = z.strictObject({
+  id,
+  sourceId: id,
+  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate']),
+  companyId: id,
+  companyName: z.string().min(1).max(200),
+  companyRelation: z.enum(['current', 'foreign']),
+  executable: z.boolean(),
+  advisory: z.boolean(),
+  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'lexical', 'semantic'])).min(1).max(6),
+  score: z.number().finite().nonnegative(),
+  vendorIdentityId: id.nullable(),
+  vendorName: nullableText,
+  action: action.nullable(),
+  actionSummary: actionSummary.nullable(),
+  originIntent: z.enum(['apply_once', 'make_recurring', 'auto_candidate']).nullable(),
+  evidenceCount: z.number().int().nonnegative().max(10_000),
+  conflictingEvidenceCount: z.number().int().nonnegative().max(10_000),
+  conflicts: z.array(conflict).max(20),
+  provenance,
+  rationale: z.string().max(2_000).nullable(),
+  examples: z.array(text).max(20),
+  counterexamples: z.array(text).max(20),
+  jurisdiction: z.string().max(128).nullable(),
+  currency: z.string().regex(/^[A-Z]{3}$/u).nullable(),
+  verifiedAt: nullableIsoDate,
+  ruleRevision: z.number().int().nonnegative().nullable(),
+}).superRefine((card, issue) => {
+  if (
+    card.companyRelation === 'foreign'
+    && (card.action !== null || card.executable || !card.advisory)
+  ) {
+    issue.addIssue({
+      code: 'custom',
+      path: ['action'],
+      message: 'Foreign evidence must be advisory and omit executable action identifiers.',
+    });
+  }
+});
 const role = z.enum(['viewer', 'categorizer', 'admin']);
 const transactionStatus = z.enum([
   'PENDING',
@@ -207,11 +352,6 @@ const transactionStatus = z.enum([
   'ERROR',
   'SUPERSEDED',
   'REVERTED',
-]);
-const taxCalculation = z.enum([
-  'TaxInclusive',
-  'TaxExcluded',
-  'NotApplicable',
 ]);
 const suggestion = z.strictObject({
   category: text,
@@ -330,6 +470,116 @@ const ruleOutput = z.strictObject({
   valid: z.boolean(),
   invalidReasons: z.array(text).max(4),
 });
+const ruleRevisionOutput = z.strictObject({
+  id,
+  ruleId: id,
+  companyId: id,
+  revision: z.number().int().nonnegative(),
+  state: z.enum(['enabled', 'disabled', 'retired']),
+  condition: z.strictObject({ matchField: z.literal('payee'), matchText: text }),
+  action,
+  categoryName: text,
+  taxCodeName: nullableText,
+  priority: z.number().int().nonnegative(),
+  autoPost: z.boolean(),
+  originIntent: z.enum(['make_recurring', 'auto_candidate']).nullable(),
+  sourceCaseId: id.nullable(),
+  sourceCandidateId: id.nullable(),
+  changedBy: id.nullable(),
+  createdAt: isoDate,
+  retiredAt: nullableIsoDate,
+});
+const getRuleOutput = z.strictObject({
+  active: z.boolean(),
+  executable: z.boolean(),
+  reviewRequiredAt: nullableIsoDate,
+  reviewReason: nullableText,
+  revision: ruleRevisionOutput,
+});
+const ruleTestOutput = z.strictObject({
+  samples: z.array(z.strictObject({
+    transactionId: id,
+    payee: text,
+    date: isoDate,
+    amount: z.number().finite(),
+    status: z.enum(['PENDING', 'POSTED', 'DRY_RUN']),
+    wouldWin: z.boolean(),
+    currentWinner: nullableText,
+  })).max(MAX_READ_LIMIT),
+  nextCursor: z.string().max(CURSOR_MAX).nullable(),
+  pendingCount: z.number().int().nonnegative(),
+  postedCount: z.number().int().nonnegative(),
+  conflicts: z.array(z.strictObject({
+    ruleId: id,
+    matchText: text,
+    category: text,
+    priority: z.number().int(),
+  })).max(20),
+  conflictsTruncated: z.boolean(),
+});
+const candidateEvidence = z.strictObject({
+  id,
+  transactionId: id,
+  source: z.enum(['user', 'autopilot', 'mcp']),
+  polarity: z.enum(['positive', 'negative']),
+  active: z.boolean(),
+  observedAt: isoDate,
+  invalidatedAt: nullableIsoDate,
+  invalidationReason: nullableText,
+});
+const candidateOutput = z.strictObject({
+  id,
+  companyId: id,
+  state: z.enum(['ready', 'conflict', 'stale', 'dismissed', 'activated']),
+  matchField: z.literal('payee'),
+  matchText: text,
+  categoryName: nullableText,
+  taxCodeName: nullableText,
+  action: action.nullable(),
+  executable: z.literal(false),
+  advisory: z.literal(true),
+  evidenceCount: z.number().int().nonnegative().max(10_000),
+  conflictingEvidenceCount: z.number().int().nonnegative().max(10_000),
+  schemaVersion: text,
+  configVersion: text,
+  activatedRuleId: id.nullable(),
+  updatedAt: isoDate,
+  evidence: z.array(candidateEvidence).max(20).optional(),
+});
+const classificationCaseOutput = z.strictObject({
+  id,
+  companyId: id,
+  transactionId: id,
+  vendorIdentityId: id.nullable(),
+  qboMutationAttemptId: id,
+  action,
+  actionFingerprint: id,
+  originIntent: z.enum(['apply_once', 'make_recurring', 'auto_candidate']),
+  rationale: z.string().min(1).max(2_000),
+  requiredEvidence: z.array(text).max(20),
+  examples: z.array(text).max(20),
+  counterexamples: z.array(text).max(20),
+  citations: z.array(z.strictObject({
+    url: z.string().url().max(2_048),
+    title: text,
+    publisher: text,
+    retrievedAt: isoDate,
+    claimSummary: z.string().min(1).max(2_000),
+  })).max(10),
+  reviewer: z.strictObject({ userId: id.nullable(), configVersion: id, decision: z.literal('approved') }),
+  jurisdiction: z.string().min(1).max(128),
+  currency: z.string().regex(/^[A-Z]{3}$/u),
+  context: z.strictObject({
+    transactionDirection: z.enum(['in', 'out', 'unknown']),
+    qboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+    sourceAccountName: nullableText,
+    businessPurpose: nullableText,
+  }),
+  provenance,
+  verifiedAt: isoDate,
+  invalidatedAt: nullableIsoDate,
+  invalidationReason: nullableText,
+});
 const pageOutput = <T extends z.ZodType>(item: T) => z.strictObject({
   items: z.array(item).max(MAX_READ_LIMIT),
   nextCursor: z.string().max(CURSOR_MAX).nullable(),
@@ -365,6 +615,24 @@ const companyListOutput = pageOutput(company);
 const categoryListOutput = pageOutput(category);
 const tagListOutput = pageOutput(tag);
 const ruleListOutput = pageOutput(ruleOutput);
+const candidateListOutput = pageOutput(candidateOutput);
+const searchClassificationOutput = z.strictObject({
+  query: z.string().min(1).max(256),
+  companyId: id,
+  scope: z.enum(['current_company', 'accessible_companies']),
+  mode: z.enum(['exact', 'lexical', 'hybrid', 'semantic']),
+  requestedMode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  degraded: z.boolean(),
+  degradedReason: z.enum([
+    'semantic_unavailable', 'vector_capability_unavailable', 'embedding_not_configured',
+    'lexical_only', 'semantic_error',
+  ]).nullable(),
+  status: z.enum(['matched', 'no_match']),
+  noMatch: z.boolean(),
+  total: z.number().int().nonnegative().max(10_000),
+  items: z.array(evidenceCard).max(MAX_READ_LIMIT),
+  nextCursor: z.string().max(CURSOR_MAX).nullable(),
+});
 const transferCandidateListOutput = pageOutput(
   z.strictObject({ a: transaction, b: transaction }),
 );
@@ -378,6 +646,12 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [companyPageInput, taxPageOutput],
   [companyPageInput, tagListOutput],
   [companyPageInput, ruleListOutput],
+  [getRuleInput, getRuleOutput],
+  [testRuleInput, ruleTestOutput],
+  [companyPageInput, candidateListOutput],
+  [getRuleCandidateInput, candidateOutput],
+  [getClassificationCaseInput, classificationCaseOutput],
+  [searchClassificationInput, searchClassificationOutput],
   [companyPageInput, transferCandidateListOutput],
 ];
 
@@ -456,6 +730,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
             const operationValue = await operation(input);
             const parsed = outputSchema.safeParse(operationValue);
             if (!parsed.success) throw new InvalidMcpToolOutputError();
+            assertBoundedMcpOutput(parsed.data);
             return parsed.data;
           },
         );
@@ -519,6 +794,52 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     (input) => reads.listTags(context.principal.userId, input.companyId, inputWithoutCompany(input)));
   register('list_rules', 'List categorization rules visible to categorizers.', companyPageInput, ruleListOutput,
     (input) => reads.listRules(context.principal.userId, input.companyId, inputWithoutCompany(input)));
+  register(
+    'get_rule',
+    'Read one canonical rule revision and its current lifecycle state. Retired, disabled, or review-required rules are non-executable.',
+    getRuleInput,
+    getRuleOutput,
+    (input) => reads.getRule(context.principal.userId, input.companyId, input.ruleId),
+  );
+  register(
+    'test_rule',
+    'Test a bounded payee rule against deterministically paginated samples and conflicts without saving or changing it.',
+    testRuleInput,
+    ruleTestOutput,
+    (input) => reads.testRule(context.principal.userId, input.companyId, inputWithoutCompany(input)),
+  );
+  register(
+    'list_rule_candidates',
+    'List bounded learned candidates. Candidates are advisory; conflict and stale states never imply an executable rule.',
+    companyPageInput,
+    candidateListOutput,
+    (input) => reads.listRuleCandidates(context.principal.userId, input.companyId, inputWithoutCompany(input)),
+  );
+  register(
+    'get_rule_candidate',
+    'Read one learned candidate with bounded evidence. Conflicting candidates remain explicitly conflicting and advisory.',
+    getRuleCandidateInput,
+    candidateOutput,
+    (input) => reads.getRuleCandidate(context.principal.userId, input.companyId, input.candidateId),
+  );
+  register(
+    'get_classification_case',
+    'Read one immutable verified classification case and any invalidation provenance, without raw transaction or provider payloads.',
+    getClassificationCaseInput,
+    classificationCaseOutput,
+    (input) => reads.getClassificationCase(context.principal.userId, input.companyId, input.caseId),
+  );
+  register(
+    'search_classification_knowledge',
+    'Search bounded classification evidence cards. Defaults to the current company; accessible-companies includes only actual memberships and foreign hits are advisory with QBO action IDs removed. Auto may label lexical degradation; explicit semantic or hybrid fails when unavailable; empty evidence returns no_match.',
+    searchClassificationInput,
+    searchClassificationOutput,
+    (input) => reads.searchClassificationKnowledge(
+      context.principal.userId,
+      input.companyId,
+      inputWithoutCompany(input),
+    ),
+  );
   register('list_transfer_candidates', 'List bounded transfer candidate pairs.', companyPageInput, transferCandidateListOutput,
     (input) => reads.listTransferCandidates(context.principal.userId, input.companyId, inputWithoutCompany(input)));
 

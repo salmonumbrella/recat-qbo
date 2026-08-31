@@ -82,6 +82,7 @@ import {
 } from './liveMutationAuthority.js';
 import { pauseLiveCompanyInTransaction } from './circuitBreaker.js';
 import { isCanonicalLiveCheckpoint } from './liveCheckpoint.js';
+import { classificationSearchForCompany } from './classificationSearch.js';
 
 const MAX_RECONCILIATION_PASSES = 32;
 
@@ -1267,6 +1268,7 @@ function productionLiveWorkerDeps(
       model: models.decisionModel,
       reviewModel: models.reviewModel,
       limits: models.limits,
+      classificationSearch: classificationSearchForCompany(job.companyId),
     }),
     verifyDecision: async (snapshot, decision) => verifyLiveDecision(
       { snapshot, decision },

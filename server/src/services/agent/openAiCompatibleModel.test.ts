@@ -400,6 +400,52 @@ describe('OpenAiCompatibleAgentModel requests', () => {
     ]);
   });
 
+  it('accepts bounded canonical evidence-card history with honest no-match metadata', async () => {
+    const input: AgentModelInput = {
+      ...modelInput(),
+      history: [
+        {
+          role: 'assistant',
+          toolCalls: [{
+            id: 'classification-call',
+            name: 'search_classification_knowledge',
+            arguments: { query: 'Coffee', limit: 5, mode: 'lexical' },
+          }],
+        },
+        {
+          role: 'tool',
+          toolCallId: 'classification-call',
+          name: 'search_classification_knowledge',
+          result: {
+            items: [],
+            search: {
+              query: 'Coffee', scope: 'current_company', mode: 'lexical', requestedMode: 'lexical',
+              degraded: false, degradedReason: null, status: 'no_match', noMatch: true, total: 0,
+            },
+          },
+        },
+      ],
+    };
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'custom', model: 'local-model', baseUrl: 'https://models.invalid/v1',
+    });
+
+    const { body } = await capturedRequest(model, input);
+
+    expect(body.messages).toContainEqual({
+      role: 'tool',
+      tool_call_id: 'classification-call',
+      name: 'search_classification_knowledge',
+      content: JSON.stringify({
+        items: [],
+        search: {
+          degraded: false, degradedReason: null, mode: 'lexical', noMatch: true,
+          query: 'Coffee', requestedMode: 'lexical', scope: 'current_company', status: 'no_match', total: 0,
+        },
+      }),
+    });
+  });
+
   it.each([
     '',
     '   ',

@@ -364,6 +364,54 @@ describePostgres('durable shadow worker PostgreSQL lifecycle', () => {
     }
   });
 
+  it('passes the job-company canonical search dependency into the durable runner', async () => {
+    const fixture = await seed();
+    try {
+      const classificationSearch = vi.fn(async (request) => ({
+        query: request.query,
+        companyId: fixture.companyId,
+        scope: 'current_company' as const,
+        mode: 'lexical' as const,
+        requestedMode: request.mode,
+        degraded: false,
+        degradedReason: null,
+        status: 'no_match' as const,
+        noMatch: true,
+        hits: [],
+        total: 0,
+      }));
+      let turn = 0;
+      const decision = new TestModel(
+        { provider: 'custom', model: 'decision-model' },
+        async () => {
+          turn += 1;
+          return turn === 1
+            ? {
+                kind: 'tool_calls',
+                toolCalls: [{
+                  id: 'classification-search',
+                  name: 'search_classification_knowledge',
+                  arguments: { query: 'merchant', mode: 'lexical', limit: 5 },
+                }],
+              }
+            : abstainTurn();
+        },
+      );
+
+      await runClaimedShadowJob(fixture.job, deps(
+        decision,
+        model('review-model'),
+        { classificationSearch },
+      ));
+
+      expect(classificationSearch).toHaveBeenCalledTimes(1);
+      await expect(firstClient.agentJob.findUniqueOrThrow({ where: { id: fixture.job.id } }))
+        .resolves.toMatchObject({ status: 'completed', lastErrorCode: null });
+    } finally {
+      await cleanup(fixture);
+    }
+  });
+
   it('completes genuine model abstentions without retrying', async () => {
     const fixture = await seed();
     try {

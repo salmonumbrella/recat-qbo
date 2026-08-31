@@ -15,16 +15,21 @@ import {
   parseClassificationSearchHit,
   parseClassificationSearchResult,
 } from './contracts.js';
-import type { VoyageEmbeddingClient } from './embedding/client.js';
-import type {
-  ClassificationEmbeddingGeneration,
-  ClassificationSearchDocument,
+import {
+  classificationEmbeddingRuntimeConfig,
+  createVoyageEmbeddingClient,
+  type VoyageEmbeddingClient,
+} from './embedding/client.js';
+import {
+  classificationEmbeddingGeneration,
+  createClassificationSearchDocument,
+  type ClassificationEmbeddingGeneration,
+  type ClassificationSearchDocument,
 } from './embedding/recipe.js';
-import { createClassificationSearchDocument } from './embedding/recipe.js';
-import type {
+import {
   PgClassificationVectorStore,
-  VectorGenerationHealth,
-  VectorSearchHit,
+  type VectorGenerationHealth,
+  type VectorSearchHit,
 } from './embedding/vectorStore.js';
 import {
   reciprocalRankFuse,
@@ -436,6 +441,30 @@ export async function searchClassificationMemory(
       { matchedIn: 'semantic', hits: rolled },
     ],
     limit,
+  });
+}
+
+/** Shared runtime adapter. Provider configuration remains optional: exact and
+ * lexical reads stay provider-independent, auto labels lexical degradation,
+ * and explicit semantic/hybrid requests fail closed through the canonical
+ * search service when configuration is absent or unhealthy. */
+export async function searchClassificationMemoryWithRuntime(
+  input: ClassificationSearchInput,
+): Promise<ClassificationSearchResult> {
+  const config = classificationEmbeddingRuntimeConfig();
+  const semantic = config === null
+    ? null
+    : {
+        generation: classificationEmbeddingGeneration({
+          baseUrl: config.baseUrl,
+          fingerprintSalt: config.fingerprintSalt,
+        }),
+        client: createVoyageEmbeddingClient(config),
+        store: new PgClassificationVectorStore(prisma),
+      };
+  return searchClassificationMemory(input, {
+    repository: new PrismaClassificationSearchRepository(prisma),
+    semantic,
   });
 }
 

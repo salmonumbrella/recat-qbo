@@ -23,6 +23,10 @@ import {
   loadAgentSnapshotSourceInTransaction,
   type AgentSnapshotQueryDb,
 } from './snapshotLoader.js';
+import {
+  classificationSearchForCompany,
+  type AgentClassificationSearch,
+} from './classificationSearch.js';
 
 const MAX_ATTEMPTS = 3;
 const TRANSIENT_PROVIDER_CODES = new Set<AgentModelErrorCode>([
@@ -45,6 +49,7 @@ export interface ShadowWorkerDeps {
   readonly decisionModel: AgentModel;
   readonly reviewModel: AgentModel;
   readonly limits: Partial<AgentLimits>;
+  readonly classificationSearch?: AgentClassificationSearch;
   readonly now?: (tx: WorkerTransactionDb) => Promise<Date> | Date;
   /** Deterministic crash/race seams used by the durable PostgreSQL tests. */
   readonly afterStarted?: () => Promise<void> | void;
@@ -104,6 +109,8 @@ export async function runClaimedShadowJob(
     model: deps.decisionModel,
     reviewModel: deps.reviewModel,
     limits: deps.limits,
+    classificationSearch: deps.classificationSearch
+      ?? classificationSearchForCompany(job.companyId),
   });
   await deps.beforeComplete?.();
   await completeRunAndJob(job, prepared.runId, result, deps);

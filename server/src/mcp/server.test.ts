@@ -695,7 +695,7 @@ describe('stateless MCP handler', () => {
     expectSafeInvalidToolFailure(payload!, 'PRIVATE_STREAM_SENTINEL');
   });
 
-  it('passes through a schema-valid Unicode legacy success larger than one MiB', async () => {
+  it('replaces a schema-valid Unicode legacy output above the response bound with a safe failure', async () => {
     const largeUnicodeText = '😀'.repeat(1_024);
     const largeRules = Array.from({ length: 100 }, (_, index) => ({
       id: `rule-${index}`,
@@ -748,16 +748,17 @@ describe('stateless MCP handler', () => {
     }), { authInfo: auth('one') });
     const text = await response.text();
 
-    expect(Buffer.byteLength(text)).toBeGreaterThan(1_024 * 1_024);
+    expect(Buffer.byteLength(text)).toBeLessThan(16 * 1_024);
     expect(text.includes('\uFFFD')).toBe(false);
     const [payload] = await legacyPayload(
       new Response(text, { headers: response.headers }),
     );
     expect(payload?.id).toBe('large-valid-output');
-    expect(payload?.result.isError).not.toBe(true);
-    expect(payload?.result.structuredContent.items).toHaveLength(100);
-    expect(payload?.result.structuredContent.items[99].invalidReasons[3])
-      .toBe(largeUnicodeText);
+    expect(payload?.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: 'INVALID_INPUT' } },
+    });
+    expect(text).not.toContain(largeUnicodeText);
   });
 
   it('rejects modern legacy-handshake methods and routing binding mismatches', async () => {
