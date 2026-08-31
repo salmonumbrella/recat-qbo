@@ -1,5 +1,6 @@
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { describe, expect, it, vi } from 'vitest';
+import { QboRateLimitError } from '../lib/qbo/types.js';
 import { createRecatMcpServer, type CompanyReadOperations } from './readTools.js';
 
 const principal = Object.freeze({
@@ -96,7 +97,7 @@ describe('MCP provider actionability refresh', () => {
     );
   });
 
-  it('rejects a limit over 25 before invoking the refresh operation', async () => {
+  it('rejects a limit over one before invoking the refresh operation', async () => {
     const refresh = vi.fn();
     const handler = createMcpHandler(
       () => createRecatMcpServer({
@@ -108,8 +109,35 @@ describe('MCP provider actionability refresh', () => {
       { legacy: 'stateless' },
     );
 
-    const response = await call(handler, { companyId: 'company-a', limit: 26 });
+    const response = await call(handler, { companyId: 'company-a', limit: 2 });
     expect(response.result.isError).toBe(true);
     expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('returns a sanitized rate-limit error and bounded retry hint', async () => {
+    const refresh = vi.fn().mockRejectedValue(
+      new QboRateLimitError(999, 'private provider rate detail'),
+    );
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal,
+        era: 'legacy',
+        reads: reads(),
+        actionabilityRefresh: { refreshProviderActionability: refresh },
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await call(handler, { companyId: 'company-a', limit: 1 });
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: 'RATE_LIMITED',
+          retryAfterSeconds: 60,
+        },
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain('private provider rate detail');
   });
 });

@@ -1,4 +1,5 @@
 import { prisma } from '../lib/prisma.js';
+import { QboRateLimitError } from '../lib/qbo/types.js';
 import {
   persistProviderActionability,
   type PersistProviderActionabilityInput,
@@ -11,8 +12,11 @@ import {
 
 /** A refresh deliberately processes a small page. Callers resume with the
  * returned cursor instead of holding a request open over the whole queue. */
-export const DEFAULT_ACTIONABILITY_REFRESH_LIMIT = 10;
-export const MAX_ACTIONABILITY_REFRESH_LIMIT = 25;
+// A single safety read can issue several QBO requests, each with the normal
+// 30-second provider timeout. Keep one transaction per request so a refresh
+// cannot accumulate an unbounded series of provider timeouts.
+export const DEFAULT_ACTIONABILITY_REFRESH_LIMIT = 1;
+export const MAX_ACTIONABILITY_REFRESH_LIMIT = 1;
 
 export interface ActionabilityRefreshTransaction {
   id: string;
@@ -78,6 +82,32 @@ function unavailableCode(error: unknown): string {
     if (typeof code === 'string' && /^[A-Z0-9_]{1,64}$/u.test(code)) return code;
   }
   return 'QBO_WRITE_SAFETY_UNAVAILABLE';
+}
+
+function isRateLimited(error: unknown): boolean {
+  if (error instanceof QboRateLimitError) return true;
+  return typeof error === 'object'
+    && error !== null
+    && 'status' in error
+    && (error as { status?: unknown }).status === 429;
+}
+
+function retryAfterHint(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null || !('retryAfterSeconds' in error)) {
+    return undefined;
+  }
+  const value = (error as { retryAfterSeconds?: unknown }).retryAfterSeconds;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Keep the provider's retry hint while replacing an arbitrary HTTP 429 with
+ * the typed error that the MCP result layer sanitizes. QboRateLimitError's
+ * constructor clamps the value to the safe one-to-sixty-second range.
+ */
+function normalizedRateLimitError(error: unknown): QboRateLimitError {
+  if (error instanceof QboRateLimitError) return error;
+  return new QboRateLimitError(retryAfterHint(error));
 }
 
 function dispositionFromSafety(result: WriteSafetyReadResult): ProviderActionabilityRefreshItem['disposition'] {
@@ -168,7 +198,13 @@ export async function refreshProviderActionability(
 ): Promise<ProviderActionabilityRefreshResult> {
   const limit = boundedLimit(options.limit);
   const cursor = boundedCursor(options.cursor);
-  const rows = await deps.listTransactions(userId, companyId, cursor, limit);
+  let rows: ActionabilityRefreshTransaction[];
+  try {
+    rows = await deps.listTransactions(userId, companyId, cursor, limit);
+  } catch (error) {
+    if (isRateLimited(error)) throw normalizedRateLimitError(error);
+    throw error;
+  }
   const items: ProviderActionabilityRefreshItem[] = [];
   let persisted = 0;
   let failed = 0;
@@ -186,12 +222,19 @@ export async function refreshProviderActionability(
         errorCode: null,
       };
     } catch (error) {
+      // A rate-limit response means the provider did not give us an
+      // authoritative observation. Do not turn it into UNAVAILABLE and move
+      // the cursor past this transaction: retrying the same cursor is the
+      // only safe continuation. The MCP result layer turns this typed error
+      // into a sanitized RATE_LIMITED response with its bounded hint.
+      if (isRateLimited(error)) throw normalizedRateLimitError(error);
       failed += 1;
       let didPersist = false;
       try {
         didPersist = await deps.persist(unavailableInput(txn, error));
         if (didPersist) persisted += 1;
-      } catch {
+      } catch (persistError) {
+        if (isRateLimited(persistError)) throw normalizedRateLimitError(persistError);
         // Keep the cursor moving even when the local index is unavailable.
       }
       item = {

@@ -36,6 +36,8 @@ import {
   type WriteSafetyReadOperations,
 } from '../services/writeSafetyReads.js';
 import {
+  DEFAULT_ACTIONABILITY_REFRESH_LIMIT,
+  MAX_ACTIONABILITY_REFRESH_LIMIT,
   refreshProviderActionability,
   type ProviderActionabilityRefreshResult,
 } from '../services/providerActionabilityRefresh.js';
@@ -425,14 +427,15 @@ const writeSafetyOutput = z.strictObject({
 const actionabilityRefreshInput = z.strictObject({
   companyId: id,
   cursor: z.string().min(1).max(ACTIONABILITY_CURSOR_MAX).nullable().optional(),
-  limit: z.number().int().min(1).max(25).default(10).optional(),
+  limit: z.number().int().min(1).max(MAX_ACTIONABILITY_REFRESH_LIMIT)
+    .default(DEFAULT_ACTIONABILITY_REFRESH_LIMIT).optional(),
 });
 const actionabilityRefreshOutput = z.strictObject({
   refresh: z.strictObject({
     companyId: id,
-    processed: z.number().int().nonnegative().max(25),
-    persisted: z.number().int().nonnegative().max(25),
-    failed: z.number().int().nonnegative().max(25),
+    processed: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+    persisted: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
+    failed: z.number().int().nonnegative().max(MAX_ACTIONABILITY_REFRESH_LIMIT),
     nextCursor: z.string().max(ACTIONABILITY_CURSOR_MAX).nullable(),
     partial: z.boolean(),
     complete: z.boolean(),
@@ -447,7 +450,7 @@ const actionabilityRefreshOutput = z.strictObject({
         'UNAVAILABLE',
       ]),
       errorCode: nullableText,
-    })).max(25),
+    })).max(MAX_ACTIONABILITY_REFRESH_LIMIT),
   }),
 });
 const identityOutput = z.strictObject({

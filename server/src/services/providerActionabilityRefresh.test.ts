@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { HttpError } from '../lib/http.js';
+import { QboRateLimitError } from '../lib/qbo/types.js';
 import {
   MAX_ACTIONABILITY_REFRESH_LIMIT,
   refreshProviderActionability,
@@ -69,26 +71,26 @@ function deps(overrides: Partial<ProviderActionabilityRefreshDeps> = {}): Provid
 describe('bounded provider actionability refresh', () => {
   it('processes a hard-bounded page and returns a resumable cursor', async () => {
     const dependencies = deps();
-    const result = await refreshProviderActionability('user-a', 'company-a', { limit: 2 }, dependencies);
+    const result = await refreshProviderActionability('user-a', 'company-a', { limit: 1 }, dependencies);
 
     expect(result).toMatchObject({
       companyId: 'company-a',
-      processed: 2,
-      persisted: 2,
+      processed: 1,
+      persisted: 1,
       failed: 0,
-      nextCursor: 'txn-b',
+      nextCursor: 'txn-a',
       partial: true,
       complete: false,
     });
-    expect(result.items.map((item) => item.disposition)).toEqual(['WRITABLE', 'BLOCKED_CLEARED']);
-    expect(dependencies.listTransactions).toHaveBeenCalledWith('user-a', 'company-a', null, 2);
-    expect(dependencies.readSafety).toHaveBeenCalledTimes(2);
-    expect(dependencies.persist).toHaveBeenCalledTimes(2);
+    expect(result.items.map((item) => item.disposition)).toEqual(['WRITABLE']);
+    expect(dependencies.listTransactions).toHaveBeenCalledWith('user-a', 'company-a', null, 1);
+    expect(dependencies.readSafety).toHaveBeenCalledTimes(1);
+    expect(dependencies.persist).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the cursor moving and records UNAVAILABLE when one exact read fails', async () => {
     const dependencies = deps({
-      readSafety: vi.fn().mockRejectedValue(Object.assign(new Error('provider prose'), { code: 'QBO_RATE_LIMITED' })),
+      readSafety: vi.fn().mockRejectedValue(Object.assign(new Error('provider prose'), { code: 'QBO_WRITE_SAFETY_UNAVAILABLE' })),
     });
     const result = await refreshProviderActionability(
       'user-a',
@@ -106,11 +108,50 @@ describe('bounded provider actionability refresh', () => {
       complete: false,
     });
     expect(result.items.every((item) => item.disposition === 'UNAVAILABLE')).toBe(true);
-    expect(result.items.every((item) => item.errorCode === 'QBO_RATE_LIMITED')).toBe(true);
+    expect(result.items.every((item) => item.errorCode === 'QBO_WRITE_SAFETY_UNAVAILABLE')).toBe(true);
     expect(dependencies.persist).toHaveBeenCalledWith(expect.objectContaining({
       disposition: 'UNAVAILABLE',
-      unavailableCode: 'QBO_RATE_LIMITED',
+      unavailableCode: 'QBO_WRITE_SAFETY_UNAVAILABLE',
     }));
+  });
+
+  it('stops on a typed QBO rate limit without persisting or advancing the failed row', async () => {
+    const rateLimit = new QboRateLimitError(7, 'provider detail must not escape');
+    const dependencies = deps({
+      readSafety: vi.fn().mockRejectedValue(rateLimit),
+    });
+
+    await expect(refreshProviderActionability(
+      'user-a',
+      'company-a',
+      { cursor: 'txn-before', limit: 1 },
+      dependencies,
+    )).rejects.toBe(rateLimit);
+
+    expect(dependencies.readSafety).toHaveBeenCalledWith('user-a', 'company-a', 'txn-a');
+    expect(dependencies.persist).not.toHaveBeenCalled();
+  });
+
+  it('normalizes an HTTP 429 to a bounded typed rate limit without advancing', async () => {
+    const rateLimit = Object.assign(
+      new HttpError(429, 'provider detail must not escape', 'RATE_LIMITED'),
+      { retryAfterSeconds: 999 },
+    );
+    const dependencies = deps({
+      readSafety: vi.fn().mockRejectedValue(rateLimit),
+    });
+
+    await expect(refreshProviderActionability(
+      'user-a',
+      'company-a',
+      { limit: 1 },
+      dependencies,
+    )).rejects.toMatchObject({
+      name: 'QboRateLimitError',
+      code: 'QBO_RATE_LIMITED',
+      retryAfterSeconds: 60,
+    });
+    expect(dependencies.persist).not.toHaveBeenCalled();
   });
 
   it('rejects an unbounded request before listing or reading provider data', async () => {
