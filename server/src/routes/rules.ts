@@ -23,6 +23,34 @@ type RuleCandidateOrigin = {
   configVersion: string;
 };
 
+function ruleRevisionSnapshot(
+  rule: RuleRow,
+  state: 'enabled' | 'disabled' | 'retired',
+  changedBy: string | null,
+): Prisma.RuleRevisionUncheckedCreateInput {
+  return {
+    ruleId: rule.id,
+    companyId: rule.companyId,
+    revision: rule.revision,
+    state,
+    matchField: rule.matchField,
+    matchText: rule.matchText,
+    category: rule.category,
+    categoryQboId: rule.categoryQboId,
+    taxCalculation: rule.taxCalculation,
+    taxCode: rule.taxCode,
+    taxCodeQboId: rule.taxCodeQboId,
+    tagIds: [...rule.ruleTags.map((ruleTag) => ruleTag.tagId)].sort(),
+    priority: rule.priority,
+    autoPost: rule.autoPost,
+    originIntent: rule.originIntent,
+    sourceCaseId: rule.sourceCaseId,
+    sourceCandidateId: rule.sourceCandidateId,
+    changedBy,
+    retiredAt: rule.retiredAt,
+  };
+}
+
 const createBody = z.object({
   matchText: z.string().trim().min(1).max(200),
   category: z.string().trim().min(1).max(200),
@@ -120,7 +148,14 @@ async function loadRule(
     where: { id },
     include: { ruleTags: true, candidateOrigin: true },
   });
-  if (!rule || rule.companyId !== companyId) throw new HttpError(404, 'Rule not found', 'RULE_NOT_FOUND');
+  if (
+    !rule
+    || rule.companyId !== companyId
+    || !rule.enabled
+    || rule.retiredAt !== null
+  ) {
+    throw new HttpError(404, 'Rule not found', 'RULE_NOT_FOUND');
+  }
   return rule;
 }
 
@@ -133,7 +168,7 @@ rulesRouter.get(
     const company = scopedCompany(req);
     // Priority order — lowest number first (the match order). Client renders as-is.
     const rules = await prisma.rule.findMany({
-      where: { companyId: company.id },
+      where: { companyId: company.id, enabled: true, retiredAt: null },
       include: { ruleTags: true, candidateOrigin: true },
       orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
     });
@@ -157,7 +192,7 @@ rulesRouter.post(
         await assertTagsBelong(company.id, tagIds, tx);
         // New rules go to the TOP of the match order: min(priority) - 1.
         const agg = await tx.rule.aggregate({
-          where: { companyId: company.id },
+          where: { companyId: company.id, enabled: true, retiredAt: null },
           _min: { priority: true },
         });
         const priority = agg._min.priority === null ? 0 : agg._min.priority - 1;
@@ -207,7 +242,7 @@ rulesRouter.post(
         take: 200,
       }),
       prisma.rule.findMany({
-        where: { companyId: company.id },
+        where: { companyId: company.id, enabled: true, retiredAt: null },
         select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
         orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
       }),
@@ -267,7 +302,7 @@ rulesRouter.put(
       company.id,
       async (tx) => {
         const existing = await tx.rule.findMany({
-          where: { companyId: company.id },
+          where: { companyId: company.id, enabled: true, retiredAt: null },
           select: { id: true },
         });
         const existingIds = new Set(existing.map((rule) => rule.id));
@@ -284,7 +319,7 @@ rulesRouter.put(
         await Promise.all(ids.map((id, index) =>
           tx.rule.update({ where: { id }, data: { priority: index } })));
         return tx.rule.findMany({
-          where: { companyId: company.id },
+          where: { companyId: company.id, enabled: true, retiredAt: null },
           include: { ruleTags: true, candidateOrigin: true },
           orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
         });
@@ -347,7 +382,20 @@ rulesRouter.delete(
     const company = scopedCompany(req);
     await runCompanyMutationTransaction(prisma, company.id, async (tx) => {
       const rule = await loadRule(company.id, req.params.id, tx);
-      await tx.rule.delete({ where: { id: rule.id } });
+      const changedBy = req.user?.id ?? null;
+      const retired = await tx.rule.update({
+        where: { id: rule.id },
+        data: {
+          enabled: false,
+          retiredAt: new Date(),
+          revision: { increment: 1 },
+          updatedById: changedBy,
+        },
+        include: { ruleTags: true, candidateOrigin: true },
+      });
+      await tx.ruleRevision.create({
+        data: ruleRevisionSnapshot(retired, 'retired', changedBy),
+      });
     });
     res.json({ ok: true });
   }),

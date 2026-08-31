@@ -175,6 +175,8 @@ async function hasOverlappingRule(
       SELECT rule."id"
       FROM "Rule" rule
       WHERE rule."companyId" = ${candidate.companyId}
+        AND rule."enabled" = true
+        AND rule."retiredAt" IS NULL
         AND rule."matchField" = 'payee'
         AND trim(rule."matchText") <> ''
         ${activatedRuleFilter}
@@ -491,7 +493,7 @@ export async function activateRuleCandidate(
         throw new RuleCandidateError('CANDIDATE_STALE', checked.staleReasons[0] ?? 'Rule candidate is stale.');
       }
       const priority = await tx.rule.aggregate({
-        where: { companyId },
+        where: { companyId, enabled: true, retiredAt: null },
         _min: { priority: true },
       });
       const rule = await tx.rule.create({

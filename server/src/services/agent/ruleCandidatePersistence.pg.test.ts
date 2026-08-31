@@ -413,7 +413,10 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await expect(racedActivation).rejects.toMatchObject({
         code: 'CANDIDATE_STALE',
       });
-      await db.rule.delete({ where: { id: overlapping.id } });
+      await db.rule.update({
+        where: { id: overlapping.id },
+        data: { enabled: false, retiredAt: NOW },
+      });
 
       const activated = await activateRuleCandidate(
         company.id,

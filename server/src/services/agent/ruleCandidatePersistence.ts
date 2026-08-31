@@ -255,6 +255,7 @@ async function foldOutcome(
         });
         await tx.autopilotRuleCandidateEvidence.create({
           data: {
+            companyId: outcome.companyId,
             candidateId: candidate.id,
             transactionId: outcome.transactionId,
             inputRevision: outcome.inputRevision,

@@ -213,6 +213,7 @@ model Company {
   agentJobs         AgentJob[]
   agentRuns         AgentRun[]
   autopilotRuleCandidates AutopilotRuleCandidate[]
+  autopilotRuleCandidateEvidence AutopilotRuleCandidateEvidence[]
   autopilotRuleCandidateFolds AutopilotRuleCandidateFold[]
   liveWritePermits LiveWritePermit[]
   attachmentBlobs AttachmentBlob[]
@@ -226,6 +227,12 @@ model Company {
   receiptIntakeOperations ReceiptIntakeOperation[]
   receiptCompanyConfig ReceiptCompanyConfig?
   receiptEvents ReceiptEvent[]
+  vendorIdentities            VendorIdentity[]
+  vendorAliases               VendorAlias[]
+  vendorIdentityMerges        VendorIdentityMerge[]
+  classificationCases         ClassificationCase[]
+  classificationCaseInvalidations ClassificationCaseInvalidation[]
+  ruleRevisions               RuleRevision[]
 }
 
 model Transaction {
@@ -264,8 +271,12 @@ model Transaction {
   attachmentOperations AttachmentOperation[]
   matchedReceipts ReceiptDocument[]
   receiptMatchCandidates ReceiptMatchCandidate[]
+  classificationCases            ClassificationCase[]
 
   @@unique([companyId, qboType, qboId])
+  // Composite identity lets every company-owned child prove its tenant in
+  // the database, rather than relying on a caller to pair IDs correctly.
+  @@unique([companyId, id])
   @@index([companyId, status])
 }
 
@@ -679,6 +690,128 @@ model TxnTag {
   @@id([txnId, tagId])
 }
 
+/// A company-local vendor identity. `displayName` is the bounded raw value
+/// received from QBO or a user; `normalizedName` is only the deterministic
+/// NFC/trim/collapsed-whitespace/lowercase lookup key. No fuzzy similarity or
+/// automatic merge is represented by this model.
+model VendorIdentity {
+  id                  String               @id @default(uuid())
+  companyId           String
+  company             Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  qboVendorId         String?              @db.VarChar(120)
+  displayName         String               @db.VarChar(500)
+  normalizedName      String               @db.VarChar(500)
+  aliases             VendorAlias[]
+  classificationCases ClassificationCase[]
+  mergeAsSource       VendorIdentityMerge?  @relation("VendorIdentityMergeSource")
+  mergesAsTarget      VendorIdentityMerge[] @relation("VendorIdentityMergeTarget")
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@unique([companyId, id])
+  @@unique([companyId, normalizedName])
+  @@unique([companyId, qboVendorId])
+  @@index([companyId, qboVendorId])
+}
+
+/// Raw aliases are retained for auditability; matching uses only the stored
+/// deterministic key. A key can belong to one identity in one company.
+model VendorAlias {
+  id               String         @id @default(uuid())
+  companyId        String
+  company          Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  vendorIdentityId String
+  vendorIdentity   VendorIdentity @relation(fields: [companyId, vendorIdentityId], references: [companyId, id], onDelete: Cascade)
+  value            String         @db.VarChar(500)
+  normalizedValue  String         @db.VarChar(500)
+  source           String         @db.VarChar(32)
+  createdAt        DateTime       @default(now())
+
+  @@unique([companyId, id])
+  @@unique([companyId, normalizedValue])
+  @@index([companyId, vendorIdentityId])
+  @@index([companyId, normalizedValue])
+}
+
+/// An explicit, immutable audit event joining one reviewed duplicate identity
+/// to its canonical target. Exact lookup never creates this row implicitly.
+model VendorIdentityMerge {
+  id                     String         @id @default(uuid())
+  companyId              String
+  company                Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  sourceVendorIdentityId String
+  sourceVendorIdentity   VendorIdentity @relation("VendorIdentityMergeSource", fields: [companyId, sourceVendorIdentityId], references: [companyId, id], onDelete: Cascade)
+  targetVendorIdentityId String
+  targetVendorIdentity   VendorIdentity @relation("VendorIdentityMergeTarget", fields: [companyId, targetVendorIdentityId], references: [companyId, id], onDelete: Cascade)
+  mergedBy               String         @db.VarChar(128)
+  reason                 String         @db.VarChar(500)
+  createdAt              DateTime       @default(now())
+
+  @@unique([companyId, id])
+  @@unique([companyId, sourceVendorIdentityId])
+  @@index([companyId, targetVendorIdentityId])
+}
+
+/// Immutable evidence produced only from a verified QBO mutation attempt.
+/// Typed columns support bounded indexed reads; `snapshot` is a structured,
+/// allow-listed copy of the transaction/action/evidence context and is never
+/// a provider payload or raw QBO response.
+model ClassificationCase {
+  id                   String             @id @default(uuid())
+  companyId            String
+  company              Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactionId        String
+  transaction          Transaction        @relation(fields: [companyId, transactionId], references: [companyId, id], onDelete: Cascade)
+  vendorIdentityId     String?
+  vendorIdentity       VendorIdentity?    @relation(fields: [companyId, vendorIdentityId], references: [companyId, id], onDelete: Cascade)
+  qboMutationAttemptId String             @unique
+  qboMutationAttempt   QboMutationAttempt @relation(fields: [transactionId, qboMutationAttemptId], references: [transactionId, id], onDelete: Cascade)
+  action               Json
+  actionFingerprint    String             @db.Char(64)
+  originIntent         String             @db.VarChar(32)
+  rationale            String             @db.VarChar(2000)
+  requiredEvidence     Json               @default("[]")
+  examples             Json               @default("[]")
+  counterexamples      Json               @default("[]")
+  citations            Json               @default("[]")
+  reviewer             Json
+  jurisdiction         String             @db.VarChar(128)
+  currency             String             @db.Char(3)
+  context              Json
+  provenance           Json
+  /// Structured bounded transaction context assembled by cases.ts; it
+  /// intentionally excludes Transaction.rawData and QBO provider payloads.
+  transactionSnapshot  Json
+  verifiedAt           DateTime
+  createdAt            DateTime           @default(now())
+  sourceRules          Rule[]             @relation("RuleSourceCase")
+  ruleRevisions        RuleRevision[]     @relation("RuleRevisionSourceCase")
+  invalidation          ClassificationCaseInvalidation?
+
+  @@unique([companyId, id])
+  @@unique([transactionId, qboMutationAttemptId])
+  @@index([companyId, verifiedAt])
+  @@index([companyId, transactionId])
+  @@index([companyId, vendorIdentityId, verifiedAt])
+}
+
+/// A case can be invalidated without rewriting its verified evidence. This is
+/// a separate append-only event so the base case remains immutable.
+model ClassificationCaseInvalidation {
+  id                   String              @id @default(uuid())
+  companyId            String
+  company              Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  classificationCaseId String
+  classificationCase   ClassificationCase @relation(fields: [companyId, classificationCaseId], references: [companyId, id], onDelete: Cascade, map: "ClassificationCaseInvalidation_company_case_fkey")
+  invalidatedAt        DateTime            @default(now())
+  reason               String              @db.VarChar(500)
+  createdAt            DateTime            @default(now())
+
+  @@unique([companyId, id])
+  @@unique([companyId, classificationCaseId], map: "ClassificationCaseInvalidation_company_case_key")
+  @@index([companyId, invalidatedAt])
+}
+
 model Rule {
   id               String                  @id @default(uuid())
   companyId        String
@@ -693,12 +826,29 @@ model Rule {
   taxCode          String?
   taxCodeQboId     String?
   autoPost         Boolean                 @default(false)
+  /// Lifecycle state is deliberately separate from the historical autoPost
+  /// permission. Existing rules are backfilled as enabled without changing
+  /// their autoPost value.
+  enabled           Boolean                 @default(true)
+  revision          Int                     @default(0)
+  originIntent      String?                 @db.VarChar(32)
+  sourceCaseId      String?
+  sourceCandidateId String?
+  retiredAt         DateTime?
   createdById      String?
   createdAt        DateTime                @default(now())
+  updatedAt         DateTime                @default(now()) @updatedAt
+  updatedById       String?                 @db.VarChar(128)
   reviewRequiredAt DateTime?
   reviewReason     String?
   ruleTags         RuleTag[]
   candidateOrigin  AutopilotRuleCandidate? @relation("ActivatedCandidateRule")
+  revisions         RuleRevision[]
+  sourceCase        ClassificationCase?     @relation("RuleSourceCase", fields: [companyId, sourceCaseId], references: [companyId, id], onDelete: Cascade)
+  sourceCandidate   AutopilotRuleCandidate? @relation("RuleSourceCandidate", fields: [companyId, sourceCandidateId], references: [companyId, id], onDelete: Cascade)
+
+  @@unique([companyId, id])
+  @@index([companyId, enabled, retiredAt])
 }
 
 model RuleTag {
@@ -708,6 +858,42 @@ model RuleTag {
   tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
 
   @@id([ruleId, tagId])
+}
+
+/// One immutable version of a Rule. Rule lifecycle writes create a new row;
+/// revisions are never edited or deleted, and `state` records the lifecycle
+/// at the time of that version rather than being inferred from the live Rule.
+model RuleRevision {
+  id                String                  @id @default(uuid())
+  ruleId            String
+  rule              Rule                    @relation(fields: [companyId, ruleId], references: [companyId, id], onDelete: Cascade)
+  companyId         String
+  company           Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  revision          Int
+  state             String                  @default("enabled") @db.VarChar(32)
+  matchField        String                  @default("payee") @db.VarChar(64)
+  matchText         String                  @db.VarChar(500)
+  category          String                  @db.VarChar(500)
+  categoryQboId     String?                 @db.VarChar(120)
+  taxCalculation    String?                 @db.VarChar(32)
+  taxCode           String?                 @db.VarChar(500)
+  taxCodeQboId      String?                 @db.VarChar(120)
+  tagIds            Json                    @default("[]")
+  priority          Int
+  autoPost          Boolean
+  originIntent      String?                 @db.VarChar(32)
+  sourceCaseId      String?
+  sourceCase        ClassificationCase?     @relation("RuleRevisionSourceCase", fields: [companyId, sourceCaseId], references: [companyId, id], onDelete: Cascade)
+  sourceCandidateId String?
+  sourceCandidate   AutopilotRuleCandidate? @relation("RuleRevisionSourceCandidate", fields: [companyId, sourceCandidateId], references: [companyId, id], onDelete: Cascade)
+  changedBy         String?                 @db.VarChar(128)
+  createdAt         DateTime                @default(now())
+  retiredAt         DateTime?
+
+  @@unique([companyId, id])
+  @@unique([companyId, ruleId, revision])
+  @@index([companyId, state, createdAt])
+  @@index([companyId, ruleId, revision])
 }
 
 model SavedReport {
@@ -833,7 +1019,9 @@ model QboMutationAttempt {
   ruleCandidateFoldedAt DateTime?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
+  classificationCase    ClassificationCase?
 
+  @@unique([transactionId, id])
   @@index([transactionId, status])
 }
 
@@ -1023,11 +1211,14 @@ model AutopilotRuleCandidate {
   activationActionFingerprint String?
   activatedRuleId             String?                          @unique
   activatedRule               Rule?                            @relation("ActivatedCandidateRule", fields: [activatedRuleId], references: [id], onDelete: SetNull)
+  sourceRules                 Rule[]                           @relation("RuleSourceCandidate")
+  sourceRuleRevisions         RuleRevision[]                   @relation("RuleRevisionSourceCandidate")
   evidence                    AutopilotRuleCandidateEvidence[]
   createdAt                   DateTime                         @default(now())
   updatedAt                   DateTime                         @updatedAt
 
   @@unique([companyId, conditionFingerprint, schemaVersion, configVersion])
+  @@unique([companyId, id])
   @@index([companyId, state, updatedAt])
 }
 
@@ -1035,10 +1226,12 @@ model AutopilotRuleCandidate {
 /// inactive; requestId makes VERIFIED replay idempotent.
 model AutopilotRuleCandidateEvidence {
   id                 String                 @id @default(uuid())
+  companyId          String
+  company            Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
   candidateId        String
-  candidate          AutopilotRuleCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  candidate          AutopilotRuleCandidate @relation(fields: [companyId, candidateId], references: [companyId, id], onDelete: Cascade)
   transactionId      String
-  transaction        Transaction            @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transaction        Transaction            @relation(fields: [companyId, transactionId], references: [companyId, id], onDelete: Cascade)
   inputRevision      Int
   requestId          String                 @unique
   source             String
@@ -1051,6 +1244,7 @@ model AutopilotRuleCandidateEvidence {
 
   @@index([candidateId, active])
   @@index([transactionId, active])
+  @@index([companyId, active])
 }
 
 /// Immutable receipt showing that one durable VERIFIED mutation was considered.

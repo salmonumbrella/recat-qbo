@@ -1113,7 +1113,7 @@ export function createCompanyReadService(
       resource: 'rules',
       minimum: 'categorizer',
       model: db.rule,
-      where: {},
+      where: { enabled: true, retiredAt: null },
       orderField: 'priority',
       include: {
         ruleTags: { select: { tagId: true } },
