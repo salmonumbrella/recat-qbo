@@ -190,7 +190,11 @@ const INVALID_SALES_CODE_CASES: Array<[string, string, TaxReadinessDto]> = [
   }],
 ];
 
-function transaction(overrides: Partial<TransactionDto> = {}): TransactionDto {
+type ActionabilityTransactionOverrides = Partial<TransactionDto> & {
+  providerActionability?: unknown;
+};
+
+function transaction(overrides: ActionabilityTransactionOverrides = {}): TransactionDto {
   return {
     id: 'TRANSACTION_GENERIC',
     companyId: 'COMPANY_GENERIC',
@@ -215,8 +219,12 @@ function transaction(overrides: Partial<TransactionDto> = {}): TransactionDto {
     postedAt: null,
     postedBy: null,
     activeCategorizationAttempt: null,
+    // Existing queue fixtures represent provider-writable rows explicitly;
+    // the client compatibility helper treats an omitted observation as
+    // unknown/safety-required.
+    providerActionability: { disposition: 'WRITABLE' },
     ...overrides,
-  };
+  } as TransactionDto;
 }
 
 function deposit(overrides: Partial<TransactionDto> = {}): TransactionDto {
@@ -1402,7 +1410,12 @@ describe('tax-aware manual queue', () => {
   it('uses categorization undo for a reloaded posted Deposit when sales readiness is unavailable', async () => {
     mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
     const user = userEvent.setup();
-    await renderQueue(deposit({ status: 'POSTED', postedAt: '2026-07-28T00:00:00.000Z' }));
+    // Keep the fixture inside the server's 30-day undo window regardless of
+    // when this suite runs.
+    await renderQueue(deposit({
+      status: 'POSTED',
+      postedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    }));
 
     await user.click(screen.getByRole('button', { name: /^undo$/i }));
     await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalledWith(
@@ -1466,4 +1479,86 @@ describe('tax-aware manual queue', () => {
       expect(mocks.stage).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('provider actionability queue views', () => {
+  function providerRow(
+    id: string,
+    payee: string,
+    disposition: string | undefined,
+    reason?: string,
+    overrides: ActionabilityTransactionOverrides = {},
+  ): TransactionDto {
+    return transaction({
+      id,
+      payee,
+      ...overrides,
+      ...(disposition === undefined
+        ? { providerActionability: undefined }
+        : { providerActionability: { disposition, ...(reason ? { reason } : {}) } }),
+    });
+  }
+
+  it('defaults an omitted provider observation to Needs safety check, not the actionable queue', async () => {
+    const user = userEvent.setup();
+    await renderQueue([
+      providerRow('TXN_WRITABLE', 'Writable supplier', 'WRITABLE'),
+      providerRow('TXN_UNKNOWN', 'Unknown supplier', undefined),
+    ]);
+
+    expect(screen.getByTestId('queue-count-actionable')).toHaveTextContent('1');
+    expect(screen.getByTestId('queue-count-blocked')).toHaveTextContent('0');
+    expect(screen.getByTestId('queue-count-safety')).toHaveTextContent('1');
+    expect(screen.getByText('Writable supplier')).toBeInTheDocument();
+    expect(screen.queryByText('Unknown supplier')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: /Needs safety check 1/i }));
+    expect(screen.getByText('Unknown supplier')).toBeInTheDocument();
+    expect(screen.getByText('Needs safety check · Actionability unknown')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Expenses · Generic expense' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '+ tag' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Split' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
+    expect(screen.getAllByRole('checkbox').every((checkbox) => (checkbox as HTMLInputElement).disabled)).toBe(true);
+    expect(mocks.categorize).not.toHaveBeenCalled();
+    expect(mocks.stage).not.toHaveBeenCalled();
+    expect(mocks.commit).not.toHaveBeenCalled();
+    expect(mocks.legacyPost).not.toHaveBeenCalled();
+  });
+
+  it('keeps writable rows in Queue and gives blocked and safety rows separate counts', async () => {
+    await renderQueue([
+      providerRow('TXN_WRITABLE', 'Writable supplier', 'WRITABLE'),
+      providerRow('TXN_CLEARED', 'Cleared supplier', 'BLOCKED_CLEARED'),
+      providerRow('TXN_RECONCILED', 'Reconciled supplier', 'BLOCKED_RECONCILED'),
+      providerRow('TXN_CLOSED', 'Closed supplier', 'BLOCKED_PERIOD_CLOSED'),
+      providerRow('TXN_UNAVAILABLE', 'Unavailable supplier', 'UNAVAILABLE'),
+      providerRow('TXN_POSTED', 'Posted writable supplier', 'WRITABLE', undefined, { status: 'POSTED' }),
+    ]);
+
+    expect(screen.getByTestId('queue-count-actionable')).toHaveTextContent('1');
+    expect(screen.getByTestId('queue-count-blocked')).toHaveTextContent('3');
+    expect(screen.getByTestId('queue-count-safety')).toHaveTextContent('1');
+    expect(screen.getByText('Writable supplier')).toBeInTheDocument();
+    expect(screen.queryByText('Cleared supplier')).not.toBeInTheDocument();
+    expect(screen.getByText('Posted writable supplier')).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('tab', { name: /Blocked in QuickBooks 3/i }));
+    expect(screen.getByText('Cleared supplier')).toBeInTheDocument();
+    expect(screen.getByText('Reconciled supplier')).toBeInTheDocument();
+    expect(screen.getByText('Closed supplier')).toBeInTheDocument();
+    expect(screen.getByText('Blocked in QuickBooks · Cleared')).toBeInTheDocument();
+    expect(screen.getByText('Blocked in QuickBooks · Reconciled')).toBeInTheDocument();
+    expect(screen.getByText('Blocked in QuickBooks · Closed period')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /^post$/i }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    expect(screen.getAllByRole('checkbox').every((checkbox) => (checkbox as HTMLInputElement).disabled)).toBe(true);
+    expect(screen.getAllByRole('button', { name: '+ tag' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    expect(screen.getAllByRole('button', { name: 'Split' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+
+    await user.click(screen.getByRole('tab', { name: /Needs safety check 1/i }));
+    expect(screen.getByText('Unavailable supplier')).toBeInTheDocument();
+    expect(screen.getByText('Needs safety check · Unavailable')).toBeInTheDocument();
+  });
 });
