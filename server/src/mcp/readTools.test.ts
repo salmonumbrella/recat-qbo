@@ -207,7 +207,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly ten core reads and twenty conservatively annotated action tools', async () => {
+  it('registers exactly eleven core reads and twenty conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -238,7 +238,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(30);
+    expect(tools).toHaveLength(31);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,

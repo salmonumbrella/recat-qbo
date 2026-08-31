@@ -94,6 +94,41 @@ describe('write-safety reads', () => {
     });
   });
 
+  it('persists the exact read as a bounded actionability observation', async () => {
+    const persistActionability = vi.fn().mockResolvedValue(true);
+    const client = {
+      fetchTxn: vi.fn().mockResolvedValue(qbo()),
+      fetchWriteSafety: vi.fn().mockResolvedValue({
+        bookCloseDate: '2026-02-01',
+        cleared: false,
+        reconciled: false,
+      }),
+    } as unknown as QboClient;
+    const operations = createWriteSafetyReadOperations({
+      getTransaction: vi.fn().mockResolvedValue(recat),
+      qboForCompany: vi.fn().mockResolvedValue(client),
+      persistActionability,
+    });
+
+    await operations.getWriteSafety('user-a', 'company-a', 'transaction-a');
+
+    expect(persistActionability).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'transaction-a',
+      companyId: 'company-a',
+      revision: 3,
+      qboSyncToken: '7',
+      qboType: 'Purchase',
+      qboId: 'purchase-a',
+      date: '2026-01-02',
+      bankAccountQboId: 'bank-9',
+      evidence: {
+        bookCloseDate: '2026-02-01',
+        cleared: false,
+        reconciled: false,
+      },
+    }));
+  });
+
   it.each([
     [{ bookCloseDate: null, cleared: true, reconciled: false }, 'QBO_TRANSACTION_LOCKED'],
     [{ bookCloseDate: null, cleared: false, reconciled: true }, 'QBO_TRANSACTION_LOCKED'],

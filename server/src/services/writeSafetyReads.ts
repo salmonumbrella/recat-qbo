@@ -6,6 +6,10 @@ import {
   QboWriteSafetyError,
   type QboWriteSafetyTarget,
 } from '../lib/qbo/writeSafety.js';
+import {
+  persistProviderActionability,
+  type PersistProviderActionabilityInput,
+} from './providerActionability.js';
 
 export type QboWriteSafetyBlockCode =
   | 'QBO_PERIOD_CLOSED'
@@ -31,6 +35,7 @@ export interface WriteSafetyReadOperations {
     userId: string,
     companyId: string,
     transactionId: string,
+    options?: { persist?: boolean },
   ): Promise<WriteSafetyReadResult>;
 }
 
@@ -41,6 +46,8 @@ export interface WriteSafetyReadDeps {
     transactionId: string,
   ): Promise<CompanyReadTransactionDto>;
   qboForCompany(companyId: string): Promise<QboClient>;
+  /** Optional local index sink. It never writes to QuickBooks. */
+  persistActionability?(input: PersistProviderActionabilityInput): Promise<boolean>;
 }
 
 function unavailable(message?: string): never {
@@ -95,7 +102,12 @@ export function createWriteSafetyReadOperations(
   deps: WriteSafetyReadDeps,
 ): WriteSafetyReadOperations {
   return Object.freeze({
-    async getWriteSafety(userId: string, companyId: string, transactionId: string) {
+    async getWriteSafety(
+      userId: string,
+      companyId: string,
+      transactionId: string,
+      options: { persist?: boolean } = {},
+    ) {
       const recat = await deps.getTransaction(userId, companyId, transactionId);
       if (recat.qboType === 'JournalEntry') {
         return unavailable('QuickBooks write-safety preflight supports purchases and deposits only.');
@@ -121,7 +133,7 @@ export function createWriteSafetyReadOperations(
           throw error;
         }
       }
-      return {
+      const result: WriteSafetyReadResult = {
         transactionId: recat.id,
         revision: recat.revision,
         qboId: current.qboId,
@@ -135,6 +147,32 @@ export function createWriteSafetyReadOperations(
         writable: blockCode === null,
         blockCode,
       };
+      // A successful exact read is the only observation permitted to move a
+      // transaction out of UNKNOWN. Persistence is best-effort for this read
+      // surface: a local index outage must not hide the authoritative safety
+      // result, and the bounded refresh worker can retry it later.
+      try {
+        if (options.persist !== false) await deps.persistActionability?.({
+          id: result.transactionId,
+          companyId,
+          revision: result.revision,
+          qboSyncToken: result.qboSyncToken,
+          qboType: result.qboType,
+          qboId: result.qboId,
+          date: result.txnDate,
+          checkedAt: new Date(),
+          bankAccountQboId: result.bankAccountQboId,
+          evidence: {
+            bookCloseDate: result.bookCloseDate,
+            cleared: result.cleared,
+            reconciled: result.reconciled,
+          },
+        });
+      } catch {
+        // The read remains authoritative even if the local index is down;
+        // callers can retry through the bounded refresh path.
+      }
+      return result;
     },
   });
 }
@@ -145,4 +183,5 @@ export const writeSafetyReads = createWriteSafetyReadOperations({
     const { qboFactory } = await import('../lib/qbo/factory.js');
     return qboFactory.forCompany(companyId);
   },
+  persistActionability: persistProviderActionability,
 });

@@ -11,6 +11,7 @@ import { Prisma } from '@prisma/client';
 import type { User } from '@prisma/client';
 import {
   MAX_EXPECTED_TRANSACTION_REVISION,
+  type ProviderActionabilityDisposition,
   type CategorizationMutationResult,
   type CommitCategorizationBody,
   type ReconcileCategorizationBody,
@@ -28,11 +29,16 @@ import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/sugge
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import {
   filterTransactionDtos,
+  providerActionabilityWhere,
   sortTransactionRows,
   transactionDtos,
   transactionReadInclude,
   type TransactionReadRow,
 } from '../services/companyReads.js';
+import {
+  PROVIDER_ACTIONABILITY_DISPOSITIONS,
+} from '../services/providerActionability.js';
+import { refreshProviderActionability } from '../services/providerActionabilityRefresh.js';
 
 export { transactionDtos } from '../services/companyReads.js';
 import { stageCategorization } from '../services/categorization.js';
@@ -115,6 +121,7 @@ const txnStatusSchema = z.enum(['PENDING', 'POSTING', 'POSTED', 'DRY_RUN', 'ERRO
 
 const listQuery = z.object({
   status: txnStatusSchema.optional(),
+  providerDisposition: z.enum(PROVIDER_ACTIONABILITY_DISPOSITIONS as [ProviderActionabilityDisposition, ...ProviderActionabilityDisposition[]]).optional(),
   search: z.string().optional(),
   account: z.string().optional(),
   cursor: z.string().optional(),
@@ -122,6 +129,11 @@ const listQuery = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true' || v === '1'),
+});
+
+const actionabilityRefreshQuery = z.object({
+  cursor: z.string().min(1).max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(25).optional(),
 });
 
 export const companyTransactionsRouter = Router({ mergeParams: true });
@@ -133,20 +145,70 @@ companyTransactionsRouter.get(
     const company = req.company;
     if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
     const query = validate(listQuery)(req.query);
+    const supportsActionability = Boolean(
+      (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
+    );
 
-    // Queue badge: everything still waiting for a human (pending or errored).
-    const pendingCount = await prisma.transaction.count({
-      where: { companyId: company.id, status: { in: ['PENDING', 'ERROR'] } },
-    });
+    // Queue badge: only a fresh provider WRITABLE observation is actionable.
+    // The total remains useful to account for stale/unknown rows without
+    // conflating them with a local TxnStatus.
+    const pendingWhere: Prisma.TransactionWhereInput = {
+      companyId: company.id,
+      status: { in: ['PENDING', 'ERROR'] as TxnStatus[] },
+    };
+    const totalPending = await prisma.transaction.count({ where: pendingWhere });
+    const actionableCount = supportsActionability
+      ? await prisma.transaction.count({
+          where: {
+            ...pendingWhere,
+            providerActionability: { ...providerActionabilityWhere('WRITABLE') },
+          },
+        })
+      : totalPending;
+    const blockedCount = supportsActionability
+      ? await prisma.transaction.count({
+          where: {
+            ...pendingWhere,
+            providerActionability: {
+              is: {
+                disposition: {
+                  in: ['BLOCKED_CLEARED', 'BLOCKED_RECONCILED', 'BLOCKED_PERIOD_CLOSED'],
+                },
+              },
+            },
+          },
+        })
+      : 0;
+    const pendingCount = supportsActionability ? actionableCount : totalPending;
     if (query.countOnly) {
-      res.json({ transactions: [], nextCursor: null, pendingCount });
+      res.json({
+        transactions: [],
+        nextCursor: null,
+        pendingCount,
+        ...(supportsActionability
+          ? {
+              actionableCount,
+              blockedCount,
+              unknownCount: Math.max(0, totalPending - actionableCount - blockedCount),
+            }
+          : {}),
+      });
       return;
     }
 
     // The queue shows posted/dry-run/error rows too; only SUPERSEDED is hidden.
     // Prototype order: date ascending as entered.
+    const queueWhere: Record<string, unknown> = {
+      companyId: company.id,
+      status: { not: 'SUPERSEDED' },
+    };
+    if (supportsActionability) {
+      if (query.providerDisposition !== undefined) {
+        queueWhere.AND = [{ providerActionability: providerActionabilityWhere(query.providerDisposition) }];
+      }
+    }
     const rows = await prisma.transaction.findMany({
-      where: { companyId: company.id, status: { not: 'SUPERSEDED' } },
+      where: queueWhere,
       include: transactionReadInclude,
       orderBy: { date: 'asc' },
     });
@@ -162,8 +224,34 @@ companyTransactionsRouter.get(
     } else {
       dtos = filterTransactionDtos(dtos, query);
     }
+    res.json({
+      transactions: dtos,
+      nextCursor: null,
+      pendingCount,
+      ...(supportsActionability
+        ? {
+            actionableCount,
+            blockedCount,
+            unknownCount: Math.max(0, totalPending - actionableCount - blockedCount),
+          }
+        : {}),
+    });
+  }),
+);
 
-    res.json({ transactions: dtos, nextCursor: null, pendingCount });
+/**
+ * Refresh one bounded page of provider safety observations. This is a
+ * read-only QBO operation; callers resume with nextCursor until complete.
+ */
+companyTransactionsRouter.post(
+  '/actionability/refresh',
+  asyncHandler(async (req, res) => {
+    const company = req.company;
+    if (!company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
+    const user = requestUser(req);
+    const query = validate(actionabilityRefreshQuery)(req.query);
+    const result = await refreshProviderActionability(user.id, company.id, query);
+    res.json(result);
   }),
 );
 

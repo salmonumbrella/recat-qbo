@@ -1,0 +1,177 @@
+import { describe, expect, it } from 'vitest';
+import {
+  assertProviderActionabilityAllowsPrepare,
+  dispositionFromWriteSafety,
+  effectiveProviderDisposition,
+  isFreshProviderActionability,
+  persistProviderActionability,
+  providerActionabilityWhere,
+  type ProviderActionabilityDb,
+  type ProviderActionabilityObservation,
+} from './providerActionability.js';
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
+
+const TXN = {
+  id: 'txn-1',
+  companyId: 'company-1',
+  revision: 4,
+  qboSyncToken: '17',
+  qboType: 'Purchase',
+  qboId: 'qbo-1',
+  date: new Date('2026-08-01T00:00:00.000Z'),
+} as const;
+
+function evidence(overrides: Partial<{
+  bookCloseDate: string | null;
+  cleared: boolean;
+  reconciled: boolean;
+}> = {}) {
+  return {
+    bookCloseDate: null,
+    cleared: false,
+    reconciled: false,
+    ...overrides,
+  };
+}
+
+function observation(overrides: Partial<ProviderActionabilityObservation> = {}) {
+  return {
+    companyId: TXN.companyId,
+    transactionId: TXN.id,
+    disposition: 'WRITABLE' as const,
+    checkedAt: new Date('2026-08-30T18:00:00.000Z'),
+    revision: TXN.revision,
+    qboSyncToken: TXN.qboSyncToken,
+    qboType: TXN.qboType,
+    qboId: TXN.qboId,
+    txnDate: TXN.date,
+    bankAccountQboId: 'bank-1',
+    bookCloseDate: null,
+    cleared: false,
+    reconciled: false,
+    unavailableCode: null,
+    unavailableReason: null,
+    ...overrides,
+  };
+}
+
+describe('provider actionability', () => {
+  it('maps safety evidence by specificity and never changes local TxnStatus', () => {
+    expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence())).toBe('WRITABLE');
+    expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence({ cleared: true })))
+      .toBe('BLOCKED_CLEARED');
+    expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence({ reconciled: true })))
+      .toBe('BLOCKED_RECONCILED');
+    expect(dispositionFromWriteSafety(
+      { txnDate: '2026-08-01' },
+      evidence({ bookCloseDate: '2026-08-15', cleared: true, reconciled: true }),
+    )).toBe('BLOCKED_PERIOD_CLOSED');
+  });
+
+  it('fails closed when evidence is missing, stale, or bound to another mirror', () => {
+    const now = new Date('2026-08-30T18:15:00.000Z');
+    expect(effectiveProviderDisposition(null, TXN, now)).toBe('UNKNOWN');
+    expect(effectiveProviderDisposition(
+      observation({ checkedAt: new Date('2026-08-30T17:59:59.000Z') }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('UNKNOWN');
+    expect(isFreshProviderActionability(
+      observation({ qboSyncToken: '18' }),
+      TXN,
+      now,
+    )).toBe(false);
+    expect(isFreshProviderActionability(
+      observation({ checkedAt: now }),
+      TXN,
+      now,
+    )).toBe(true);
+  });
+
+  it('uses a fresh WRITABLE selector but does not treat a stale row as writable', () => {
+    const now = new Date('2026-08-30T18:15:00.000Z');
+    expect(providerActionabilityWhere('WRITABLE', now)).toEqual({
+      is: {
+        disposition: 'WRITABLE',
+        checkedAt: { gte: new Date('2026-08-30T18:00:00.000Z') },
+      },
+    });
+    expect(providerActionabilityWhere('BLOCKED_CLEARED', now)).toEqual({
+      is: {
+        disposition: 'BLOCKED_CLEARED',
+        checkedAt: { gte: new Date('2026-08-30T18:00:00.000Z') },
+      },
+    });
+  });
+
+  it('rejects known blocked or unknown prepare before any operation is created', () => {
+    const now = new Date('2026-08-30T18:00:00.000Z');
+    expect(() => assertProviderActionabilityAllowsPrepare(
+      observation({ disposition: 'BLOCKED_PERIOD_CLOSED' }),
+      TXN,
+      now,
+    )).toThrowError(new QboWriteSafetyError('QBO_PERIOD_CLOSED'));
+    expect(() => assertProviderActionabilityAllowsPrepare(
+      observation({ disposition: 'BLOCKED_CLEARED' }),
+      TXN,
+      now,
+    )).toThrowError(new QboWriteSafetyError('QBO_TRANSACTION_LOCKED'));
+    expect(() => assertProviderActionabilityAllowsPrepare(null, TXN, now))
+      .toThrowError(new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE'));
+  });
+
+  it('persists only when the transaction and actionability bindings still match (bounded CAS)', async () => {
+    let actionability: ProviderActionabilityObservation | null = null;
+    const updates: Array<Record<string, unknown>> = [];
+    const db: ProviderActionabilityDb = {
+      transaction: {
+        findFirst: async () => ({ ...TXN }),
+      },
+      transactionActionability: {
+        findUnique: async () => actionability,
+        findMany: async () => actionability ? [actionability] : [],
+        count: async () => actionability ? 1 : 0,
+        updateMany: async ({ where, data }) => {
+          updates.push({ where, data });
+          if (!actionability) return { count: 0 };
+          const exact = where.revision === actionability.revision
+            && where.qboSyncToken === actionability.qboSyncToken
+            && where.qboId === actionability.qboId;
+          if (exact) {
+            actionability = { ...actionability, ...(data as Partial<ProviderActionabilityObservation>) };
+            return { count: 1 };
+          }
+          return { count: 0 };
+        },
+        upsert: async () => {
+          throw new Error('upsert must not be used for an existing CAS row');
+        },
+        create: async ({ data }) => {
+          actionability = data as ProviderActionabilityObservation;
+          return actionability;
+        },
+      },
+    };
+
+    actionability = observation();
+    await expect(persistProviderActionability({
+      ...TXN,
+      checkedAt: new Date('2026-08-30T18:14:00.000Z'),
+      evidence: evidence({ cleared: true }),
+    }, db)).resolves.toBe(true);
+    expect(updates[0]?.where).toMatchObject({
+      transactionId: TXN.id,
+      companyId: TXN.companyId,
+      revision: TXN.revision,
+      qboSyncToken: TXN.qboSyncToken,
+      qboType: TXN.qboType,
+      qboId: TXN.qboId,
+    });
+    expect(actionability?.disposition).toBe('BLOCKED_CLEARED');
+
+    actionability = observation({ revision: TXN.revision + 1, qboSyncToken: '18' });
+    await expect(persistProviderActionability({ ...TXN, evidence: evidence() }, db)).resolves.toBe(false);
+    expect(actionability.disposition).toBe('WRITABLE');
+  });
+});

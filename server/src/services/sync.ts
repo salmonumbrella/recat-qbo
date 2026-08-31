@@ -21,6 +21,10 @@ import {
 } from './entityLease.js';
 import { refreshSuggestions } from './suggestions.js';
 import { postTransaction } from './writeback.js';
+import {
+  ensureUnknownProviderActionability,
+  providerActionabilityWhere,
+} from './providerActionability.js';
 
 export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
 
@@ -130,6 +134,32 @@ function isStaleProviderToken(
 ): boolean {
   const order = syncTokenOrder(incoming, current);
   return order === null || order < 0;
+}
+
+/** Keep the read-only provider index bound to the mirror after every sync
+ * write.  This is deliberately feature-detected so a rolling deployment can
+ * sync transactions before the new migration has reached its database. */
+async function syncProviderActionabilityBinding(
+  companyId: string,
+  qboType: string,
+  qboId: string,
+): Promise<void> {
+  const actionability = (prisma as unknown as { transactionActionability?: unknown }).transactionActionability;
+  if (!actionability) return;
+  const txn = await prisma.transaction.findUnique({
+    where: { companyId_qboType_qboId: { companyId, qboType, qboId } },
+    select: {
+      id: true,
+      companyId: true,
+      revision: true,
+      qboSyncToken: true,
+      qboType: true,
+      qboId: true,
+      date: true,
+    },
+  });
+  if (!txn) return;
+  await ensureUnknownProviderActionability(txn);
 }
 
 /** SUPERSEDED + audit, atomically. Lazy audit import (other agent's module). */
@@ -391,6 +421,10 @@ async function runSyncCompany(
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
+      // A changed SyncToken or local revision invalidates any cached safety
+      // evidence.  The helper uses the current mirror as the binding fence;
+      // it never calls QBO and never grants write authority.
+      await syncProviderActionabilityBinding(companyId, t.qboType, t.qboId);
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -429,8 +463,17 @@ async function runSyncCompany(
     // ---- 6. auto-post rules (respects dry-run via the write-back service) ----
     let autoPosted = 0;
     const autoPostFailures: string[] = [];
+    const hasActionabilityIndex = Boolean(
+      (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
+    );
     const pending = await prisma.transaction.findMany({
-      where: { companyId, status: 'PENDING' },
+      where: {
+        companyId,
+        status: 'PENDING',
+        ...(hasActionabilityIndex
+          ? { providerActionability: providerActionabilityWhere('WRITABLE') }
+          : {}),
+      },
       include: { txnTags: true, _count: { select: { splitLines: true } } },
     });
     const rules = await prisma.rule.findMany({ where: { companyId }, include: { ruleTags: true } });

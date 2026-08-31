@@ -35,6 +35,10 @@ import {
   writeSafetyReads,
   type WriteSafetyReadOperations,
 } from '../services/writeSafetyReads.js';
+import {
+  refreshProviderActionability,
+  type ProviderActionabilityRefreshResult,
+} from '../services/providerActionabilityRefresh.js';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
 import {
@@ -59,6 +63,7 @@ export const READ_TOOL_NAMES = [
   'list_transactions',
   'get_transaction',
   'get_write_safety',
+  'refresh_provider_actionability',
   'list_categories',
   'list_tax_codes',
   'list_tags',
@@ -105,6 +110,14 @@ export interface CompanyReadOperations {
   ): Promise<Page<TransferCandidateDto>>;
 }
 
+export interface ProviderActionabilityRefreshOperations {
+  refreshProviderActionability(
+    userId: string,
+    companyId: string,
+    options?: { cursor?: string | null; limit?: number },
+  ): Promise<ProviderActionabilityRefreshResult>;
+}
+
 export const companyReads: CompanyReadOperations = Object.freeze({
   listCompanies,
   listTransactions,
@@ -121,6 +134,7 @@ export interface RecatMcpContext {
   era: 'legacy' | 'modern';
   reads?: CompanyReadOperations;
   writeSafetyReads?: WriteSafetyReadOperations;
+  actionabilityRefresh?: ProviderActionabilityRefreshOperations;
   mutations?: McpMutationOperations;
   requestId?: string;
   traceId?: string;
@@ -133,6 +147,7 @@ const ID_MAX = 128;
 const CURSOR_MAX = 2_048;
 const SEARCH_MAX = 200;
 const ACCOUNT_MAX = 120;
+const ACTIONABILITY_CURSOR_MAX = 128;
 const annotations: ToolAnnotations = Object.freeze({
   readOnlyHint: true,
   destructiveHint: false,
@@ -171,6 +186,14 @@ const listTransactionsInput = z.strictObject({
     'ERROR',
     'SUPERSEDED',
     'REVERTED',
+  ]).optional(),
+  providerDisposition: z.enum([
+    'UNKNOWN',
+    'WRITABLE',
+    'BLOCKED_CLEARED',
+    'BLOCKED_RECONCILED',
+    'BLOCKED_PERIOD_CLOSED',
+    'UNAVAILABLE',
   ]).optional(),
   search: z.string().max(SEARCH_MAX).optional(),
   account: z.string().max(ACCOUNT_MAX).optional(),
@@ -264,6 +287,28 @@ const transaction = z.strictObject({
     operation: z.enum(['recategorize', 'restore']),
     status: z.enum(['PREPARED', 'COMMITTING', 'UNCERTAIN']),
   }).nullable(),
+  providerActionability: z.strictObject({
+    disposition: z.enum([
+      'UNKNOWN',
+      'WRITABLE',
+      'BLOCKED_CLEARED',
+      'BLOCKED_RECONCILED',
+      'BLOCKED_PERIOD_CLOSED',
+      'UNAVAILABLE',
+    ]),
+    checkedAt: nullableIsoDate,
+    revision: z.number().int().nonnegative(),
+    qboSyncToken: text,
+    qboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+    qboId: text,
+    txnDate: isoDate,
+    bankAccountQboId: nullableText,
+    bookCloseDate: nullableIsoDate,
+    cleared: z.boolean().nullable(),
+    reconciled: z.boolean().nullable(),
+    unavailableCode: nullableText,
+    unavailableReason: nullableText,
+  }).nullable().optional(),
   transferCandidateId: id.nullable().optional(),
 });
 const transactionRead = transaction.extend({
@@ -345,6 +390,9 @@ const transactionPageOutput = z.strictObject({
   items: z.array(transactionRead).max(MAX_READ_LIMIT),
   nextCursor: z.string().max(CURSOR_MAX).nullable(),
   pendingCount: z.number().int().nonnegative(),
+  actionableCount: z.number().int().nonnegative().optional(),
+  blockedCount: z.number().int().nonnegative().optional(),
+  unknownCount: z.number().int().nonnegative().optional(),
 });
 const taxPageOutput = z.strictObject({
   status: z.enum(['unsupported', 'needs_setup', 'ready']),
@@ -374,6 +422,34 @@ const writeSafetyOutput = z.strictObject({
     ]).nullable(),
   }),
 });
+const actionabilityRefreshInput = z.strictObject({
+  companyId: id,
+  cursor: z.string().min(1).max(ACTIONABILITY_CURSOR_MAX).nullable().optional(),
+  limit: z.number().int().min(1).max(25).default(10).optional(),
+});
+const actionabilityRefreshOutput = z.strictObject({
+  refresh: z.strictObject({
+    companyId: id,
+    processed: z.number().int().nonnegative().max(25),
+    persisted: z.number().int().nonnegative().max(25),
+    failed: z.number().int().nonnegative().max(25),
+    nextCursor: z.string().max(ACTIONABILITY_CURSOR_MAX).nullable(),
+    partial: z.boolean(),
+    complete: z.boolean(),
+    items: z.array(z.strictObject({
+      transactionId: id,
+      persisted: z.boolean(),
+      disposition: z.enum([
+        'WRITABLE',
+        'BLOCKED_CLEARED',
+        'BLOCKED_RECONCILED',
+        'BLOCKED_PERIOD_CLOSED',
+        'UNAVAILABLE',
+      ]),
+      errorCode: nullableText,
+    })).max(25),
+  }),
+});
 const identityOutput = z.strictObject({
   identity: z.strictObject({
     userId: id,
@@ -401,6 +477,7 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [listTransactionsInput, transactionPageOutput],
   [getTransactionInput, transactionOutput],
   [getTransactionInput, writeSafetyOutput],
+  [actionabilityRefreshInput, actionabilityRefreshOutput],
   [companyPageInput, categoryListOutput],
   [companyPageInput, taxPageOutput],
   [companyPageInput, tagListOutput],
@@ -429,6 +506,9 @@ function inputWithoutCompany<T extends { companyId: string }>(
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
   const safetyReads = context.writeSafetyReads ?? writeSafetyReads;
+  const actionabilityRefresh = context.actionabilityRefresh ?? {
+    refreshProviderActionability,
+  } satisfies ProviderActionabilityRefreshOperations;
   const mutations = context.mutations ?? mcpMutationOperations;
   const requestId = context.requestId ?? randomUUID();
   const traceContext = context.traceContext ?? (
@@ -549,6 +629,19 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
         context.principal.userId,
         input.companyId,
         input.transactionId,
+      ),
+    }),
+  );
+  register(
+    'refresh_provider_actionability',
+    'Read and persist one bounded page of current QuickBooks write-safety observations. Resume with nextCursor; this never mutates QuickBooks.',
+    actionabilityRefreshInput,
+    actionabilityRefreshOutput,
+    async (input) => ({
+      refresh: await actionabilityRefresh.refreshProviderActionability(
+        context.principal.userId,
+        input.companyId,
+        { cursor: input.cursor ?? null, limit: input.limit },
       ),
     }),
   );
