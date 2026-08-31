@@ -473,18 +473,30 @@ describePostgres('classification search on PostgreSQL', () => {
     const expected = [
       'classification_corpus_company_nickname',
       'classification_corpus_vendor_identity',
+      'classification_corpus_vendor_identity_update',
       'classification_corpus_vendor_alias',
+      'classification_corpus_vendor_alias_update',
       'classification_corpus_vendor_merge',
+      'classification_corpus_vendor_merge_update',
       'classification_corpus_case',
+      'classification_corpus_case_update',
       'classification_corpus_case_invalidation',
+      'classification_corpus_case_invalidation_update',
       'classification_corpus_rule',
+      'classification_corpus_rule_update',
       'classification_corpus_rule_revision',
+      'classification_corpus_rule_revision_update',
       'classification_corpus_rule_tag',
+      'classification_corpus_rule_tag_update',
       'classification_corpus_candidate',
+      'classification_corpus_candidate_update',
       'classification_corpus_candidate_evidence',
+      'classification_corpus_candidate_evidence_update',
       'classification_corpus_tag',
       'classification_corpus_account',
+      'classification_corpus_account_update',
       'classification_corpus_tax_code',
+      'classification_corpus_tax_code_update',
       'classification_corpus_transaction',
     ].sort();
     const triggers = await db.$queryRaw<Array<{ name: string; definition: string }>>`
@@ -501,27 +513,31 @@ describePostgres('classification search on PostgreSQL', () => {
         updateClause.split(',').map((column) => column.trim().replaceAll('"', '')).filter(Boolean),
       ];
     }));
-    expect(scopedColumns.get('classification_corpus_vendor_identity')).toEqual(
+    expect(scopedColumns.get('classification_corpus_vendor_identity_update')).toEqual(
       expect.arrayContaining(['id', 'companyId', 'displayName', 'normalizedName']),
     );
-    expect(scopedColumns.get('classification_corpus_vendor_alias')).toEqual(
+    expect(scopedColumns.get('classification_corpus_vendor_alias_update')).toEqual(
       expect.arrayContaining(['companyId', 'vendorIdentityId', 'value', 'normalizedValue', 'source']),
     );
-    expect(scopedColumns.get('classification_corpus_vendor_merge')).toEqual(
+    expect(scopedColumns.get('classification_corpus_vendor_merge_update')).toEqual(
       expect.arrayContaining(['companyId', 'sourceVendorIdentityId', 'targetVendorIdentityId']),
     );
     expect(scopedColumns.get('classification_corpus_tag')).toEqual(
       expect.arrayContaining(['companyId', 'name']),
     );
-    expect(scopedColumns.get('classification_corpus_account')).toEqual(
+    expect(scopedColumns.get('classification_corpus_account_update')).toEqual(
       expect.arrayContaining(['companyId', 'qboId', 'name', 'fullName']),
     );
-    expect(scopedColumns.get('classification_corpus_tax_code')).toEqual(
+    expect(scopedColumns.get('classification_corpus_tax_code_update')).toEqual(
       expect.arrayContaining(['companyId', 'qboId', 'name']),
     );
     expect(scopedColumns.get('classification_corpus_transaction')).toEqual(
       expect.arrayContaining(['companyId', 'payee', 'memo']),
     );
+    for (const trigger of triggers.filter((row) => row.definition.includes(' UPDATE '))) {
+      expect(trigger.definition, trigger.name).toContain('WHEN (');
+      expect(trigger.definition, trigger.name).toContain('IS DISTINCT FROM');
+    }
     const before = await db.classificationCorpusRevision.findFirstOrThrow({
       where: { companyId: owner.id }, orderBy: { revision: 'desc' },
     });
@@ -536,6 +552,68 @@ describePostgres('classification search on PostgreSQL', () => {
       where: { companyId: owner.id }, orderBy: { revision: 'desc' },
     });
     expect(after.revision).toBeGreaterThan(before.revision);
+  });
+
+  it('does not append revisions for idempotent assignments on mutable corpus sources', async () => {
+    const data = await fixtures();
+    const identity = await db.vendorIdentity.findFirstOrThrow({
+      where: { companyId: data.current.id },
+    });
+    const tag = await db.tag.create({
+      data: { companyId: data.current.id, name: 'Stable tag', color: '#123456' },
+    });
+    await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: tag.id } });
+    const account = await db.qboAccount.findFirstOrThrow({
+      where: { companyId: data.current.id },
+    });
+    const taxCode = await db.qboTaxCode.findFirstOrThrow({
+      where: { companyId: data.current.id },
+    });
+    const evidence = await db.autopilotRuleCandidateEvidence.create({
+      data: {
+        companyId: data.current.id,
+        candidateId: data.candidate.id,
+        transactionId: data.transaction.id,
+        inputRevision: 0,
+        requestId: `no-op-${randomUUID()}`,
+        source: 'verified_outcome',
+        actionFingerprint: 'f'.repeat(64),
+        pattern: { payee: 'Stable evidence' },
+      },
+    });
+    const revisionStats = () => db.classificationCorpusRevision.aggregate({
+      where: { companyId: data.current.id },
+      _count: { revision: true },
+      _max: { revision: true },
+    });
+    const before = await revisionStats();
+
+    await db.company.update({ where: { id: data.current.id }, data: { nickname: data.current.nickname } });
+    await db.vendorIdentity.update({
+      where: { id: identity.id }, data: { displayName: identity.displayName },
+    });
+    await db.rule.update({ where: { id: data.rule.id }, data: { matchText: data.rule.matchText } });
+    await db.autopilotRuleCandidate.update({
+      where: { id: data.candidate.id }, data: { matchText: data.candidate.matchText },
+    });
+    await db.$executeRaw`UPDATE "AutopilotRuleCandidateEvidence" SET "pattern" = "pattern" WHERE "id" = ${evidence.id}`;
+    await db.tag.update({ where: { id: tag.id }, data: { name: tag.name } });
+    await db.qboAccount.update({ where: { id: account.id }, data: { name: account.name } });
+    await db.qboTaxCode.update({ where: { id: taxCode.id }, data: { name: taxCode.name } });
+    await db.transaction.update({
+      where: { id: data.transaction.id }, data: { payee: data.transaction.payee },
+    });
+    await db.ruleTag.update({
+      where: { ruleId_tagId: { ruleId: data.rule.id, tagId: tag.id } },
+      data: { ruleId: data.rule.id },
+    });
+
+    expect(await revisionStats()).toEqual(before);
+
+    await db.$executeRaw`UPDATE "Transaction" SET "payee" = 'Changed corpus payee' WHERE "id" = ${data.transaction.id}`;
+    const afterRealChange = await revisionStats();
+    expect(afterRealChange._count.revision).toBe(before._count.revision + 1);
+    expect(afterRealChange._max.revision).toBeGreaterThan(before._max.revision);
   });
 
   it('invalidates both old and new rule owners on a cross-company RuleTag update', async () => {

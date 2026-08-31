@@ -220,6 +220,46 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
     })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
   }
 
+  it('keeps a succeeded generation healthy across idempotent QBO lookup syncs', async () => {
+    const owner = await company('Idempotent Lookup Sync Company');
+    const account = await db.qboAccount.create({
+      data: {
+        companyId: owner.id, qboId: 'stable-account', name: 'Stable account',
+        fullName: 'Expenses · Stable account', classification: 'Expense',
+      },
+    });
+    const taxCode = await db.qboTaxCode.create({
+      data: {
+        companyId: owner.id, qboId: 'stable-tax', name: 'Stable tax',
+        purchaseTaxRateList: [],
+      },
+    });
+    const store = new PgClassificationVectorStore(db);
+    await store.ensureAvailable();
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: 'idempotent-lookup-sync',
+    });
+    await publishEmptyGeneration(store, owner.id, generation);
+    const before = await latestRevision(owner.id);
+
+    await db.qboAccount.update({
+      where: { id: account.id },
+      data: { qboId: account.qboId, name: account.name, fullName: account.fullName },
+    });
+    await db.qboTaxCode.update({
+      where: { id: taxCode.id },
+      data: { qboId: taxCode.qboId, name: taxCode.name },
+    });
+
+    expect(await latestRevision(owner.id)).toBe(before);
+    await expect(store.health(owner.id, generation.fingerprint)).resolves.toMatchObject({
+      expectedState: 'succeeded',
+      backlog: 0,
+      currentCorpusRevision: before.toString(),
+      indexedCorpusRevision: before.toString(),
+    });
+  });
+
   it.each(ownerMoveScenarios)(
     '$name advances both owner revisions and invalidates active semantic indexes',
     async ({ name, arrange }) => {

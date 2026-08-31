@@ -82,44 +82,128 @@ EXECUTE FUNCTION classification_corpus_append_company_nickname();
 -- affect the bounded corpus. Database triggers cover every writer, including
 -- rolling or legacy application processes.
 CREATE TRIGGER classification_corpus_vendor_identity
-AFTER INSERT OR DELETE OR UPDATE OF "id", "companyId", "displayName", "normalizedName" ON "VendorIdentity"
+AFTER INSERT OR DELETE ON "VendorIdentity"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_vendor_identity_update
+AFTER UPDATE OF "id", "companyId", "displayName", "normalizedName" ON "VendorIdentity"
+FOR EACH ROW WHEN (
+  OLD."id" IS DISTINCT FROM NEW."id"
+  OR OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."displayName" IS DISTINCT FROM NEW."displayName"
+  OR OLD."normalizedName" IS DISTINCT FROM NEW."normalizedName"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_alias
-AFTER INSERT OR DELETE OR UPDATE OF "companyId", "vendorIdentityId", "value", "normalizedValue", "source" ON "VendorAlias"
+AFTER INSERT OR DELETE ON "VendorAlias"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_vendor_alias_update
+AFTER UPDATE OF "companyId", "vendorIdentityId", "value", "normalizedValue", "source" ON "VendorAlias"
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."vendorIdentityId" IS DISTINCT FROM NEW."vendorIdentityId"
+  OR OLD."value" IS DISTINCT FROM NEW."value"
+  OR OLD."normalizedValue" IS DISTINCT FROM NEW."normalizedValue"
+  OR OLD."source" IS DISTINCT FROM NEW."source"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_merge
-AFTER INSERT OR DELETE OR UPDATE OF "companyId", "sourceVendorIdentityId", "targetVendorIdentityId" ON "VendorIdentityMerge"
+AFTER INSERT OR DELETE ON "VendorIdentityMerge"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_vendor_merge_update
+AFTER UPDATE OF "companyId", "sourceVendorIdentityId", "targetVendorIdentityId" ON "VendorIdentityMerge"
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."sourceVendorIdentityId" IS DISTINCT FROM NEW."sourceVendorIdentityId"
+  OR OLD."targetVendorIdentityId" IS DISTINCT FROM NEW."targetVendorIdentityId"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_case
-AFTER INSERT OR UPDATE OR DELETE ON "ClassificationCase"
+AFTER INSERT OR DELETE ON "ClassificationCase"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_case_update
+AFTER UPDATE OF "id", "companyId", "transactionId", "vendorIdentityId", "action", "originIntent", "rationale", "requiredEvidence", "examples", "counterexamples", "citations", "reviewer", "jurisdiction", "currency", "context", "provenance", "transactionSnapshot", "verifiedAt" ON "ClassificationCase"
+FOR EACH ROW WHEN (
+  ROW(OLD."id", OLD."companyId", OLD."transactionId", OLD."vendorIdentityId", OLD."action", OLD."originIntent", OLD."rationale", OLD."requiredEvidence", OLD."examples", OLD."counterexamples", OLD."citations", OLD."reviewer", OLD."jurisdiction", OLD."currency", OLD."context", OLD."provenance", OLD."transactionSnapshot", OLD."verifiedAt")
+  IS DISTINCT FROM
+  ROW(NEW."id", NEW."companyId", NEW."transactionId", NEW."vendorIdentityId", NEW."action", NEW."originIntent", NEW."rationale", NEW."requiredEvidence", NEW."examples", NEW."counterexamples", NEW."citations", NEW."reviewer", NEW."jurisdiction", NEW."currency", NEW."context", NEW."provenance", NEW."transactionSnapshot", NEW."verifiedAt")
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_case_invalidation
-AFTER INSERT OR UPDATE OR DELETE ON "ClassificationCaseInvalidation"
+AFTER INSERT OR DELETE ON "ClassificationCaseInvalidation"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_case_invalidation_update
+AFTER UPDATE OF "companyId", "classificationCaseId" ON "ClassificationCaseInvalidation"
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."classificationCaseId" IS DISTINCT FROM NEW."classificationCaseId"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_rule
-AFTER INSERT OR UPDATE OR DELETE ON "Rule"
+AFTER INSERT OR DELETE ON "Rule"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_rule_update
+AFTER UPDATE OF "id", "companyId", "matchText", "category", "categoryQboId", "taxCalculation", "taxCode", "taxCodeQboId", "enabled", "revision", "originIntent", "retiredAt", "reviewRequiredAt", "reviewReason" ON "Rule"
+FOR EACH ROW WHEN (
+  ROW(OLD."id", OLD."companyId", OLD."matchText", OLD."category", OLD."categoryQboId", OLD."taxCalculation", OLD."taxCode", OLD."taxCodeQboId", OLD."enabled", OLD."revision", OLD."originIntent", OLD."retiredAt", OLD."reviewRequiredAt", OLD."reviewReason")
+  IS DISTINCT FROM
+  ROW(NEW."id", NEW."companyId", NEW."matchText", NEW."category", NEW."categoryQboId", NEW."taxCalculation", NEW."taxCode", NEW."taxCodeQboId", NEW."enabled", NEW."revision", NEW."originIntent", NEW."retiredAt", NEW."reviewRequiredAt", NEW."reviewReason")
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_rule_revision
-AFTER INSERT OR UPDATE OR DELETE ON "RuleRevision"
+AFTER INSERT OR DELETE ON "RuleRevision"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_rule_revision_update
+AFTER UPDATE ON "RuleRevision"
+FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
+EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_candidate
-AFTER INSERT OR UPDATE OR DELETE ON "AutopilotRuleCandidate"
+AFTER INSERT OR DELETE ON "AutopilotRuleCandidate"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_candidate_update
+AFTER UPDATE OF "id", "companyId", "matchText", "state", "categoryQboId", "taxCalculation", "taxCodeQboId", "tagIds", "evidenceCount", "conflictingEvidenceCount" ON "AutopilotRuleCandidate"
+FOR EACH ROW WHEN (
+  ROW(OLD."id", OLD."companyId", OLD."matchText", OLD."state", OLD."categoryQboId", OLD."taxCalculation", OLD."taxCodeQboId", OLD."tagIds", OLD."evidenceCount", OLD."conflictingEvidenceCount")
+  IS DISTINCT FROM
+  ROW(NEW."id", NEW."companyId", NEW."matchText", NEW."state", NEW."categoryQboId", NEW."taxCalculation", NEW."taxCodeQboId", NEW."tagIds", NEW."evidenceCount", NEW."conflictingEvidenceCount")
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_candidate_evidence
-AFTER INSERT OR UPDATE OR DELETE ON "AutopilotRuleCandidateEvidence"
+AFTER INSERT OR DELETE ON "AutopilotRuleCandidateEvidence"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_candidate_evidence_update
+AFTER UPDATE OF "id", "companyId", "candidateId", "transactionId", "pattern", "active", "observedAt" ON "AutopilotRuleCandidateEvidence"
+FOR EACH ROW WHEN (
+  ROW(OLD."id", OLD."companyId", OLD."candidateId", OLD."transactionId", OLD."pattern", OLD."active", OLD."observedAt")
+  IS DISTINCT FROM
+  ROW(NEW."id", NEW."companyId", NEW."candidateId", NEW."transactionId", NEW."pattern", NEW."active", NEW."observedAt")
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tag
 AFTER UPDATE OF "companyId", "name" ON "Tag"
-FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."name" IS DISTINCT FROM NEW."name"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_account
-AFTER INSERT OR DELETE OR UPDATE OF "companyId", "qboId", "name", "fullName" ON "QboAccount"
+AFTER INSERT OR DELETE ON "QboAccount"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_account_update
+AFTER UPDATE OF "companyId", "qboId", "name", "fullName" ON "QboAccount"
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."qboId" IS DISTINCT FROM NEW."qboId"
+  OR OLD."name" IS DISTINCT FROM NEW."name"
+  OR OLD."fullName" IS DISTINCT FROM NEW."fullName"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tax_code
-AFTER INSERT OR DELETE OR UPDATE OF "companyId", "qboId", "name" ON "QboTaxCode"
+AFTER INSERT OR DELETE ON "QboTaxCode"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_tax_code_update
+AFTER UPDATE OF "companyId", "qboId", "name" ON "QboTaxCode"
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."qboId" IS DISTINCT FROM NEW."qboId"
+  OR OLD."name" IS DISTINCT FROM NEW."name"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_transaction
 AFTER UPDATE OF "companyId", "payee", "memo" ON "Transaction"
-FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+FOR EACH ROW WHEN (
+  OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."payee" IS DISTINCT FROM NEW."payee"
+  OR OLD."memo" IS DISTINCT FROM NEW."memo"
+) EXECUTE FUNCTION classification_corpus_append_company_id();
 
 -- RuleTag has no companyId column. Resolve the owning rule; a cascade after
 -- rule deletion needs no second event because the Rule trigger already wrote
@@ -151,5 +235,11 @@ END;
 $$;
 
 CREATE TRIGGER classification_corpus_rule_tag
-AFTER INSERT OR UPDATE OR DELETE ON "RuleTag"
+AFTER INSERT OR DELETE ON "RuleTag"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_rule_tag();
+CREATE TRIGGER classification_corpus_rule_tag_update
+AFTER UPDATE OF "ruleId", "tagId" ON "RuleTag"
+FOR EACH ROW WHEN (
+  OLD."ruleId" IS DISTINCT FROM NEW."ruleId"
+  OR OLD."tagId" IS DISTINCT FROM NEW."tagId"
+) EXECUTE FUNCTION classification_corpus_append_rule_tag();
