@@ -289,7 +289,7 @@ describe('classification embedding reconciliation', () => {
     const result = await runClassificationEmbeddingTick({
       runtimeConfig: () => null,
       async listCompanyIds() { companyReads += 1; return ['company-a']; },
-      async documents() { return { documents: [], totalDocuments: 0, skippedDocuments: 0 }; },
+      async documents() { return { documents: [], totalDocuments: 0, skippedDocuments: 0, revision: '1' }; },
       createClient() { throw new Error('not called'); },
       createStore() { throw new Error('not called'); },
       reconcile: reconcileClassificationEmbeddings,
@@ -321,6 +321,7 @@ describe('classification embedding reconciliation', () => {
           documents: [document(`case-${companyId}`, companyId)],
           totalDocuments: 1,
           skippedDocuments: 0,
+          revision: '1',
         };
       },
       createClient() {
@@ -332,6 +333,7 @@ describe('classification embedding reconciliation', () => {
       createStore() {
         return {
           async ensureAvailable() { return { available: true, reason: null }; },
+          async beginAttempt() { return '1'; },
           async recordProgress() {},
           async publishGeneration() {},
           async recordFailure() {},
@@ -353,5 +355,75 @@ describe('classification embedding reconciliation', () => {
       failed: 1,
       unavailable: 0,
     });
+  });
+
+  it('marks the target corpus revision before scanning documents', async () => {
+    const events: string[] = [];
+    const result = await runClassificationEmbeddingTick({
+      runtimeConfig: () => ({
+        apiKey: 'synthetic-key', baseUrl: 'https://api.voyageai.com/v1',
+        timeoutMs: 1_000, batchSize: 2, fingerprintSalt: 'synthetic',
+      }),
+      async listCompanyIds() { return ['company-a']; },
+      async documents(_companyId, expectedRevision) {
+        events.push(`documents:${expectedRevision}`);
+        return { documents: [], totalDocuments: 0, skippedDocuments: 0, revision: '7' };
+      },
+      createClient() {
+        return {
+          async embedDocuments() { return []; },
+          async embedQuery() { return vector(0); },
+        };
+      },
+      createStore() {
+        return {
+          async ensureAvailable() { events.push('available'); return { available: true, reason: null }; },
+          async beginAttempt() { events.push('begin:7'); return '7'; },
+          async recordProgress() {},
+          async publishGeneration() {},
+          async recordFailure() {},
+        };
+      },
+      async reconcile(input) {
+        events.push(`reconcile:${input.targetRevision}`);
+        return { status: 'published', embedded: 0, skipped: 0, backlog: 0, error: null };
+      },
+    } as never);
+
+    expect(result.published).toBe(1);
+    expect(events).toEqual(['available', 'begin:7', 'documents:7', 'reconcile:7']);
+  });
+
+  it('records a failed attempt when the corpus revision changes during scanning', async () => {
+    const failures: unknown[] = [];
+    const result = await runClassificationEmbeddingTick({
+      runtimeConfig: () => ({
+        apiKey: 'synthetic-key', baseUrl: 'https://api.voyageai.com/v1',
+        timeoutMs: 1_000, batchSize: 2, fingerprintSalt: 'synthetic',
+      }),
+      async listCompanyIds() { return ['company-a']; },
+      async documents() { throw new Error('revision changed'); },
+      createClient() {
+        return {
+          async embedDocuments() { return []; },
+          async embedQuery() { return vector(0); },
+        };
+      },
+      createStore() {
+        return {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          async beginAttempt() { return '9'; },
+          async recordProgress() {},
+          async publishGeneration() {},
+          async recordFailure(input) { failures.push(input); },
+        };
+      },
+      reconcile: reconcileClassificationEmbeddings,
+    });
+
+    expect(result).toMatchObject({ processed: 1, failed: 1, published: 0 });
+    expect(failures).toEqual([expect.objectContaining({
+      companyId: 'company-a', targetRevision: '9', errorCode: 'semantic_error',
+    })]);
   });
 });

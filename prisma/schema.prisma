@@ -233,6 +233,19 @@ model Company {
   classificationCases         ClassificationCase[]
   classificationCaseInvalidations ClassificationCaseInvalidation[]
   ruleRevisions               RuleRevision[]
+  classificationCorpusRevisions ClassificationCorpusRevision[]
+}
+
+/// Append-only company-local freshness fence for the classification retrieval
+/// corpus. Database triggers append one event transactionally with every
+/// canonical write; the global sequence avoids a tenant-wide mutation lock.
+model ClassificationCorpusRevision {
+  revision BigInt   @id @default(autoincrement())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([companyId, revision(sort: Desc)])
 }
 
 model Transaction {

@@ -50,6 +50,11 @@ export interface ClassificationSearchRecord {
 }
 
 export interface ClassificationSearchRepository {
+  exact(
+    companyIds: readonly string[],
+    query: string,
+    limit: number,
+  ): Promise<ClassificationSearchRecord[]>;
   search(
     companyIds: readonly string[],
     query: string,
@@ -59,13 +64,14 @@ export interface ClassificationSearchRepository {
     companyIds: readonly string[],
     documentIds: readonly string[],
   ): Promise<ClassificationSearchRecord[]>;
-  documents(companyId: string): Promise<ClassificationSearchCorpus>;
+  documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus>;
 }
 
 export interface ClassificationSearchCorpus {
   documents: ClassificationSearchDocument[];
   totalDocuments: number;
   skippedDocuments: number;
+  revision: string;
 }
 
 export interface ClassificationSemanticSearch {
@@ -252,6 +258,8 @@ async function semanticLeg(
     || state.backlog !== 0
     || state.progress !== 1
     || state.lastError !== null
+    || state.currentCorpusRevision !== state.indexedCorpusRevision
+    || state.currentCorpusRevision !== state.expectedCorpusRevision
   ))) {
     throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'semantic_unavailable');
   }
@@ -326,7 +334,7 @@ export async function searchClassificationMemory(
 
   if (rawInput.mode === 'exact') {
     const records = await boundedRepositoryRead(() => (
-      repository.search(companyIds, query, fetchLimit)
+      repository.exact(companyIds, query, fetchLimit)
     ));
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'exact', mode: 'exact',
@@ -432,6 +440,37 @@ export async function searchClassificationMemory(
 export class PrismaClassificationSearchRepository implements ClassificationSearchRepository {
   constructor(private readonly db: PrismaClient = prisma) {}
 
+  async exact(
+    companyIds: readonly string[],
+    query: string,
+    limit: number,
+  ): Promise<ClassificationSearchRecord[]> {
+    const checkedCompanyIds = checkedCompanyList(companyIds);
+    const checkedQuery = checkedText(query, CLASSIFICATION_CONTRACT_LIMITS.query);
+    const boundedLimit = boundedFetchLimit(limit);
+    const [identities, aliases, rules] = await Promise.all([
+      this.identityRows(checkedCompanyIds, checkedQuery, null, boundedLimit, true),
+      this.aliasRows(checkedCompanyIds, checkedQuery, null, boundedLimit, true),
+      this.ruleRows(checkedCompanyIds, checkedQuery, null, boundedLimit, true),
+    ]);
+    return [
+      ...identities.map(identityRecord),
+      ...aliases.map(aliasRecord),
+      ...rules.map(ruleRecord),
+    ].flatMap((factory) => {
+      try {
+        const record = factory();
+        record.exactReasons = record.hit.kind === 'rule' ? ['rule'] : ['alias'];
+        return [record];
+      } catch {
+        return [];
+      }
+    }).sort((left, right) => (
+      Date.parse(right.revisedAt) - Date.parse(left.revisedAt)
+      || left.hit.id.localeCompare(right.hit.id)
+    ));
+  }
+
   async search(
     companyIds: readonly string[],
     query: string,
@@ -455,17 +494,23 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     return this.load(checkedCompanyIds, null, checkedIds, checkedIds.length);
   }
 
-  async documents(companyId: string): Promise<ClassificationSearchCorpus> {
+  async documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus> {
     const checkedCompanyId = checkedText(companyId, CLASSIFICATION_CONTRACT_LIMITS.identifier);
+    const revision = expectedRevision === undefined
+      ? await this.corpusRevision(checkedCompanyId)
+      : checkedCorpusRevision(expectedRevision);
+    await this.assertCorpusRevision(checkedCompanyId, revision);
     const documents: ClassificationSearchDocument[] = [];
     let totalDocuments = 0;
     let skippedDocuments = 0;
     let afterDocumentId: string | null = null;
     for (;;) {
       const ids = await this.documentIdsPage(checkedCompanyId, afterDocumentId, MAX_FETCH);
+      await this.assertCorpusRevision(checkedCompanyId, revision);
       if (ids.length === 0) break;
       totalDocuments += ids.length;
       const records = await this.rehydrate([checkedCompanyId], ids);
+      await this.assertCorpusRevision(checkedCompanyId, revision);
       const recordsById = new Map(records.map((record) => [record.hit.id, record]));
       for (const id of ids) {
         const document = recordsById.get(id)?.document;
@@ -475,7 +520,25 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       afterDocumentId = ids.at(-1) ?? null;
       if (ids.length < MAX_FETCH) break;
     }
-    return { documents, totalDocuments, skippedDocuments };
+    await this.assertCorpusRevision(checkedCompanyId, revision);
+    return { documents, totalDocuments, skippedDocuments, revision };
+  }
+
+  private async corpusRevision(companyId: string): Promise<string> {
+    const rows = await this.db.$queryRaw<Array<{ revision: bigint }>>(Prisma.sql`
+      SELECT "revision" FROM "ClassificationCorpusRevision"
+      WHERE "companyId" = ${companyId}
+      ORDER BY "revision" DESC
+      LIMIT 1
+    `);
+    if (rows.length !== 1) throw new ClassificationSearchError('COMPANY_UNAVAILABLE');
+    return rows[0]!.revision.toString();
+  }
+
+  private async assertCorpusRevision(companyId: string, expectedRevision: string): Promise<void> {
+    if (await this.corpusRevision(companyId) !== expectedRevision) {
+      throw new ClassificationSearchError('COMPANY_UNAVAILABLE');
+    }
   }
 
   private async documentIdsPage(
@@ -579,11 +642,14 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string | null,
     ids: readonly string[] | null,
     limit: number,
+    exactOnly = false,
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as VendorIdentitySearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND identity."id" IN (${Prisma.join(ids)})`;
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
-    const queryFilter = query === null ? Prisma.empty : Prisma.sql`
+    const queryFilter = query === null ? Prisma.empty : exactOnly ? Prisma.sql`
+      AND identity."normalizedName" = ${exactKey}
+    ` : Prisma.sql`
       AND (
         identity."normalizedName" = ${exactKey}
         OR to_tsvector('simple', concat_ws(' ', identity."displayName", aliases."values"))
@@ -623,11 +689,14 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string | null,
     ids: readonly string[] | null,
     limit: number,
+    exactOnly = false,
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as VendorAliasSearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND alias."id" IN (${Prisma.join(ids)})`;
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
-    const queryFilter = query === null ? Prisma.empty : Prisma.sql`
+    const queryFilter = query === null ? Prisma.empty : exactOnly ? Prisma.sql`
+      AND alias."normalizedValue" = ${exactKey}
+    ` : Prisma.sql`
       AND (
         alias."normalizedValue" = ${exactKey}
         OR to_tsvector('simple', concat_ws(' ', alias."value", identity."displayName"))
@@ -726,13 +795,16 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string | null,
     ids: readonly string[] | null,
     limit: number,
+    exactOnly = false,
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as RuleSearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND rule."id" IN (${Prisma.join(ids)})`;
     const text = Prisma.sql`concat_ws(' ', rule."matchText", rule."category", account."fullName",
       rule."taxCode", tax."name", tags."names", rule."reviewReason")`;
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
-    const queryFilter = query === null ? Prisma.empty : Prisma.sql`
+    const queryFilter = query === null ? Prisma.empty : exactOnly ? Prisma.sql`
+      AND normalize(lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
+    ` : Prisma.sql`
       AND (
         normalize(lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
         OR to_tsvector('simple', ${text}) @@ plainto_tsquery('simple', ${query})
@@ -913,6 +985,13 @@ type CandidateSearchRow = BaseSearchRow & {
 function boundedFetchLimit(limit: number): number {
   if (!Number.isFinite(limit)) throw new ClassificationSearchError('INVALID_INPUT');
   return Math.max(1, Math.min(MAX_FETCH, Math.trunc(limit)));
+}
+
+function checkedCorpusRevision(value: string): string {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,18})$/u.test(value)) {
+    throw new ClassificationSearchError('INVALID_INPUT');
+  }
+  return value;
 }
 
 function checkedCompanyList(companyIds: readonly string[]): string[] {

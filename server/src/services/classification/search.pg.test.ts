@@ -428,6 +428,88 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(corpus.documents).toHaveLength(10_001);
   }, 20_000);
 
+  it('rejects a corpus scan when a canonical write lands between keyset pages', async () => {
+    const owner = await company('Changing Corpus');
+    await db.vendorIdentity.createMany({
+      data: Array.from({ length: 501 }, (_unused, index) => ({
+        companyId: owner.id,
+        displayName: `Changing Vendor ${String(index).padStart(3, '0')}`,
+        normalizedName: `changing vendor ${String(index).padStart(3, '0')}`,
+      })),
+    });
+    let documentPageQueries = 0;
+    const intercepted = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === '$queryRaw') {
+          return async (query: { strings?: readonly string[] }) => {
+            const rows = await target.$queryRaw(query as never);
+            if (
+              query.strings?.join(' ').includes('canonical_documents')
+              && ++documentPageQueries === 1
+            ) {
+              await db.vendorIdentity.create({
+                data: {
+                  companyId: owner.id,
+                  displayName: 'Concurrent Page Write',
+                  normalizedName: 'concurrent page write',
+                },
+              });
+            }
+            return rows;
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    await expect(new PrismaClassificationSearchRepository(intercepted).documents(owner.id))
+      .rejects.toMatchObject({ code: 'COMPANY_UNAVAILABLE' });
+    expect(documentPageQueries).toBe(1);
+  });
+
+  it('installs transactional revision triggers for every corpus source and joined dependency', async () => {
+    const owner = await company('Corpus Trigger Coverage');
+    const expected = [
+      'classification_corpus_company_nickname',
+      'classification_corpus_vendor_identity',
+      'classification_corpus_vendor_alias',
+      'classification_corpus_vendor_merge',
+      'classification_corpus_case',
+      'classification_corpus_case_invalidation',
+      'classification_corpus_rule',
+      'classification_corpus_rule_revision',
+      'classification_corpus_rule_tag',
+      'classification_corpus_candidate',
+      'classification_corpus_candidate_evidence',
+      'classification_corpus_tag',
+      'classification_corpus_account',
+      'classification_corpus_tax_code',
+      'classification_corpus_transaction',
+    ].sort();
+    const triggers = await db.$queryRaw<Array<{ name: string }>>`
+      SELECT tgname AS name FROM pg_trigger
+      WHERE NOT tgisinternal AND tgname LIKE 'classification_corpus_%'
+      ORDER BY tgname ASC
+    `;
+    expect(triggers.map((row) => row.name).filter((name) => name !== 'classification_corpus_company_insert'))
+      .toEqual(expected);
+    const before = await db.classificationCorpusRevision.findFirstOrThrow({
+      where: { companyId: owner.id }, orderBy: { revision: 'desc' },
+    });
+    await db.vendorIdentity.create({
+      data: {
+        companyId: owner.id,
+        displayName: 'Trigger Mutation',
+        normalizedName: 'trigger mutation',
+      },
+    });
+    const after = await db.classificationCorpusRevision.findFirstOrThrow({
+      where: { companyId: owner.id }, orderBy: { revision: 'desc' },
+    });
+    expect(after.revision).toBeGreaterThan(before.revision);
+  });
+
   it('bounds oversized candidate evidence without dropping the lexical hit', async () => {
     const data = await fixtures();
     await db.autopilotRuleCandidateEvidence.create({
@@ -449,5 +531,43 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(records.map((record) => record.hit.id)).toContain(`rule_candidate:${data.candidate.id}`);
     expect(records.find((record) => record.hit.id === `rule_candidate:${data.candidate.id}`)?.document)
       .toBeDefined();
+  });
+
+  it('retains exact aliases and active rules under saturated higher-score lexical noise', async () => {
+    const data = await fixtures();
+    await db.autopilotRuleCandidate.createMany({
+      data: Array.from({ length: 60 }, (_unused, index) => ({
+        companyId: data.current.id,
+        conditionFingerprint: index.toString(16).padStart(64, '0'),
+        schemaVersion: 'v2',
+        configVersion: 'saturation',
+        matchText: 'COACH Calgary Chinook COACH Calgary Chinook COACH Calgary Chinook',
+        state: 'ready',
+      })),
+    });
+    const exactRule = await db.rule.create({
+      data: {
+        companyId: data.current.id,
+        matchText: 'COACH Calgary Chinook',
+        category: 'Inventory purchases',
+      },
+    });
+
+    const result = await searchClassificationMemory({
+      query: 'COACH Calgary Chinook',
+      companyId: data.current.id,
+      scope: 'current_company',
+      mode: 'exact',
+      limit: 20,
+      accessibleCompanyIds: [data.current.id],
+    }, { repository: new PrismaClassificationSearchRepository(db), semantic: null });
+
+    expect(result.hits.map((candidate) => candidate.id)).toEqual(expect.arrayContaining([
+      `vendor_alias:${data.alias.id}`,
+      `rule:${exactRule.id}`,
+    ]));
+    expect(result.hits.every((candidate) => (
+      candidate.matchedIn.includes('alias') || candidate.matchedIn.includes('rule')
+    ))).toBe(true);
   });
 });

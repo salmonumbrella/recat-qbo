@@ -30,6 +30,10 @@ export interface ClassificationSemanticHealth {
   latestAttemptState: string | null;
   latestAttemptAt: string | null;
   latestAttemptError: string | null;
+  currentCorpusRevision: string | null;
+  indexedCorpusRevision: string | null;
+  expectedCorpusRevision: string | null;
+  latestAttemptCorpusRevision: string | null;
 }
 
 type HealthVectorStore = Pick<PgClassificationVectorStore, 'ensureAvailable' | 'health'>;
@@ -48,6 +52,10 @@ const EMPTY_STATE: VectorGenerationHealth = {
   latestAttemptState: null,
   latestAttemptAt: null,
   latestAttemptError: null,
+  currentCorpusRevision: null,
+  indexedCorpusRevision: null,
+  expectedCorpusRevision: null,
+  latestAttemptCorpusRevision: null,
 };
 
 export async function classificationSemanticHealth(
@@ -113,5 +121,9 @@ export async function classificationSemanticHealth(
     latestAttemptState: state.latestAttemptState,
     latestAttemptAt: state.latestAttemptAt,
     latestAttemptError: state.latestAttemptError,
+    currentCorpusRevision: state.currentCorpusRevision,
+    indexedCorpusRevision: state.indexedCorpusRevision,
+    expectedCorpusRevision: state.expectedCorpusRevision,
+    latestAttemptCorpusRevision: state.latestAttemptCorpusRevision,
   };
 }

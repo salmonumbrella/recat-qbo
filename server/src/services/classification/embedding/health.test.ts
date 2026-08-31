@@ -38,6 +38,10 @@ describe('classification semantic health', () => {
       latestAttemptState: null,
       latestAttemptAt: null,
       latestAttemptError: null,
+      currentCorpusRevision: null,
+      indexedCorpusRevision: null,
+      expectedCorpusRevision: null,
+      latestAttemptCorpusRevision: null,
     });
     expect(vectorCalls).toBe(0);
   });
@@ -77,6 +81,10 @@ describe('classification semantic health', () => {
             latestAttemptState: 'succeeded',
             latestAttemptAt: '2026-08-31T00:00:00.000Z',
             latestAttemptError: null,
+            currentCorpusRevision: '8',
+            indexedCorpusRevision: '8',
+            expectedCorpusRevision: '8',
+            latestAttemptCorpusRevision: '8',
           };
         },
       },

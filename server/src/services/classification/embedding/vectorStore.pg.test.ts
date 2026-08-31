@@ -82,6 +82,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       fingerprintSalt: 'new-synthetic-generation',
     });
     await store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: first.id, fingerprint: oldGeneration.fingerprint }),
       companyId: first.id,
       generation: oldGeneration,
       totalDocuments: 1,
@@ -98,6 +99,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       }],
     });
     await store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: second.id, fingerprint: newGeneration.fingerprint }),
       companyId: second.id,
       generation: newGeneration,
       totalDocuments: 1,
@@ -114,6 +116,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       }],
     });
     await store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: first.id, fingerprint: newGeneration.fingerprint }),
       companyId: first.id,
       generation: newGeneration,
       totalDocuments: 1,
@@ -136,7 +139,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       embedding: vector(0),
       cosineFloor: 0.8,
       limit: 10,
-    })).resolves.toEqual([]);
+    })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
     const current = await store.search({
       companyIds: [first.id],
       fingerprint: newGeneration.fingerprint,
@@ -173,6 +176,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       fingerprintSalt: 'replacement-synthetic-generation',
     });
     await store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: owner.id, fingerprint: active.fingerprint }),
       companyId: owner.id,
       generation: active,
       totalDocuments: 1,
@@ -189,6 +193,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       }],
     });
     await expect(store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: owner.id, fingerprint: replacement.fingerprint }),
       companyId: owner.id,
       generation: replacement,
       totalDocuments: 1,
@@ -205,6 +210,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       }],
     })).rejects.toMatchObject({ code: 'INVALID_VECTOR' });
     await expect(store.publishGeneration({
+      targetRevision: await store.beginAttempt({ companyId: owner.id, fingerprint: replacement.fingerprint }),
       companyId: owner.id,
       generation: replacement,
       totalDocuments: 2,
@@ -251,7 +257,9 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       contentHash: String(seed).repeat(64).slice(0, 64),
       embedding: vector(seed),
     });
+    let targetRevision = await store.beginAttempt({ companyId: owner.id, fingerprint: active.fingerprint });
     await store.publishGeneration({
+      targetRevision,
       companyId: owner.id, generation: active, chunks: [chunk('active', 2)],
       totalDocuments: 1, skippedDocuments: 0,
     });
@@ -261,6 +269,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       totalDocuments: 2,
       embeddedDocuments: 1,
       skippedDocuments: 0,
+      targetRevision,
     });
     await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
       activeGeneration: active.fingerprint,
@@ -268,11 +277,15 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       backlog: 1,
       progress: 0.5,
     });
+    targetRevision = await store.beginAttempt({ companyId: owner.id, fingerprint: interim.fingerprint });
     await store.publishGeneration({
+      targetRevision,
       companyId: owner.id, generation: interim, chunks: [chunk('interim', 3)],
       totalDocuments: 1, skippedDocuments: 0,
     });
+    targetRevision = await store.beginAttempt({ companyId: owner.id, fingerprint: active.fingerprint });
     await store.publishGeneration({
+      targetRevision,
       companyId: owner.id, generation: active, chunks: [chunk('active', 2)],
       totalDocuments: 1, skippedDocuments: 0,
     });
@@ -283,6 +296,7 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       embeddedDocuments: 0,
       skippedDocuments: 0,
       errorCode: 'semantic_error',
+      targetRevision: await store.beginAttempt({ companyId: owner.id, fingerprint: failed.fingerprint }),
     });
 
     await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
@@ -295,6 +309,113 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       latestAttemptGeneration: failed.fingerprint,
       latestAttemptState: 'failed',
       latestAttemptError: 'semantic_error',
+    });
+  });
+
+  it('invalidates same-generation vectors immediately and fences stale publish before a clean retry', async () => {
+    const owner = await company('Vector Revision Fence Company');
+    const store = new PgClassificationVectorStore(db);
+    await store.ensureAvailable();
+    const active = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1',
+      fingerprintSalt: 'same-generation-revision-fence',
+    });
+    let targetRevision = await store.beginAttempt({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+    });
+    await store.publishGeneration({
+      companyId: owner.id,
+      generation: active,
+      chunks: [],
+      totalDocuments: 0,
+      skippedDocuments: 0,
+      targetRevision,
+    });
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
+      currentCorpusRevision: targetRevision,
+      indexedCorpusRevision: targetRevision,
+      expectedCorpusRevision: targetRevision,
+      expectedState: 'succeeded',
+    });
+    await expect(store.search({
+      companyIds: [owner.id], fingerprint: active.fingerprint,
+      embedding: vector(0), cosineFloor: 0.8, limit: 10,
+    })).resolves.toEqual([]);
+
+    await db.vendorIdentity.create({
+      data: {
+        companyId: owner.id,
+        displayName: 'Write Between Ticks',
+        normalizedName: 'write between ticks',
+      },
+    });
+    const stale = await store.health(owner.id, active.fingerprint);
+    expect(stale.currentCorpusRevision).not.toBe(stale.indexedCorpusRevision);
+    await expect(store.search({
+      companyIds: [owner.id], fingerprint: active.fingerprint,
+      embedding: vector(0), cosineFloor: 0.8, limit: 10,
+    })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
+
+    targetRevision = await store.beginAttempt({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+    });
+    await store.recordProgress({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+      totalDocuments: 0,
+      embeddedDocuments: 0,
+      skippedDocuments: 0,
+      targetRevision,
+    });
+    await db.vendorIdentity.create({
+      data: {
+        companyId: owner.id,
+        displayName: 'Write Before Publish',
+        normalizedName: 'write before publish',
+      },
+    });
+    await expect(store.publishGeneration({
+      companyId: owner.id,
+      generation: active,
+      chunks: [],
+      totalDocuments: 0,
+      skippedDocuments: 0,
+      targetRevision,
+    })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
+    await store.recordFailure({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+      totalDocuments: 0,
+      embeddedDocuments: 0,
+      skippedDocuments: 0,
+      errorCode: 'semantic_error',
+      targetRevision,
+    });
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
+      expectedState: 'failed',
+      latestAttemptCorpusRevision: targetRevision,
+    });
+
+    const retryRevision = await store.beginAttempt({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+    });
+    await store.publishGeneration({
+      companyId: owner.id,
+      generation: active,
+      chunks: [],
+      totalDocuments: 0,
+      skippedDocuments: 0,
+      targetRevision: retryRevision,
+    });
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
+      currentCorpusRevision: retryRevision,
+      indexedCorpusRevision: retryRevision,
+      expectedCorpusRevision: retryRevision,
+      expectedState: 'succeeded',
+      lastError: null,
     });
   });
 });

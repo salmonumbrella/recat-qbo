@@ -42,7 +42,7 @@ export interface ClassificationEmbeddingTickResult {
 export interface ClassificationEmbeddingTickDependencies {
   runtimeConfig: () => ClassificationEmbeddingRuntimeConfig | null;
   listCompanyIds: () => Promise<readonly string[]>;
-  documents: (companyId: string) => Promise<ClassificationSearchCorpus>;
+  documents: (companyId: string, expectedRevision?: string) => Promise<ClassificationSearchCorpus>;
   createClient: (config: ClassificationEmbeddingRuntimeConfig) => VoyageEmbeddingClient;
   createStore: () => ClassificationEmbeddingStore;
   reconcile: typeof reconcileClassificationEmbeddings;
@@ -76,7 +76,9 @@ export async function reconcileClassificationEmbeddings(input: {
   generation: ClassificationEmbeddingGeneration;
   client: VoyageEmbeddingClient;
   store: ClassificationEmbeddingStore;
+  targetRevision?: string;
 }): Promise<ClassificationEmbeddingReconcileResult> {
+  const targetRevision = input.targetRevision ?? '0';
   const totalDocuments = input.totalDocuments ?? input.documents.length;
   const skippedDocuments = input.skippedDocuments ?? 0;
   if (
@@ -90,6 +92,7 @@ export async function reconcileClassificationEmbeddings(input: {
       embeddedDocuments: 0,
       skippedDocuments: 0,
       errorCode: 'semantic_error',
+      targetRevision,
     }).catch(() => undefined);
     return {
       status: 'failed',
@@ -192,6 +195,7 @@ export async function reconcileClassificationEmbeddings(input: {
       totalDocuments,
       embeddedDocuments: embeddedDocumentCount(),
       skippedDocuments,
+      targetRevision,
     });
     for (let offset = 0; offset < changed.length; offset += PROVIDER_CALL_INPUT_LIMIT) {
       const batch = changed.slice(offset, offset + PROVIDER_CALL_INPUT_LIMIT);
@@ -217,6 +221,7 @@ export async function reconcileClassificationEmbeddings(input: {
         totalDocuments,
         embeddedDocuments: embeddedDocumentCount(),
         skippedDocuments,
+        targetRevision,
       });
     }
     await input.store.publishGeneration({
@@ -225,6 +230,7 @@ export async function reconcileClassificationEmbeddings(input: {
       chunks: stored,
       totalDocuments,
       skippedDocuments,
+      targetRevision,
     });
     return {
       status: 'published',
@@ -241,6 +247,7 @@ export async function reconcileClassificationEmbeddings(input: {
       embeddedDocuments: embeddedDocumentCount(),
       skippedDocuments,
       errorCode: 'semantic_error',
+      targetRevision,
     }).catch(() => undefined);
     return {
       status: 'failed',
@@ -295,8 +302,25 @@ export async function runClassificationEmbeddingTick(
   };
   for (const companyId of companyIds) {
     result.processed += 1;
+    let targetRevision: string | null = null;
     try {
-      const corpus = await dependencies.documents(companyId);
+      const capability = await store.ensureAvailable();
+      if (!capability.available) {
+        result.unavailable += 1;
+        continue;
+      }
+      if (store.beginAttempt === undefined) {
+        result.failed += 1;
+        continue;
+      }
+      targetRevision = await store.beginAttempt({
+        companyId,
+        fingerprint: generation.fingerprint,
+      });
+      const corpus = await dependencies.documents(companyId, targetRevision);
+      if (corpus.revision !== targetRevision) {
+        throw new Error('classification-corpus-revision-changed');
+      }
       const outcome = await dependencies.reconcile({
         companyId,
         documents: corpus.documents,
@@ -305,11 +329,23 @@ export async function runClassificationEmbeddingTick(
         generation,
         client,
         store,
+        targetRevision,
       });
       if (outcome.status === 'published') result.published += 1;
       else if (outcome.status === 'unavailable') result.unavailable += 1;
       else result.failed += 1;
     } catch {
+      if (targetRevision !== null) {
+        await store.recordFailure({
+          companyId,
+          fingerprint: generation.fingerprint,
+          totalDocuments: 0,
+          embeddedDocuments: 0,
+          skippedDocuments: 0,
+          errorCode: 'semantic_error',
+          targetRevision,
+        }).catch(() => undefined);
+      }
       result.failed += 1;
     }
   }
