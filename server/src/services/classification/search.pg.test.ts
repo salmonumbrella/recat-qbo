@@ -256,6 +256,30 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(lexical.hits.map((candidate) => candidate.id))
       .toContain(`classification_case:${data.classificationCase.id}`);
 
+    const matchingContext = await searchClassificationMemory({
+      query: 'Ontario thirteen percent inventory', companyId: data.current.id,
+      scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [data.current.id],
+      context: {
+        transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: 'Synthetic Bank',
+        currency: 'CAD', transactionPeriod: '2026-06', jurisdiction: 'CA-ON',
+        taxCalculation: 'TaxExcluded',
+      },
+    }, { repository, semantic: null });
+    expect(matchingContext.hits.map((candidate) => candidate.id))
+      .toContain(`classification_case:${data.classificationCase.id}`);
+
+    const mismatchingContext = await searchClassificationMemory({
+      query: 'Ontario thirteen percent inventory', companyId: data.current.id,
+      scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [data.current.id],
+      context: {
+        transactionDirection: 'in', qboType: 'Deposit', sourceAccountName: 'Savings',
+        currency: 'USD', transactionPeriod: '2025-01', jurisdiction: 'US-CA',
+        taxCalculation: 'NotApplicable',
+      },
+    }, { repository, semantic: null });
+    expect(mismatchingContext.hits.map((candidate) => candidate.id))
+      .not.toContain(`classification_case:${data.classificationCase.id}`);
+
     const activeOnly = await repository.search(
       [data.current.id],
       'Coach',

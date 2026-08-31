@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import type { ClassificationSearchHit } from '@recat/shared';
 import {
   ClassificationSearchError,
+  classificationSemanticRuntime,
   searchClassificationMemory,
+  searchClassificationMemorySnapshot,
   type ClassificationSearchRecord,
   type ClassificationSearchRepository,
 } from './search.js';
@@ -81,6 +83,24 @@ const generation = classificationEmbeddingGeneration({
 });
 
 describe('classification memory search', () => {
+  it('bypasses semantic initialization for exact and lexical and fails malformed config by mode', () => {
+    let reads = 0;
+    const malformed = () => {
+      reads += 1;
+      throw new Error('synthetic malformed provider URL');
+    };
+    expect(classificationSemanticRuntime('exact', malformed)).toBeNull();
+    expect(classificationSemanticRuntime('lexical', malformed)).toBeNull();
+    expect(reads).toBe(0);
+    expect(classificationSemanticRuntime('auto', malformed)).toBeNull();
+    expect(reads).toBe(1);
+    for (const mode of ['semantic', 'hybrid'] as const) {
+      expect(() => classificationSemanticRuntime(mode, malformed)).toThrowError(
+        expect.objectContaining({ code: 'SEMANTIC_UNAVAILABLE' }),
+      );
+    }
+    expect(reads).toBe(3);
+  });
   it('uses the exact-only repository path so saturated lexical results cannot evict exact hits', async () => {
     const exact = record();
     let exactCalls = 0;
@@ -106,6 +126,31 @@ describe('classification memory search', () => {
     expect(result.hits.map((candidate) => candidate.id)).toEqual([exact.hit.id]);
     expect(exactCalls).toBe(1);
     expect(lexicalCalls).toBe(0);
+  });
+
+  it('binds snapshots to authoritative corpus revisions and rejects an in-flight corpus change', async () => {
+    let revision = '1';
+    const base = repository([record()]);
+    const stable: ClassificationSearchRepository = {
+      ...base,
+      async revisions() { return { 'company-a': revision }; },
+    };
+    const input = {
+      query: 'Coach', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, limit: 10, accessibleCompanyIds: ['company-a'],
+    };
+    const first = await searchClassificationMemorySnapshot(input, { repository: stable, semantic: null });
+    revision = '2';
+    const second = await searchClassificationMemorySnapshot(input, { repository: stable, semantic: null });
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+
+    let calls = 0;
+    const changing: ClassificationSearchRepository = {
+      ...base,
+      async revisions() { calls += 1; return { 'company-a': String(calls) }; },
+    };
+    await expect(searchClassificationMemorySnapshot(input, { repository: changing, semantic: null }))
+      .rejects.toMatchObject({ code: 'COMPANY_UNAVAILABLE' });
   });
 
   it('returns immediately consistent exact and lexical matches without semantic configuration', async () => {
@@ -142,6 +187,49 @@ describe('classification memory search', () => {
     });
     expect(result.hits[0]?.matchedIn).toEqual(expect.arrayContaining(['alias', 'lexical']));
     expect(result.hits[1]?.matchedIn).toEqual(expect.arrayContaining(['rule', 'lexical']));
+  });
+
+  it('filters known transaction-context mismatches before ranking while retaining explicit unknown evidence', async () => {
+    const matching = record({
+      hit: { id: 'classification_case:matching', sourceId: 'matching', kind: 'classification_case' },
+      lexicalScore: 0.5,
+      exactReasons: [],
+      context: {
+        transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: 'Operating',
+        currency: 'CAD', transactionDate: '2026-08-10', jurisdiction: 'CA-AB',
+        taxCalculation: 'TaxExcluded',
+      },
+    });
+    const mismatching = record({
+      hit: { id: 'classification_case:mismatch', sourceId: 'mismatch', kind: 'classification_case' },
+      lexicalScore: 0.99,
+      exactReasons: [],
+      context: {
+        transactionDirection: 'in', qboType: 'Deposit', sourceAccountName: 'Savings',
+        currency: 'USD', transactionDate: '2025-01-10', jurisdiction: 'US-CA',
+        taxCalculation: 'NotApplicable',
+      },
+    });
+    const unknownRule = record({
+      hit: { id: 'rule:unknown', sourceId: 'unknown', kind: 'rule', vendorIdentityId: null },
+      lexicalScore: 0.4,
+      exactReasons: [],
+    });
+
+    const result = await searchClassificationMemory({
+      query: 'same vendor', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
+      limit: 10, accessibleCompanyIds: ['company-a'],
+      context: {
+        transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: 'Operating',
+        currency: 'CAD', transactionPeriod: '2026-08', jurisdiction: 'CA-AB',
+        taxCalculation: 'TaxExcluded',
+      },
+    }, { repository: repository([mismatching, matching, unknownRule]), semantic: null });
+
+    expect(result.hits.map((candidate) => candidate.id)).toEqual([
+      'classification_case:matching',
+      'rule:unknown',
+    ]);
   });
 
   it('never lets a requested company escape the caller accessibility fence', async () => {

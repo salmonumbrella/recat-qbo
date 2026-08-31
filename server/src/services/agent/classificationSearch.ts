@@ -23,12 +23,22 @@ export function classificationSearchForCompany(
   companyId: string,
   search: CanonicalSearch = searchClassificationMemoryWithRuntime,
 ): AgentClassificationSearch {
-  return ({ query, mode, limit }: AgentClassificationSearchRequest) => search({
+  return ({ query, mode, limit, transaction }: AgentClassificationSearchRequest) => search({
     query,
     companyId,
     scope: 'current_company',
     mode,
     limit,
     accessibleCompanyIds: [companyId],
+    context: {
+      transactionDirection: transaction.transactionDirection,
+      ...(transaction.qboType === null ? {} : { qboType: transaction.qboType }),
+      ...(transaction.sourceAccountName === null ? {} : {
+        sourceAccountName: transaction.sourceAccountName,
+      }),
+      currency: transaction.currency,
+      transactionPeriod: transaction.transactionPeriod,
+      ...(transaction.jurisdiction === null ? {} : { jurisdiction: transaction.jurisdiction }),
+    },
   });
 }

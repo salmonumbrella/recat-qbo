@@ -139,7 +139,13 @@ describe('createSnapshotTools', () => {
 
     expect(legacy).toMatchObject({
       items: [],
-      search: { requestedMode: 'auto', mode: 'lexical', degraded: true, noMatch: true },
+      search: {
+        requestedMode: 'auto', mode: 'lexical', degraded: true, noMatch: true,
+        context: {
+          transactionDirection: 'out', qboType: null, sourceAccountName: null,
+          currency: 'CAD', transactionPeriod: '2026-07', jurisdiction: null, taxStatus: 'ready',
+        },
+      },
     });
     expect(explicit).toMatchObject({
       items: [],
@@ -152,9 +158,14 @@ describe('createSnapshotTools', () => {
         date: '2026-07-20',
         signedAmountCents: -10000,
         currency: 'CAD',
-        sourceAccountName: 'Operating account',
+        sourceAccountName: null,
         payee: 'Example merchant',
         memo: 'Generic fixture',
+        transactionDirection: 'out',
+        qboType: null,
+        transactionPeriod: '2026-07',
+        jurisdiction: null,
+        taxStatus: 'ready',
       },
     }));
   });

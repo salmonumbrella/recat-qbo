@@ -7,7 +7,7 @@ import {
 } from './companyReads.js';
 import {
   PrismaClassificationSearchRepository,
-  searchClassificationMemory,
+  searchClassificationMemorySnapshot,
 } from './classification/search.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -153,6 +153,14 @@ describePostgres('classification company reads on PostgreSQL', () => {
         conflictingEvidenceCount: 1,
       },
     });
+    const gatheringCandidate = await db.autopilotRuleCandidate.create({
+      data: {
+        companyId: company.id, conditionFingerprint: 'f'.repeat(64),
+        schemaVersion: 'rule-candidate-v1', configVersion: 'config-1',
+        matchText: 'Coffee gathering', state: 'gathering', evidenceCount: 1,
+        conflictingEvidenceCount: 0,
+      },
+    });
     await db.autopilotRuleCandidateEvidence.create({
       data: {
         companyId: company.id,
@@ -176,7 +184,7 @@ describePostgres('classification company reads on PostgreSQL', () => {
       db as unknown as CompanyReadDb,
       'company-reads-pg-cursor-secret',
       {
-        classificationSearch: (input) => searchClassificationMemory(input, { repository, semantic: null }),
+        classificationSearch: (input) => searchClassificationMemorySnapshot(input, { repository, semantic: null }),
       },
     );
 
@@ -189,8 +197,14 @@ describePostgres('classification company reads on PostgreSQL', () => {
       service.searchClassificationKnowledge(user.id, company.id, { query: 'Coffee', mode: 'lexical', limit: 10 }),
     ]);
 
-    expect(ruleRead).toMatchObject({ active: true, executable: true, revision: { revision: 1, state: 'enabled' } });
-    expect(candidates.items).toEqual([expect.objectContaining({ id: candidate.id, state: 'conflict', executable: false })]);
+    expect(ruleRead).toMatchObject({
+      active: true, executable: true,
+      revision: { revision: 1, state: 'enabled', valid: true, invalidReasons: [] },
+    });
+    expect(candidates.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: candidate.id, state: 'conflict', executable: false }),
+      expect.objectContaining({ id: gatheringCandidate.id, state: 'gathering', executable: false }),
+    ]));
     expect(candidateRead.evidence).toEqual([expect.objectContaining({
       polarity: 'negative', active: false, invalidationReason: 'Superseded.',
     })]);
@@ -199,5 +213,38 @@ describePostgres('classification company reads on PostgreSQL', () => {
     expect(JSON.stringify(candidateRead)).not.toContain('privatePatternSentinel');
     expect(tested.samples).toEqual([expect.objectContaining({ transactionId: transaction.id })]);
     expect(searched.items.map((item) => item.id)).toContain(`rule:${rule.id}`);
+
+    const firstPage = await service.searchClassificationKnowledge(user.id, company.id, {
+      query: 'Coffee', mode: 'lexical', limit: 1,
+    });
+    expect(firstPage.nextCursor).toEqual(expect.any(String));
+    await db.rule.create({
+      data: {
+        companyId: company.id, matchText: 'Coffee new', category: account.name,
+        categoryQboId: account.qboId, taxCalculation: 'NotApplicable', revision: 1,
+        originIntent: 'make_recurring',
+      },
+    });
+    await expect(service.searchClassificationKnowledge(user.id, company.id, {
+      query: 'Coffee', mode: 'lexical', limit: 1, cursor: firstPage.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+
+    const legacyRule = await db.rule.create({
+      data: {
+        companyId: company.id, matchText: 'Legacy', category: 'Historical category',
+        categoryQboId: null, taxCalculation: null, revision: 1, originIntent: null,
+      },
+    });
+    await db.ruleRevision.create({
+      data: {
+        ruleId: legacyRule.id, companyId: company.id, revision: 1, state: 'enabled',
+        matchText: 'Legacy', category: 'Historical category', categoryQboId: null,
+        taxCalculation: null, priority: 0, autoPost: false,
+      },
+    });
+    await expect(service.getRule(user.id, company.id, legacyRule.id)).resolves.toMatchObject({
+      active: true, executable: false,
+      revision: { action: null, valid: false },
+    });
   });
 });

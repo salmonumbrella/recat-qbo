@@ -78,9 +78,14 @@ export interface AgentClassificationSearchRequest {
     date: string;
     signedAmountCents: number;
     currency: string;
-    sourceAccountName: string;
+    sourceAccountName: string | null;
     payee: string;
     memo: string | null;
+    transactionDirection: 'in' | 'out' | 'unknown';
+    qboType: 'Purchase' | 'Deposit' | 'JournalEntry' | null;
+    transactionPeriod: string;
+    jurisdiction: null;
+    taxStatus: 'unsupported' | 'needs_setup' | 'ready';
   }>;
 }
 
@@ -199,7 +204,7 @@ export const TOOL_DEFINITIONS: readonly AgentToolDefinition[] = deepFreeze([
     type: 'function',
     function: {
       name: 'find_similar_transactions',
-      description: 'Backward-compatible current-company classification evidence search using auto mode. Returns at most 20 evidence cards; lexical fallback and no-match are explicit. Use only QBO IDs supplied in executable cards.',
+      description: 'Backward-compatible current-company classification evidence search using auto mode and available canonical transaction context (direction, currency, and monthly period; unavailable QBO type, account identity, or jurisdiction stays unknown). Evidence with known context mismatches is excluded; missing evidence context remains explicitly unknown. Returns at most 20 evidence cards; lexical fallback and no-match are explicit. Use only QBO IDs supplied in executable cards.',
       strict: true,
       parameters: {
         type: 'object',
@@ -213,7 +218,7 @@ export const TOOL_DEFINITIONS: readonly AgentToolDefinition[] = deepFreeze([
     type: 'function',
     function: {
       name: 'search_classification_knowledge',
-      description: 'Search up to 20 current-company classification evidence cards using an explicit mode. Auto may return labelled lexical degradation; explicit semantic or hybrid may be unavailable; no evidence returns no_match. Use only QBO IDs supplied in executable current-company cards.',
+      description: 'Search up to 20 current-company classification evidence cards using an explicit mode and available canonical transaction context (direction, currency, and monthly period; unavailable QBO type, account identity, or jurisdiction stays unknown). Evidence with known context mismatches is excluded; missing evidence context remains explicitly unknown. Auto may return labelled lexical degradation; explicit semantic or hybrid may be unavailable; no evidence returns no_match. Use only QBO IDs supplied in executable current-company cards.',
       strict: true,
       parameters: {
         type: 'object',
@@ -287,13 +292,21 @@ const classificationActionSchema = z.object({
   taxCodeQboId: z.string().min(1).max(120).nullable(),
   tagIds: z.array(z.string().min(1).max(128)).max(50),
   memo: z.string().max(500).nullable().optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if ((value.taxCalculation === 'NotApplicable') !== (value.taxCodeQboId === null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['taxCodeQboId'], message: 'Invalid tax reference.' });
+  }
+});
 const classificationActionSummarySchema = z.object({
   categoryName: z.string().min(1).max(500),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   taxCodeName: z.string().min(1).max(500).nullable(),
   tagNames: z.array(z.string().min(1).max(500)).max(50),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if ((value.taxCalculation === 'NotApplicable') !== (value.taxCodeName === null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['taxCodeName'], message: 'Invalid tax summary.' });
+  }
+});
 const classificationConflictSchema = z.object({
   id: z.string().min(1).max(128),
   companyId: z.string().min(1).max(128),
@@ -303,7 +316,15 @@ const classificationConflictSchema = z.object({
   action: classificationActionSchema.nullable(),
   actionSummary: classificationActionSummarySchema.nullable(),
   evidenceCount: z.number().int().min(0).max(10_000),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.action !== null && value.actionSummary === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Action summary required.' });
+  }
+  if (value.action !== null && value.actionSummary !== null
+    && value.action.taxCalculation !== value.actionSummary.taxCalculation) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Tax summaries must agree.' });
+  }
+});
 const classificationEvidenceCardSchema = z.object({
   id: z.string().min(1).max(128),
   sourceId: z.string().min(1).max(128),
@@ -336,8 +357,31 @@ const classificationEvidenceCardSchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/u).nullable(),
   verifiedAt: z.string().min(1).max(64).nullable(),
   ruleRevision: z.number().int().min(0).nullable(),
-}).strict();
-const canonicalClassificationResultSchema = z.object({
+}).strict().superRefine((value, context) => {
+  if (value.executable && value.advisory) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['executable'], message: 'Executable evidence is not advisory.' });
+  }
+  if (value.executable && value.action === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['action'], message: 'Executable evidence requires an action.' });
+  }
+  if (value.action !== null && value.actionSummary === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Action summary required.' });
+  }
+  if (value.action !== null && value.actionSummary !== null
+    && value.action.taxCalculation !== value.actionSummary.taxCalculation) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Tax summaries must agree.' });
+  }
+  if (value.conflictingEvidenceCount !== value.conflicts.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['conflictingEvidenceCount'], message: 'Conflict count mismatch.' });
+  }
+  if (value.action?.taxCalculation !== 'NotApplicable'
+    && value.action !== null
+    && value.jurisdiction === 'unknown'
+    && (!value.advisory || value.executable)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['jurisdiction'], message: 'Unknown tax jurisdiction is advisory.' });
+  }
+});
+const canonicalClassificationResultBaseSchema = z.object({
   query: z.string().min(1).max(256),
   companyId: z.string().min(1).max(128),
   scope: z.literal('current_company'),
@@ -353,10 +397,50 @@ const canonicalClassificationResultSchema = z.object({
   hits: z.array(classificationEvidenceCardSchema).max(MAX_TOOL_RESULTS),
   total: z.number().int().min(0).max(10_000),
 }).strict();
+const canonicalClassificationResultSchema = canonicalClassificationResultBaseSchema.superRefine((value, context) => {
+  if (value.degraded !== (value.degradedReason !== null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['degraded'], message: 'Degradation metadata mismatch.' });
+  }
+  if (value.requestedMode !== 'auto' && value.requestedMode !== value.mode) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['mode'], message: 'Explicit search mode mismatch.' });
+  }
+  if (value.requestedMode === 'auto' && value.mode === 'lexical' && !value.degraded) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['degraded'], message: 'Auto lexical mode must be labelled.' });
+  }
+  const noMatch = value.hits.length === 0 && value.total === 0;
+  if (value.noMatch !== noMatch || (value.status === 'no_match') !== noMatch || value.total < value.hits.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['status'], message: 'Search status mismatch.' });
+  }
+});
 const agentClassificationToolResultSchema = z.object({
   items: z.array(classificationEvidenceCardSchema).max(MAX_TOOL_RESULTS),
-  search: canonicalClassificationResultSchema.omit({ companyId: true, hits: true }),
-}).strict();
+  search: canonicalClassificationResultBaseSchema.omit({ companyId: true, hits: true }).extend({
+    context: z.object({
+      transactionDirection: z.enum(['in', 'out', 'unknown']),
+      qboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']).nullable(),
+      sourceAccountName: z.string().min(1).max(500).nullable(),
+      currency: z.string().regex(/^[A-Z]{3}$/u),
+      transactionPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/u),
+      jurisdiction: z.string().min(1).max(128).nullable(),
+      taxStatus: z.enum(['unsupported', 'needs_setup', 'ready']),
+    }).strict().optional(),
+  }).strict(),
+}).strict().superRefine((value, context) => {
+  const search = value.search;
+  if (search.degraded !== (search.degradedReason !== null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['search', 'degraded'], message: 'Degradation metadata mismatch.' });
+  }
+  if (search.requestedMode !== 'auto' && search.requestedMode !== search.mode) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['search', 'mode'], message: 'Explicit search mode mismatch.' });
+  }
+  if (search.requestedMode === 'auto' && search.mode === 'lexical' && !search.degraded) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['search', 'degraded'], message: 'Auto lexical mode must be labelled.' });
+  }
+  const noMatch = value.items.length === 0 && search.total === 0;
+  if (search.noMatch !== noMatch || (search.status === 'no_match') !== noMatch || search.total < value.items.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['search', 'status'], message: 'Search status mismatch.' });
+  }
+});
 
 export function parseAgentClassificationToolResult(raw: unknown): AgentToolResult {
   const parsed = agentClassificationToolResultSchema.safeParse(raw);
@@ -380,9 +464,18 @@ async function canonicalClassificationResult(
         date: snapshot.date,
         signedAmountCents: snapshot.signedAmountCents,
         currency: snapshot.currency,
-        sourceAccountName: snapshot.sourceAccount.displayName,
+        // The bounded agent snapshot deliberately exposes a generic account
+        // label, not the canonical QBO account name stored in case context.
+        sourceAccountName: null,
         payee: snapshot.payee,
         memo: snapshot.memo ?? null,
+        transactionDirection: snapshot.signedAmountCents < 0
+          ? 'out'
+          : snapshot.signedAmountCents > 0 ? 'in' : 'unknown',
+        qboType: null,
+        transactionPeriod: snapshot.date.slice(0, 7),
+        jurisdiction: null,
+        taxStatus: snapshot.tax.status,
       },
     });
   } catch {
@@ -391,7 +484,18 @@ async function canonicalClassificationResult(
   const parsed = canonicalClassificationResultSchema.safeParse(raw);
   if (!parsed.success) throw new AgentToolError('AGENT_TOOL_INVALID_OUTPUT');
   const { hits, companyId: _companyId, ...search } = parsed.data;
-  return parseAgentClassificationToolResult({ items: hits, search });
+  const context = {
+    transactionDirection: snapshot.signedAmountCents < 0
+      ? 'out' as const
+      : snapshot.signedAmountCents > 0 ? 'in' as const : 'unknown' as const,
+    qboType: null,
+    sourceAccountName: null,
+    currency: snapshot.currency,
+    transactionPeriod: snapshot.date.slice(0, 7),
+    jurisdiction: null,
+    taxStatus: snapshot.tax.status,
+  };
+  return parseAgentClassificationToolResult({ items: hits, search: { ...search, context } });
 }
 
 function resultLimit(requested: number): number {

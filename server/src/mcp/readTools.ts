@@ -60,6 +60,7 @@ import {
   mutationToolDefinitions,
   type McpMutationOperations,
 } from './mutationTools.js';
+import { parseClassificationSearchResult } from '../services/classification/contracts.js';
 
 export const READ_TOOL_NAMES = [
   'get_identity',
@@ -334,7 +335,12 @@ const evidenceCard = z.strictObject({
 }).superRefine((card, issue) => {
   if (
     card.companyRelation === 'foreign'
-    && (card.action !== null || card.executable || !card.advisory)
+    && (
+      card.action !== null
+      || card.executable
+      || !card.advisory
+      || card.conflicts.some((item) => item.action !== null)
+    )
   ) {
     issue.addIssue({
       code: 'custom',
@@ -477,7 +483,7 @@ const ruleRevisionOutput = z.strictObject({
   revision: z.number().int().nonnegative(),
   state: z.enum(['enabled', 'disabled', 'retired']),
   condition: z.strictObject({ matchField: z.literal('payee'), matchText: text }),
-  action,
+  action: action.nullable(),
   categoryName: text,
   taxCodeName: nullableText,
   priority: z.number().int().nonnegative(),
@@ -488,6 +494,8 @@ const ruleRevisionOutput = z.strictObject({
   changedBy: id.nullable(),
   createdAt: isoDate,
   retiredAt: nullableIsoDate,
+  valid: z.boolean(),
+  invalidReasons: z.array(text).max(4),
 });
 const getRuleOutput = z.strictObject({
   active: z.boolean(),
@@ -495,6 +503,16 @@ const getRuleOutput = z.strictObject({
   reviewRequiredAt: nullableIsoDate,
   reviewReason: nullableText,
   revision: ruleRevisionOutput,
+}).superRefine((value, issue) => {
+  if (value.executable && (!value.active || !value.revision.valid || value.revision.action === null)) {
+    issue.addIssue({ code: 'custom', path: ['executable'], message: 'Executable rules require an active valid action.' });
+  }
+  if (value.revision.valid !== (value.revision.invalidReasons.length === 0)) {
+    issue.addIssue({ code: 'custom', path: ['revision', 'valid'], message: 'Rule validity must agree with its reasons.' });
+  }
+  if (value.revision.valid !== (value.revision.action !== null)) {
+    issue.addIssue({ code: 'custom', path: ['revision', 'action'], message: 'Only valid rule revisions may expose actions.' });
+  }
 });
 const ruleTestOutput = z.strictObject({
   samples: z.array(z.strictObject({
@@ -530,7 +548,7 @@ const candidateEvidence = z.strictObject({
 const candidateOutput = z.strictObject({
   id,
   companyId: id,
-  state: z.enum(['ready', 'conflict', 'stale', 'dismissed', 'activated']),
+  state: z.enum(['gathering', 'ready', 'conflict', 'stale', 'dismissed', 'activated']),
   matchField: z.literal('payee'),
   matchText: text,
   categoryName: nullableText,
@@ -704,6 +722,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
     outputSchema: z.ZodObject,
     operation: (input: z.output<T>) => Promise<unknown>,
     toolAnnotations: ToolAnnotations = annotations,
+    validateOutput?: (output: unknown) => void,
   ): void => {
     const callback = async (input: z.output<T>, sdkContext: ServerContext) => {
       const tokenPrefixPolicy =
@@ -730,11 +749,21 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
             const operationValue = await operation(input);
             const parsed = outputSchema.safeParse(operationValue);
             if (!parsed.success) throw new InvalidMcpToolOutputError();
+            try {
+              validateOutput?.(parsed.data);
+            } catch {
+              throw new InvalidMcpToolOutputError();
+            }
             assertBoundedMcpOutput(parsed.data);
+            assertBoundedMcpOutput(toolSuccess(asJson(parsed.data)));
             return parsed.data;
           },
         );
-        return toolSuccess(asJson(value));
+        const result = toolSuccess(asJson(value));
+        // The SDK wire shape intentionally mirrors structured output into a
+        // text content block. Bound the actual combined representation.
+        assertBoundedMcpOutput(result);
+        return result;
       } catch (error) {
         if (error instanceof InvalidMcpToolOutputError) {
           return safeInvalidToolFailure(requestId);
@@ -839,6 +868,26 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
       input.companyId,
       inputWithoutCompany(input),
     ),
+    annotations,
+    (output) => {
+      const page = output as ClassificationSearchPage;
+      if (page.nextCursor !== null && (page.noMatch || page.items.length === 0)) {
+        throw new InvalidMcpToolOutputError();
+      }
+      parseClassificationSearchResult({
+        query: page.query,
+        companyId: page.companyId,
+        scope: page.scope,
+        mode: page.mode,
+        requestedMode: page.requestedMode,
+        degraded: page.degraded,
+        degradedReason: page.degradedReason,
+        status: page.status,
+        noMatch: page.noMatch,
+        total: page.total,
+        hits: page.items,
+      });
+    },
   );
   register('list_transfer_candidates', 'List bounded transfer candidate pairs.', companyPageInput, transferCandidateListOutput,
     (input) => reads.listTransferCandidates(context.principal.userId, input.companyId, inputWithoutCompany(input)));

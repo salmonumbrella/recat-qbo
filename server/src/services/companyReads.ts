@@ -30,8 +30,9 @@ import {
   parseRuleRevision,
 } from './classification/contracts.js';
 import {
-  searchClassificationMemoryWithRuntime,
+  searchClassificationMemoryWithRuntimeSnapshot,
   type ClassificationSearchInput,
+  type ClassificationSearchSnapshot,
 } from './classification/search.js';
 import type { RuleRevision } from '@recat/shared';
 
@@ -142,18 +143,24 @@ export interface ClassificationSearchPage extends Page<ClassificationSearchHit> 
   total: number;
 }
 
+export interface CompanyRuleRevisionReadDto extends Omit<RuleRevision, 'action'> {
+  action: RuleRevision['action'] | null;
+  valid: boolean;
+  invalidReasons: string[];
+}
+
 export interface CompanyRuleReadDto {
   active: boolean;
   executable: boolean;
   reviewRequiredAt: string | null;
   reviewReason: string | null;
-  revision: RuleRevision;
+  revision: CompanyRuleRevisionReadDto;
 }
 
 export interface RuleCandidateReadDto {
   id: string;
   companyId: string;
-  state: 'ready' | 'conflict' | 'stale' | 'dismissed' | 'activated';
+  state: 'gathering' | 'ready' | 'conflict' | 'stale' | 'dismissed' | 'activated';
   matchField: 'payee';
   matchText: string;
   categoryName: string | null;
@@ -226,7 +233,9 @@ export interface CompanyReadDeps {
     txns: { payee: string; memo?: string | null; amount: number }[],
   ): Promise<(SuggestionDto | null)[]>;
   transferCandidates(companyId: string): Promise<Map<string, string>>;
-  classificationSearch(input: ClassificationSearchInput): Promise<ClassificationSearchResult>;
+  classificationSearch(
+    input: ClassificationSearchInput,
+  ): Promise<ClassificationSearchSnapshot | ClassificationSearchResult>;
 }
 
 const defaultDeps: CompanyReadDeps = {
@@ -234,7 +243,7 @@ const defaultDeps: CompanyReadDeps = {
   suggestForMany: defaultSuggestForMany,
   transferCandidates: (companyId) =>
     defaultTransferCandidates(companyId, prisma),
-  classificationSearch: searchClassificationMemoryWithRuntime,
+  classificationSearch: searchClassificationMemoryWithRuntimeSnapshot,
 };
 
 const safeCompanySelect = {
@@ -742,6 +751,46 @@ export function eligibleTaxCodes(readiness: TaxReadinessDto): TaxCodeDto[] {
   return readiness.taxCodes.filter(isUsableTaxCodeDto);
 }
 
+function ruleReferenceReasons(
+  rule: {
+    categoryQboId: string | null;
+    taxCalculation: unknown;
+    taxCodeQboId: string | null;
+    tagIds: readonly string[];
+  },
+  activeAccounts: ReadonlySet<string>,
+  existingTags: ReadonlySet<string>,
+  readiness: TaxReadinessDto | null,
+): string[] {
+  const reasons: string[] = [];
+  if (rule.categoryQboId === null || !activeAccounts.has(rule.categoryQboId)) {
+    reasons.push('Category account is missing or inactive.');
+  }
+  const calculation = rule.taxCalculation;
+  if (calculation !== 'TaxInclusive'
+    && calculation !== 'TaxExcluded'
+    && calculation !== 'NotApplicable') {
+    reasons.push('Tax treatment is missing or invalid.');
+  }
+  const taxed = calculation === 'TaxInclusive' || calculation === 'TaxExcluded';
+  if (taxed && readiness?.status !== 'ready') {
+    reasons.push('Tax reference is not ready.');
+  }
+  const eligibleCodes = new Set(
+    readiness === null ? [] : eligibleTaxCodes(readiness).map((code) => code.qboId),
+  );
+  if (taxed && (rule.taxCodeQboId === null || !eligibleCodes.has(rule.taxCodeQboId))) {
+    reasons.push('Tax code is missing or ineligible.');
+  }
+  if (calculation === 'NotApplicable' && rule.taxCodeQboId !== null) {
+    reasons.push('Tax treatment is missing or invalid.');
+  }
+  if (rule.tagIds.some((tagId) => !existingTags.has(tagId))) {
+    reasons.push('One or more tags no longer exist.');
+  }
+  return reasons.slice(0, 4);
+}
+
 export function boundedTaxReadiness(
   readiness: TaxReadinessDto,
   limit = MAX_READ_LIMIT,
@@ -917,20 +966,23 @@ export function createCompanyReadService(
       badRequest('Invalid classification search mode');
     }
     const requestedLimit = readLimit(input.limit);
-    const filter = canonicalFilter({ query, scope, mode: input.mode });
-    const expected = { resource: 'classification-search', userId, companyId, filter };
-    const position = decodeCursor(cursorSecret, input.cursor, expected);
-    const offset = position === null ? 0 : Number(position.offset);
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) {
-      badRequest('Invalid cursor', 'INVALID_CURSOR');
-    }
     const membershipIds = scope === 'accessible_companies'
       ? await actualMembershipCompanyIds(userId)
       : [companyId];
     if (!membershipIds.includes(companyId)) {
       throw new HttpError(403, 'Current company is not an actual membership', 'FORBIDDEN');
     }
-    const canonical = await deps.classificationSearch({
+    const filter = canonicalFilter({
+      query, scope, mode: input.mode, limit: requestedLimit,
+      accessibleCompanyIds: [...membershipIds].sort(),
+    });
+    const expected = { resource: 'classification-search', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const offset = position === null ? 0 : Number(position.offset);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const searched = await deps.classificationSearch({
       query,
       companyId,
       scope,
@@ -938,6 +990,13 @@ export function createCompanyReadService(
       limit: MAX_READ_LIMIT,
       accessibleCompanyIds: membershipIds,
     });
+    const canonical = 'result' in searched ? searched.result : searched;
+    const fingerprint = 'result' in searched
+      ? searched.fingerprint
+      : createHmac('sha256', cursorSecret).update(JSON.stringify(canonical)).digest('hex');
+    if (position !== null && position.fingerprint !== fingerprint) {
+      badRequest('Search population changed; restart pagination', 'INVALID_CURSOR');
+    }
     const items = canonical.hits.slice(offset, offset + requestedLimit);
     const nextOffset = offset + items.length;
     return {
@@ -953,7 +1012,9 @@ export function createCompanyReadService(
       total: Math.min(canonical.total, canonical.hits.length),
       items,
       nextCursor: nextOffset < canonical.hits.length
-        ? encodeCursor(cursorSecret, { v: 1, ...expected, position: { offset: nextOffset } })
+        ? encodeCursor(cursorSecret, {
+            v: 1, ...expected, position: { offset: nextOffset, fingerprint },
+          })
         : null,
     };
   }
@@ -982,18 +1043,39 @@ export function createCompanyReadService(
     if (revisionRow === null) {
       throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
     }
-    const revision = parseRuleRevision({
+    const rawCalculation = revisionRow.taxCalculation;
+    const rawCategoryQboId = typeof revisionRow.categoryQboId === 'string'
+      ? revisionRow.categoryQboId
+      : null;
+    const rawTaxCodeQboId = typeof revisionRow.taxCodeQboId === 'string'
+      ? revisionRow.taxCodeQboId
+      : null;
+    const tagIds = stringArray(revisionRow.tagIds).slice(0, MAX_READ_LIMIT);
+    const structurallyValidAction = rawCategoryQboId !== null
+      && (rawCalculation === 'TaxInclusive'
+        || rawCalculation === 'TaxExcluded'
+        || rawCalculation === 'NotApplicable')
+      && ((rawCalculation === 'NotApplicable') === (rawTaxCodeQboId === null));
+    const parsedRevision = parseRuleRevision({
       id: String(revisionRow.id),
       ruleId: String(revisionRow.ruleId),
       companyId: String(revisionRow.companyId),
       revision: Number(revisionRow.revision),
       state: revisionRow.state,
       condition: { matchField: 'payee', matchText: revisionRow.matchText },
-      action: {
-        categoryQboId: revisionRow.categoryQboId,
-        taxCalculation: revisionRow.taxCalculation,
-        taxCodeQboId: revisionRow.taxCodeQboId ?? null,
-        tagIds: stringArray(revisionRow.tagIds),
+      action: structurallyValidAction ? {
+        categoryQboId: rawCategoryQboId,
+        taxCalculation: rawCalculation,
+        taxCodeQboId: rawTaxCodeQboId,
+        tagIds,
+      } : {
+        // Legacy rows predate executable QBO references. This placeholder is
+        // used only to validate the immutable non-action revision fields and
+        // is removed from the returned historical representation below.
+        categoryQboId: 'legacy-invalid-action',
+        taxCalculation: 'NotApplicable',
+        taxCodeQboId: null,
+        tagIds: [],
       },
       categoryName: revisionRow.category,
       taxCodeName: revisionRow.taxCode ?? null,
@@ -1006,6 +1088,40 @@ export function createCompanyReadService(
       createdAt: iso(revisionRow.createdAt),
       retiredAt: nullableIso(revisionRow.retiredAt),
     });
+    const [accounts, tags, readiness] = await Promise.all([
+      rawCategoryQboId === null
+        ? Promise.resolve([])
+        : db.qboAccount.findMany({
+            where: { companyId, qboId: { in: [rawCategoryQboId] } },
+            select: { qboId: true, active: true },
+          }) as Promise<Row[]>,
+      tagIds.length === 0
+        ? Promise.resolve([])
+        : db.tag.findMany({
+            where: { companyId, id: { in: tagIds } },
+            select: { id: true },
+          }) as Promise<Row[]>,
+      rawCalculation === 'TaxInclusive' || rawCalculation === 'TaxExcluded'
+        ? deps.getTaxReadiness(companyId)
+        : Promise.resolve(null),
+    ]);
+    const activeAccounts = new Set(
+      accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
+    );
+    const existingTags = new Set(tags.map((tag) => String(tag.id)));
+    const invalidReasons = ruleReferenceReasons({
+      categoryQboId: rawCategoryQboId,
+      taxCalculation: rawCalculation,
+      taxCodeQboId: rawTaxCodeQboId,
+      tagIds,
+    }, activeAccounts, existingTags, readiness);
+    const valid = structurallyValidAction && invalidReasons.length === 0;
+    const revision: CompanyRuleRevisionReadDto = {
+      ...parsedRevision,
+      action: valid ? parsedRevision.action : null,
+      valid,
+      invalidReasons,
+    };
     const active = rule.enabled === true
       && rule.retiredAt == null
       && revision.state === 'enabled'
@@ -1013,7 +1129,7 @@ export function createCompanyReadService(
     const reviewRequiredAt = nullableIso(rule.reviewRequiredAt);
     return {
       active,
-      executable: active && reviewRequiredAt === null,
+      executable: active && reviewRequiredAt === null && revision.valid,
       reviewRequiredAt,
       reviewReason: typeof rule.reviewReason === 'string' ? rule.reviewReason : null,
       revision,
@@ -1021,9 +1137,15 @@ export function createCompanyReadService(
   }
 
   function candidateState(value: unknown): RuleCandidateReadDto['state'] {
-    return value === 'ready' || value === 'conflict' || value === 'dismissed' || value === 'activated'
-      ? value
-      : 'stale';
+    if (
+      value === 'gathering'
+      || value === 'ready'
+      || value === 'conflict'
+      || value === 'stale'
+      || value === 'dismissed'
+      || value === 'activated'
+    ) return value;
+    throw new HttpError(503, 'Rule candidate has an invalid state', 'COMPANY_UNAVAILABLE');
   }
 
   async function candidateDtos(companyId: string, rows: Row[]): Promise<RuleCandidateReadDto[]> {
@@ -1098,7 +1220,7 @@ export function createCompanyReadService(
     const rows = await db.autopilotRuleCandidate.findMany({
       where: {
         companyId,
-        state: { in: ['ready', 'conflict', 'dismissed', 'activated', 'stale'] },
+        state: { in: ['gathering', 'ready', 'conflict', 'dismissed', 'activated', 'stale'] },
         ...(updatedAt && id ? {
           OR: [{ updatedAt: { lt: updatedAt } }, { updatedAt, id: { lt: id } }],
         } : {}),
@@ -1652,27 +1774,11 @@ export function createCompanyReadService(
       accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
     );
     const existingTags = new Set(tags.map((tag) => String(tag.id)));
-    const eligibleCodes = new Set(
-      readiness === null ? [] : eligibleTaxCodes(readiness).map((code) => code.qboId),
-    );
     return {
       ...base,
       items: base.items.map((rule) => {
-        const reasons: string[] = [];
-        if (rule.categoryQboId === null || !activeAccounts.has(rule.categoryQboId)) {
-          reasons.push('Category account is missing or inactive.');
-        }
-        const taxed = rule.taxCalculation === 'TaxInclusive' || rule.taxCalculation === 'TaxExcluded';
-        if (taxed && readiness?.status !== 'ready') {
-          reasons.push('Tax reference is not ready.');
-        }
-        if (taxed && (rule.taxCodeQboId === null || !eligibleCodes.has(rule.taxCodeQboId))) {
-          reasons.push('Tax code is missing or ineligible.');
-        }
-        if (rule.tagIds.some((tagId) => !existingTags.has(tagId))) {
-          reasons.push('One or more tags no longer exist.');
-        }
-        return { ...rule, valid: reasons.length === 0, invalidReasons: reasons.slice(0, 4) };
+        const reasons = ruleReferenceReasons(rule, activeAccounts, existingTags, readiness);
+        return { ...rule, valid: reasons.length === 0, invalidReasons: reasons };
       }),
     };
   }

@@ -8,6 +8,7 @@ import type {
   ClassificationSearchResult,
   ClassificationSearchScope,
 } from '@recat/shared';
+import { createHash } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import {
@@ -54,6 +55,29 @@ export interface ClassificationSearchRecord {
   document?: ClassificationSearchDocument;
   /** Deterministic exact-key source; never returned to callers. */
   lookupValue?: string;
+  /** Optional evidence-native transaction dimensions. Missing dimensions are
+   * unknown and remain eligible; known mismatches are excluded before rank. */
+  context?: ClassificationSearchRecordContext;
+}
+
+export interface ClassificationSearchRecordContext {
+  transactionDirection?: 'in' | 'out' | 'unknown';
+  qboType?: 'Purchase' | 'Deposit' | 'JournalEntry';
+  sourceAccountName?: string | null;
+  currency?: string;
+  transactionDate?: string;
+  jurisdiction?: string;
+  taxCalculation?: ClassificationAction['taxCalculation'];
+}
+
+export interface ClassificationSearchContextFilter {
+  transactionDirection?: 'in' | 'out' | 'unknown';
+  qboType?: 'Purchase' | 'Deposit' | 'JournalEntry';
+  sourceAccountName?: string;
+  currency?: string;
+  transactionPeriod?: string;
+  jurisdiction?: string;
+  taxCalculation?: ClassificationAction['taxCalculation'];
 }
 
 export interface ClassificationSearchRepository {
@@ -61,17 +85,21 @@ export interface ClassificationSearchRepository {
     companyIds: readonly string[],
     query: string,
     limit: number,
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]>;
   search(
     companyIds: readonly string[],
     query: string,
     limit: number,
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]>;
   rehydrate(
     companyIds: readonly string[],
     documentIds: readonly string[],
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]>;
   documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus>;
+  revisions?(companyIds: readonly string[]): Promise<Readonly<Record<string, string>>>;
 }
 
 export interface ClassificationSearchCorpus {
@@ -95,6 +123,11 @@ export interface ClassificationSearchDependencies {
   semantic: ClassificationSemanticSearch | null;
 }
 
+export interface ClassificationSearchSnapshot {
+  result: ClassificationSearchResult;
+  fingerprint: string;
+}
+
 export interface ClassificationSearchInput {
   query: string;
   companyId: string;
@@ -102,6 +135,9 @@ export interface ClassificationSearchInput {
   mode: ClassificationSearchMode;
   limit?: number;
   accessibleCompanyIds: readonly string[];
+  /** Internal-only evidence filters. Unknown evidence values are retained;
+   * an evidence-native known mismatch is excluded before ranking. */
+  context?: ClassificationSearchContextFilter;
 }
 
 type DegradedReason = Exclude<ClassificationSearchResult['degradedReason'], null>;
@@ -160,6 +196,80 @@ function selectedCompanyIds(input: ClassificationSearchInput): string[] {
     throw new ClassificationSearchError('FORBIDDEN');
   }
   return input.scope === 'current_company' ? [current] : accessible;
+}
+
+function checkedContext(
+  raw: ClassificationSearchContextFilter | undefined,
+): ClassificationSearchContextFilter | undefined {
+  if (raw === undefined) return undefined;
+  const result: ClassificationSearchContextFilter = {};
+  if (raw.transactionDirection !== undefined) {
+    if (!['in', 'out', 'unknown'].includes(raw.transactionDirection)) {
+      throw new ClassificationSearchError('INVALID_INPUT');
+    }
+    result.transactionDirection = raw.transactionDirection;
+  }
+  if (raw.qboType !== undefined) {
+    if (!['Purchase', 'Deposit', 'JournalEntry'].includes(raw.qboType)) {
+      throw new ClassificationSearchError('INVALID_INPUT');
+    }
+    result.qboType = raw.qboType;
+  }
+  if (raw.sourceAccountName !== undefined) {
+    result.sourceAccountName = checkedText(raw.sourceAccountName, 500);
+  }
+  if (raw.currency !== undefined) {
+    if (!/^[A-Z]{3}$/u.test(raw.currency)) throw new ClassificationSearchError('INVALID_INPUT');
+    result.currency = raw.currency;
+  }
+  if (raw.transactionPeriod !== undefined) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/u.test(raw.transactionPeriod)) {
+      throw new ClassificationSearchError('INVALID_INPUT');
+    }
+    result.transactionPeriod = raw.transactionPeriod;
+  }
+  if (raw.jurisdiction !== undefined) {
+    result.jurisdiction = checkedText(raw.jurisdiction, 128);
+  }
+  if (raw.taxCalculation !== undefined) {
+    if (!['TaxInclusive', 'TaxExcluded', 'NotApplicable'].includes(raw.taxCalculation)) {
+      throw new ClassificationSearchError('INVALID_INPUT');
+    }
+    result.taxCalculation = raw.taxCalculation;
+  }
+  return Object.keys(result).length === 0 ? undefined : result;
+}
+
+function recordsMatchingContext(
+  records: readonly ClassificationSearchRecord[],
+  filter: ClassificationSearchContextFilter | undefined,
+): ClassificationSearchRecord[] {
+  if (filter === undefined) return [...records];
+  const folded = (value: string) => value.normalize('NFC').trim().toLocaleLowerCase('en-US');
+  return records.filter((record) => {
+    const value = record.context;
+    if (value === undefined) return true;
+    if (filter.transactionDirection !== undefined
+      && value.transactionDirection !== undefined
+      && value.transactionDirection !== filter.transactionDirection) return false;
+    if (filter.qboType !== undefined && value.qboType !== undefined && value.qboType !== filter.qboType) return false;
+    if (filter.sourceAccountName !== undefined
+      && value.sourceAccountName !== undefined
+      && value.sourceAccountName !== null
+      && folded(value.sourceAccountName) !== folded(filter.sourceAccountName)) return false;
+    if (filter.currency !== undefined && value.currency !== undefined && value.currency !== filter.currency) return false;
+    if (filter.transactionPeriod !== undefined
+      && value.transactionDate !== undefined
+      && !value.transactionDate.startsWith(`${filter.transactionPeriod}-`)) return false;
+    if (filter.jurisdiction !== undefined
+      && value.jurisdiction !== undefined
+      && value.jurisdiction !== 'unknown'
+      && value.jurisdiction !== filter.jurisdiction) return false;
+    if (filter.taxCalculation !== undefined
+      && value.taxCalculation !== undefined
+      && value.taxCalculation !== filter.taxCalculation) return false;
+    return true;
+  });
 }
 
 function kindReason(
@@ -331,18 +441,22 @@ export async function searchClassificationMemory(
   const query = checkedText(rawInput.query, CLASSIFICATION_CONTRACT_LIMITS.query);
   const companyId = checkedText(rawInput.companyId, CLASSIFICATION_CONTRACT_LIMITS.identifier);
   const companyIds = selectedCompanyIds(rawInput);
+  const context = checkedContext(rawInput.context);
   const limit = Math.max(1, Math.min(
     CLASSIFICATION_CONTRACT_LIMITS.hits,
     Math.trunc(rawInput.limit ?? 20),
   ));
   if (!Number.isFinite(limit)) throw new ClassificationSearchError('INVALID_INPUT');
-  const fetchLimit = Math.min(MAX_FETCH, limit * SEARCH_FETCH_MULTIPLIER);
+  const fetchLimit = context === undefined
+    ? Math.min(MAX_FETCH, limit * SEARCH_FETCH_MULTIPLIER)
+    : MAX_FETCH;
   const repository = dependencies.repository ?? new PrismaClassificationSearchRepository();
 
   if (rawInput.mode === 'exact') {
-    const records = await boundedRepositoryRead(() => (
-      repository.exact(companyIds, query, fetchLimit)
+    const loaded = await boundedRepositoryRead(() => (
+      repository.exact(companyIds, query, fetchLimit, context)
     ));
+    const records = recordsMatchingContext(loaded, context);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'exact', mode: 'exact',
       degradedReason: null, records, lists: exactLists(records), limit,
@@ -350,9 +464,10 @@ export async function searchClassificationMemory(
   }
 
   if (rawInput.mode === 'lexical') {
-    const records = await boundedRepositoryRead(() => (
-      repository.search(companyIds, query, fetchLimit)
+    const loaded = await boundedRepositoryRead(() => (
+      repository.search(companyIds, query, fetchLimit, context)
     ));
+    const records = recordsMatchingContext(loaded, context);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'lexical', mode: 'lexical',
       degradedReason: null, records, lists: lexicalLists(records), limit,
@@ -363,9 +478,10 @@ export async function searchClassificationMemory(
     if (rawInput.mode !== 'auto') {
       throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'embedding_not_configured');
     }
-    const records = await boundedRepositoryRead(() => (
-      repository.search(companyIds, query, fetchLimit)
+    const loaded = await boundedRepositoryRead(() => (
+      repository.search(companyIds, query, fetchLimit, context)
     ));
+    const records = recordsMatchingContext(loaded, context);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'auto', mode: 'lexical',
       degradedReason: 'embedding_not_configured', records, lists: lexicalLists(records), limit,
@@ -381,18 +497,21 @@ export async function searchClassificationMemory(
       similarity: hit.similarity,
       revisedAt: hit.revisedAt,
     })), { cosineFloor: COSINE_FLOOR, limit: fetchLimit });
-    const records = await boundedRepositoryRead(() => (
-      repository.rehydrate(companyIds, rolled.map((hit) => hit.id))
+    const loaded = await boundedRepositoryRead(() => (
+      repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
     ));
+    const records = recordsMatchingContext(loaded, context);
+    const eligibleIds = new Set(records.map((record) => record.hit.id));
+    const eligibleSemantic = rolled.filter((hit) => eligibleIds.has(hit.id));
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'semantic', mode: 'semantic',
       degradedReason: null, records,
-      lists: [{ matchedIn: 'semantic', hits: rolled }], limit,
+      lists: [{ matchedIn: 'semantic', hits: eligibleSemantic }], limit,
     });
   }
 
   const lexicalPromise = boundedRepositoryRead(() => (
-    repository.search(companyIds, query, fetchLimit)
+    repository.search(companyIds, query, fetchLimit, context)
   ));
   const semanticPromise = semanticLeg(
     companyIds, query, fetchLimit, dependencies.semantic,
@@ -406,7 +525,7 @@ export async function searchClassificationMemory(
     if (error instanceof ClassificationSearchError && error.code !== 'SEMANTIC_UNAVAILABLE') {
       throw error;
     }
-    lexical = await lexicalPromise;
+    lexical = recordsMatchingContext(await lexicalPromise, context);
     const reason = error instanceof ClassificationSearchError && error.reason !== null
       ? error.reason
       : 'semantic_error';
@@ -420,9 +539,13 @@ export async function searchClassificationMemory(
     similarity: hit.similarity,
     revisedAt: hit.revisedAt,
   })), { cosineFloor: COSINE_FLOOR, limit: fetchLimit });
-  const rehydrated = await boundedRepositoryRead(() => (
-    repository.rehydrate(companyIds, rolled.map((hit) => hit.id))
+  const loadedRehydrated = await boundedRepositoryRead(() => (
+    repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
   ));
+  const rehydrated = recordsMatchingContext(loadedRehydrated, context);
+  const eligibleSemanticIds = new Set(rehydrated.map((record) => record.hit.id));
+  const eligibleSemantic = rolled.filter((hit) => eligibleSemanticIds.has(hit.id));
+  lexical = recordsMatchingContext(lexical, context);
   // Lexical rows carry query-specific exact-source provenance; queryless
   // semantic rehydration may fill only IDs that the lexical leg did not find.
   const records = [...new Map(
@@ -438,10 +561,44 @@ export async function searchClassificationMemory(
     records,
     lists: [
       ...lexicalLists(lexical),
-      { matchedIn: 'semantic', hits: rolled },
+      { matchedIn: 'semantic', hits: eligibleSemantic },
     ],
     limit,
   });
+}
+
+export async function searchClassificationMemorySnapshot(
+  rawInput: ClassificationSearchInput,
+  dependencies: ClassificationSearchDependencies,
+): Promise<ClassificationSearchSnapshot> {
+  const repository = dependencies.repository ?? new PrismaClassificationSearchRepository();
+  const companyIds = selectedCompanyIds(rawInput);
+  const before = repository.revisions === undefined
+    ? {}
+    : await boundedRepositoryRead(() => repository.revisions!(companyIds));
+  const result = await searchClassificationMemory(rawInput, { ...dependencies, repository });
+  const after = repository.revisions === undefined
+    ? before
+    : await boundedRepositoryRead(() => repository.revisions!(companyIds));
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    throw new ClassificationSearchError('COMPANY_UNAVAILABLE');
+  }
+  const fingerprint = createHash('sha256').update(JSON.stringify({
+    v: 1,
+    input: {
+      query: rawInput.query,
+      companyId: rawInput.companyId,
+      scope: rawInput.scope,
+      mode: rawInput.mode,
+      limit: rawInput.limit ?? 20,
+      accessibleCompanyIds: [...new Set(rawInput.accessibleCompanyIds)].sort(),
+      context: rawInput.context ?? null,
+    },
+    revisions: after,
+    semanticGeneration: dependencies.semantic?.generation.fingerprint ?? null,
+    result,
+  }), 'utf8').digest('hex');
+  return { result, fingerprint };
 }
 
 /** Shared runtime adapter. Provider configuration remains optional: exact and
@@ -451,21 +608,43 @@ export async function searchClassificationMemory(
 export async function searchClassificationMemoryWithRuntime(
   input: ClassificationSearchInput,
 ): Promise<ClassificationSearchResult> {
-  const config = classificationEmbeddingRuntimeConfig();
-  const semantic = config === null
-    ? null
-    : {
-        generation: classificationEmbeddingGeneration({
-          baseUrl: config.baseUrl,
-          fingerprintSalt: config.fingerprintSalt,
-        }),
-        client: createVoyageEmbeddingClient(config),
-        store: new PgClassificationVectorStore(prisma),
-      };
+  const semantic = classificationSemanticRuntime(input.mode);
   return searchClassificationMemory(input, {
     repository: new PrismaClassificationSearchRepository(prisma),
     semantic,
   });
+}
+
+export async function searchClassificationMemoryWithRuntimeSnapshot(
+  input: ClassificationSearchInput,
+): Promise<ClassificationSearchSnapshot> {
+  const semantic = classificationSemanticRuntime(input.mode);
+  return searchClassificationMemorySnapshot(input, {
+    repository: new PrismaClassificationSearchRepository(prisma),
+    semantic,
+  });
+}
+
+export function classificationSemanticRuntime(
+  mode: ClassificationSearchMode,
+  readConfig: typeof classificationEmbeddingRuntimeConfig = classificationEmbeddingRuntimeConfig,
+): ClassificationSemanticSearch | null {
+  if (mode === 'exact' || mode === 'lexical') return null;
+  try {
+    const config = readConfig();
+    if (config === null) return null;
+    return {
+      generation: classificationEmbeddingGeneration({
+        baseUrl: config.baseUrl,
+        fingerprintSalt: config.fingerprintSalt,
+      }),
+      client: createVoyageEmbeddingClient(config),
+      store: new PgClassificationVectorStore(prisma),
+    };
+  } catch {
+    if (mode === 'auto') return null;
+    throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'embedding_not_configured');
+  }
 }
 
 /** PostgreSQL-backed repository is implemented below; lexical reads never
@@ -473,10 +652,19 @@ export async function searchClassificationMemoryWithRuntime(
 export class PrismaClassificationSearchRepository implements ClassificationSearchRepository {
   constructor(private readonly db: PrismaClient = prisma) {}
 
+  async revisions(companyIds: readonly string[]): Promise<Readonly<Record<string, string>>> {
+    const checked = checkedCompanyList(companyIds).sort();
+    const pairs = await Promise.all(checked.map(async (companyId) => (
+      [companyId, await this.corpusRevision(companyId)] as const
+    )));
+    return Object.fromEntries(pairs);
+  }
+
   async exact(
     companyIds: readonly string[],
     query: string,
     limit: number,
+    _context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     const checkedQuery = checkedText(query, CLASSIFICATION_CONTRACT_LIMITS.query);
@@ -508,15 +696,19 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     companyIds: readonly string[],
     query: string,
     limit: number,
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     const checkedQuery = checkedText(query, CLASSIFICATION_CONTRACT_LIMITS.query);
-    return this.load(checkedCompanyIds, checkedQuery, null, boundedFetchLimit(limit));
+    return this.load(
+      checkedCompanyIds, checkedQuery, null, boundedFetchLimit(limit), checkedContext(context),
+    );
   }
 
   async rehydrate(
     companyIds: readonly string[],
     documentIds: readonly string[],
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     if (!Array.isArray(documentIds) || documentIds.length > MAX_FETCH) {
@@ -524,7 +716,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     }
     const checkedIds = [...new Set(documentIds.map((id) => checkedText(id, 260)))];
     if (checkedIds.length === 0) return [];
-    return this.load(checkedCompanyIds, null, checkedIds, checkedIds.length);
+    return this.load(checkedCompanyIds, null, checkedIds, checkedIds.length, checkedContext(context));
   }
 
   async documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus> {
@@ -630,12 +822,13 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string | null,
     documentIds: readonly string[] | null,
     limit: number,
+    context?: ClassificationSearchContextFilter,
   ): Promise<ClassificationSearchRecord[]> {
     const idsByKind = splitDocumentIds(documentIds);
     const [identities, aliases, cases, rules, candidates] = await Promise.all([
       this.identityRows(companyIds, query, idsByKind.vendor_identity, limit),
       this.aliasRows(companyIds, query, idsByKind.vendor_alias, limit),
-      this.caseRows(companyIds, query, idsByKind.classification_case, limit),
+      this.caseRows(companyIds, query, idsByKind.classification_case, limit, context),
       this.ruleRows(companyIds, query, idsByKind.rule, limit),
       this.candidateRows(companyIds, query, idsByKind.rule_candidate, limit),
     ]);
@@ -821,6 +1014,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string | null,
     ids: readonly string[] | null,
     limit: number,
+    context?: ClassificationSearchContextFilter,
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as ClassificationCaseSearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND memory."id" IN (${Prisma.join(ids)})`;
@@ -849,12 +1043,14 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     const score = query === null ? Prisma.sql`0::double precision` : Prisma.sql`
       ts_rank_cd(to_tsvector('simple', ${text}), plainto_tsquery('simple', ${query}))::double precision
     `;
+    const contextFilter = classificationCaseSqlFilter(context);
     return this.db.$queryRaw<ClassificationCaseSearchRow[]>(Prisma.sql`
       SELECT memory."id", memory."companyId", company."nickname" AS "companyName",
              memory."vendorIdentityId", identity."displayName" AS "vendorName", memory."action",
              memory."originIntent", memory."rationale", memory."requiredEvidence", memory."examples",
              memory."counterexamples", memory."reviewer", memory."jurisdiction", memory."currency",
-             memory."provenance", memory."verifiedAt", memory."verifiedAt" AS "revisedAt",
+             memory."context", memory."provenance", memory."verifiedAt", memory."verifiedAt" AS "revisedAt",
+             transaction."date" AS "transactionDate",
              ${snapshotPayee} AS "payee", ${snapshotMemo} AS "memo", account."name" AS "categoryName",
              tax."name" AS "taxCodeName", ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "ClassificationCase" memory
@@ -872,7 +1068,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
        AND invalidation."classificationCaseId" = memory."id"
       WHERE memory."companyId" IN (${Prisma.join(companyIds)})
         AND invalidation."id" IS NULL
-        ${idFilter} ${queryFilter}
+        ${idFilter} ${queryFilter} ${contextFilter}
       ORDER BY "lexicalScore" DESC, memory."verifiedAt" DESC, memory."id" ASC
       LIMIT ${limit}
     `);
@@ -1028,10 +1224,12 @@ type ClassificationCaseSearchRow = BaseSearchRow & {
   examples: Prisma.JsonValue;
   counterexamples: Prisma.JsonValue;
   reviewer: Prisma.JsonValue;
+  context: Prisma.JsonValue;
   jurisdiction: string;
   currency: string;
   provenance: Prisma.JsonValue;
   verifiedAt: Date;
+  transactionDate: Date;
   payee: string;
   memo: string | null;
   categoryName: string | null;
@@ -1082,6 +1280,51 @@ function checkedCorpusRevision(value: string): string {
     throw new ClassificationSearchError('INVALID_INPUT');
   }
   return value;
+}
+
+function classificationCaseSqlFilter(
+  context: ClassificationSearchContextFilter | undefined,
+): Prisma.Sql {
+  if (context === undefined) return Prisma.empty;
+  const clauses: Prisma.Sql[] = [];
+  if (context.transactionDirection !== undefined) clauses.push(Prisma.sql`
+    AND (
+      NOT (memory."context" ? 'transactionDirection')
+      OR jsonb_typeof(memory."context"->'transactionDirection') <> 'string'
+      OR memory."context"->>'transactionDirection' = ${context.transactionDirection}
+    )
+  `);
+  if (context.qboType !== undefined) clauses.push(Prisma.sql`
+    AND (
+      NOT (memory."context" ? 'qboType')
+      OR jsonb_typeof(memory."context"->'qboType') <> 'string'
+      OR memory."context"->>'qboType' = ${context.qboType}
+    )
+  `);
+  if (context.sourceAccountName !== undefined) clauses.push(Prisma.sql`
+    AND (
+      NOT (memory."context" ? 'sourceAccountName')
+      OR jsonb_typeof(memory."context"->'sourceAccountName') <> 'string'
+      OR lower(trim(memory."context"->>'sourceAccountName')) = lower(trim(${context.sourceAccountName}))
+    )
+  `);
+  if (context.currency !== undefined) clauses.push(Prisma.sql`
+    AND memory."currency" = ${context.currency}
+  `);
+  if (context.transactionPeriod !== undefined) clauses.push(Prisma.sql`
+    AND to_char(transaction."date", 'YYYY-MM') = ${context.transactionPeriod}
+  `);
+  if (context.jurisdiction !== undefined) clauses.push(Prisma.sql`
+    AND (memory."jurisdiction" = 'unknown' OR memory."jurisdiction" = ${context.jurisdiction})
+  `);
+  if (context.taxCalculation !== undefined) clauses.push(Prisma.sql`
+    AND (
+      NOT (memory."action" ? 'taxCalculation')
+      OR jsonb_typeof(memory."action"->'taxCalculation') <> 'string'
+      OR memory."action"->>'taxCalculation' = ${context.taxCalculation}
+    )
+  `);
+  return clauses.length === 0 ? Prisma.empty : Prisma.join(clauses, ' ');
 }
 
 function checkedCompanyList(companyIds: readonly string[]): string[] {
@@ -1387,9 +1630,34 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
       counterexamples: jsonStrings(row.counterexamples), jurisdiction: row.jurisdiction,
       currency: row.currency, verifiedAt: row.verifiedAt.toISOString(),
     });
+    const rawContext = typeof row.context === 'object' && row.context !== null && !Array.isArray(row.context)
+      ? row.context as Record<string, Prisma.JsonValue>
+      : {};
+    const transactionDirection = rawContext.transactionDirection === 'in'
+      || rawContext.transactionDirection === 'out'
+      || rawContext.transactionDirection === 'unknown'
+      ? rawContext.transactionDirection
+      : undefined;
+    const qboType = rawContext.qboType === 'Purchase'
+      || rawContext.qboType === 'Deposit'
+      || rawContext.qboType === 'JournalEntry'
+      ? rawContext.qboType
+      : undefined;
+    const sourceAccountName = typeof rawContext.sourceAccountName === 'string'
+      ? rawContext.sourceAccountName
+      : rawContext.sourceAccountName === null ? null : undefined;
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
       document: optionalDocumentFor(hit, revisedAt, row.searchText),
+      context: {
+        ...(transactionDirection === undefined ? {} : { transactionDirection }),
+        ...(qboType === undefined ? {} : { qboType }),
+        ...(sourceAccountName === undefined ? {} : { sourceAccountName }),
+        currency: row.currency,
+        transactionDate: row.transactionDate.toISOString().slice(0, 10),
+        jurisdiction: row.jurisdiction,
+        ...(action === null ? {} : { taxCalculation: action.taxCalculation }),
+      },
     };
   };
 }

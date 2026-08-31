@@ -15,9 +15,14 @@ describe('classificationSearchForCompany', () => {
         date: '2026-08-31',
         signedAmountCents: -1_200,
         currency: 'CAD',
-        sourceAccountName: 'Operating',
+        sourceAccountName: null,
         payee: 'Coffee shop',
         memo: null,
+        transactionDirection: 'out',
+        qboType: null,
+        transactionPeriod: '2026-08',
+        jurisdiction: null,
+        taxStatus: 'ready',
       },
     });
 
@@ -28,6 +33,11 @@ describe('classificationSearchForCompany', () => {
       mode: 'auto',
       limit: 12,
       accessibleCompanyIds: ['company-a'],
+      context: {
+        transactionDirection: 'out',
+        currency: 'CAD',
+        transactionPeriod: '2026-08',
+      },
     });
   });
 });
