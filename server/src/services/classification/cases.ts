@@ -542,6 +542,10 @@ function dbTransaction<T>(
   return callback(db);
 }
 
+function ownsTransaction(db: ClassificationCaseDb): boolean {
+  return typeof (db as unknown as { $transaction?: unknown }).$transaction === 'function';
+}
+
 /**
  * Persists one immutable case for one verified QBO attempt. The attempt's
  * globally unique requestId and the case's unique attempt FK make retries
@@ -552,6 +556,7 @@ export async function recordVerifiedClassificationCase(
   db: ClassificationCaseDb = prisma,
 ): Promise<ClassificationCase> {
   const checked = validateInput(input);
+  const canRecoverWithRootClient = ownsTransaction(db);
   let recoveryAttemptId: string | null = null;
   try {
     return await dbTransaction(db, async (tx) => {
@@ -617,6 +622,10 @@ export async function recordVerifiedClassificationCase(
     });
   } catch (error) {
     if (!isUniqueViolation(error) || recoveryAttemptId === null) throw error;
+    // PostgreSQL aborts a transaction after a unique violation. A caller-owned
+    // TransactionClient cannot safely re-query here; its root caller must
+    // recover outside the failed transaction instead.
+    if (!canRecoverWithRootClient) throw error;
     const raced = await findCaseByAttempt(input.companyId, recoveryAttemptId, db);
     if (raced === null) throw error;
     if (raced.actionFingerprint !== checked.actionFingerprint) {

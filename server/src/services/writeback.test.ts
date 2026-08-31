@@ -1595,6 +1595,40 @@ function commitInput(requestId = 'request-generic') {
   };
 }
 
+function decisionContext() {
+  return {
+    vendorIdentityHint: {
+      displayName: '  Generic\u00a0 Supplier  ',
+      qboVendorId: '  vendor-generic  ',
+    },
+    rationale: '  Reviewed against the synthetic receipt.  ',
+    requiredEvidence: ['  Synthetic receipt  '],
+    examples: ['  Synthetic invoice  '],
+    counterexamples: ['  Personal purchase  '],
+    citations: [{
+      url: 'https://example.invalid/policy',
+      title: '  Synthetic policy  ',
+      publisher: '  Example publisher  ',
+      retrievedAt: '2026-07-28T10:00:00.000Z',
+      claimSummary: '  The synthetic purchase is an expense.  ',
+    }],
+    reviewer: {
+      userId: DURABLE_ACTOR_ID,
+      configVersion: '  classification-v1  ',
+      decision: 'approved' as const,
+    },
+    originIntent: 'apply_once' as const,
+    jurisdiction: '  CA-BC  ',
+    currency: 'CAD',
+    context: {
+      transactionDirection: 'out' as const,
+      qboType: 'Purchase' as const,
+      sourceAccountName: '  Generic bank  ',
+      businessPurpose: '  Team supplies  ',
+    },
+  };
+}
+
 function seedAttempt(
   db: FakeDurableDb,
   status: string,
@@ -1699,6 +1733,125 @@ function pauseCommittingTransitions(db: FakeDurableDb, expectedArrivals: number)
 }
 
 describe('commitStagedCategorization durable lifecycle', () => {
+  it('persists normalized bounded decision context and binds every field without redefining the QBO request hash', async () => {
+    const fixture = durableDeps();
+    const input = {
+      ...commitInput(),
+      decisionContext: decisionContext(),
+    };
+
+    await commitStagedCategorization(input, fixture.deps);
+
+    const attempt = fixture.db.attempts[0]!;
+    const payload = attempt.requestPayload as Record<string, unknown>;
+    const prepared = payload as unknown as QboPreparedWrite;
+    expect(attempt.requestHash).toBe(hashPreparedWriteBody(prepared.body));
+    expect(payload.classificationDecision).toEqual({
+      version: 1,
+      context: {
+        vendorIdentityHint: {
+          displayName: 'Generic\u00a0 Supplier',
+          normalizedName: 'generic supplier',
+          qboVendorId: 'vendor-generic',
+        },
+        rationale: 'Reviewed against the synthetic receipt.',
+        requiredEvidence: ['Synthetic receipt'],
+        examples: ['Synthetic invoice'],
+        counterexamples: ['Personal purchase'],
+        citations: [{
+          url: 'https://example.invalid/policy',
+          title: 'Synthetic policy',
+          publisher: 'Example publisher',
+          retrievedAt: '2026-07-28T10:00:00.000Z',
+          claimSummary: 'The synthetic purchase is an expense.',
+        }],
+        reviewer: {
+          userId: DURABLE_ACTOR_ID,
+          configVersion: 'classification-v1',
+          decision: 'approved',
+        },
+        originIntent: 'apply_once',
+        jurisdiction: 'CA-BC',
+        currency: 'CAD',
+        context: {
+          transactionDirection: 'out',
+          qboType: 'Purchase',
+          sourceAccountName: 'Generic bank',
+          businessPurpose: 'Team supplies',
+        },
+      },
+      contextHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: 'request-generic',
+        decisionContext: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+          originIntent: 'apply_once',
+        }),
+      }),
+    );
+
+    const changes: Array<(value: ReturnType<typeof decisionContext>) => void> = [
+      (value) => { value.vendorIdentityHint.displayName = 'Different supplier'; },
+      (value) => { value.rationale = 'Different rationale'; },
+      (value) => { value.requiredEvidence = ['Different evidence']; },
+      (value) => { value.examples = ['Different example']; },
+      (value) => { value.counterexamples = ['Different counterexample']; },
+      (value) => { value.citations[0]!.claimSummary = 'Different cited claim'; },
+      (value) => { value.reviewer.configVersion = 'classification-v2'; },
+      (value) => { value.originIntent = 'make_recurring'; },
+      (value) => { value.jurisdiction = 'CA-ON'; },
+      (value) => { value.currency = 'USD'; },
+      (value) => { value.context.businessPurpose = 'Different purpose'; },
+    ];
+    for (const change of changes) {
+      const changed = decisionContext();
+      change(changed);
+      await expect(commitStagedCategorization({
+        ...commitInput(),
+        decisionContext: changed,
+      }, fixture.deps)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    }
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects unbounded, unsafe, unapproved, or transaction-mismatched decision context before QBO access', async () => {
+    const base = decisionContext();
+    const invalidContexts = [
+      { ...base, rationale: 'x'.repeat(2_001) },
+      { ...base, examples: Array.from({ length: 21 }, (_, index) => `Example ${index}`) },
+      {
+        ...base,
+        citations: [{ ...base.citations[0]!, url: 'http://example.invalid/policy' }],
+      },
+      {
+        ...base,
+        reviewer: { ...base.reviewer, userId: '00000000-0000-4000-8000-000000000999' },
+      },
+      {
+        ...base,
+        context: { ...base.context, qboType: 'Deposit' as const },
+      },
+      {
+        ...base,
+        vendorIdentityHint: { ...base.vendorIdentityHint, displayName: 'Bad\u0000vendor' },
+      },
+    ];
+
+    for (const invalid of invalidContexts) {
+      const fixture = durableDeps();
+      await expect(commitStagedCategorization({
+        ...commitInput(),
+        decisionContext: invalid,
+      }, fixture.deps)).rejects.toMatchObject({ code: 'INVALID_DECISION_CONTEXT' });
+      expect(fixture.getClient).not.toHaveBeenCalled();
+      expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.attempts).toHaveLength(0);
+    }
+  });
+
   it('keeps null actors forbidden on the public durable write path', async () => {
     const fixture = durableDeps();
     fixture.authorize.mockImplementation(async (actorId) => actorId !== null);
@@ -1853,6 +2006,30 @@ describe('commitStagedCategorization durable lifecycle', () => {
 
     expect(result).toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
     expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits an approved verified case even when the payee cannot form a rule candidate', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.payee = 'x';
+    (fixture.client.fetchTxn as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...currentQboTxn(),
+      payee: 'x',
+    });
+
+    await commitStagedCategorization({
+      ...commitInput(),
+      decisionContext: decisionContext(),
+    }, fixture.deps);
+
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: 'request-generic',
+        candidateContext: null,
+        decisionContext: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+        }),
+      }),
+    );
   });
 
   it('keeps a verified write verified when evidence evaluation fails and retries the hook on replay', async () => {

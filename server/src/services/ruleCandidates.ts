@@ -143,6 +143,18 @@ async function readiness(
   ) {
     reasons.push('Company tax readiness changed after this evidence was collected.');
   }
+  // Rule rows can retain tax provenance, but the current normal Rule executor
+  // does not reproduce the verified tax write. Keep any legacy/manual taxed
+  // candidate inert until CRUD validation and execution support the same exact
+  // action end to end.
+  if (
+    candidate.taxCalculation === 'TaxInclusive'
+    || candidate.taxCalculation === 'TaxExcluded'
+  ) {
+    reasons.push(
+      'Taxed candidates cannot activate until normal rules reproduce the same QBO tax write.',
+    );
+  }
   if (ownedTags !== tagIds.length) reasons.push('One or more tags are no longer available.');
   const currentConfigVersion = config?.configVersion ?? 'verified-writeback-v1';
   if (currentConfigVersion !== candidate.configVersion) {

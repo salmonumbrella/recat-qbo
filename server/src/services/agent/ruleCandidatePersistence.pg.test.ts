@@ -13,6 +13,7 @@ import { candidateContextFor } from './ruleCandidates.js';
 import {
   activateRuleCandidate,
   dismissRuleCandidate,
+  getRuleCandidate,
 } from '../ruleCandidates.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
 
@@ -562,4 +563,128 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await db.company.delete({ where: { id: company.id } });
     }
   }, 30_000);
+
+  it('keeps a legacy taxed candidate inert until the normal rule executor can reproduce tax writes', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({
+      data: {
+        realmId: `candidate-tax-${suffix}`,
+        legalName: 'Tax candidate fixture',
+        nickname: `candidate-tax-${suffix.slice(0, 8)}`,
+        taxSupportStatus: 'ready',
+        taxUsingSalesTax: true,
+      },
+    });
+    const account = await db.qboAccount.create({
+      data: {
+        companyId: company.id,
+        qboId: `account-${suffix}`,
+        name: 'Taxed category',
+        fullName: 'Expenses · Taxed category',
+        classification: 'Expenses',
+      },
+    });
+    const taxCode = await db.qboTaxCode.create({
+      data: {
+        companyId: company.id,
+        qboId: `tax-${suffix}`,
+        name: 'Synthetic tax',
+        active: true,
+        taxable: true,
+        purchaseTaxRateList: [{ taxRateQboId: `rate-${suffix}` }],
+        salesTaxRateList: [],
+        combinedPurchaseRate: '5',
+      },
+    });
+    await db.agentCompanyConfig.create({
+      data: {
+        companyId: company.id,
+        mode: 'shadow',
+        provider: 'custom',
+        decisionModel: 'decision-model',
+        verifierModel: 'verifier-model',
+        limits: {},
+        configVersion: `config-${suffix}`,
+      },
+    });
+    const candidate = await db.autopilotRuleCandidate.create({
+      data: {
+        companyId: company.id,
+        conditionFingerprint: `condition-${suffix}`,
+        schemaVersion: 'rule-candidate-v1',
+        configVersion: `config-${suffix}`,
+        matchText: 'synthetic taxed vendor',
+        state: 'ready',
+        winningActionFingerprint: `action-${suffix}`,
+        categoryQboId: account.qboId,
+        taxCalculation: 'TaxInclusive',
+        taxCodeQboId: taxCode.qboId,
+        tagIds: [],
+        evidenceCount: 3,
+        conflictingEvidenceCount: 0,
+      },
+    });
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        const transaction = await db.transaction.create({
+          data: {
+            companyId: company.id,
+            qboId: `purchase-${index}-${suffix}`,
+            qboType: 'Purchase',
+            qboSyncToken: '1',
+            date: NOW,
+            payee: 'Synthetic taxed vendor',
+            amount: '-10.50',
+            bankAccount: 'Fixture bank',
+            status: 'POSTED',
+            revision: 1,
+          },
+        });
+        const requestId = randomUUID();
+        await db.qboMutationAttempt.create({
+          data: {
+            transactionId: transaction.id,
+            requestId,
+            operation: 'recategorize',
+            status: 'VERIFIED',
+            expectedRevision: 1,
+            expectedSyncToken: '0',
+            requestHash: `hash-${requestId}`,
+            requestPayload: {},
+            beforeSnapshot: {},
+          },
+        });
+        await db.autopilotRuleCandidateEvidence.create({
+          data: {
+            companyId: company.id,
+            candidateId: candidate.id,
+            transactionId: transaction.id,
+            inputRevision: 1,
+            requestId,
+            source: 'user',
+            actionFingerprint: `action-${suffix}`,
+            pattern: {},
+            active: true,
+            observedAt: NOW,
+          },
+        });
+      }
+
+      await expect(getRuleCandidate(company.id, candidate.id, db)).resolves.toMatchObject({
+        canActivate: false,
+        staleReasons: [
+          'Taxed candidates cannot activate until normal rules reproduce the same QBO tax write.',
+        ],
+      });
+      await expect(activateRuleCandidate(
+        company.id,
+        candidate.id,
+        { id: randomUUID(), label: 'Fixture reviewer' },
+        db,
+      )).rejects.toMatchObject({ code: 'CANDIDATE_STALE' });
+      await expect(db.rule.count({ where: { companyId: company.id } })).resolves.toBe(0);
+    } finally {
+      await db.company.delete({ where: { id: company.id } });
+    }
+  });
 });

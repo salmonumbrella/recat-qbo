@@ -45,6 +45,7 @@ async function recomputeCandidate(
   tx: CandidateTransaction,
   candidateId: string,
   now: Date,
+  markActivatedRule = true,
 ): Promise<void> {
   const candidate = await tx.autopilotRuleCandidate.findUnique({
     where: { id: candidateId },
@@ -123,7 +124,8 @@ async function recomputeCandidate(
     },
   });
   if (
-    candidate.state === 'activated'
+    markActivatedRule
+    && candidate.state === 'activated'
     && candidate.activatedRuleId !== null
     && (
       state !== 'ready'
@@ -158,23 +160,43 @@ export async function recordVerifiedRuleCandidateOutcome(
 ): Promise<void> {
   const now = deps.now?.() ?? new Date();
   await runCompanyMutationTransaction(deps.db, outcome.companyId, async (tx) => {
-    const transaction = await tx.transaction.findUnique({
-      where: { id: outcome.transactionId },
-      select: {
-        id: true,
-        companyId: true,
-        revision: true,
-        status: true,
-        payee: true,
-      },
-    });
-    if (transaction === null) return;
-    const affected = new Set<string>();
-    await foldOutcome(tx, outcome, transaction, now, affected);
-    for (const candidateId of affected) {
-      await recomputeCandidate(tx, candidateId, now);
-    }
+    await foldVerifiedRuleCandidateOutcomeInTransaction(tx, outcome, now);
   });
+}
+
+/**
+ * Caller-owned transaction variant used by the classification outcome
+ * recorder. It deliberately never starts a nested transaction; the caller is
+ * responsible for taking the company mutation fence before invoking it.
+ */
+export async function foldVerifiedRuleCandidateOutcomeInTransaction(
+  tx: CandidateTransaction,
+  outcome: VerifiedCategorizationOutcome,
+  now: Date,
+  options: { markAffectedRules?: boolean } = {},
+): Promise<{ processed: boolean; affectedCandidateIds: string[] }> {
+  const transaction = await tx.transaction.findUnique({
+    where: { id: outcome.transactionId },
+    select: {
+      id: true,
+      companyId: true,
+      revision: true,
+      status: true,
+      payee: true,
+    },
+  });
+  if (transaction === null) return { processed: false, affectedCandidateIds: [] };
+  const affected = new Set<string>();
+  const processed = await foldOutcome(tx, outcome, transaction, now, affected);
+  for (const candidateId of affected) {
+    await recomputeCandidate(
+      tx,
+      candidateId,
+      now,
+      options.markAffectedRules !== false,
+    );
+  }
+  return { processed, affectedCandidateIds: [...affected] };
 }
 
 async function foldOutcome(
@@ -189,14 +211,14 @@ async function foldOutcome(
   },
   now: Date,
   affected: Set<string>,
-): Promise<void> {
+): Promise<boolean> {
   const folded = await tx.autopilotRuleCandidateFold.findUnique({
     where: { requestId: outcome.requestId },
     select: { requestId: true },
   });
   if (folded !== null) {
     await markAttemptFolded(tx, outcome, now);
-    return;
+    return false;
   }
 
   const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'REVERTED';
@@ -291,6 +313,7 @@ async function foldOutcome(
   if (marked !== 1) {
     throw new Error('Verified rule-candidate outcome is not backed by one durable attempt.');
   }
+  return true;
 }
 
 async function markAttemptFolded(
@@ -375,6 +398,10 @@ function missingRepairRows(
         AND attempt."operation" IN ('recategorize', 'restore')
         AND attempt."ruleCandidateFoldedAt" IS NULL
         AND attempt."requestPayload"->'ruleCandidateFold'->>'version' = '1'
+        -- Approved classification decisions are folded only by the atomic
+        -- case + candidate recorder. This legacy repair path remains for
+        -- attempts that predate case recording.
+        AND attempt."requestPayload"->'classificationDecision' IS NULL
         ${extraPredicate}
       ORDER BY attempt."createdAt" DESC, attempt."id" DESC
       LIMIT ${limit}

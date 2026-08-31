@@ -57,8 +57,14 @@ import { pauseLiveCompanyInTransaction } from './agent/circuitBreaker.js';
 import { isCanonicalLiveCheckpoint } from './agent/liveCheckpoint.js';
 import { candidateContextFor } from './agent/ruleCandidates.js';
 import {
+  categorizationDecisionContextHash,
+  classificationDecisionForPreparedWrite,
+  normalizeCategorizationDecisionContext,
+  persistedClassificationDecision,
   persistedEvidenceProposal,
   persistedRuleCandidateContext,
+  type CategorizationDecisionContext,
+  type NormalizedCategorizationDecisionContext,
 } from './categorizationEvidence.js';
 import {
   assertQboWriteAllowed,
@@ -980,6 +986,7 @@ export interface CommitStagedCategorizationInput {
   expectedStageHash?: string;
   expectedQboBinding?: ExpectedQboBinding;
   authorization?: DurableMutationAuthorization;
+  decisionContext?: CategorizationDecisionContext;
 }
 
 export interface ReconcileMutationAttemptInput {
@@ -1149,14 +1156,14 @@ async function defaultDurableDeps(): Promise<DurableWritebackDeps> {
     onVerifiedCategorizationOutcome: async (outcome) => {
       const [
         { evaluateShadowRunAgainstOutcome },
-        { recordVerifiedRuleCandidateOutcome },
+        { recordVerifiedClassificationOutcome },
       ] = await Promise.all([
         import('./agent/evaluation.js'),
-        import('./agent/ruleCandidatePersistence.js'),
+        import('./classification/outcomeRecorder.js'),
       ]);
       const results = await Promise.allSettled([
         evaluateShadowRunAgainstOutcome(outcome),
-        recordVerifiedRuleCandidateOutcome(outcome),
+        recordVerifiedClassificationOutcome(outcome),
       ]);
       const failure = results.find(
         (result): result is PromiseRejectedResult => result.status === 'rejected',
@@ -2168,9 +2175,14 @@ async function emitVerifiedCategorizationOutcome(
   const candidateContext = operation === 'posted'
     ? persistedRuleCandidateContext(attempt.requestPayload)
     : null;
+  const prepared = validateAttemptPersistence(attempt);
+  const classificationDecision = persistedClassificationDecision(
+    attempt.requestPayload,
+    hashClassificationPreparedWrite(prepared),
+  );
   // Legacy or corrupt recategorization attempts cannot prove the exact staged
   // proposal, so they are deliberately excluded instead of guessed from QBO.
-  if (operation === 'posted' && (proposal === null || candidateContext === null)) return;
+  if (operation === 'posted' && proposal === null) return;
   try {
     await d.onVerifiedCategorizationOutcome({
       companyId: txn.companyId,
@@ -2180,6 +2192,9 @@ async function emitVerifiedCategorizationOutcome(
       operation,
       proposal,
       candidateContext,
+      ...(classificationDecision === null
+        ? {}
+        : { decisionContext: classificationDecision.context }),
     });
   } catch {
     // The QuickBooks readback and local VERIFIED state are already durable.
@@ -2202,6 +2217,7 @@ interface RequestIntent {
   operation: 'recategorize' | 'restore';
   expectedRevision: number;
   requestHash?: string;
+  decisionContextHash?: string | null;
 }
 
 function assertRequestIdentity(attempt: DurableAttempt, intent: RequestIntent): void {
@@ -2214,7 +2230,16 @@ function assertRequestIdentity(attempt: DurableAttempt, intent: RequestIntent): 
     lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
   }
   if (attempt.status !== 'DRY_RUN') {
-    validateAttemptPersistence(attempt);
+    const prepared = validateAttemptPersistence(attempt);
+    if (intent.decisionContextHash !== undefined) {
+      const decision = persistedClassificationDecision(
+        attempt.requestPayload,
+        hashClassificationPreparedWrite(prepared),
+      );
+      if ((decision?.contextHash ?? null) !== intent.decisionContextHash) {
+        lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
+      }
+    }
   }
 }
 
@@ -2508,7 +2533,18 @@ async function finalizeVerified(
   }
   await emitVerifiedCategorizationOutcome(
     d,
-    { ...attempt, status: 'VERIFIED' },
+    {
+      ...attempt,
+      status: 'VERIFIED',
+      responseSnapshot: response,
+      verification: {
+        outcome: 'VERIFIED',
+        status,
+        newSyncToken,
+      },
+      errorCode: null,
+      errorMessage: null,
+    },
     txn,
     status,
   );
@@ -2643,6 +2679,7 @@ async function persistPrepared(
     payee: string;
     source: 'user' | 'autopilot' | 'mcp';
   },
+  decisionContext?: NormalizedCategorizationDecisionContext | null,
 ): Promise<{ attempt: DurableAttempt; created: boolean }> {
   try {
     const attempt = await d.db.$transaction(async (tx) => {
@@ -2671,6 +2708,14 @@ async function persistPrepared(
           requestHash: prepared.requestHash,
           requestPayload: {
             ...prepared,
+            ...(decisionContext === undefined || decisionContext === null
+              ? {}
+              : {
+                  classificationDecision: classificationDecisionForPreparedWrite(
+                    decisionContext,
+                    hashClassificationPreparedWrite(prepared),
+                  ),
+                }),
             ruleCandidateFold: { version: 1 },
             ...(staged === undefined
               ? {}
@@ -2729,6 +2774,9 @@ async function persistPrepared(
       operation: prepared.operation,
       expectedRevision,
       requestHash: prepared.requestHash,
+      decisionContextHash: decisionContext === undefined || decisionContext === null
+        ? null
+        : categorizationDecisionContextHash(decisionContext),
     });
     return { attempt: raced, created: false };
   }
@@ -3221,6 +3269,20 @@ async function commitStagedCategorizationInternal(
   },
 ): Promise<DurableMutationResult> {
   const base = deps ?? (await defaultDurableDeps());
+  let decisionContext: NormalizedCategorizationDecisionContext | null = null;
+  if (input.decisionContext !== undefined) {
+    try {
+      decisionContext = normalizeCategorizationDecisionContext(input.decisionContext);
+    } catch {
+      lifecycleError('INVALID_DECISION_CONTEXT', 'The classification decision context is invalid.');
+    }
+    if (decisionContext.reviewer.userId !== input.actor.id) {
+      lifecycleError(
+        'INVALID_DECISION_CONTEXT',
+        'The classification reviewer does not match the committing actor.',
+      );
+    }
+  }
   let d = base;
   const authorityInput: AutopilotWritebackAuthorityInput | undefined = autopilot === undefined
     ? undefined
@@ -3272,11 +3334,23 @@ async function commitStagedCategorizationInternal(
   if (preliminary.companyId !== input.companyId) {
     lifecycleError('TRANSACTION_NOT_FOUND', 'Transaction was not found for this company.');
   }
+  if (
+    decisionContext !== null
+    && decisionContext.context.qboType !== preliminary.qboType
+  ) {
+    lifecycleError(
+      'INVALID_DECISION_CONTEXT',
+      'The classification context does not match the transaction type.',
+    );
+  }
   return d.lease(leaseKey(preliminary), invocationOwner, async () => {
     const intent: RequestIntent = {
       transactionId: input.transactionId,
       operation: 'recategorize',
       expectedRevision: input.expectedRevision,
+      decisionContextHash: decisionContext === null
+        ? null
+        : categorizationDecisionContextHash(decisionContext),
     };
     let existing = await findRequestOrConflict(d, input.requestId, intent);
     if (
@@ -3491,6 +3565,7 @@ async function commitStagedCategorizationInternal(
         payee: freshTxn.payee,
         source: autopilot === undefined ? 'user' : 'autopilot',
       },
+      decisionContext,
     );
     if (!persisted.created) {
       const { txn: racedTxn } = await loadAuthorizedAttempt(
@@ -3595,6 +3670,19 @@ export function hashPreparedWriteBody(body: QboPreparedWrite['body']): string {
 export function hashPreparedWriteBinding(prepared: QboPreparedWrite): string {
   const { requestId: _throwawayRequestId, ...binding } = prepared;
   return createHash('sha256').update(canonicalJson(binding)).digest('hex');
+}
+
+export function hashClassificationPreparedWrite(prepared: QboPreparedWrite): string {
+  return createHash('sha256').update(canonicalJson({
+    operation: prepared.operation,
+    qboType: prepared.qboType,
+    qboId: prepared.qboId,
+    requestId: prepared.requestId,
+    requestHash: prepared.requestHash,
+    body: prepared.body,
+    before: prepared.before,
+    expected: prepared.expected,
+  })).digest('hex');
 }
 
 function hashPurchaseSnapshot(snapshot: QboPreparedSnapshot): string {
