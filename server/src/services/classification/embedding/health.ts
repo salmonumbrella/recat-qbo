@@ -108,7 +108,7 @@ export async function classificationSemanticHealth(
     ...base,
     vectorAvailable: true,
     expectedGeneration: input.generation.fingerprint,
-    indexedGeneration: state.expectedGeneration,
+    indexedGeneration: state.activeGeneration,
     activeGeneration: state.activeGeneration,
     expectedState: state.expectedState,
     embedded: state.embedded,

@@ -82,13 +82,13 @@ EXECUTE FUNCTION classification_corpus_append_company_nickname();
 -- affect the bounded corpus. Database triggers cover every writer, including
 -- rolling or legacy application processes.
 CREATE TRIGGER classification_corpus_vendor_identity
-AFTER INSERT OR DELETE OR UPDATE OF "displayName", "normalizedName" ON "VendorIdentity"
+AFTER INSERT OR DELETE OR UPDATE OF "id", "companyId", "displayName", "normalizedName" ON "VendorIdentity"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_alias
-AFTER INSERT OR DELETE OR UPDATE OF "vendorIdentityId", "value", "normalizedValue", "source" ON "VendorAlias"
+AFTER INSERT OR DELETE OR UPDATE OF "companyId", "vendorIdentityId", "value", "normalizedValue", "source" ON "VendorAlias"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_vendor_merge
-AFTER INSERT OR DELETE OR UPDATE OF "sourceVendorIdentityId", "targetVendorIdentityId" ON "VendorIdentityMerge"
+AFTER INSERT OR DELETE OR UPDATE OF "companyId", "sourceVendorIdentityId", "targetVendorIdentityId" ON "VendorIdentityMerge"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_case
 AFTER INSERT OR UPDATE OR DELETE ON "ClassificationCase"
@@ -109,16 +109,16 @@ CREATE TRIGGER classification_corpus_candidate_evidence
 AFTER INSERT OR UPDATE OR DELETE ON "AutopilotRuleCandidateEvidence"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tag
-AFTER UPDATE OF "name" ON "Tag"
+AFTER UPDATE OF "companyId", "name" ON "Tag"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_account
-AFTER INSERT OR DELETE OR UPDATE OF "name", "fullName" ON "QboAccount"
+AFTER INSERT OR DELETE OR UPDATE OF "companyId", "qboId", "name", "fullName" ON "QboAccount"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tax_code
-AFTER INSERT OR DELETE OR UPDATE OF "name" ON "QboTaxCode"
+AFTER INSERT OR DELETE OR UPDATE OF "companyId", "qboId", "name" ON "QboTaxCode"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_transaction
-AFTER UPDATE OF "payee", "memo" ON "Transaction"
+AFTER UPDATE OF "companyId", "payee", "memo" ON "Transaction"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 
 -- RuleTag has no companyId column. Resolve the owning rule; a cascade after

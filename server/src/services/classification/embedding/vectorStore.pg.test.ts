@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { PrismaClassificationSearchRepository } from '../search.js';
 import { classificationEmbeddingGeneration } from './recipe.js';
 import { PgClassificationVectorStore } from './vectorStore.js';
 
@@ -12,6 +13,111 @@ const describePgvector = TEST_PGVECTOR_DATABASE_URL ? describe : describe.skip;
 function vector(seed: number): number[] {
   return Array.from({ length: 1024 }, (_unused, index) => index === seed ? 1 : 0);
 }
+
+type OwnerMoveScenario = {
+  name: string;
+  arrange(
+    db: PrismaClient,
+    oldCompanyId: string,
+    newCompanyId: string,
+  ): Promise<() => Promise<unknown>>;
+};
+
+const ownerMoveScenarios: readonly OwnerMoveScenario[] = [
+  {
+    name: 'VendorIdentity.companyId',
+    async arrange(db, oldCompanyId, newCompanyId) {
+      const row = await db.vendorIdentity.create({
+        data: { companyId: oldCompanyId, displayName: 'Moving identity', normalizedName: 'moving identity' },
+      });
+      return () => db.vendorIdentity.update({ where: { id: row.id }, data: { companyId: newCompanyId } });
+    },
+  },
+  {
+    name: 'Tag.companyId',
+    async arrange(db, oldCompanyId, newCompanyId) {
+      const row = await db.tag.create({
+        data: { companyId: oldCompanyId, name: 'Moving tag', color: '#123456' },
+      });
+      const [oldRule, newRule] = await Promise.all([
+        db.rule.create({
+          data: { companyId: oldCompanyId, matchText: 'Old tagged rule', category: 'Synthetic expense' },
+        }),
+        db.rule.create({
+          data: { companyId: newCompanyId, matchText: 'New tagged rule', category: 'Synthetic expense' },
+        }),
+      ]);
+      await db.ruleTag.createMany({
+        data: [
+          { ruleId: oldRule.id, tagId: row.id },
+          { ruleId: newRule.id, tagId: row.id },
+        ],
+      });
+      return () => db.tag.update({ where: { id: row.id }, data: { companyId: newCompanyId } });
+    },
+  },
+  {
+    name: 'QboAccount.companyId',
+    async arrange(db, oldCompanyId, newCompanyId) {
+      const row = await db.qboAccount.create({
+        data: {
+          companyId: oldCompanyId, qboId: 'moving-account', name: 'Moving account',
+          fullName: 'Expenses · Moving account', classification: 'Expense',
+        },
+      });
+      await db.rule.createMany({
+        data: [
+          {
+            companyId: oldCompanyId, matchText: 'Old account rule', category: row.name,
+            categoryQboId: row.qboId,
+          },
+          {
+            companyId: newCompanyId, matchText: 'New account rule', category: row.name,
+            categoryQboId: row.qboId,
+          },
+        ],
+      });
+      return () => db.qboAccount.update({ where: { id: row.id }, data: { companyId: newCompanyId } });
+    },
+  },
+  {
+    name: 'QboTaxCode.companyId',
+    async arrange(db, oldCompanyId, newCompanyId) {
+      const row = await db.qboTaxCode.create({
+        data: {
+          companyId: oldCompanyId, qboId: 'moving-tax-code', name: 'Moving tax code',
+          purchaseTaxRateList: [],
+        },
+      });
+      await db.rule.createMany({
+        data: [
+          {
+            companyId: oldCompanyId, matchText: 'Old tax rule', category: 'Synthetic expense',
+            taxCode: row.name, taxCodeQboId: row.qboId,
+          },
+          {
+            companyId: newCompanyId, matchText: 'New tax rule', category: 'Synthetic expense',
+            taxCode: row.name, taxCodeQboId: row.qboId,
+          },
+        ],
+      });
+      return () => db.qboTaxCode.update({ where: { id: row.id }, data: { companyId: newCompanyId } });
+    },
+  },
+  {
+    name: 'Transaction.companyId',
+    async arrange(db, oldCompanyId, newCompanyId) {
+      const row = await db.transaction.create({
+        data: {
+          companyId: oldCompanyId, qboId: 'moving-transaction', qboType: 'Purchase',
+          qboSyncToken: '1', date: new Date('2026-08-31T00:00:00.000Z'),
+          payee: 'Moving transaction', amount: '-1.00', bankAccount: 'Synthetic bank',
+        },
+      });
+      return () => db.transaction.update({ where: { id: row.id }, data: { companyId: newCompanyId } });
+    },
+  },
+];
 
 describePostgres('classification vector store on vanilla PostgreSQL', () => {
   let db: PrismaClient;
@@ -67,6 +173,143 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
     companyIds.add(created.id);
     return created;
   }
+
+  async function publishEmptyGeneration(
+    store: PgClassificationVectorStore,
+    companyId: string,
+    generation: ReturnType<typeof classificationEmbeddingGeneration>,
+  ) {
+    const attempt = await store.beginAttempt({ companyId, fingerprint: generation.fingerprint });
+    const corpus = await new PrismaClassificationSearchRepository(db).documents(
+      companyId,
+      attempt.targetRevision,
+    );
+    await store.publishGeneration({
+      companyId,
+      generation,
+      chunks: corpus.documents.flatMap((document) => document.chunks.map((chunk) => ({
+        companyId,
+        documentId: document.id,
+        kind: document.kind,
+        sourceId: document.sourceId,
+        revisedAt: document.revisedAt,
+        chunkIndex: chunk.index,
+        contentHash: chunk.contentHash,
+        embedding: vector(chunk.index % 1024),
+      }))),
+      totalDocuments: corpus.totalDocuments,
+      skippedDocuments: corpus.skippedDocuments,
+      targetRevision: attempt.targetRevision, attemptToken: attempt.token,
+    });
+  }
+
+  async function latestRevision(companyId: string) {
+    return (await db.classificationCorpusRevision.findFirstOrThrow({
+      where: { companyId }, orderBy: { revision: 'desc' },
+    })).revision;
+  }
+
+  async function expectSemanticGuardRejectsStale(
+    store: PgClassificationVectorStore,
+    companyId: string,
+    generation: ReturnType<typeof classificationEmbeddingGeneration>,
+  ) {
+    await expect(store.search({
+      companyIds: [companyId], fingerprint: generation.fingerprint,
+      embedding: vector(0), cosineFloor: 0.8, limit: 10,
+    })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
+  }
+
+  it.each(ownerMoveScenarios)(
+    '$name advances both owner revisions and invalidates active semantic indexes',
+    async ({ name, arrange }) => {
+      const oldOwner = await company(`${name} old owner`);
+      const newOwner = await company(`${name} new owner`);
+      const move = await arrange(db, oldOwner.id, newOwner.id);
+      const store = new PgClassificationVectorStore(db);
+      await store.ensureAvailable();
+      const generation = classificationEmbeddingGeneration({
+        baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: `owner-move-${name}`,
+      });
+      await publishEmptyGeneration(store, oldOwner.id, generation);
+      await publishEmptyGeneration(store, newOwner.id, generation);
+      const [oldBefore, newBefore] = await Promise.all([
+        latestRevision(oldOwner.id), latestRevision(newOwner.id),
+      ]);
+
+      await move();
+
+      const [oldAfter, newAfter] = await Promise.all([
+        latestRevision(oldOwner.id), latestRevision(newOwner.id),
+      ]);
+      expect(oldAfter).toBeGreaterThan(oldBefore);
+      expect(newAfter).toBeGreaterThan(newBefore);
+      await expectSemanticGuardRejectsStale(store, oldOwner.id, generation);
+      await expectSemanticGuardRejectsStale(store, newOwner.id, generation);
+    },
+  );
+
+  it.each([
+    {
+      name: 'VendorIdentity.id',
+      async arrange(companyId: string) {
+        const row = await db.vendorIdentity.create({
+          data: { companyId, displayName: 'Identity document ID', normalizedName: 'identity document id' },
+        });
+        return () => db.vendorIdentity.update({ where: { id: row.id }, data: { id: randomUUID() } });
+      },
+    },
+    {
+      name: 'QboAccount.qboId',
+      async arrange(companyId: string) {
+        const row = await db.qboAccount.create({
+          data: {
+            companyId, qboId: 'old-account-qbo-id', name: 'Joined account',
+            fullName: 'Expenses · Joined account', classification: 'Expense',
+          },
+        });
+        await db.rule.create({
+          data: {
+            companyId, matchText: 'Joined account rule', category: row.name,
+            categoryQboId: row.qboId,
+          },
+        });
+        return () => db.qboAccount.update({ where: { id: row.id }, data: { qboId: 'new-account-qbo-id' } });
+      },
+    },
+    {
+      name: 'QboTaxCode.qboId',
+      async arrange(companyId: string) {
+        const row = await db.qboTaxCode.create({
+          data: {
+            companyId, qboId: 'old-tax-qbo-id', name: 'Joined tax code', purchaseTaxRateList: [],
+          },
+        });
+        await db.rule.create({
+          data: {
+            companyId, matchText: 'Joined tax rule', category: 'Synthetic expense',
+            taxCode: row.name, taxCodeQboId: row.qboId,
+          },
+        });
+        return () => db.qboTaxCode.update({ where: { id: row.id }, data: { qboId: 'new-tax-qbo-id' } });
+      },
+    },
+  ])('$name invalidates an active semantic index', async ({ name, arrange }) => {
+    const owner = await company(`${name} owner`);
+    const mutate = await arrange(owner.id);
+    const store = new PgClassificationVectorStore(db);
+    await store.ensureAvailable();
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: `join-key-${name}`,
+    });
+    await publishEmptyGeneration(store, owner.id, generation);
+    const before = await latestRevision(owner.id);
+
+    await mutate();
+
+    expect(await latestRevision(owner.id)).toBeGreaterThan(before);
+    await expectSemanticGuardRejectsStale(store, owner.id, generation);
+  });
 
   it('publishes atomically, fences companies, and never ranks a retired generation', async () => {
     const first = await company('Vector Company A');

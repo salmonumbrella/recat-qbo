@@ -99,4 +99,45 @@ describe('classification semantic health', () => {
       lastError: null,
     });
   });
+
+  it.each(['building', 'failed'] as const)(
+    'reports the older active generation as indexed while the expected replacement is %s',
+    async (expectedState) => {
+      const activeGeneration = 'a'.repeat(64);
+      const health = await classificationSemanticHealth('company-a', {
+        generation,
+        store: {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          async health() {
+            return {
+              activeGeneration,
+              expectedGeneration: generation.fingerprint,
+              expectedState,
+              embedded: 0,
+              skipped: 0,
+              backlog: 1,
+              progress: 0,
+              lastSuccessAt: null,
+              lastError: expectedState === 'failed' ? 'semantic_error' : null,
+              latestAttemptGeneration: generation.fingerprint,
+              latestAttemptState: expectedState,
+              latestAttemptAt: '2026-08-31T00:00:00.000Z',
+              latestAttemptError: expectedState === 'failed' ? 'semantic_error' : null,
+              currentCorpusRevision: '9',
+              indexedCorpusRevision: '8',
+              expectedCorpusRevision: '9',
+              latestAttemptCorpusRevision: '9',
+            };
+          },
+        },
+      });
+
+      expect(health).toMatchObject({
+        activeGeneration,
+        expectedGeneration: generation.fingerprint,
+        expectedState,
+        indexedGeneration: activeGeneration,
+      });
+    },
+  );
 });

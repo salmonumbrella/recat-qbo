@@ -487,13 +487,41 @@ describePostgres('classification search on PostgreSQL', () => {
       'classification_corpus_tax_code',
       'classification_corpus_transaction',
     ].sort();
-    const triggers = await db.$queryRaw<Array<{ name: string }>>`
-      SELECT tgname AS name FROM pg_trigger
+    const triggers = await db.$queryRaw<Array<{ name: string; definition: string }>>`
+      SELECT tgname AS name, pg_get_triggerdef(oid) AS definition FROM pg_trigger
       WHERE NOT tgisinternal AND tgname LIKE 'classification_corpus_%'
       ORDER BY tgname ASC
     `;
     expect(triggers.map((row) => row.name).filter((name) => name !== 'classification_corpus_company_insert'))
       .toEqual(expected);
+    const scopedColumns = new Map(triggers.map((trigger) => {
+      const updateClause = trigger.definition.match(/UPDATE OF (.+?) ON /u)?.[1] ?? '';
+      return [
+        trigger.name,
+        updateClause.split(',').map((column) => column.trim().replaceAll('"', '')).filter(Boolean),
+      ];
+    }));
+    expect(scopedColumns.get('classification_corpus_vendor_identity')).toEqual(
+      expect.arrayContaining(['id', 'companyId', 'displayName', 'normalizedName']),
+    );
+    expect(scopedColumns.get('classification_corpus_vendor_alias')).toEqual(
+      expect.arrayContaining(['companyId', 'vendorIdentityId', 'value', 'normalizedValue', 'source']),
+    );
+    expect(scopedColumns.get('classification_corpus_vendor_merge')).toEqual(
+      expect.arrayContaining(['companyId', 'sourceVendorIdentityId', 'targetVendorIdentityId']),
+    );
+    expect(scopedColumns.get('classification_corpus_tag')).toEqual(
+      expect.arrayContaining(['companyId', 'name']),
+    );
+    expect(scopedColumns.get('classification_corpus_account')).toEqual(
+      expect.arrayContaining(['companyId', 'qboId', 'name', 'fullName']),
+    );
+    expect(scopedColumns.get('classification_corpus_tax_code')).toEqual(
+      expect.arrayContaining(['companyId', 'qboId', 'name']),
+    );
+    expect(scopedColumns.get('classification_corpus_transaction')).toEqual(
+      expect.arrayContaining(['companyId', 'payee', 'memo']),
+    );
     const before = await db.classificationCorpusRevision.findFirstOrThrow({
       where: { companyId: owner.id }, orderBy: { revision: 'desc' },
     });
