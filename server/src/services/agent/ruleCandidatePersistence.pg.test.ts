@@ -77,7 +77,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
     }
   });
 
-  it('replays idempotently, conflicts on correction, and removes reverted evidence', async () => {
+  it('replays idempotently and preserves threshold-breaking correction and undo counterevidence', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({
       data: {
@@ -193,7 +193,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       });
       const firstRequest = randomUUID();
       const first = outcome(0, accountA.qboId, firstRequest);
-      const agreeing = [first, outcome(1), outcome(2)];
+      const agreeing = [first, outcome(1), outcome(2), outcome(3)];
       let firstAttemptUpdatedAt: Date | null = null;
       for (const current of agreeing) {
         const attempt = await db.qboMutationAttempt.create({
@@ -237,14 +237,14 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         state: 'ready',
         matchText: 'northwind market',
         categoryQboId: accountA.qboId,
-        evidenceCount: 3,
+        evidenceCount: 4,
         conflictingEvidenceCount: 0,
       });
       await expect(db.autopilotRuleCandidateEvidence.count({
         where: { candidateId: ready.id, active: true },
-      })).resolves.toBe(3);
+      })).resolves.toBe(4);
 
-      const firstEvidence = await db.autopilotRuleCandidateEvidence.findUniqueOrThrow({
+      const firstEvidence = await db.autopilotRuleCandidateEvidence.findFirstOrThrow({
         where: { requestId: firstRequest },
       });
       await db.transaction.update({
@@ -262,7 +262,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await expect(db.autopilotRuleCandidate.count({
         where: { companyId: company.id },
       })).resolves.toBe(1);
-      await expect(db.autopilotRuleCandidateEvidence.findUniqueOrThrow({
+      await expect(db.autopilotRuleCandidateEvidence.findFirstOrThrow({
         where: { requestId: firstRequest },
       })).resolves.toMatchObject({
         candidateId: firstEvidence.candidateId,
@@ -301,7 +301,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       });
       expect(ready).toMatchObject({
         state: 'ready',
-        evidenceCount: 3,
+        evidenceCount: 4,
         conflictingEvidenceCount: 0,
       });
 
@@ -372,8 +372,42 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
         where: { id: ready.id },
       })).resolves.toMatchObject({
-        state: 'ready',
+        state: 'conflict',
         evidenceCount: 3,
+        conflictingEvidenceCount: 1,
+      });
+
+      await db.transaction.update({
+        where: { id: transactions[3]!.id },
+        data: { status: 'POSTED' },
+      });
+      const replacement = outcome(3, accountA.qboId);
+      await db.qboMutationAttempt.create({
+        data: {
+          transactionId: replacement.transactionId,
+          requestId: replacement.requestId,
+          operation: 'recategorize',
+          status: 'VERIFIED',
+          expectedRevision: 1,
+          expectedSyncToken: '1',
+          requestHash: `hash-${replacement.requestId}`,
+          requestPayload: {
+            ruleCandidateFold: { version: 1 },
+            categorizationEvidence: { version: 1, proposal: replacement.proposal },
+            ruleCandidateEvidence: {
+              version: 1,
+              ...replacement.candidateContext,
+            },
+          },
+          beforeSnapshot: {},
+        },
+      });
+      await recordVerifiedRuleCandidateOutcome(replacement, { db, now: () => NOW });
+      await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: ready.id },
+      })).resolves.toMatchObject({
+        state: 'ready',
+        evidenceCount: 4,
         conflictingEvidenceCount: 0,
       });
 
@@ -429,7 +463,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       expect(activated).toMatchObject({
         state: 'activated',
         canActivate: false,
-        evidenceCount: 3,
+        evidenceCount: 4,
         category: 'Category A',
       });
       const rule = await db.rule.findUniqueOrThrow({
@@ -466,7 +500,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         where: { id: ready.id },
       });
       expect(activationSnapshot).toMatchObject({
-        activationEvidenceCount: 3,
+        activationEvidenceCount: 4,
         activationActionFingerprint: ready.winningActionFingerprint,
       });
 
@@ -553,7 +587,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
         where: { id: ready.id },
       })).resolves.toMatchObject({
-        activationEvidenceCount: 3,
+        activationEvidenceCount: 4,
         activationActionFingerprint: ready.winningActionFingerprint,
       });
       await expect(db.auditEntry.count({

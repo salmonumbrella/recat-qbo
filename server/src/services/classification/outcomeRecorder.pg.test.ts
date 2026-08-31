@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient, type Prisma } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { StagedCategorization } from '@recat/shared';
 import { preparePurchaseRecategorization } from '../../lib/qbo/purchaseTax.js';
 import type { QboPurchaseSnapshot, RawPurchase } from '../../lib/qbo/types.js';
 import {
   classificationDecisionForPreparedWrite,
+  classificationEvidenceBindingForPreparedWrite,
   normalizeCategorizationDecisionContext,
 } from '../categorizationEvidence.js';
 import { candidateContextFor } from '../agent/ruleCandidates.js';
+import { foldVerifiedRuleCandidateOutcomeInTransaction } from '../agent/ruleCandidatePersistence.js';
 import {
   hashClassificationPreparedWrite,
   hashPreparedWriteBody,
@@ -17,6 +19,7 @@ import {
   reconcileVerifiedClassificationOutcomes,
   recordVerifiedClassificationOutcome,
 } from './outcomeRecorder.js';
+import { recordVerifiedClassificationCase } from './cases.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -204,6 +207,11 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
             hashClassificationPreparedWrite(prepared),
           ),
           ruleCandidateFold: { version: 1 },
+          classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
+            proposal,
+            candidateContext,
+            hashClassificationPreparedWrite(prepared),
+          ),
           categorizationEvidence: { version: 1, proposal },
           ruleCandidateEvidence: { version: 1, ...candidateContext },
         } as unknown as Prisma.InputJsonValue,
@@ -277,6 +285,101 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     }))).not.toContain('must-not-leak');
   });
 
+  it('rejects a persisted proposal that does not match the provider-verified prepared action', async () => {
+    const value = await fixture();
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    const tamperedProposal = {
+      ...value.outcome.proposal!,
+      lines: [{
+        ...value.outcome.proposal!.lines[0]!,
+        categoryQboId: `unverified-${randomUUID()}`,
+      }],
+    };
+    payload.categorizationEvidence = {
+      version: 1,
+      proposal: tamperedProposal,
+    };
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: { requestPayload: payload as Prisma.InputJsonValue },
+    });
+
+    await recordVerifiedClassificationOutcome({
+      ...value.outcome,
+      proposal: tamperedProposal,
+    }, { db, now: () => NOW });
+
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+  });
+
+  it('rejects self-consistent stored and callback candidate config/source tampering for the same payee', async () => {
+    const value = await fixture();
+    const tamperedContext = candidateContextFor(
+      value.transaction.payee,
+      `unverified-config-${randomUUID()}`,
+      'mcp',
+    );
+    if (tamperedContext === null) throw new Error('Tampered fixture context is invalid.');
+    const payload = structuredClone(
+      value.attempt.requestPayload,
+    ) as unknown as Record<string, unknown>;
+    payload.ruleCandidateEvidence = {
+      version: 1,
+      ...tamperedContext,
+    };
+    await db.qboMutationAttempt.update({
+      where: { id: value.attempt.id },
+      data: { requestPayload: payload as Prisma.InputJsonValue },
+    });
+
+    await recordVerifiedClassificationOutcome({
+      ...value.outcome,
+      candidateContext: tamperedContext,
+    }, { db, now: () => NOW });
+
+    await expect(db.classificationCase.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { companyId: value.company.id },
+    })).resolves.toBe(0);
+  });
+
+  it('returns the same non-disclosing result for foreign-company and unknown request identities', async () => {
+    const owned = await fixture();
+    const foreign = await fixture();
+
+    const foreignResult = await recordVerifiedClassificationOutcome({
+      ...owned.outcome,
+      companyId: foreign.company.id,
+    }, { db, now: () => NOW });
+    const unknownResult = await recordVerifiedClassificationOutcome({
+      ...owned.outcome,
+      companyId: foreign.company.id,
+      requestId: `unknown-${randomUUID()}`,
+    }, { db, now: () => NOW });
+
+    expect(foreignResult).toBe(false);
+    expect(unknownResult).toBe(false);
+    await expect(db.classificationCase.count({
+      where: { companyId: { in: [owned.company.id, foreign.company.id] } },
+    })).resolves.toBe(0);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { companyId: { in: [owned.company.id, foreign.company.id] } },
+    })).resolves.toBe(0);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: owned.attempt.id },
+      select: { ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ ruleCandidateFoldedAt: null });
+  });
+
   it('keeps non-VERIFIED and mismatched outcomes out of all positive evidence', async () => {
     const negatives = await Promise.all([
       'PREPARED',
@@ -329,9 +432,14 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     await expect(db.autopilotRuleCandidateEvidence.count({
       where: { companyId: { in: [...companyIds] } },
     })).resolves.toBe(0);
-    await expect(db.autopilotRuleCandidateFold.count({
+    await expect(db.autopilotRuleCandidateFold.findMany({
       where: { companyId: { in: [...companyIds] } },
-    })).resolves.toBe(0);
+      select: { requestId: true },
+      orderBy: { requestId: 'asc' },
+    })).resolves.toEqual([
+      { requestId: readbackMismatch.attempt.requestId },
+      { requestId: stale.attempt.requestId },
+    ].sort((left, right) => left.requestId.localeCompare(right.requestId)));
   });
 
   it('reconciles an interrupted VERIFIED fold idempotently and concurrently', async () => {
@@ -355,6 +463,169 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     } finally {
       await second.$disconnect();
     }
+  });
+
+  it('recovers through the root client after a completed competing fold aborts its caller-owned transaction', async () => {
+    const value = await fixture();
+    const second = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+    let releaseCompeting!: () => void;
+    let signalCompetingReady!: () => void;
+    const competingCanCommit = new Promise<void>((resolve) => {
+      releaseCompeting = resolve;
+    });
+    const competingReady = new Promise<void>((resolve) => {
+      signalCompetingReady = resolve;
+    });
+    const decision = value.outcome.decisionContext!;
+    const proposal = value.outcome.proposal!;
+    const line = proposal.lines[0]!;
+    const competing = second.$transaction(async (tx) => {
+      await recordVerifiedClassificationCase({
+        companyId: value.company.id,
+        transactionId: value.transaction.id,
+        qboMutationAttemptId: value.attempt.id,
+        vendorIdentityId: null,
+        action: {
+          categoryQboId: line.categoryQboId,
+          taxCalculation: proposal.taxCalculation,
+          taxCodeQboId: line.taxCodeQboId,
+          tagIds: [...new Set([...proposal.tagIds, ...line.tagIds])].sort(),
+          memo: line.memo,
+        },
+        originIntent: decision.originIntent,
+        rationale: decision.rationale,
+        requiredEvidence: decision.requiredEvidence,
+        examples: decision.examples,
+        counterexamples: decision.counterexamples,
+        citations: decision.citations,
+        reviewer: decision.reviewer,
+        jurisdiction: decision.jurisdiction,
+        currency: decision.currency,
+        context: decision.context,
+        provenance: {
+          source: 'qbo_verified',
+          sourceId: value.attempt.id,
+          actorId: decision.reviewer.userId,
+          recordedAt: value.attempt.updatedAt.toISOString(),
+        },
+      }, tx);
+      await foldVerifiedRuleCandidateOutcomeInTransaction(
+        tx,
+        value.outcome,
+        NOW,
+        { markAffectedRules: false },
+      );
+      signalCompetingReady();
+      await competingCanCommit;
+    });
+    await competingReady;
+
+    const raced = recordVerifiedClassificationOutcome(
+      value.outcome,
+      { db, now: () => NOW },
+    );
+    let blockedOnUniqueOwner = false;
+    try {
+      for (let poll = 0; poll < 100; poll += 1) {
+        const [state] = await db.$queryRaw<{ blocked: boolean }[]>(Prisma.sql`
+          SELECT EXISTS (
+            SELECT 1
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND wait_event_type = 'Lock'
+              AND query ILIKE '%ClassificationCase%'
+          ) AS blocked
+        `);
+        if (state?.blocked === true) {
+          blockedOnUniqueOwner = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      releaseCompeting();
+    }
+    await competing;
+    expect(blockedOnUniqueOwner).toBe(true);
+    await expect(raced).resolves.toBe(false);
+    await expect(db.classificationCase.count({
+      where: { qboMutationAttemptId: value.attempt.id },
+    })).resolves.toBe(1);
+    await expect(db.autopilotRuleCandidateEvidence.count({
+      where: { requestId: value.attempt.requestId, polarity: 'positive' },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { status: true, ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ status: 'VERIFIED', ruleCandidateFoldedAt: NOW });
+    await second.$disconnect();
+  });
+
+  it('makes bounded reconciliation progress past more than 25 permanently ineligible attempts', async () => {
+    const repairable = await fixture();
+    const oldCreatedAt = new Date('2026-08-29T00:00:00.000Z');
+    const staleRequestIds = await Promise.all(Array.from({ length: 26 }, async (_, index) => {
+      const requestId = `stale-${index}-${randomUUID()}`;
+      await db.qboMutationAttempt.create({
+        data: {
+          transactionId: repairable.transaction.id,
+          requestId,
+          operation: 'recategorize',
+          status: 'VERIFIED',
+          expectedRevision: 1,
+          expectedSyncToken: '0',
+          requestHash: `corrupt-${requestId}`,
+          requestPayload: { ruleCandidateFold: { version: 1 } },
+          beforeSnapshot: {},
+          responseSnapshot: {},
+          verification: { outcome: 'VERIFIED', status: 'POSTED', newSyncToken: '1' },
+          createdAt: new Date(oldCreatedAt.getTime() + index),
+        },
+      });
+      return requestId;
+    }));
+
+    await reconcileVerifiedClassificationOutcomes(
+      repairable.company.id,
+      { db, now: () => NOW },
+    );
+    await reconcileVerifiedClassificationOutcomes(
+      repairable.company.id,
+      { db, now: () => NOW },
+    );
+
+    await expect(db.classificationCase.count({
+      where: { qboMutationAttemptId: repairable.attempt.id },
+    })).resolves.toBe(1);
+    await expect(db.qboMutationAttempt.count({
+      where: {
+        requestId: { in: staleRequestIds },
+        ruleCandidateFoldedAt: { not: null },
+      },
+    })).resolves.toBe(26);
+  });
+
+  it('repairs a verified attempt marker when its exact fold receipt already exists', async () => {
+    const value = await fixture();
+    await db.autopilotRuleCandidateFold.create({
+      data: {
+        requestId: value.attempt.requestId,
+        companyId: value.company.id,
+        transactionId: value.transaction.id,
+        operation: 'posted',
+        processedAt: NOW,
+      },
+    });
+
+    await reconcileVerifiedClassificationOutcomes(
+      value.company.id,
+      { db, now: () => NOW },
+    );
+
+    await expect(db.qboMutationAttempt.findUniqueOrThrow({
+      where: { id: value.attempt.id },
+      select: { status: true, ruleCandidateFoldedAt: true },
+    })).resolves.toEqual({ status: 'VERIFIED', ruleCandidateFoldedAt: NOW });
   });
 
   it('rolls back case, vendor, candidate, and request fold together before reconciliation retries', async () => {
@@ -527,6 +798,11 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
             hashClassificationPreparedWrite(correctionPrepared),
           ),
           ruleCandidateFold: { version: 1 },
+          classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
+            correctionProposal,
+            first.outcome.candidateContext,
+            hashClassificationPreparedWrite(correctionPrepared),
+          ),
           categorizationEvidence: { version: 1, proposal: correctionProposal },
           ruleCandidateEvidence: { version: 1, ...first.outcome.candidateContext! },
         } as unknown as Prisma.InputJsonValue,
@@ -553,7 +829,7 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
       id: firstCase.id,
       invalidation: { reason: 'Corrected by a later verified QBO outcome.' },
     });
-    await expect(db.autopilotRuleCandidateEvidence.findUniqueOrThrow({
+    await expect(db.autopilotRuleCandidateEvidence.findFirstOrThrow({
       where: { requestId: first.attempt.requestId },
     })).resolves.toMatchObject({ active: false, invalidationReason: 'corrected' });
     await expect(db.rule.findUniqueOrThrow({ where: { id: rule.id } })).resolves.toMatchObject({
@@ -641,9 +917,20 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     await expect(db.classificationCase.count({
       where: { companyId: first.company.id },
     })).resolves.toBe(2);
-    await expect(db.autopilotRuleCandidateEvidence.count({
+    await expect(db.autopilotRuleCandidateEvidence.findFirstOrThrow({
       where: { companyId: first.company.id, active: true },
-    })).resolves.toBe(0);
+    })).resolves.toMatchObject({
+      requestId: undoAttempt.requestId,
+      candidateId: candidate.id,
+      polarity: 'negative',
+    });
+    await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
+      where: { id: candidate.id },
+    })).resolves.toMatchObject({
+      state: 'conflict',
+      evidenceCount: 0,
+      conflictingEvidenceCount: 1,
+    });
     await expect(db.autopilotRuleCandidateFold.count({
       where: { companyId: first.company.id },
     })).resolves.toBe(3);

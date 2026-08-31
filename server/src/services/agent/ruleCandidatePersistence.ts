@@ -52,7 +52,7 @@ async function recomputeCandidate(
   });
   if (candidate === null) return;
   const groups = await tx.$queryRaw<{
-    actionFingerprint: string;
+    actionFingerprint: string | null;
     evidenceCount: bigint;
     conflictingEvidenceCount: bigint;
   }[]>(
@@ -62,24 +62,37 @@ async function recomputeCandidate(
           "actionFingerprint",
           COUNT(DISTINCT "transactionId")::bigint AS evidence_count
         FROM "AutopilotRuleCandidateEvidence"
-        WHERE "candidateId" = ${candidateId} AND "active" = true
+        WHERE "candidateId" = ${candidateId}
+          AND "active" = true
+          AND "polarity" = 'positive'
         GROUP BY "actionFingerprint"
+      ),
+      winner AS (
+        SELECT "actionFingerprint", evidence_count
+        FROM action_counts
+        ORDER BY evidence_count DESC, "actionFingerprint" ASC
+        LIMIT 1
       )
       SELECT
         winner."actionFingerprint",
-        winner.evidence_count AS "evidenceCount",
-        COALESCE((
+        COALESCE(winner.evidence_count, 0)::bigint AS "evidenceCount",
+        (COALESCE((
           SELECT SUM(other.evidence_count)
           FROM action_counts other
           WHERE other."actionFingerprint" <> winner."actionFingerprint"
-        ), 0)::bigint AS "conflictingEvidenceCount"
-      FROM action_counts winner
-      ORDER BY winner.evidence_count DESC, winner."actionFingerprint" ASC
-      LIMIT 1
+        ), 0) + (
+          SELECT COUNT(DISTINCT negative."transactionId")
+          FROM "AutopilotRuleCandidateEvidence" negative
+          WHERE negative."candidateId" = ${candidateId}
+            AND negative."active" = true
+            AND negative."polarity" = 'negative'
+        ))::bigint AS "conflictingEvidenceCount"
+      FROM (SELECT 1) seed
+      LEFT JOIN winner ON true
     `,
   );
   const winner = groups[0];
-  const patternRow = winner === undefined
+  const patternRow = winner === undefined || winner.actionFingerprint === null
     ? null
     : await tx.autopilotRuleCandidateEvidence.findFirst({
         where: {
@@ -227,7 +240,7 @@ async function foldOutcome(
     && transaction.companyId === outcome.companyId
     && transaction.revision === outcome.inputRevision
     && transaction.status === expectedStatus;
-  const existingEvidence = await tx.autopilotRuleCandidateEvidence.findUnique({
+  const existingEvidence = await tx.autopilotRuleCandidateEvidence.findFirst({
     where: { requestId: outcome.requestId },
     select: { candidateId: true },
   });
@@ -235,7 +248,12 @@ async function foldOutcome(
   if (current && existingEvidence === null) {
     const activeRows = await tx.autopilotRuleCandidateEvidence.findMany({
       where: { transactionId: outcome.transactionId, active: true },
-      select: { candidateId: true },
+      select: {
+        candidateId: true,
+        actionFingerprint: true,
+        pattern: true,
+        source: true,
+      },
     });
     for (const row of activeRows) affected.add(row.candidateId);
     await tx.autopilotRuleCandidateEvidence.updateMany({
@@ -247,6 +265,7 @@ async function foldOutcome(
       },
     });
 
+    let positiveCandidateId: string | null = null;
     if (
       outcome.operation === 'posted'
       && outcome.proposal !== null
@@ -289,14 +308,36 @@ async function foldOutcome(
             inputRevision: outcome.inputRevision,
             requestId: outcome.requestId,
             source: outcome.candidateContext.source,
+            polarity: 'positive',
             actionFingerprint: pattern.actionFingerprint,
             pattern: pattern as unknown as Prisma.InputJsonValue,
             active: true,
             observedAt: now,
           },
         });
+        positiveCandidateId = candidate.id;
         affected.add(candidate.id);
       }
+    }
+    const counterexamples = new Map(activeRows.map((row) => [row.candidateId, row]));
+    for (const row of counterexamples.values()) {
+      if (row.candidateId === positiveCandidateId) continue;
+      await tx.autopilotRuleCandidateEvidence.create({
+        data: {
+          companyId: outcome.companyId,
+          candidateId: row.candidateId,
+          transactionId: outcome.transactionId,
+          inputRevision: outcome.inputRevision,
+          requestId: outcome.requestId,
+          source: outcome.candidateContext?.source ?? row.source,
+          polarity: 'negative',
+          actionFingerprint: row.actionFingerprint,
+          pattern: row.pattern as Prisma.InputJsonValue,
+          active: true,
+          observedAt: now,
+        },
+      });
+      affected.add(row.candidateId);
     }
   }
 

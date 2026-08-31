@@ -1817,6 +1817,40 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it('persists and replay-binds normalized decision context for dry runs without provider access', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.company.dryRun = true;
+    const context = decisionContext();
+
+    await commitStagedCategorization({
+      ...commitInput('request-dry-run-context'),
+      decisionContext: context,
+    }, fixture.deps);
+
+    expect(fixture.db.attempts[0]!.requestPayload).toMatchObject({
+      outcome: 'DRY_RUN',
+      classificationDecision: {
+        version: 1,
+        context: expect.objectContaining({
+          rationale: 'Reviewed against the synthetic receipt.',
+          currency: 'CAD',
+        }),
+        contextHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        preparedBindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-dry-run-context'),
+      decisionContext: {
+        ...context,
+        rationale: 'A different dry-run rationale.',
+      },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    expect(fixture.getClient).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('rejects unbounded, unsafe, unapproved, or transaction-mismatched decision context before QBO access', async () => {
     const base = decisionContext();
     const invalidContexts = [

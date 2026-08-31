@@ -49,6 +49,13 @@ export interface PersistedClassificationDecision {
   preparedBindingHash: string;
 }
 
+export interface PersistedClassificationEvidenceBinding {
+  version: 1;
+  proposalHash: string;
+  candidateContextHash: string;
+  preparedBindingHash: string;
+}
+
 function boundedText(maximum: number) {
   return z.string().superRefine((value, context) => {
     const normalized = value.normalize('NFC').trim();
@@ -166,6 +173,52 @@ export function classificationDecisionForPreparedWrite(
       contextHash,
     }),
   };
+}
+
+export function classificationEvidenceBindingForPreparedWrite(
+  proposal: VerifiedCategorizationProposal,
+  candidateContext: VerifiedCategorizationOutcome['candidateContext'],
+  preparedWriteHash: string,
+): PersistedClassificationEvidenceBinding {
+  const proposalHash = sha256(proposal);
+  const candidateContextHash = sha256(candidateContext);
+  return {
+    version: 1,
+    proposalHash,
+    candidateContextHash,
+    preparedBindingHash: sha256({
+      preparedWriteHash,
+      proposalHash,
+      candidateContextHash,
+    }),
+  };
+}
+
+export function persistedClassificationEvidenceBinding(
+  value: unknown,
+  proposal: VerifiedCategorizationProposal,
+  candidateContext: VerifiedCategorizationOutcome['candidateContext'],
+  expectedPreparedWriteHash: string,
+): PersistedClassificationEvidenceBinding | null {
+  if (!isRuntimeRecord(value)) return null;
+  const stored = value.classificationEvidenceBinding;
+  if (
+    !isRuntimeRecord(stored)
+    || stored.version !== 1
+    || typeof stored.proposalHash !== 'string'
+    || typeof stored.candidateContextHash !== 'string'
+    || typeof stored.preparedBindingHash !== 'string'
+  ) return null;
+  const canonical = classificationEvidenceBindingForPreparedWrite(
+    proposal,
+    candidateContext,
+    expectedPreparedWriteHash,
+  );
+  return (
+    stored.proposalHash === canonical.proposalHash
+    && stored.candidateContextHash === canonical.candidateContextHash
+    && stored.preparedBindingHash === canonical.preparedBindingHash
+  ) ? canonical : null;
 }
 
 export function persistedClassificationDecision(

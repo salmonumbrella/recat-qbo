@@ -59,6 +59,7 @@ import { candidateContextFor } from './agent/ruleCandidates.js';
 import {
   categorizationDecisionContextHash,
   classificationDecisionForPreparedWrite,
+  classificationEvidenceBindingForPreparedWrite,
   normalizeCategorizationDecisionContext,
   persistedClassificationDecision,
   persistedEvidenceProposal,
@@ -1946,7 +1947,7 @@ function validateDryRunBinding(
   attempt: DurableAttempt,
   txn: DurableTransaction,
 ): void {
-  const expectedPayload = {
+  const expectedSummary = {
     operation: 'recategorize',
     qboType: txn.qboType,
     qboId: txn.qboId,
@@ -1956,6 +1957,21 @@ function validateDryRunBinding(
       taxCodeQboIds: uniqueStrings(txn.splitLines.map((line) => line.taxCodeQboId)),
     },
     outcome: 'DRY_RUN',
+  };
+  const payload = isRuntimeRecord(attempt.requestPayload)
+    ? attempt.requestPayload
+    : lifecycleError('ATTEMPT_CORRUPT', 'Stored dry-run summary is malformed.');
+  const hasDecision = payload.classificationDecision !== undefined;
+  const decision = persistedClassificationDecision(
+    attempt.requestPayload,
+    hashDryRunClassificationSummary(expectedSummary),
+  );
+  if (hasDecision && decision === null) {
+    lifecycleError('ATTEMPT_CORRUPT', 'Stored dry-run decision context is inconsistent.');
+  }
+  const expectedPayload = {
+    ...expectedSummary,
+    ...(decision === null ? {} : { classificationDecision: decision }),
   };
   if (
     attempt.status !== 'DRY_RUN' ||
@@ -1977,6 +1993,30 @@ function validateDryRunBinding(
       'Stored dry-run attempt is not bound to its transaction and summary.',
     );
   }
+}
+
+function hashDryRunClassificationSummary(summary: unknown): string {
+  return createHash('sha256').update(canonicalJson(summary)).digest('hex');
+}
+
+function persistedDryRunClassificationDecision(
+  attempt: DurableAttempt,
+): ReturnType<typeof persistedClassificationDecision> {
+  const payload = isRuntimeRecord(attempt.requestPayload)
+    ? attempt.requestPayload
+    : null;
+  if (payload === null) return null;
+  return persistedClassificationDecision(
+    attempt.requestPayload,
+    hashDryRunClassificationSummary({
+      operation: payload.operation,
+      qboType: payload.qboType,
+      qboId: payload.qboId,
+      requestId: payload.requestId,
+      references: payload.references,
+      outcome: payload.outcome,
+    }),
+  );
 }
 
 function validateRecordedAttemptBinding(
@@ -2229,7 +2269,14 @@ function assertRequestIdentity(attempt: DurableAttempt, intent: RequestIntent): 
   ) {
     lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
   }
-  if (attempt.status !== 'DRY_RUN') {
+  if (attempt.status === 'DRY_RUN') {
+    if (intent.decisionContextHash !== undefined) {
+      const decision = persistedDryRunClassificationDecision(attempt);
+      if ((decision?.contextHash ?? null) !== intent.decisionContextHash) {
+        lifecycleError('REQUEST_ID_CONFLICT', 'This request ID represents a different mutation.');
+      }
+    }
+  } else {
     const prepared = validateAttemptPersistence(attempt);
     if (intent.decisionContextHash !== undefined) {
       const decision = persistedClassificationDecision(
@@ -2720,6 +2767,11 @@ async function persistPrepared(
             ...(staged === undefined
               ? {}
               : {
+                classificationEvidenceBinding: classificationEvidenceBindingForPreparedWrite(
+                  evidenceProposal(staged),
+                  candidateContext,
+                  hashClassificationPreparedWrite(prepared),
+                ),
                 categorizationEvidence: {
                   version: 1,
                   proposal: evidenceProposal(staged),
@@ -3174,16 +3226,28 @@ async function recordDryRun(
   txn: DurableTransaction,
   staged: StagedCategorization,
   d: DurableWritebackDeps,
+  decisionContext: NormalizedCategorizationDecisionContext | null,
 ): Promise<DurableMutationResult> {
   const accountQboIds = uniqueStrings(staged.lines.map((line) => line.categoryQboId));
   const taxCodeQboIds = uniqueStrings(staged.lines.map((line) => line.taxCodeQboId));
-  const requestPayload = {
+  const summary = {
     operation: 'recategorize',
     qboType: txn.qboType,
     qboId: txn.qboId,
     requestId: input.requestId,
     references: { accountQboIds, taxCodeQboIds },
     outcome: 'DRY_RUN',
+  };
+  const requestPayload = {
+    ...summary,
+    ...(decisionContext === null
+      ? {}
+      : {
+          classificationDecision: classificationDecisionForPreparedWrite(
+            decisionContext,
+            hashDryRunClassificationSummary(summary),
+          ),
+        }),
   };
   const mutation: MutationAuditInput = {
     requestId: input.requestId,
@@ -3514,7 +3578,7 @@ async function commitStagedCategorizationInternal(
       input.expectedQboBinding,
     );
     if (txn.company.dryRun || d.envDryRun) {
-      return recordDryRun(input, txn, staged, d);
+      return recordDryRun(input, txn, staged, d, decisionContext);
     }
 
     await d.renewLease(leaseKey(txn), invocationOwner);

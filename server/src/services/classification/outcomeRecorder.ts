@@ -4,6 +4,7 @@ import { prisma } from '../../lib/prisma.js';
 import type { QboPreparedWrite } from '../../lib/qbo/types.js';
 import {
   persistedClassificationDecision,
+  persistedClassificationEvidenceBinding,
   persistedEvidenceProposal,
   persistedRuleCandidateContext,
   type NormalizedCategorizationDecisionContext,
@@ -12,6 +13,7 @@ import { runCompanyMutationTransaction } from '../companyMutationScope.js';
 import { appendRuleRevision } from '../ruleRevisionHistory.js';
 import type { VerifiedCategorizationOutcome } from '../agent/evaluation.js';
 import { foldVerifiedRuleCandidateOutcomeInTransaction } from '../agent/ruleCandidatePersistence.js';
+import { candidateContextFor } from '../agent/ruleCandidates.js';
 import {
   hashClassificationPreparedWrite,
   validateDurableAttemptPersistence,
@@ -84,6 +86,41 @@ function caseAction(
   };
 }
 
+function proposalMatchesPrepared(
+  proposal: NonNullable<VerifiedCategorizationOutcome['proposal']>,
+  prepared: QboPreparedWrite,
+): boolean {
+  const expectedTaxCalculation = prepared.expected.globalTaxCalculation ?? 'NotApplicable';
+  if (
+    proposal.taxCalculation !== expectedTaxCalculation
+    || proposal.lines.length !== prepared.expected.targetLines.length
+  ) return false;
+  return proposal.lines.every((line, index) => {
+    const target = prepared.expected.targetLines[index];
+    if (
+      target === undefined
+      || line.idx !== index
+      || line.subtotalCents !== target.amountCents
+      || line.categoryQboId !== target.accountQboId
+      || line.taxCodeQboId !== target.taxCodeQboId
+      || line.memo !== target.description
+    ) return false;
+    if (prepared.qboType === 'Purchase') {
+      const purchaseTarget = prepared.expected.targetLines[index];
+      if (purchaseTarget === undefined) return false;
+      return (
+        line.taxCents === (purchaseTarget.taxAmountCents ?? 0)
+        && line.totalCents === (
+          proposal.taxCalculation === 'TaxInclusive'
+            ? purchaseTarget.taxInclusiveCents
+            : line.subtotalCents + line.taxCents
+        )
+      );
+    }
+    return line.totalCents === line.subtotalCents + line.taxCents;
+  });
+}
+
 async function markAffectedRulesReviewRequired(
   tx: OutcomeTransaction,
   companyId: string,
@@ -125,20 +162,121 @@ async function markAffectedRulesReviewRequired(
 
 async function completedReceiptExists(
   db: PrismaClient,
-  identity: Pick<ExpectedOutcomeIdentity, 'companyId' | 'requestId'>,
+  identity: ExpectedOutcomeIdentity,
 ): Promise<boolean> {
   const attempt = await db.qboMutationAttempt.findFirst({
     where: {
       requestId: identity.requestId,
       transaction: { companyId: identity.companyId },
     },
-    select: { ruleCandidateFoldedAt: true },
+    select: {
+      transactionId: true,
+      operation: true,
+      status: true,
+      expectedRevision: true,
+      ruleCandidateFoldedAt: true,
+    },
   });
-  if (attempt === null || attempt.ruleCandidateFoldedAt === null) return false;
-  return await db.autopilotRuleCandidateFold.findUnique({
+  if (
+    attempt === null
+    || attempt.status !== 'VERIFIED'
+    || attempt.ruleCandidateFoldedAt === null
+    || (attempt.operation !== 'recategorize' && attempt.operation !== 'restore')
+    || (identity.transactionId !== undefined && identity.transactionId !== attempt.transactionId)
+    || (identity.inputRevision !== undefined && identity.inputRevision !== attempt.expectedRevision)
+  ) return false;
+  const operation = attempt.operation === 'restore' ? 'reverted' : 'posted';
+  if (identity.operation !== undefined && identity.operation !== operation) return false;
+  const receipt = await db.autopilotRuleCandidateFold.findUnique({
     where: { requestId: identity.requestId },
-    select: { requestId: true },
-  }) !== null;
+    select: { companyId: true, transactionId: true, operation: true },
+  });
+  return receipt !== null
+    && receipt.companyId === identity.companyId
+    && receipt.transactionId === attempt.transactionId
+    && receipt.operation === operation;
+}
+
+async function stampAttemptFolded(
+  tx: OutcomeTransaction,
+  attempt: {
+    requestId: string;
+    transactionId: string;
+    operation: string;
+    expectedRevision: number;
+  },
+  now: Date,
+): Promise<number> {
+  return tx.$executeRaw(
+    Prisma.sql`
+      UPDATE "QboMutationAttempt"
+      SET "ruleCandidateFoldedAt" = ${now}
+      WHERE "requestId" = ${attempt.requestId}
+        AND "transactionId" = ${attempt.transactionId}
+        AND "operation" = ${attempt.operation}
+        AND "status" = 'VERIFIED'
+        AND "expectedRevision" = ${attempt.expectedRevision}
+        AND "ruleCandidateFoldedAt" IS NULL
+        AND "requestPayload"->'ruleCandidateFold'->>'version' = '1'
+    `,
+  );
+}
+
+async function repairExistingFoldMarker(
+  tx: OutcomeTransaction,
+  attempt: {
+    requestId: string;
+    transactionId: string;
+    operation: string;
+    expectedRevision: number;
+    ruleCandidateFoldedAt: Date | null;
+  },
+  companyId: string,
+  operation: 'posted' | 'reverted',
+  now: Date,
+): Promise<boolean | null> {
+  const receipt = await tx.autopilotRuleCandidateFold.findUnique({
+    where: { requestId: attempt.requestId },
+  });
+  if (receipt === null) return null;
+  if (
+    receipt.companyId !== companyId
+    || receipt.transactionId !== attempt.transactionId
+    || receipt.operation !== operation
+  ) return false;
+  if (
+    attempt.ruleCandidateFoldedAt === null
+    && await stampAttemptFolded(tx, attempt, now) !== 1
+  ) {
+    throw new Error('Existing classification fold receipt could not stamp its VERIFIED attempt.');
+  }
+  return false;
+}
+
+async function recordTerminalFoldDisposition(
+  tx: OutcomeTransaction,
+  attempt: {
+    requestId: string;
+    transactionId: string;
+    operation: string;
+    expectedRevision: number;
+  },
+  companyId: string,
+  operation: 'posted' | 'reverted',
+  now: Date,
+): Promise<void> {
+  await tx.autopilotRuleCandidateFold.create({
+    data: {
+      requestId: attempt.requestId,
+      companyId,
+      transactionId: attempt.transactionId,
+      operation,
+      processedAt: now,
+    },
+  });
+  if (await stampAttemptFolded(tx, attempt, now) !== 1) {
+    throw new Error('Terminal classification fold disposition could not stamp its VERIFIED attempt.');
+  }
 }
 
 async function recordInTransaction(
@@ -166,6 +304,15 @@ async function recordInTransaction(
     || (expected.operation !== undefined && expected.operation !== operation)
   ) return false;
 
+  const repairedExistingFold = await repairExistingFoldMarker(
+    tx,
+    attempt,
+    expected.companyId,
+    operation,
+    now,
+  );
+  if (repairedExistingFold !== null) return repairedExistingFold;
+
   const durableStatus = operation === 'posted' ? 'POSTED' : 'REVERTED';
   const response = runtimeRecord(attempt.responseSnapshot);
   if (
@@ -173,19 +320,28 @@ async function recordInTransaction(
     || attempt.transaction.status !== durableStatus
     || response === null
     || response.syncToken !== attempt.transaction.qboSyncToken
-  ) return false;
+  ) {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
+    return false;
+  }
 
   let proof: ReturnType<typeof validateDurableAttemptPersistence>;
+  let prepared: QboPreparedWrite;
   try {
     proof = validateDurableAttemptPersistence(attempt);
+    prepared = attempt.requestPayload as unknown as QboPreparedWrite;
   } catch {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
     return false;
   }
   if (
     proof.qboId !== attempt.transaction.qboId
     || proof.qboType !== attempt.transaction.qboType
     || proof.operation !== attempt.operation
-  ) return false;
+  ) {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
+    return false;
+  }
 
   const payload = runtimeRecord(attempt.requestPayload);
   if (payload === null || runtimeRecord(payload.ruleCandidateFold)?.version !== 1) return false;
@@ -195,25 +351,42 @@ async function recordInTransaction(
   const candidateContext = operation === 'posted'
     ? persistedRuleCandidateContext(attempt.requestPayload)
     : null;
-  if (operation === 'posted' && proposal === null) return false;
+  if (operation === 'posted' && proposal === null) {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
+    return false;
+  }
 
   const hasDecisionEnvelope = payload.classificationDecision !== undefined;
   const decision = persistedClassificationDecision(
     attempt.requestPayload,
-    hashClassificationPreparedWrite(attempt.requestPayload as unknown as QboPreparedWrite),
+    hashClassificationPreparedWrite(prepared),
   );
-  if (hasDecisionEnvelope && decision === null) return false;
+  const expectedCandidateContext = candidateContext === null
+    ? null
+    : candidateContextFor(
+        attempt.transaction.payee,
+        candidateContext.configVersion,
+        candidateContext.source,
+      );
+  if (
+    hasDecisionEnvelope && decision === null
+    || operation === 'posted' && !proposalMatchesPrepared(proposal!, prepared)
+    || !exactJson(candidateContext, expectedCandidateContext)
+    || operation === 'posted' && persistedClassificationEvidenceBinding(
+      attempt.requestPayload,
+      proposal!,
+      candidateContext,
+      hashClassificationPreparedWrite(prepared),
+    ) === null
+  ) {
+    await recordTerminalFoldDisposition(tx, attempt, expected.companyId, operation, now);
+    return false;
+  }
   if (
     (expected.proposal !== undefined && !exactJson(expected.proposal, proposal))
     || (expected.candidateContext !== undefined && !exactJson(expected.candidateContext, candidateContext))
     || (expected.decisionContext !== undefined && !exactJson(expected.decisionContext, decision?.context))
   ) return false;
-
-  const existingFold = await tx.autopilotRuleCandidateFold.findUnique({
-    where: { requestId: attempt.requestId },
-    select: { requestId: true },
-  });
-  if (existingFold !== null) return false;
 
   const priorCases = await tx.classificationCase.findMany({
     where: {

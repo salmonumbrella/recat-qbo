@@ -206,7 +206,7 @@ async function hasOverlappingRule(
 type CandidateRow = Prisma.AutopilotRuleCandidateGetPayload<{
   include: {
     evidence: {
-      where: { active: true };
+      where: { active: true; polarity: 'positive' };
       orderBy: { observedAt: 'desc' };
       select: { transactionId: true; source: true; observedAt: true };
     };
@@ -230,7 +230,7 @@ async function toDto(db: CandidateDb, candidate: CandidateRow): Promise<RuleCand
     readiness(db, candidate),
     db.autopilotRuleCandidateEvidence.groupBy({
       by: ['source'],
-      where: { candidateId: candidate.id, active: true },
+      where: { candidateId: candidate.id, active: true, polarity: 'positive' },
       _count: { _all: true },
     }),
   ]);
@@ -281,7 +281,7 @@ async function toDto(db: CandidateDb, candidate: CandidateRow): Promise<RuleCand
 
 const candidateInclude = {
   evidence: {
-    where: { active: true },
+    where: { active: true, polarity: 'positive' },
     orderBy: { observedAt: 'desc' },
     take: RULE_CANDIDATE_PROVENANCE_LIMIT,
     select: { transactionId: true, source: true, observedAt: true },
@@ -364,7 +364,13 @@ async function assertDurableEvidence(
     where: {
       candidateId: candidate.id,
       active: true,
-      actionFingerprint: { not: candidate.winningActionFingerprint ?? '' },
+      OR: [
+        { polarity: 'negative' },
+        {
+          polarity: 'positive',
+          actionFingerprint: { not: candidate.winningActionFingerprint ?? '' },
+        },
+      ],
     },
   });
   if (conflicting > 0) {
@@ -377,6 +383,7 @@ async function assertDurableEvidence(
     where: {
       candidateId: candidate.id,
       active: true,
+      polarity: 'positive',
       actionFingerprint: candidate.winningActionFingerprint ?? '',
     },
     include: {
