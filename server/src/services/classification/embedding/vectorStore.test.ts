@@ -1,0 +1,79 @@
+import { describe, expect, it } from 'vitest';
+import {
+  PgClassificationVectorStore,
+  VectorStoreError,
+} from './vectorStore.js';
+
+describe('classification pgvector capability', () => {
+  it('reports an unavailable extension without attempting to create tables', async () => {
+    const calls: string[] = [];
+    const db = {
+      async $queryRaw(query: { strings: readonly string[] }) {
+        calls.push(query.strings.join('?'));
+        return [{ installed: false }];
+      },
+      async $executeRaw(query: { strings: readonly string[] }) {
+        calls.push(query.strings.join('?'));
+        return 0;
+      },
+    };
+
+    const store = new PgClassificationVectorStore(db as never);
+
+    await expect(store.ensureAvailable()).resolves.toEqual({
+      available: false,
+      reason: 'vector_capability_unavailable',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('pg_extension');
+    expect(calls[0]).not.toContain('CREATE EXTENSION');
+    expect(calls[0]).not.toContain('CREATE TABLE');
+  });
+
+  it('turns database details into a bounded vector-store error', async () => {
+    const db = {
+      async $queryRaw() {
+        throw new Error('postgresql://private-host/recat secret-table');
+      },
+      async $executeRaw() {
+        return 0;
+      },
+    };
+    const store = new PgClassificationVectorStore(db as never);
+
+    const failure = await store.ensureAvailable().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(VectorStoreError);
+    expect(failure).toMatchObject({ code: 'VECTOR_STORE_UNAVAILABLE' });
+    expect(String(failure)).not.toContain('private-host');
+    expect(JSON.stringify(failure)).not.toContain('secret-table');
+  });
+
+  it('does not misreport a failed build fingerprint as an active generation', async () => {
+    const db = {
+      async $queryRaw() {
+        return [{
+          fingerprint: 'a'.repeat(64),
+          activeFingerprint: null,
+          state: 'failed',
+          embeddedDocuments: 0,
+          skippedDocuments: 0,
+          backlogDocuments: 2,
+          totalDocuments: 2,
+          lastSuccessAt: null,
+          lastErrorCode: 'semantic_error',
+        }];
+      },
+      async $executeRaw() {
+        return 0;
+      },
+    };
+
+    await expect(new PgClassificationVectorStore(db as never).health('company-a'))
+      .resolves.toMatchObject({
+        activeGeneration: null,
+        backlog: 2,
+        lastError: 'semantic_error',
+      });
+  });
+});
