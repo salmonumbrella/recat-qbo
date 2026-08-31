@@ -190,7 +190,7 @@ const INVALID_SALES_CODE_CASES: Array<[string, string, TaxReadinessDto]> = [
   }],
 ];
 
-type ActionabilityTransactionOverrides = Partial<TransactionDto> & {
+type ActionabilityTransactionOverrides = Omit<Partial<TransactionDto>, 'providerActionability'> & {
   providerActionability?: unknown;
 };
 
