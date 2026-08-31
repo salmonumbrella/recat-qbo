@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { StagedCategorization } from '@recat/shared';
+import { preparePurchaseRecategorization } from '../../lib/qbo/purchaseTax.js';
+import type { QboPurchaseSnapshot, RawPurchase } from '../../lib/qbo/types.js';
 import type {
   VerifiedCategorizationOutcome,
   VerifiedCategorizationProposal,
@@ -21,11 +24,135 @@ import {
   getRuleCandidate,
 } from '../ruleCandidates.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
-import { hashClassificationPreparedWrite } from '../writeback.js';
+import {
+  hashClassificationPreparedWrite,
+  validateDurableAttemptPersistence,
+} from '../writeback.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
 const NOW = new Date('2026-07-30T12:00:00.000Z');
+
+async function createVerifiedBoundPurchaseAttempt(input: {
+  db: PrismaClient;
+  transaction: { id: string; qboId: string };
+  requestId: string;
+  expectedRevision: number;
+  beforeSyncToken: string;
+  responseSyncToken: string;
+  preparedCategoryQboId: string;
+  persistedProposal: VerifiedCategorizationProposal;
+  candidateContext: NonNullable<VerifiedCategorizationOutcome['candidateContext']>;
+}) {
+  const before: QboPurchaseSnapshot = {
+    qboId: input.transaction.qboId,
+    syncToken: input.beforeSyncToken,
+    totalCents: -1000,
+    accountQboId: 'payment-bound-fixture',
+    date: '2026-07-30',
+    direction: 'purchase',
+    globalTaxCalculation: 'NotApplicable',
+    totalTaxCents: 0,
+    lines: [{
+      id: 'line-holding',
+      amountCents: -1000,
+      description: null,
+      accountQboId: 'holding-bound-fixture',
+      customerQboId: null,
+      classQboId: null,
+      taxCodeQboId: null,
+      taxAmountCents: null,
+      taxInclusiveCents: null,
+    }],
+  };
+  const raw: RawPurchase = {
+    Id: input.transaction.qboId,
+    SyncToken: input.beforeSyncToken,
+    TxnDate: '2026-07-30',
+    TotalAmt: 10,
+    AccountRef: { value: 'payment-bound-fixture' },
+    GlobalTaxCalculation: 'NotApplicable',
+    Line: [{
+      Id: 'line-holding',
+      Amount: 10,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'holding-bound-fixture' },
+      },
+    }],
+  };
+  const staged: StagedCategorization = {
+    transactionId: input.transaction.id,
+    revision: input.expectedRevision,
+    taxCalculation: 'NotApplicable',
+    totals: { subtotalCents: -1000, taxCents: 0, totalCents: -1000 },
+    lines: [{
+      idx: 0,
+      subtotalCents: -1000,
+      taxCents: 0,
+      totalCents: -1000,
+      categoryQboId: input.preparedCategoryQboId,
+      taxCodeQboId: null,
+      memo: null,
+    }],
+    tagIds: [],
+  };
+  const prepared = preparePurchaseRecategorization({
+    current: raw,
+    holdingAccountQboIds: ['holding-bound-fixture'],
+    staged,
+    before,
+    requestId: input.requestId,
+  });
+  const response: QboPurchaseSnapshot = {
+    ...before,
+    syncToken: input.responseSyncToken,
+    globalTaxCalculation: prepared.expected.globalTaxCalculation,
+    totalTaxCents: prepared.expected.totalTaxCents,
+    lines: prepared.expected.targetLines.map((line) => ({
+      ...line,
+      id: 'line-posted',
+    })),
+  };
+  const preparedWriteHash = hashClassificationPreparedWrite(prepared);
+  const binding = classificationEvidenceBindingForPreparedWrite(
+    input.persistedProposal,
+    input.candidateContext,
+    preparedWriteHash,
+  );
+  const attempt = await input.db.qboMutationAttempt.create({
+    data: {
+      transactionId: input.transaction.id,
+      requestId: input.requestId,
+      operation: 'recategorize',
+      status: 'VERIFIED',
+      expectedRevision: input.expectedRevision,
+      expectedSyncToken: input.beforeSyncToken,
+      requestHash: prepared.requestHash,
+      classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
+      classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
+        preparedWriteHash,
+        null,
+        binding,
+      ),
+      requestPayload: {
+        ...prepared,
+        ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
+        classificationEvidenceBinding: binding,
+        categorizationEvidence: { version: 1, proposal: input.persistedProposal },
+        ruleCandidateEvidence: { version: 1, ...input.candidateContext },
+      } as unknown as Prisma.InputJsonValue,
+      beforeSnapshot: before as unknown as Prisma.InputJsonValue,
+      responseSnapshot: response as unknown as Prisma.InputJsonValue,
+      verification: {
+        outcome: 'VERIFIED',
+        status: 'POSTED',
+        newSyncToken: input.responseSyncToken,
+      },
+    },
+  });
+  return { attempt, prepared, binding };
+}
 
 describePostgres('rule candidate PostgreSQL persistence', () => {
   let db: PrismaClient;
@@ -83,7 +210,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
     }
   });
 
-  it('routes a bound no-decision attempt through validated recording before activation', async () => {
+  it('terminally rejects a durable but semantically mismatched no-decision attempt before activation', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({
       data: {
@@ -169,49 +296,39 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       expect(candidate).toMatchObject({ state: 'gathering', evidenceCount: 2 });
 
       const third = outcome(2);
-      const prepared = {
+      const {
+        attempt: thirdAttempt,
+        prepared,
+        binding,
+      } = await createVerifiedBoundPurchaseAttempt({
+        db,
+        transaction: transactions[2]!,
+        requestId: third.requestId,
+        expectedRevision: 1,
+        beforeSyncToken: '0',
+        responseSyncToken: '1',
+        preparedCategoryQboId: `different-provider-action-${suffix}`,
+        persistedProposal: proposal,
+        candidateContext,
+      });
+      expect(validateDurableAttemptPersistence(thirdAttempt)).toMatchObject({
         operation: 'recategorize',
         qboType: 'Purchase',
         qboId: transactions[2]!.qboId,
         requestId: third.requestId,
-        requestHash: `provider-${third.requestId}`,
-        body: { Id: transactions[2]!.qboId, SyncToken: '0' },
-        before: { qboId: transactions[2]!.qboId, syncToken: '0' },
-        expected: {
-          qboId: transactions[2]!.qboId,
-          targetLines: [{ accountQboId: `different-provider-action-${suffix}` }],
-        },
-      } as unknown as Parameters<typeof hashClassificationPreparedWrite>[0];
-      const binding = classificationEvidenceBindingForPreparedWrite(
-        proposal,
-        candidateContext,
-        hashClassificationPreparedWrite(prepared),
-      );
-      await db.qboMutationAttempt.create({
-        data: {
-          transactionId: third.transactionId,
-          requestId: third.requestId,
-          operation: 'recategorize',
-          status: 'VERIFIED',
-          expectedRevision: 1,
-          expectedSyncToken: '0',
-          requestHash: prepared.requestHash,
-          classificationEnvelopeVersion: CLASSIFICATION_ENVELOPE_VERSION,
-          classificationEnvelopeHash: classificationEnvelopeHashForPreparedWrite(
-            hashClassificationPreparedWrite(prepared),
-            null,
-            binding,
-          ),
-          requestPayload: {
-            ...prepared,
-            ruleCandidateFold: { version: CLASSIFICATION_ENVELOPE_VERSION },
-            classificationEvidenceBinding: binding,
-            categorizationEvidence: { version: 1, proposal },
-            ruleCandidateEvidence: { version: 1, ...candidateContext },
-          } as unknown as Prisma.InputJsonValue,
-          beforeSnapshot: {},
-        },
+        requestHash: prepared.requestHash,
+        expectedSyncToken: '0',
       });
+      expect(prepared.expected.targetLines[0]?.accountQboId).not.toBe(
+        proposal.lines[0]?.categoryQboId,
+      );
+      expect(thirdAttempt.classificationEnvelopeHash).toBe(
+        classificationEnvelopeHashForPreparedWrite(
+          hashClassificationPreparedWrite(prepared),
+          null,
+          binding,
+        ),
+      );
 
       await expect(activateRuleCandidate(
         company.id,
@@ -225,6 +342,9 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
       await expect(db.autopilotRuleCandidateEvidence.count({
         where: { candidateId: candidate.id, active: true },
       })).resolves.toBe(2);
+      await expect(db.autopilotRuleCandidateEvidence.count({
+        where: { requestId: third.requestId },
+      })).resolves.toBe(0);
       await expect(db.classificationCase.count({
         where: { companyId: company.id },
       })).resolves.toBe(0);
@@ -235,6 +355,174 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         where: { requestId: third.requestId },
         select: { ruleCandidateFoldedAt: true },
       })).resolves.toEqual({ ruleCandidateFoldedAt: expect.any(Date) });
+    } finally {
+      await db.company.delete({ where: { id: company.id } });
+    }
+  });
+
+  it('folds a pending cross-config correction before activating its old candidate', async () => {
+    const suffix = randomUUID();
+    const oldConfigVersion = `old-config-${suffix}`;
+    const newConfigVersion = `new-config-${suffix}`;
+    const company = await db.company.create({
+      data: {
+        realmId: `candidate-cross-config-${suffix}`,
+        legalName: 'Cross-config candidate fixture',
+        nickname: `cross-${suffix.slice(0, 8)}`,
+      },
+    });
+    const accountA = await db.qboAccount.create({
+      data: {
+        companyId: company.id,
+        qboId: `account-a-${suffix}`,
+        name: 'Original category',
+        fullName: 'Expenses · Original category',
+        classification: 'Expenses',
+      },
+    });
+    const accountB = await db.qboAccount.create({
+      data: {
+        companyId: company.id,
+        qboId: `account-b-${suffix}`,
+        name: 'Corrected category',
+        fullName: 'Expenses · Corrected category',
+        classification: 'Expenses',
+      },
+    });
+    await db.agentCompanyConfig.create({
+      data: {
+        companyId: company.id,
+        mode: 'shadow',
+        provider: 'custom',
+        decisionModel: 'decision-model',
+        verifierModel: 'verifier-model',
+        limits: {},
+        configVersion: oldConfigVersion,
+      },
+    });
+    const transactions = await Promise.all([0, 1, 2, 3].map((index) => db.transaction.create({
+      data: {
+        companyId: company.id,
+        qboId: `cross-config-purchase-${index}-${suffix}`,
+        qboType: 'Purchase',
+        qboSyncToken: '1',
+        date: NOW,
+        payee: 'Cross Config Vendor',
+        amount: '-10.00',
+        bankAccount: 'Fixture bank',
+        status: 'POSTED',
+        revision: 1,
+      },
+    })));
+    const oldContext = candidateContextFor('Cross Config Vendor', oldConfigVersion, 'user');
+    const newContext = candidateContextFor('Cross Config Vendor', newConfigVersion, 'user');
+    if (oldContext === null || newContext === null) {
+      throw new Error('Fixture candidate context is invalid.');
+    }
+    const proposal = (categoryQboId: string): VerifiedCategorizationProposal => ({
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        idx: 0,
+        subtotalCents: -1000,
+        taxCents: 0,
+        totalCents: -1000,
+        categoryQboId,
+        taxCodeQboId: null,
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    });
+
+    try {
+      for (const transaction of transactions) {
+        const requestId = randomUUID();
+        const outcome: VerifiedCategorizationOutcome = {
+          companyId: company.id,
+          transactionId: transaction.id,
+          inputRevision: 1,
+          requestId,
+          operation: 'posted',
+          proposal: proposal(accountA.qboId),
+          candidateContext: oldContext,
+        };
+        await db.qboMutationAttempt.create({
+          data: {
+            transactionId: transaction.id,
+            requestId,
+            operation: 'recategorize',
+            status: 'VERIFIED',
+            expectedRevision: 1,
+            expectedSyncToken: '0',
+            requestHash: `legacy-${requestId}`,
+            requestPayload: { ruleCandidateFold: { version: 1 } },
+            beforeSnapshot: {},
+          },
+        });
+        await recordVerifiedRuleCandidateOutcome(outcome, { db, now: () => NOW });
+      }
+      const oldCandidate = await db.autopilotRuleCandidate.findFirstOrThrow({
+        where: { companyId: company.id, configVersion: oldConfigVersion },
+      });
+      expect(oldCandidate).toMatchObject({
+        state: 'ready',
+        evidenceCount: 4,
+        conflictingEvidenceCount: 0,
+      });
+
+      const corrected = transactions[0]!;
+      const correctionRequestId = randomUUID();
+      await createVerifiedBoundPurchaseAttempt({
+        db,
+        transaction: corrected,
+        requestId: correctionRequestId,
+        expectedRevision: 2,
+        beforeSyncToken: '1',
+        responseSyncToken: '2',
+        preparedCategoryQboId: accountB.qboId,
+        persistedProposal: proposal(accountB.qboId),
+        candidateContext: newContext,
+      });
+      await db.transaction.update({
+        where: { id: corrected.id },
+        data: { revision: 2, qboSyncToken: '2' },
+      });
+
+      await expect(activateRuleCandidate(
+        company.id,
+        oldCandidate.id,
+        { id: randomUUID(), label: 'Fixture reviewer' },
+        db,
+      )).rejects.toMatchObject({ code: 'CANDIDATE_NOT_READY' });
+      await expect(db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: oldCandidate.id },
+      })).resolves.toMatchObject({
+        state: 'conflict',
+        evidenceCount: 3,
+        conflictingEvidenceCount: 1,
+      });
+      await expect(db.autopilotRuleCandidateEvidence.count({
+        where: {
+          candidateId: oldCandidate.id,
+          requestId: correctionRequestId,
+          polarity: 'negative',
+          active: true,
+        },
+      })).resolves.toBe(1);
+      await expect(db.autopilotRuleCandidate.findFirstOrThrow({
+        where: { companyId: company.id, configVersion: newConfigVersion },
+      })).resolves.toMatchObject({ state: 'gathering', evidenceCount: 1 });
+      await expect(db.autopilotRuleCandidateFold.count({
+        where: { requestId: correctionRequestId },
+      })).resolves.toBe(1);
+      await expect(db.qboMutationAttempt.findUniqueOrThrow({
+        where: { requestId: correctionRequestId },
+        select: { ruleCandidateFoldedAt: true },
+      })).resolves.toEqual({ ruleCandidateFoldedAt: expect.any(Date) });
+      await expect(db.rule.count({ where: { companyId: company.id } })).resolves.toBe(0);
+      await expect(db.classificationCase.count({
+        where: { companyId: company.id },
+      })).resolves.toBe(0);
     } finally {
       await db.company.delete({ where: { id: company.id } });
     }

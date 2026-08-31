@@ -580,15 +580,14 @@ export async function reconcileBoundClassificationOutcomesBeforeActivation(
             AND attempt."requestPayload"->'ruleCandidateEvidence'->>'configVersion'
               = ${candidate.configVersion}
           )
-          OR (
-            attempt."operation" = 'restore'
-            AND EXISTS (
-              SELECT 1
-              FROM "AutopilotRuleCandidateEvidence" evidence
-              WHERE evidence."candidateId" = ${candidate.id}
-                AND evidence."transactionId" = attempt."transactionId"
-                AND evidence."active" = true
-            )
+          OR EXISTS (
+            -- A correction can use a new config while invalidating evidence
+            -- that still supports the candidate being activated.
+            SELECT 1
+            FROM "AutopilotRuleCandidateEvidence" evidence
+            WHERE evidence."candidateId" = ${candidate.id}
+              AND evidence."transactionId" = attempt."transactionId"
+              AND evidence."active" = true
           )
         )
       ORDER BY attempt."createdAt" DESC, attempt."id" DESC
