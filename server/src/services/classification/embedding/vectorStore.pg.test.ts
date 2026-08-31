@@ -148,8 +148,10 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
       expect.objectContaining({ documentId: 'classification_case:new-a', companyId: first.id, similarity: 1 }),
     ]);
     expect(current.some((hit) => hit.companyId === second.id)).toBe(false);
-    await expect(store.health(first.id)).resolves.toMatchObject({
+    await expect(store.health(first.id, newGeneration.fingerprint)).resolves.toMatchObject({
       activeGeneration: newGeneration.fingerprint,
+      expectedGeneration: newGeneration.fingerprint,
+      expectedState: 'succeeded',
       embedded: 1,
       skipped: 0,
       backlog: 0,
@@ -202,8 +204,97 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
         embedding: [1, 2],
       }],
     })).rejects.toMatchObject({ code: 'INVALID_VECTOR' });
-    await expect(store.health(owner.id)).resolves.toMatchObject({
+    await expect(store.publishGeneration({
+      companyId: owner.id,
+      generation: replacement,
+      totalDocuments: 2,
+      skippedDocuments: 0,
+      chunks: [{
+        companyId: owner.id,
+        documentId: 'rule:incomplete-replacement',
+        kind: 'rule',
+        sourceId: 'incomplete-replacement',
+        revisedAt: '2026-08-31T00:00:00.000Z',
+        chunkIndex: 0,
+        contentHash: 'f'.repeat(64),
+        embedding: vector(1),
+      }],
+    })).rejects.toMatchObject({ code: 'GENERATION_CONFLICT' });
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
       activeGeneration: active.fingerprint,
+    });
+  });
+
+  it('persists build health before cutover and separates a reactivated generation from a newer failed attempt', async () => {
+    const owner = await company('Vector Attempt Company');
+    const store = new PgClassificationVectorStore(db);
+    await store.ensureAvailable();
+    const active = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1',
+      fingerprintSalt: 'reactivated-generation',
+    });
+    const interim = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1',
+      fingerprintSalt: 'interim-generation',
+    });
+    const failed = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1',
+      fingerprintSalt: 'newer-failed-generation',
+    });
+    const chunk = (generationId: string, seed: number) => ({
+      companyId: owner.id,
+      documentId: `rule:${generationId}`,
+      kind: 'rule' as const,
+      sourceId: generationId,
+      revisedAt: '2026-08-31T00:00:00.000Z',
+      chunkIndex: 0,
+      contentHash: String(seed).repeat(64).slice(0, 64),
+      embedding: vector(seed),
+    });
+    await store.publishGeneration({
+      companyId: owner.id, generation: active, chunks: [chunk('active', 2)],
+      totalDocuments: 1, skippedDocuments: 0,
+    });
+    await store.recordProgress({
+      companyId: owner.id,
+      fingerprint: active.fingerprint,
+      totalDocuments: 2,
+      embeddedDocuments: 1,
+      skippedDocuments: 0,
+    });
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
+      activeGeneration: active.fingerprint,
+      expectedState: 'building',
+      backlog: 1,
+      progress: 0.5,
+    });
+    await store.publishGeneration({
+      companyId: owner.id, generation: interim, chunks: [chunk('interim', 3)],
+      totalDocuments: 1, skippedDocuments: 0,
+    });
+    await store.publishGeneration({
+      companyId: owner.id, generation: active, chunks: [chunk('active', 2)],
+      totalDocuments: 1, skippedDocuments: 0,
+    });
+    await store.recordFailure({
+      companyId: owner.id,
+      fingerprint: failed.fingerprint,
+      totalDocuments: 2,
+      embeddedDocuments: 0,
+      skippedDocuments: 0,
+      errorCode: 'semantic_error',
+    });
+
+    await expect(store.health(owner.id, active.fingerprint)).resolves.toMatchObject({
+      activeGeneration: active.fingerprint,
+      expectedGeneration: active.fingerprint,
+      expectedState: 'succeeded',
+      embedded: 1,
+      backlog: 0,
+      lastError: null,
+      latestAttemptGeneration: failed.fingerprint,
+      latestAttemptState: 'failed',
+      latestAttemptError: 'semantic_error',
     });
   });
 });

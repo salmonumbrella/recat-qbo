@@ -207,11 +207,23 @@ describePostgres('classification search on PostgreSQL', () => {
           actorId: null,
           recordedAt: '2026-06-15T00:00:00.000Z',
         },
-        transactionSnapshot: {},
+        transactionSnapshot: {
+          schemaVersion: 'classification-case/v1',
+          transactionId: transaction.id,
+          transactionRevision: 0,
+          qboType: 'Purchase',
+          qboId: transaction.qboId,
+          date: '2026-06-15T00:00:00.000Z',
+          amountCents: -11300,
+          currency: 'CAD',
+          payee: 'Coach Yorkdale',
+          memo: 'Wholesale handbags for resale',
+          sourceAccountName: 'Synthetic Bank',
+        },
         verifiedAt: new Date('2026-06-15T00:00:00.000Z'),
       },
     });
-    return { current, foreign, alias, rule, candidate, classificationCase };
+    return { current, foreign, alias, rule, candidate, classificationCase, transaction };
   }
 
   it('finds live aliases, rules, candidates, and case evidence while excluding inactive rows', async () => {
@@ -283,5 +295,159 @@ describePostgres('classification search on PostgreSQL', () => {
       [data.current.id],
       [`classification_case:${data.classificationCase.id}`],
     )).resolves.toEqual([]);
+  });
+
+  it('keeps rule tags tenant-owned and searches immutable bounded case snapshots', async () => {
+    const data = await fixtures();
+    const foreignTag = await db.tag.create({
+      data: {
+        id: `foreign-tag-${randomUUID()}`,
+        companyId: data.foreign.id,
+        name: 'ForeignSecretTag',
+        color: '#000000',
+      },
+    });
+    await db.ruleTag.create({
+      data: { ruleId: data.rule.id, tagId: foreignTag.id },
+    });
+    await db.transaction.update({
+      where: { id: data.transaction.id },
+      data: { payee: 'Mutated Live Payee', memo: 'MutatedSecretMemo' },
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    await expect(repository.search([data.current.id], 'ForeignSecretTag', 20))
+      .resolves.toEqual([]);
+    const immutable = await repository.search([data.current.id], 'Coach Yorkdale', 20);
+    expect(immutable.map((record) => record.hit.id))
+      .toContain(`classification_case:${data.classificationCase.id}`);
+    expect(await repository.search([data.current.id], 'MutatedSecretMemo', 20))
+      .toEqual([]);
+  });
+
+  it('matches canonically equivalent Unicode rules and emits canonical aggregate order', async () => {
+    const data = await fixtures();
+    const decomposed = await db.rule.create({
+      data: {
+        companyId: data.current.id,
+        matchText: 'Cafe\u0301 Inventory',
+        category: 'Inventory purchases',
+      },
+    });
+    const vendor = await db.vendorIdentity.create({
+      data: { companyId: data.current.id, displayName: 'Aggregate Vendor', normalizedName: 'aggregate vendor' },
+    });
+    await db.vendorAlias.createMany({
+      data: [
+        { companyId: data.current.id, vendorIdentityId: vendor.id, value: 'Zulu alias', normalizedValue: 'zulu alias', source: 'user' },
+        { companyId: data.current.id, vendorIdentityId: vendor.id, value: 'Alpha alias', normalizedValue: 'alpha alias', source: 'user' },
+      ],
+    });
+    const [alphaTagId, zuluTagId] = [randomUUID(), randomUUID()].sort();
+    const alphaTag = await db.tag.create({
+      data: { id: alphaTagId!, companyId: data.current.id, name: 'Alpha tag', color: '#111111' },
+    });
+    const zuluTag = await db.tag.create({
+      data: { id: zuluTagId!, companyId: data.current.id, name: 'Zulu tag', color: '#222222' },
+    });
+    await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: zuluTag.id } });
+    await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: alphaTag.id } });
+    const observedAt = new Date('2026-08-31T00:00:00.000Z');
+    const [alphaEvidenceId, zuluEvidenceId] = [randomUUID(), randomUUID()].sort();
+    await db.autopilotRuleCandidateEvidence.create({
+      data: {
+        id: zuluEvidenceId!,
+        companyId: data.current.id,
+        candidateId: data.candidate.id,
+        transactionId: data.transaction.id,
+        inputRevision: 0,
+        requestId: `aggregate-z-${randomUUID()}`,
+        source: 'verified_outcome',
+        actionFingerprint: 'e'.repeat(64),
+        pattern: { value: 'Zulu pattern' },
+        observedAt,
+      },
+    });
+    await db.autopilotRuleCandidateEvidence.create({
+      data: {
+        id: alphaEvidenceId!,
+        companyId: data.current.id,
+        candidateId: data.candidate.id,
+        transactionId: data.transaction.id,
+        inputRevision: 0,
+        requestId: `aggregate-a-${randomUUID()}`,
+        source: 'verified_outcome',
+        actionFingerprint: 'e'.repeat(64),
+        pattern: { value: 'Alpha pattern' },
+        observedAt,
+      },
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    const exact = await searchClassificationMemory({
+      query: 'Caf\u00e9 Inventory',
+      companyId: data.current.id,
+      scope: 'current_company',
+      mode: 'exact',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    expect(exact.hits.map((hit) => hit.id)).toContain(`rule:${decomposed.id}`);
+    const identity = (await repository.rehydrate(
+      [data.current.id],
+      [`vendor_identity:${vendor.id}`],
+    ))[0];
+    expect(identity?.document?.text.indexOf('Alpha alias'))
+      .toBeLessThan(identity?.document?.text.indexOf('Zulu alias') ?? -1);
+    const rule = (await repository.rehydrate(
+      [data.current.id],
+      [`rule:${data.rule.id}`],
+    ))[0];
+    expect(rule?.document?.text.indexOf('Alpha tag'))
+      .toBeLessThan(rule?.document?.text.indexOf('Zulu tag') ?? -1);
+    const candidate = (await repository.rehydrate(
+      [data.current.id],
+      [`rule_candidate:${data.candidate.id}`],
+    ))[0];
+    expect(candidate?.document?.text.indexOf('Alpha pattern'))
+      .toBeLessThan(candidate?.document?.text.indexOf('Zulu pattern') ?? -1);
+  });
+
+  it('paginates the complete embedding corpus beyond the former ten-thousand-row cap', async () => {
+    const owner = await company('Large Corpus');
+    await db.vendorIdentity.createMany({
+      data: Array.from({ length: 10_001 }, (_unused, index) => ({
+        companyId: owner.id,
+        displayName: `Vendor ${String(index).padStart(5, '0')}`,
+        normalizedName: `vendor ${String(index).padStart(5, '0')}`,
+      })),
+    });
+
+    const corpus = await new PrismaClassificationSearchRepository(db).documents(owner.id);
+
+    expect(corpus).toMatchObject({ totalDocuments: 10_001, skippedDocuments: 0 });
+    expect(corpus.documents).toHaveLength(10_001);
+  }, 20_000);
+
+  it('bounds oversized candidate evidence without dropping the lexical hit', async () => {
+    const data = await fixtures();
+    await db.autopilotRuleCandidateEvidence.create({
+      data: {
+        id: `candidate-evidence-${randomUUID()}`,
+        companyId: data.current.id,
+        candidateId: data.candidate.id,
+        transactionId: data.transaction.id,
+        inputRevision: 0,
+        requestId: `candidate-search-${randomUUID()}`,
+        source: 'verified_outcome',
+        actionFingerprint: 'd'.repeat(64),
+        pattern: { note: `BoundedEvidenceNeedle ${'x'.repeat(40_000)}` },
+      },
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    const records = await repository.search([data.current.id], 'BoundedEvidenceNeedle', 20);
+    expect(records.map((record) => record.hit.id)).toContain(`rule_candidate:${data.candidate.id}`);
+    expect(records.find((record) => record.hit.id === `rule_candidate:${data.candidate.id}`)?.document)
+      .toBeDefined();
   });
 });

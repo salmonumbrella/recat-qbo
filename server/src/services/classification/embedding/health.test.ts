@@ -25,13 +25,19 @@ describe('classification semantic health', () => {
       dimensions: 1024,
       vectorAvailable: false,
       expectedGeneration: null,
+      indexedGeneration: null,
       activeGeneration: null,
+      expectedState: null,
       embedded: 0,
       skipped: 0,
       backlog: 0,
       progress: 0,
       lastSuccessAt: null,
       lastError: null,
+      latestAttemptGeneration: null,
+      latestAttemptState: null,
+      latestAttemptAt: null,
+      latestAttemptError: null,
     });
     expect(vectorCalls).toBe(0);
   });
@@ -59,12 +65,18 @@ describe('classification semantic health', () => {
         async health() {
           return {
             activeGeneration: generation.fingerprint,
+            expectedGeneration: generation.fingerprint,
+            expectedState: 'succeeded',
             embedded: 8,
             skipped: 1,
             backlog: 1,
             progress: 0.9,
             lastSuccessAt: '2026-08-31T00:00:00.000Z',
             lastError: null,
+            latestAttemptGeneration: generation.fingerprint,
+            latestAttemptState: 'succeeded',
+            latestAttemptAt: '2026-08-31T00:00:00.000Z',
+            latestAttemptError: null,
           };
         },
       },

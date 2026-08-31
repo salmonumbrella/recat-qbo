@@ -48,6 +48,9 @@ describe('classification embedding reconciliation', () => {
         events.push('publish');
         published.push(input);
       },
+      async recordProgress(input) {
+        events.push(`progress:${input.embeddedDocuments}/${input.totalDocuments}`);
+      },
       async recordFailure() {
         events.push('failure');
       },
@@ -56,6 +59,8 @@ describe('classification embedding reconciliation', () => {
     const result = await reconcileClassificationEmbeddings({
       companyId: 'company-a',
       documents: [document('case-a', 'Office meals'), document('case-b', 'Inventory freight')],
+      totalDocuments: 3,
+      skippedDocuments: 1,
       generation: classificationEmbeddingGeneration({
         baseUrl: 'https://api.voyageai.com/v1',
         fingerprintSalt: 'synthetic',
@@ -64,13 +69,13 @@ describe('classification embedding reconciliation', () => {
       store,
     });
 
-    expect(events).toEqual(['available', 'embed:2', 'publish']);
-    expect(result).toMatchObject({ status: 'published', embedded: 2, skipped: 0, backlog: 0 });
+    expect(events).toEqual(['available', 'progress:0/3', 'embed:2', 'progress:2/3', 'publish']);
+    expect(result).toMatchObject({ status: 'published', embedded: 2, skipped: 1, backlog: 0 });
     expect(published).toEqual([
       expect.objectContaining({
         companyId: 'company-a',
-        totalDocuments: 2,
-        skippedDocuments: 0,
+        totalDocuments: 3,
+        skippedDocuments: 1,
         chunks: [
           expect.objectContaining({ documentId: 'classification_case:case-a', embedding: vector(0) }),
           expect.objectContaining({ documentId: 'classification_case:case-b', embedding: vector(1) }),
@@ -96,6 +101,7 @@ describe('classification embedding reconciliation', () => {
       async publishGeneration() {
         events.push('published');
       },
+      async recordProgress() {},
       async recordFailure(input) {
         events.push(input);
       },
@@ -142,6 +148,7 @@ describe('classification embedding reconciliation', () => {
           return { available: false, reason: 'vector_capability_unavailable' };
         },
         async publishGeneration() {},
+        async recordProgress() {},
         async recordFailure() {},
       },
     });
@@ -198,6 +205,7 @@ describe('classification embedding reconciliation', () => {
       store: {
         async ensureAvailable() { return { available: true, reason: null }; },
         async currentChunks() { return existing; },
+        async recordProgress() {},
         async publishGeneration(input) { published = input.chunks; },
         async recordFailure() {},
       },
@@ -211,12 +219,77 @@ describe('classification embedding reconciliation', () => {
     ]));
   });
 
+  it('does not count a document as embedded until every one of its chunks is stored', async () => {
+    const singleChunk = Array.from({ length: 511 }, (_unused, index) => (
+      document(`single-${index}`, `single ${index}`)
+    ));
+    const splitBase = document('split', 'split');
+    const split = {
+      ...splitBase,
+      chunks: [
+        { ...splitBase.chunks[0]!, index: 0, contentHash: 'a'.repeat(64), text: 'split first' },
+        { ...splitBase.chunks[0]!, index: 1, contentHash: 'b'.repeat(64), text: 'split second' },
+      ],
+    };
+    const progress: number[] = [];
+
+    const result = await reconcileClassificationEmbeddings({
+      companyId: 'company-a',
+      documents: [...singleChunk, split],
+      generation,
+      client: {
+        async embedDocuments(inputs) { return inputs.map(() => vector(0)); },
+        async embedQuery() { return vector(0); },
+      },
+      store: {
+        async ensureAvailable() { return { available: true, reason: null }; },
+        async recordProgress(input) { progress.push(input.embeddedDocuments); },
+        async publishGeneration() {},
+        async recordFailure() {},
+      },
+    });
+
+    expect(result.status).toBe('published');
+    expect(progress).toEqual([0, 511, 512]);
+  });
+
+  it('reports partial completed-document progress when a later provider batch fails', async () => {
+    const documents = Array.from({ length: 513 }, (_unused, index) => (
+      document(`partial-${index}`, `partial ${index}`)
+    ));
+    let calls = 0;
+    let failureEmbedded = -1;
+
+    const result = await reconcileClassificationEmbeddings({
+      companyId: 'company-a',
+      documents,
+      generation,
+      client: {
+        async embedDocuments(inputs) {
+          calls += 1;
+          if (calls === 2) throw new Error('synthetic second-batch failure');
+          return inputs.map(() => vector(0));
+        },
+        async embedQuery() { return vector(0); },
+      },
+      store: {
+        async ensureAvailable() { return { available: true, reason: null }; },
+        async recordProgress() {},
+        async publishGeneration() {},
+        async recordFailure(input) { failureEmbedded = input.embeddedDocuments; },
+      },
+    });
+
+    expect(result).toMatchObject({ status: 'failed', embedded: 512, backlog: 1 });
+    expect(failureEmbedded).toBe(512);
+  });
+
   it('keeps the background tick inert when the dedicated provider is unconfigured', async () => {
     let companyReads = 0;
     const result = await runClassificationEmbeddingTick({
       runtimeConfig: () => null,
       async listCompanyIds() { companyReads += 1; return ['company-a']; },
-      async documents() { return []; },
+      async documents() { return { documents: [], totalDocuments: 0, skippedDocuments: 0 }; },
       createClient() { throw new Error('not called'); },
       createStore() { throw new Error('not called'); },
       reconcile: reconcileClassificationEmbeddings,
@@ -243,7 +316,13 @@ describe('classification embedding reconciliation', () => {
         fingerprintSalt: 'synthetic',
       }),
       async listCompanyIds() { return ['company-a', 'company-b']; },
-      async documents(companyId) { return [document(`case-${companyId}`, companyId)]; },
+      async documents(companyId) {
+        return {
+          documents: [document(`case-${companyId}`, companyId)],
+          totalDocuments: 1,
+          skippedDocuments: 0,
+        };
+      },
       createClient() {
         return {
           async embedDocuments() { return [vector(0)]; },
@@ -253,6 +332,7 @@ describe('classification embedding reconciliation', () => {
       createStore() {
         return {
           async ensureAvailable() { return { available: true, reason: null }; },
+          async recordProgress() {},
           async publishGeneration() {},
           async recordFailure() {},
         };

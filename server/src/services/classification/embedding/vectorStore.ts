@@ -32,16 +32,29 @@ export interface VectorSearchHit {
 
 export interface VectorGenerationHealth {
   activeGeneration: string | null;
+  expectedGeneration: string | null;
+  expectedState: string | null;
   embedded: number;
   skipped: number;
   backlog: number;
   progress: number;
   lastSuccessAt: string | null;
   lastError: string | null;
+  latestAttemptGeneration: string | null;
+  latestAttemptState: string | null;
+  latestAttemptAt: string | null;
+  latestAttemptError: string | null;
 }
 
 export interface ClassificationEmbeddingStore {
   ensureAvailable(): Promise<VectorCapability>;
+  recordProgress(input: {
+    companyId: string;
+    fingerprint: string;
+    totalDocuments: number;
+    embeddedDocuments: number;
+    skippedDocuments: number;
+  }): Promise<void>;
   publishGeneration(input: {
     companyId: string;
     generation: ClassificationEmbeddingGeneration;
@@ -134,11 +147,21 @@ const INSTALL_SQL = [
       "backlogDocuments" integer NOT NULL DEFAULT 0,
       "lastSuccessAt" timestamptz,
       "lastErrorCode" varchar(64),
+      "attemptState" varchar(16) NOT NULL DEFAULT 'pending',
+      "attemptedAt" timestamptz,
       "createdAt" timestamptz NOT NULL DEFAULT now(),
       "activatedAt" timestamptz,
       PRIMARY KEY ("companyId", "fingerprint"),
       FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE
     )
+  `,
+  Prisma.sql`
+    ALTER TABLE "ClassificationEmbeddingGeneration"
+      ADD COLUMN IF NOT EXISTS "attemptState" varchar(16) NOT NULL DEFAULT 'pending'
+  `,
+  Prisma.sql`
+    ALTER TABLE "ClassificationEmbeddingGeneration"
+      ADD COLUMN IF NOT EXISTS "attemptedAt" timestamptz
   `,
   Prisma.sql`
     CREATE UNIQUE INDEX IF NOT EXISTS "ClassificationEmbeddingGeneration_one_active"
@@ -188,6 +211,48 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     }
   }
 
+  async recordProgress(input: {
+    companyId: string;
+    fingerprint: string;
+    totalDocuments: number;
+    embeddedDocuments: number;
+    skippedDocuments: number;
+  }): Promise<void> {
+    const companyId = checkedIdentifier(input.companyId);
+    const fingerprint = checkedIdentifier(input.fingerprint);
+    const totalDocuments = boundedCount(input.totalDocuments);
+    const embeddedDocuments = boundedCount(input.embeddedDocuments);
+    const skippedDocuments = boundedCount(input.skippedDocuments);
+    const backlogDocuments = Math.max(0, totalDocuments - embeddedDocuments - skippedDocuments);
+    try {
+      await this.db.$executeRaw(Prisma.sql`
+        INSERT INTO "ClassificationEmbeddingGeneration" (
+          "companyId", "fingerprint", "state", "attemptState", "attemptedAt",
+          "totalDocuments", "embeddedDocuments", "skippedDocuments",
+          "backlogDocuments", "lastErrorCode"
+        ) VALUES (
+          ${companyId}, ${fingerprint}, 'building', 'building', now(),
+          ${totalDocuments}, ${embeddedDocuments}, ${skippedDocuments},
+          ${backlogDocuments}, NULL
+        )
+        ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
+          "state" = CASE
+            WHEN "ClassificationEmbeddingGeneration"."state" = 'active' THEN 'active'
+            ELSE 'building'
+          END,
+          "attemptState" = 'building',
+          "attemptedAt" = now(),
+          "totalDocuments" = EXCLUDED."totalDocuments",
+          "embeddedDocuments" = EXCLUDED."embeddedDocuments",
+          "skippedDocuments" = EXCLUDED."skippedDocuments",
+          "backlogDocuments" = EXCLUDED."backlogDocuments",
+          "lastErrorCode" = NULL
+      `);
+    } catch {
+      throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');
+    }
+  }
+
   async publishGeneration(input: {
     companyId: string;
     generation: ClassificationEmbeddingGeneration;
@@ -205,6 +270,9 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     const documentIds = new Set(input.chunks.map((chunk) => chunk.documentId));
     const embeddedDocuments = documentIds.size;
     const backlogDocuments = Math.max(0, totalDocuments - embeddedDocuments - skippedDocuments);
+    if (backlogDocuments !== 0 || embeddedDocuments + skippedDocuments !== totalDocuments) {
+      throw new VectorStoreError('GENERATION_CONFLICT');
+    }
     for (const chunk of input.chunks) {
       if (chunk.companyId !== companyId) throw new VectorStoreError('GENERATION_CONFLICT');
       checkedIdentifier(chunk.documentId);
@@ -222,10 +290,11 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
         INSERT INTO "ClassificationEmbeddingGeneration" (
           "companyId", "fingerprint", "state", "totalDocuments",
           "embeddedDocuments", "skippedDocuments", "backlogDocuments",
-          "lastErrorCode"
+          "lastErrorCode", "attemptState", "attemptedAt"
         ) VALUES (
           ${companyId}, ${fingerprint}, 'building', ${totalDocuments},
-          ${embeddedDocuments}, ${skippedDocuments}, ${backlogDocuments}, NULL
+          ${embeddedDocuments}, ${skippedDocuments}, ${backlogDocuments}, NULL,
+          'succeeded', now()
         )
         ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
           "state" = CASE
@@ -236,7 +305,9 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
           "embeddedDocuments" = EXCLUDED."embeddedDocuments",
           "skippedDocuments" = EXCLUDED."skippedDocuments",
           "backlogDocuments" = EXCLUDED."backlogDocuments",
-          "lastErrorCode" = NULL
+          "lastErrorCode" = NULL,
+          "attemptState" = 'succeeded',
+          "attemptedAt" = now()
       `);
       await tx.$executeRaw(Prisma.sql`
         DELETE FROM "ClassificationEmbeddingChunk"
@@ -264,7 +335,7 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
       await tx.$executeRaw(Prisma.sql`
         UPDATE "ClassificationEmbeddingGeneration"
         SET "state" = 'active', "activatedAt" = now(), "lastSuccessAt" = now(),
-            "lastErrorCode" = NULL
+            "lastErrorCode" = NULL, "attemptState" = 'succeeded', "attemptedAt" = now()
         WHERE "companyId" = ${companyId} AND "fingerprint" = ${fingerprint}
       `);
     };
@@ -295,12 +366,12 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
       await this.db.$executeRaw(Prisma.sql`
         INSERT INTO "ClassificationEmbeddingGeneration" (
           "companyId", "fingerprint", "state", "totalDocuments", "embeddedDocuments",
-          "skippedDocuments", "backlogDocuments", "lastErrorCode"
+          "skippedDocuments", "backlogDocuments", "lastErrorCode", "attemptState", "attemptedAt"
         ) VALUES (
           ${companyId}, ${fingerprint}, 'failed', ${boundedCount(input.totalDocuments)},
           ${boundedCount(input.embeddedDocuments)}, ${boundedCount(input.skippedDocuments)},
           ${Math.max(0, boundedCount(input.totalDocuments) - boundedCount(input.embeddedDocuments) - boundedCount(input.skippedDocuments))},
-          ${errorCode}
+          ${errorCode}, 'failed', now()
         )
         ON CONFLICT ("companyId", "fingerprint") DO UPDATE SET
           "state" = CASE
@@ -311,7 +382,9 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
           "embeddedDocuments" = EXCLUDED."embeddedDocuments",
           "skippedDocuments" = EXCLUDED."skippedDocuments",
           "backlogDocuments" = EXCLUDED."backlogDocuments",
-          "lastErrorCode" = EXCLUDED."lastErrorCode"
+          "lastErrorCode" = EXCLUDED."lastErrorCode",
+          "attemptState" = 'failed',
+          "attemptedAt" = now()
       `);
     } catch {
       throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');
@@ -413,58 +486,72 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     }
   }
 
-  async health(companyId: string): Promise<VectorGenerationHealth> {
+  async health(companyId: string, expectedFingerprint: string): Promise<VectorGenerationHealth> {
     try {
+      const checkedCompanyId = checkedIdentifier(companyId);
+      const checkedExpectedFingerprint = checkedIdentifier(expectedFingerprint);
       const rows = await this.db.$queryRaw<Array<{
-        fingerprint: string | null;
+        expectedFingerprint: string | null;
         activeFingerprint: string | null;
-        state: string;
+        expectedState: string | null;
         embeddedDocuments: number;
         skippedDocuments: number;
         backlogDocuments: number;
         totalDocuments: number;
         lastSuccessAt: Date | null;
         lastErrorCode: string | null;
+        latestAttemptFingerprint: string | null;
+        latestAttemptState: string | null;
+        latestAttemptAt: Date | null;
+        latestAttemptErrorCode: string | null;
       }>>(Prisma.sql`
-        WITH latest AS (
+        WITH expected AS (
           SELECT * FROM "ClassificationEmbeddingGeneration"
-          WHERE "companyId" = ${checkedIdentifier(companyId)}
-          ORDER BY "createdAt" DESC
+          WHERE "companyId" = ${checkedCompanyId}
+            AND "fingerprint" = ${checkedExpectedFingerprint}
+        ), active AS (
+          SELECT * FROM "ClassificationEmbeddingGeneration"
+          WHERE "companyId" = ${checkedCompanyId} AND "state" = 'active'
+          LIMIT 1
+        ), latest_attempt AS (
+          SELECT * FROM "ClassificationEmbeddingGeneration"
+          WHERE "companyId" = ${checkedCompanyId} AND "attemptedAt" IS NOT NULL
+          ORDER BY "attemptedAt" DESC, "fingerprint" ASC
           LIMIT 1
         )
-        SELECT latest."fingerprint", latest."state", latest."embeddedDocuments",
-               latest."skippedDocuments", latest."backlogDocuments", latest."totalDocuments",
-               latest."lastSuccessAt", latest."lastErrorCode",
-               (
-                 SELECT active."fingerprint"
-                 FROM "ClassificationEmbeddingGeneration" active
-                 WHERE active."companyId" = ${checkedIdentifier(companyId)}
-                   AND active."state" = 'active'
-                 LIMIT 1
-               ) AS "activeFingerprint"
-        FROM latest
+        SELECT expected."fingerprint" AS "expectedFingerprint",
+               active."fingerprint" AS "activeFingerprint",
+               expected."attemptState" AS "expectedState",
+               COALESCE(expected."embeddedDocuments", 0) AS "embeddedDocuments",
+               COALESCE(expected."skippedDocuments", 0) AS "skippedDocuments",
+               COALESCE(expected."backlogDocuments", 0) AS "backlogDocuments",
+               COALESCE(expected."totalDocuments", 0) AS "totalDocuments",
+               expected."lastSuccessAt", expected."lastErrorCode",
+               latest_attempt."fingerprint" AS "latestAttemptFingerprint",
+               latest_attempt."attemptState" AS "latestAttemptState",
+               latest_attempt."attemptedAt" AS "latestAttemptAt",
+               latest_attempt."lastErrorCode" AS "latestAttemptErrorCode"
+        FROM (SELECT 1) anchor
+        LEFT JOIN expected ON true
+        LEFT JOIN active ON true
+        LEFT JOIN latest_attempt ON true
       `);
-      const row = rows[0];
-      if (row === undefined) {
-        return {
-          activeGeneration: null,
-          embedded: 0,
-          skipped: 0,
-          backlog: 0,
-          progress: 0,
-          lastSuccessAt: null,
-          lastError: null,
-        };
-      }
+      const row = rows[0]!;
       const completed = row.embeddedDocuments + row.skippedDocuments;
       return {
         activeGeneration: row.activeFingerprint,
+        expectedGeneration: row.expectedFingerprint,
+        expectedState: row.expectedState,
         embedded: row.embeddedDocuments,
         skipped: row.skippedDocuments,
         backlog: row.backlogDocuments,
         progress: row.totalDocuments === 0 ? 1 : completed / row.totalDocuments,
         lastSuccessAt: row.lastSuccessAt?.toISOString() ?? null,
         lastError: row.lastErrorCode,
+        latestAttemptGeneration: row.latestAttemptFingerprint,
+        latestAttemptState: row.latestAttemptState,
+        latestAttemptAt: row.latestAttemptAt?.toISOString() ?? null,
+        latestAttemptError: row.latestAttemptErrorCode,
       };
     } catch {
       throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');

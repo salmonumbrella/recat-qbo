@@ -59,7 +59,13 @@ export interface ClassificationSearchRepository {
     companyIds: readonly string[],
     documentIds: readonly string[],
   ): Promise<ClassificationSearchRecord[]>;
-  documents(companyId: string): Promise<ClassificationSearchDocument[]>;
+  documents(companyId: string): Promise<ClassificationSearchCorpus>;
+}
+
+export interface ClassificationSearchCorpus {
+  documents: ClassificationSearchDocument[];
+  totalDocuments: number;
+  skippedDocuments: number;
 }
 
 export interface ClassificationSemanticSearch {
@@ -233,11 +239,20 @@ async function semanticLeg(
   }
   let health: VectorGenerationHealth[];
   try {
-    health = await Promise.all(companyIds.map((companyId) => semantic.store.health(companyId)));
+    health = await Promise.all(companyIds.map((companyId) => (
+      semantic.store.health(companyId, semantic.generation.fingerprint)
+    )));
   } catch {
     throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'semantic_error');
   }
-  if (health.some((state) => state.activeGeneration !== semantic.generation.fingerprint)) {
+  if (health.some((state) => (
+    state.activeGeneration !== semantic.generation.fingerprint
+    || state.expectedGeneration !== semantic.generation.fingerprint
+    || state.expectedState !== 'succeeded'
+    || state.backlog !== 0
+    || state.progress !== 1
+    || state.lastError !== null
+  ))) {
     throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'semantic_unavailable');
   }
   try {
@@ -440,14 +455,77 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     return this.load(checkedCompanyIds, null, checkedIds, checkedIds.length);
   }
 
-  async documents(companyId: string): Promise<ClassificationSearchDocument[]> {
-    const records = await this.load(
-      [checkedText(companyId, CLASSIFICATION_CONTRACT_LIMITS.identifier)],
-      null,
-      null,
-      10_000,
-    );
-    return records.flatMap((record) => record.document === undefined ? [] : [record.document]);
+  async documents(companyId: string): Promise<ClassificationSearchCorpus> {
+    const checkedCompanyId = checkedText(companyId, CLASSIFICATION_CONTRACT_LIMITS.identifier);
+    const documents: ClassificationSearchDocument[] = [];
+    let totalDocuments = 0;
+    let skippedDocuments = 0;
+    let afterDocumentId: string | null = null;
+    for (;;) {
+      const ids = await this.documentIdsPage(checkedCompanyId, afterDocumentId, MAX_FETCH);
+      if (ids.length === 0) break;
+      totalDocuments += ids.length;
+      const records = await this.rehydrate([checkedCompanyId], ids);
+      const recordsById = new Map(records.map((record) => [record.hit.id, record]));
+      for (const id of ids) {
+        const document = recordsById.get(id)?.document;
+        if (document === undefined) skippedDocuments += 1;
+        else documents.push(document);
+      }
+      afterDocumentId = ids.at(-1) ?? null;
+      if (ids.length < MAX_FETCH) break;
+    }
+    return { documents, totalDocuments, skippedDocuments };
+  }
+
+  private async documentIdsPage(
+    companyId: string,
+    afterDocumentId: string | null,
+    limit: number,
+  ): Promise<string[]> {
+    const afterFilter = afterDocumentId === null
+      ? Prisma.empty
+      : Prisma.sql`WHERE concat(document_kind, ':', source_id) > ${afterDocumentId}`;
+    const rows = await this.db.$queryRaw<Array<{ documentId: string }>>(Prisma.sql`
+      WITH canonical_documents AS (
+        SELECT 'vendor_identity'::text AS document_kind, identity."id"::text AS source_id
+        FROM "VendorIdentity" identity
+        LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
+          AND merge."sourceVendorIdentityId" = identity."id"
+        WHERE identity."companyId" = ${companyId} AND merge."id" IS NULL
+        UNION ALL
+        SELECT 'vendor_alias'::text, alias."id"::text
+        FROM "VendorAlias" alias
+        JOIN "VendorIdentity" identity ON identity."companyId" = alias."companyId"
+          AND identity."id" = alias."vendorIdentityId"
+        LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
+          AND merge."sourceVendorIdentityId" = identity."id"
+        WHERE alias."companyId" = ${companyId} AND merge."id" IS NULL
+        UNION ALL
+        SELECT 'classification_case'::text, memory."id"::text
+        FROM "ClassificationCase" memory
+        LEFT JOIN "ClassificationCaseInvalidation" invalidation
+          ON invalidation."companyId" = memory."companyId"
+         AND invalidation."classificationCaseId" = memory."id"
+        WHERE memory."companyId" = ${companyId} AND invalidation."id" IS NULL
+        UNION ALL
+        SELECT 'rule'::text, rule."id"::text
+        FROM "Rule" rule
+        WHERE rule."companyId" = ${companyId}
+          AND rule."enabled" = true AND rule."retiredAt" IS NULL
+        UNION ALL
+        SELECT 'rule_candidate'::text, candidate."id"::text
+        FROM "AutopilotRuleCandidate" candidate
+        WHERE candidate."companyId" = ${companyId}
+          AND candidate."state" IN ('ready', 'conflict')
+      )
+      SELECT concat(document_kind, ':', source_id) AS "documentId"
+      FROM canonical_documents
+      ${afterFilter}
+      ORDER BY document_kind ASC, source_id ASC
+      LIMIT ${boundedFetchLimit(limit)}
+    `);
+    return rows.map((row) => checkedText(row.documentId, 260));
   }
 
   private async load(
@@ -527,7 +605,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       LEFT JOIN "VendorIdentityMerge" merge ON merge."companyId" = identity."companyId"
         AND merge."sourceVendorIdentityId" = identity."id"
       LEFT JOIN LATERAL (
-        SELECT string_agg(alias."value", ' ') AS "values"
+        SELECT string_agg(alias."value", ' ' ORDER BY alias."normalizedValue" ASC, alias."id" ASC) AS "values"
         FROM "VendorAlias" alias
         WHERE alias."companyId" = identity."companyId"
           AND alias."vendorIdentityId" = identity."id"
@@ -589,7 +667,22 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as ClassificationCaseSearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND memory."id" IN (${Prisma.join(ids)})`;
-    const text = Prisma.sql`concat_ws(' ', transaction."payee", transaction."memo", identity."displayName",
+    const snapshotPayee = Prisma.sql`CASE
+      WHEN jsonb_typeof(memory."transactionSnapshot"->'payee') = 'string'
+       AND char_length(memory."transactionSnapshot"->>'payee') BETWEEN 1 AND 500
+      THEN memory."transactionSnapshot"->>'payee'
+      ELSE left(transaction."payee", 500)
+    END`;
+    const snapshotMemo = Prisma.sql`CASE
+      WHEN jsonb_typeof(memory."transactionSnapshot"->'memo') = 'string'
+       AND char_length(memory."transactionSnapshot"->>'memo') <= 500
+      THEN memory."transactionSnapshot"->>'memo'
+      WHEN memory."transactionSnapshot" ? 'memo'
+       AND memory."transactionSnapshot"->'memo' = 'null'::jsonb
+      THEN NULL
+      ELSE left(transaction."memo", 500)
+    END`;
+    const text = Prisma.sql`concat_ws(' ', ${snapshotPayee}, ${snapshotMemo}, identity."displayName",
       account."fullName", tax."name", memory."rationale", memory."requiredEvidence"::text,
       memory."examples"::text, memory."counterexamples"::text, memory."citations"::text,
       memory."context"::text)`;
@@ -605,7 +698,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              memory."originIntent", memory."rationale", memory."requiredEvidence", memory."examples",
              memory."counterexamples", memory."reviewer", memory."jurisdiction", memory."currency",
              memory."provenance", memory."verifiedAt", memory."verifiedAt" AS "revisedAt",
-             transaction."payee", transaction."memo", account."name" AS "categoryName",
+             ${snapshotPayee} AS "payee", ${snapshotMemo} AS "memo", account."name" AS "categoryName",
              tax."name" AS "taxCodeName", ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "ClassificationCase" memory
       JOIN "Company" company ON company."id" = memory."companyId"
@@ -641,7 +734,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
     const queryFilter = query === null ? Prisma.empty : Prisma.sql`
       AND (
-        lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')) = ${exactKey}
+        normalize(lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
         OR to_tsvector('simple', ${text}) @@ plainto_tsquery('simple', ${query})
       )
     `;
@@ -663,11 +756,12 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = rule."companyId"
         AND tax."qboId" = rule."taxCodeQboId"
       LEFT JOIN LATERAL (
-        SELECT string_agg(tag."name", ' ') AS "names",
+        SELECT string_agg(tag."name", ' ' ORDER BY tag."id" ASC) AS "names",
                jsonb_agg(tag."id" ORDER BY tag."id") AS "ids",
                jsonb_agg(tag."name" ORDER BY tag."id") AS "namesArray"
         FROM "RuleTag" relation
         JOIN "Tag" tag ON tag."id" = relation."tagId"
+          AND tag."companyId" = rule."companyId"
         WHERE relation."ruleId" = rule."id"
       ) tags ON true
       WHERE rule."companyId" IN (${Prisma.join(companyIds)})
@@ -710,14 +804,26 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = candidate."companyId"
         AND tax."qboId" = candidate."taxCodeQboId"
       LEFT JOIN LATERAL (
-        SELECT string_agg(candidateEvidence."pattern"::text, ' ') AS "patterns",
-               string_agg(concat_ws(' ', transaction."payee", transaction."memo"), ' ') AS "transactions"
-        FROM "AutopilotRuleCandidateEvidence" candidateEvidence
-        JOIN "Transaction" transaction ON transaction."companyId" = candidateEvidence."companyId"
-          AND transaction."id" = candidateEvidence."transactionId"
-        WHERE candidateEvidence."companyId" = candidate."companyId"
-          AND candidateEvidence."candidateId" = candidate."id"
-          AND candidateEvidence."active" = true
+        SELECT left(string_agg(bounded_evidence.pattern_text, ' '
+                              ORDER BY bounded_evidence."observedAt" DESC, bounded_evidence."id" ASC), 8000)
+                 AS "patterns",
+               left(string_agg(bounded_evidence.transaction_text, ' '
+                              ORDER BY bounded_evidence."observedAt" DESC, bounded_evidence."id" ASC), 8000)
+                 AS "transactions"
+        FROM (
+          SELECT candidateEvidence."id", candidateEvidence."observedAt",
+                 left(candidateEvidence."pattern"::text, 1000) AS pattern_text,
+                 left(concat_ws(' ', left(transaction."payee", 500), left(transaction."memo", 500)), 1000)
+                   AS transaction_text
+          FROM "AutopilotRuleCandidateEvidence" candidateEvidence
+          JOIN "Transaction" transaction ON transaction."companyId" = candidateEvidence."companyId"
+            AND transaction."id" = candidateEvidence."transactionId"
+          WHERE candidateEvidence."companyId" = candidate."companyId"
+            AND candidateEvidence."candidateId" = candidate."id"
+            AND candidateEvidence."active" = true
+          ORDER BY candidateEvidence."observedAt" DESC, candidateEvidence."id" ASC
+          LIMIT 50
+        ) bounded_evidence
       ) evidence ON true
       WHERE candidate."companyId" IN (${Prisma.join(companyIds)})
         AND candidate."state" IN ('ready', 'conflict')
@@ -911,6 +1017,18 @@ function documentFor(
   });
 }
 
+function optionalDocumentFor(
+  hit: ClassificationSearchHit,
+  revisedAt: string,
+  searchText: string,
+): ClassificationSearchDocument | undefined {
+  try {
+    return documentFor(hit, revisedAt, searchText);
+  } catch {
+    return undefined;
+  }
+}
+
 function baseHit(input: {
   row: BaseSearchRow;
   kind: ClassificationSearchHit['kind'];
@@ -975,7 +1093,7 @@ function identityRecord(row: VendorIdentitySearchRow): () => ClassificationSearc
     const searchText = `${row.displayName} ${row.aliases}`.trim();
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore),
-      exactReasons: [], document: documentFor(hit, revisedAt, searchText), lookupValue: row.displayName,
+      exactReasons: [], document: optionalDocumentFor(hit, revisedAt, searchText), lookupValue: row.displayName,
     };
   };
 }
@@ -995,7 +1113,7 @@ function aliasRecord(row: VendorAliasSearchRow): () => ClassificationSearchRecor
     const searchText = `${row.value} ${row.vendorName}`;
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore),
-      exactReasons: [], document: documentFor(hit, revisedAt, searchText), lookupValue: row.value,
+      exactReasons: [], document: optionalDocumentFor(hit, revisedAt, searchText), lookupValue: row.value,
     };
   };
 }
@@ -1018,7 +1136,7 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
     });
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
-      document: documentFor(hit, revisedAt, row.searchText),
+      document: optionalDocumentFor(hit, revisedAt, row.searchText),
     };
   };
 }
@@ -1051,7 +1169,7 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
     });
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
-      document: documentFor(hit, revisedAt, row.searchText), lookupValue: row.matchText,
+      document: optionalDocumentFor(hit, revisedAt, row.searchText), lookupValue: row.matchText,
     };
   };
 }
@@ -1082,7 +1200,7 @@ function candidateRecord(row: CandidateSearchRow): () => ClassificationSearchRec
     });
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
-      document: documentFor(hit, revisedAt, row.searchText),
+      document: optionalDocumentFor(hit, revisedAt, row.searchText),
     };
   };
 }

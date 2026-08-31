@@ -130,7 +130,11 @@ function parseEmbeddingResponse(value: unknown, expectedCount: number): number[]
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new VoyageEmbeddingError('INVALID_PROVIDER_RESPONSE');
   }
-  const data = (value as Record<string, unknown>).data;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.object !== 'list' || envelope.model !== VOYAGE_EMBEDDING_MODEL) {
+    throw new VoyageEmbeddingError('INVALID_PROVIDER_RESPONSE');
+  }
+  const data = envelope.data;
   if (!Array.isArray(data) || data.length !== expectedCount) {
     throw new VoyageEmbeddingError('INVALID_PROVIDER_RESPONSE');
   }
@@ -139,7 +143,11 @@ function parseEmbeddingResponse(value: unknown, expectedCount: number): number[]
       throw new VoyageEmbeddingError('INVALID_PROVIDER_RESPONSE');
     }
     const row = candidate as Record<string, unknown>;
-    if (row.index !== expectedIndex || !Array.isArray(row.embedding)) {
+    if (
+      row.object !== 'embedding'
+      || row.index !== expectedIndex
+      || !Array.isArray(row.embedding)
+    ) {
       throw new VoyageEmbeddingError('INVALID_PROVIDER_RESPONSE');
     }
     if (

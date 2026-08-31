@@ -143,6 +143,7 @@ describe('Voyage embedding client', () => {
     const fake = await fakeVoyage((body) => ({
       body: {
         object: 'list',
+        model: 'voyage-4-large',
         data: (body.input as string[]).map((_input, index) => ({
           object: 'embedding',
           index,
@@ -161,6 +162,27 @@ describe('Voyage embedding client', () => {
       .resolves.toHaveLength(1);
     await expect(client.embedDocuments(['vendor: Coach\u000bprivate']))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  });
+
+  it('rejects missing or wrong response model and object discriminators', async () => {
+    const malformed = [
+      { object: 'list', data: [{ object: 'embedding', index: 0, embedding: vector(0) }] },
+      { object: 'list', model: 'voyage-4-lite', data: [{ object: 'embedding', index: 0, embedding: vector(0) }] },
+      { object: 'embedding-list', model: 'voyage-4-large', data: [{ object: 'embedding', index: 0, embedding: vector(0) }] },
+      { object: 'list', model: 'voyage-4-large', data: [{ object: 'vector', index: 0, embedding: vector(0) }] },
+    ];
+    for (const body of malformed) {
+      const fake = await fakeVoyage(() => ({ body }));
+      const client = createVoyageEmbeddingClient({
+        apiKey: 'synthetic-key',
+        baseUrl: fake.baseUrl,
+        batchSize: 8,
+        timeoutMs: 2_000,
+      });
+      await expect(client.embedDocuments(['one'])).rejects.toMatchObject({
+        code: 'INVALID_PROVIDER_RESPONSE',
+      });
+    }
   });
 
   it('turns provider and malformed-body failures into bounded errors without leaking body or key', async () => {
@@ -193,7 +215,7 @@ describe('Voyage embedding client', () => {
       ],
     ];
     for (const data of malformed) {
-      const fake = await fakeVoyage(() => ({ body: { object: 'list', data } }));
+      const fake = await fakeVoyage(() => ({ body: { object: 'list', model: 'voyage-4-large', data } }));
       const client = createVoyageEmbeddingClient({
         apiKey: 'synthetic-key',
         baseUrl: fake.baseUrl,

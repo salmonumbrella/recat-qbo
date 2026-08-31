@@ -67,7 +67,7 @@ function repository(records: ClassificationSearchRecord[]): ClassificationSearch
       return records.filter((candidate) => ids.includes(candidate.hit.id));
     },
     async documents() {
-      return [];
+      return { documents: [], totalDocuments: 0, skippedDocuments: 0 };
     },
   };
 }
@@ -125,7 +125,7 @@ describe('classification memory search', () => {
         return [];
       },
       async documents() {
-        return [];
+        return { documents: [], totalDocuments: 0, skippedDocuments: 0 };
       },
     };
 
@@ -179,6 +179,59 @@ describe('classification memory search', () => {
     }
   });
 
+  it('does not rank an active generation while its expected corpus is stale or failed', async () => {
+    let providerCalls = 0;
+    const semantic = {
+      generation,
+      client: {
+        async embedDocuments() { throw new Error('not used'); },
+        async embedQuery() { providerCalls += 1; return Array.from({ length: 1024 }, () => 0); },
+      },
+      store: {
+        async ensureAvailable() { return { available: true as const, reason: null }; },
+        async health() {
+          return {
+            activeGeneration: generation.fingerprint,
+            expectedGeneration: generation.fingerprint,
+            expectedState: 'failed',
+            embedded: 8,
+            skipped: 0,
+            backlog: 1,
+            progress: 8 / 9,
+            lastSuccessAt: '2026-08-31T00:00:00.000Z',
+            lastError: 'semantic_error',
+            latestAttemptGeneration: generation.fingerprint,
+            latestAttemptState: 'failed',
+            latestAttemptAt: '2026-08-31T00:01:00.000Z',
+            latestAttemptError: 'semantic_error',
+          };
+        },
+        async search() { throw new Error('must not rank stale vectors'); },
+      },
+    };
+    const input = {
+      query: 'Coach',
+      companyId: 'company-a',
+      scope: 'current_company' as const,
+      limit: 10,
+      accessibleCompanyIds: ['company-a'],
+    };
+
+    await expect(searchClassificationMemory(
+      { ...input, mode: 'auto' },
+      { repository: repository([record()]), semantic },
+    )).resolves.toMatchObject({
+      mode: 'lexical',
+      degraded: true,
+      degradedReason: 'semantic_unavailable',
+    });
+    await expect(searchClassificationMemory(
+      { ...input, mode: 'semantic' },
+      { repository: repository([record()]), semantic },
+    )).rejects.toMatchObject({ code: 'SEMANTIC_UNAVAILABLE' });
+    expect(providerCalls).toBe(0);
+  });
+
   it('runs hybrid legs concurrently, rolls up chunks, and drops stale semantic documents on rehydration', async () => {
     const current = record({ exactReasons: [], lexicalScore: 0.7 });
     let lexicalStarted = false;
@@ -196,7 +249,7 @@ describe('classification memory search', () => {
         return ids.includes(current.hit.id) ? [current] : [];
       },
       async documents() {
-        return [];
+        return { documents: [], totalDocuments: 0, skippedDocuments: 0 };
       },
     };
     const result = await searchClassificationMemory({
@@ -219,12 +272,18 @@ describe('classification memory search', () => {
           async health() {
             return {
               activeGeneration: generation.fingerprint,
+              expectedGeneration: generation.fingerprint,
+              expectedState: 'succeeded',
               embedded: 1,
               skipped: 0,
               backlog: 0,
               progress: 1,
               lastSuccessAt: '2026-08-31T00:00:00.000Z',
               lastError: null,
+              latestAttemptGeneration: generation.fingerprint,
+              latestAttemptState: 'succeeded',
+              latestAttemptAt: '2026-08-31T00:00:00.000Z',
+              latestAttemptError: null,
             };
           },
           async search() {

@@ -17,25 +17,37 @@ export interface ClassificationSemanticHealth {
   dimensions: typeof VOYAGE_EMBEDDING_DIMENSIONS;
   vectorAvailable: boolean;
   expectedGeneration: string | null;
+  indexedGeneration: string | null;
   activeGeneration: string | null;
+  expectedState: string | null;
   embedded: number;
   skipped: number;
   backlog: number;
   progress: number;
   lastSuccessAt: string | null;
   lastError: string | null;
+  latestAttemptGeneration: string | null;
+  latestAttemptState: string | null;
+  latestAttemptAt: string | null;
+  latestAttemptError: string | null;
 }
 
 type HealthVectorStore = Pick<PgClassificationVectorStore, 'ensureAvailable' | 'health'>;
 
 const EMPTY_STATE: VectorGenerationHealth = {
   activeGeneration: null,
+  expectedGeneration: null,
+  expectedState: null,
   embedded: 0,
   skipped: 0,
   backlog: 0,
   progress: 0,
   lastSuccessAt: null,
   lastError: null,
+  latestAttemptGeneration: null,
+  latestAttemptState: null,
+  latestAttemptAt: null,
+  latestAttemptError: null,
 };
 
 export async function classificationSemanticHealth(
@@ -55,8 +67,9 @@ export async function classificationSemanticHealth(
       configured: false,
       ...base,
       vectorAvailable: false,
-      expectedGeneration: null,
       ...EMPTY_STATE,
+      expectedGeneration: null,
+      indexedGeneration: null,
     };
   }
   let capability: VectorCapability;
@@ -70,14 +83,15 @@ export async function classificationSemanticHealth(
       configured: true,
       ...base,
       vectorAvailable: false,
-      expectedGeneration: input.generation.fingerprint,
       ...EMPTY_STATE,
+      expectedGeneration: input.generation.fingerprint,
+      indexedGeneration: null,
       lastError: capability.reason,
     };
   }
   let state: VectorGenerationHealth;
   try {
-    state = await input.store.health(companyId);
+    state = await input.store.health(companyId, input.generation.fingerprint);
   } catch {
     state = { ...EMPTY_STATE, lastError: 'semantic_error' };
   }
@@ -86,6 +100,18 @@ export async function classificationSemanticHealth(
     ...base,
     vectorAvailable: true,
     expectedGeneration: input.generation.fingerprint,
-    ...state,
+    indexedGeneration: state.expectedGeneration,
+    activeGeneration: state.activeGeneration,
+    expectedState: state.expectedState,
+    embedded: state.embedded,
+    skipped: state.skipped,
+    backlog: state.backlog,
+    progress: state.progress,
+    lastSuccessAt: state.lastSuccessAt,
+    lastError: state.lastError,
+    latestAttemptGeneration: state.latestAttemptGeneration,
+    latestAttemptState: state.latestAttemptState,
+    latestAttemptAt: state.latestAttemptAt,
+    latestAttemptError: state.latestAttemptError,
   };
 }

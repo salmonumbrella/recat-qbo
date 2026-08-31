@@ -53,15 +53,19 @@ describe('classification pgvector capability', () => {
     const db = {
       async $queryRaw() {
         return [{
-          fingerprint: 'a'.repeat(64),
+          expectedFingerprint: 'a'.repeat(64),
           activeFingerprint: null,
-          state: 'failed',
+          expectedState: 'failed',
           embeddedDocuments: 0,
           skippedDocuments: 0,
           backlogDocuments: 2,
           totalDocuments: 2,
           lastSuccessAt: null,
           lastErrorCode: 'semantic_error',
+          latestAttemptFingerprint: 'a'.repeat(64),
+          latestAttemptState: 'failed',
+          latestAttemptAt: new Date('2026-08-31T00:00:00.000Z'),
+          latestAttemptErrorCode: 'semantic_error',
         }];
       },
       async $executeRaw() {
@@ -69,11 +73,49 @@ describe('classification pgvector capability', () => {
       },
     };
 
-    await expect(new PgClassificationVectorStore(db as never).health('company-a'))
+    await expect(new PgClassificationVectorStore(db as never).health('company-a', 'a'.repeat(64)))
       .resolves.toMatchObject({
         activeGeneration: null,
         backlog: 2,
         lastError: 'semantic_error',
+      });
+  });
+
+  it('reports expected-generation health separately from a newer failed attempt', async () => {
+    const expected = 'a'.repeat(64);
+    const failed = 'b'.repeat(64);
+    const db = {
+      async $queryRaw() {
+        return [{
+          expectedFingerprint: expected,
+          activeFingerprint: expected,
+          expectedState: 'active',
+          embeddedDocuments: 4,
+          skippedDocuments: 0,
+          backlogDocuments: 0,
+          totalDocuments: 4,
+          lastSuccessAt: new Date('2026-08-31T00:00:00.000Z'),
+          lastErrorCode: null,
+          latestAttemptFingerprint: failed,
+          latestAttemptState: 'failed',
+          latestAttemptAt: new Date('2026-08-31T01:00:00.000Z'),
+          latestAttemptErrorCode: 'semantic_error',
+        }];
+      },
+      async $executeRaw() { return 0; },
+    };
+
+    await expect(new PgClassificationVectorStore(db as never).health('company-a', expected))
+      .resolves.toMatchObject({
+        activeGeneration: expected,
+        expectedGeneration: expected,
+        embedded: 4,
+        backlog: 0,
+        progress: 1,
+        lastError: null,
+        latestAttemptGeneration: failed,
+        latestAttemptState: 'failed',
+        latestAttemptError: 'semantic_error',
       });
   });
 });

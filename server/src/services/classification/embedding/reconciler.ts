@@ -1,5 +1,8 @@
 import { prisma } from '../../../lib/prisma.js';
-import { PrismaClassificationSearchRepository } from '../search.js';
+import {
+  PrismaClassificationSearchRepository,
+  type ClassificationSearchCorpus,
+} from '../search.js';
 import {
   classificationEmbeddingRuntimeConfig,
   createVoyageEmbeddingClient,
@@ -18,7 +21,6 @@ import type {
 import { PgClassificationVectorStore } from './vectorStore.js';
 
 const PROVIDER_CALL_INPUT_LIMIT = 512;
-const MAX_RECONCILE_DOCUMENTS = 10_000;
 const MAX_RECONCILE_CHUNKS = 50_000;
 
 export interface ClassificationEmbeddingReconcileResult {
@@ -40,7 +42,7 @@ export interface ClassificationEmbeddingTickResult {
 export interface ClassificationEmbeddingTickDependencies {
   runtimeConfig: () => ClassificationEmbeddingRuntimeConfig | null;
   listCompanyIds: () => Promise<readonly string[]>;
-  documents: (companyId: string) => Promise<ClassificationSearchDocument[]>;
+  documents: (companyId: string) => Promise<ClassificationSearchCorpus>;
   createClient: (config: ClassificationEmbeddingRuntimeConfig) => VoyageEmbeddingClient;
   createStore: () => ClassificationEmbeddingStore;
   reconcile: typeof reconcileClassificationEmbeddings;
@@ -50,7 +52,6 @@ function validDocumentSet(
   companyId: string,
   documents: readonly ClassificationSearchDocument[],
 ): boolean {
-  if (documents.length > MAX_RECONCILE_DOCUMENTS) return false;
   let chunks = 0;
   const ids = new Set<string>();
   for (const document of documents) {
@@ -70,15 +71,22 @@ function validDocumentSet(
 export async function reconcileClassificationEmbeddings(input: {
   companyId: string;
   documents: readonly ClassificationSearchDocument[];
+  totalDocuments?: number;
+  skippedDocuments?: number;
   generation: ClassificationEmbeddingGeneration;
   client: VoyageEmbeddingClient;
   store: ClassificationEmbeddingStore;
 }): Promise<ClassificationEmbeddingReconcileResult> {
-  if (!validDocumentSet(input.companyId, input.documents)) {
+  const totalDocuments = input.totalDocuments ?? input.documents.length;
+  const skippedDocuments = input.skippedDocuments ?? 0;
+  if (
+    !validDocumentSet(input.companyId, input.documents)
+    || totalDocuments !== input.documents.length + skippedDocuments
+  ) {
     await input.store.recordFailure({
       companyId: input.companyId,
       fingerprint: input.generation.fingerprint,
-      totalDocuments: input.documents.length,
+      totalDocuments,
       embeddedDocuments: 0,
       skippedDocuments: 0,
       errorCode: 'semantic_error',
@@ -87,7 +95,7 @@ export async function reconcileClassificationEmbeddings(input: {
       status: 'failed',
       embedded: 0,
       skipped: 0,
-      backlog: input.documents.length,
+      backlog: totalDocuments,
       error: 'semantic_error',
     };
   }
@@ -100,7 +108,7 @@ export async function reconcileClassificationEmbeddings(input: {
       status: 'unavailable',
       embedded: 0,
       skipped: 0,
-      backlog: input.documents.length,
+      backlog: totalDocuments,
       error: 'vector_capability_unavailable',
     };
   }
@@ -109,7 +117,7 @@ export async function reconcileClassificationEmbeddings(input: {
       status: 'unavailable',
       embedded: 0,
       skipped: 0,
-      backlog: input.documents.length,
+      backlog: totalDocuments,
       error: 'vector_capability_unavailable',
     };
   }
@@ -162,7 +170,29 @@ export async function reconcileClassificationEmbeddings(input: {
     changedDocumentIds.add(document.id);
     changed.push(...document.chunks.map((chunk) => ({ document, chunk })));
   }
+  const expectedChunksByDocument = new Map(
+    input.documents.map((document) => [document.id, document.chunks.length]),
+  );
+  const embeddedDocumentCount = () => {
+    const storedChunksByDocument = new Map<string, number>();
+    for (const chunk of stored) {
+      storedChunksByDocument.set(
+        chunk.documentId,
+        (storedChunksByDocument.get(chunk.documentId) ?? 0) + 1,
+      );
+    }
+    return [...expectedChunksByDocument].filter(([documentId, expectedChunks]) => (
+      storedChunksByDocument.get(documentId) === expectedChunks
+    )).length;
+  };
   try {
+    await input.store.recordProgress({
+      companyId: input.companyId,
+      fingerprint: input.generation.fingerprint,
+      totalDocuments,
+      embeddedDocuments: embeddedDocumentCount(),
+      skippedDocuments,
+    });
     for (let offset = 0; offset < changed.length; offset += PROVIDER_CALL_INPUT_LIMIT) {
       const batch = changed.slice(offset, offset + PROVIDER_CALL_INPUT_LIMIT);
       const embeddings = await input.client.embedDocuments(batch.map(({ chunk }) => chunk.text));
@@ -181,18 +211,25 @@ export async function reconcileClassificationEmbeddings(input: {
           embedding,
         });
       }
+      await input.store.recordProgress({
+        companyId: input.companyId,
+        fingerprint: input.generation.fingerprint,
+        totalDocuments,
+        embeddedDocuments: embeddedDocumentCount(),
+        skippedDocuments,
+      });
     }
     await input.store.publishGeneration({
       companyId: input.companyId,
       generation: input.generation,
       chunks: stored,
-      totalDocuments: input.documents.length,
-      skippedDocuments: 0,
+      totalDocuments,
+      skippedDocuments,
     });
     return {
       status: 'published',
       embedded: changedDocumentIds.size,
-      skipped: 0,
+      skipped: skippedDocuments,
       backlog: 0,
       error: null,
     };
@@ -200,16 +237,16 @@ export async function reconcileClassificationEmbeddings(input: {
     await input.store.recordFailure({
       companyId: input.companyId,
       fingerprint: input.generation.fingerprint,
-      totalDocuments: input.documents.length,
-      embeddedDocuments: 0,
-      skippedDocuments: 0,
+      totalDocuments,
+      embeddedDocuments: embeddedDocumentCount(),
+      skippedDocuments,
       errorCode: 'semantic_error',
     }).catch(() => undefined);
     return {
       status: 'failed',
-      embedded: 0,
-      skipped: 0,
-      backlog: input.documents.length,
+      embedded: embeddedDocumentCount(),
+      skipped: skippedDocuments,
+      backlog: Math.max(0, totalDocuments - embeddedDocumentCount() - skippedDocuments),
       error: 'semantic_error',
     };
   }
@@ -259,10 +296,12 @@ export async function runClassificationEmbeddingTick(
   for (const companyId of companyIds) {
     result.processed += 1;
     try {
-      const documents = await dependencies.documents(companyId);
+      const corpus = await dependencies.documents(companyId);
       const outcome = await dependencies.reconcile({
         companyId,
-        documents,
+        documents: corpus.documents,
+        totalDocuments: corpus.totalDocuments,
+        skippedDocuments: corpus.skippedDocuments,
         generation,
         client,
         store,
