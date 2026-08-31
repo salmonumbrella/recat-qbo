@@ -918,6 +918,336 @@ export interface RuleCandidateDto {
   updatedAt: string;
 }
 
+// ---- Classification memory -------------------------------------------------
+
+/** The intent that produced a classification record. This is provenance, not
+ * an accounting operation. In particular, `make_recurring` never implies
+ * that a rule may auto-post. */
+export type ClassificationOriginIntent =
+  | 'apply_once'
+  | 'make_recurring'
+  | 'auto_candidate';
+
+/** Rule provenance; null denotes a rule that predates classification memory. */
+export type RuleOriginIntent = Exclude<
+  ClassificationOriginIntent,
+  'apply_once'
+> | null;
+
+/** Retrieval modes exposed to agents and MCP clients. */
+export type ClassificationSearchMode =
+  | 'auto'
+  | 'exact'
+  | 'lexical'
+  | 'hybrid'
+  | 'semantic';
+
+export type ClassificationEffectiveSearchMode = Exclude<
+  ClassificationSearchMode,
+  'auto'
+>;
+
+export type ClassificationSearchScope =
+  | 'current_company'
+  | 'accessible_companies';
+
+/** Reasons a canonical record was included in a search result. */
+export type ClassificationMatchReason =
+  | 'alias'
+  | 'rule'
+  | 'candidate'
+  | 'case'
+  | 'lexical'
+  | 'semantic';
+
+export type ClassificationKnowledgeKind =
+  | 'vendor_identity'
+  | 'vendor_alias'
+  | 'classification_case'
+  | 'rule'
+  | 'rule_candidate';
+
+export type ClassificationCompanyRelation = 'current' | 'foreign';
+
+/** A rule mutation is deliberately distinct from a categorization action. */
+export type RuleMutationKind =
+  | 'create'
+  | 'update'
+  | 'enable'
+  | 'disable'
+  | 'reorder'
+  | 'retire'
+  | 'activate_candidate'
+  | 'dismiss_candidate';
+
+export type RuleMutationStatus =
+  | 'PREPARED'
+  | 'COMMITTED'
+  | 'REPLAYED'
+  | 'REJECTED';
+
+/**
+ * The accounting action stored in classification memory. It intentionally
+ * models one supported QBO categorization line. Display names are useful in
+ * a preview, but categoryQboId/taxCodeQboId are the only identifiers a write
+ * path may use.
+ */
+export interface ClassificationAction {
+  categoryQboId: string;
+  taxCalculation: TaxCalculation;
+  /** Required for taxable calculations; null is required for NotApplicable. */
+  taxCodeQboId: string | null;
+  tagIds: string[];
+  /** Optional line memo, retained only when the caller explicitly supplied it. */
+  memo?: string | null;
+}
+
+/** Human-readable action context. It is never executable and contains no QBO IDs. */
+export interface ClassificationActionSummary {
+  categoryName: string;
+  taxCalculation: TaxCalculation;
+  taxCodeName: string | null;
+  tagNames: string[];
+}
+
+export interface ClassificationRuleCondition {
+  matchField: 'payee';
+  matchText: string;
+}
+
+export type ClassificationJurisdiction = 'unknown' | string;
+
+export interface ClassificationCitation {
+  url: string;
+  title: string;
+  publisher: string;
+  retrievedAt: string;
+  claimSummary: string;
+}
+
+/** One bounded, explainable disagreement with a hit's proposed action. */
+export interface ClassificationConflict {
+  id: string;
+  companyId: string;
+  sourceId: string;
+  kind: 'case' | 'candidate' | 'rule' | 'jurisdiction' | 'tax';
+  reason: string;
+  action: ClassificationAction | null;
+  actionSummary: ClassificationActionSummary | null;
+  evidenceCount: number;
+}
+
+export interface ClassificationProvenance {
+  source: 'user' | 'mcp' | 'autopilot' | 'qbo_verified' | 'rule' | 'candidate';
+  sourceId: string;
+  actorId: string | null;
+  recordedAt: string;
+}
+
+export interface VendorAlias {
+  id: string;
+  companyId: string;
+  vendorIdentityId: string;
+  value: string;
+  normalizedValue: string;
+  source: 'qbo' | 'user' | 'import' | 'inferred';
+  createdAt: string;
+}
+
+export interface VendorIdentity {
+  id: string;
+  companyId: string;
+  /** The authoritative QuickBooks vendor ID, when this identity is QBO-backed. */
+  qboVendorId: string | null;
+  displayName: string;
+  normalizedName: string;
+  aliases: VendorAlias[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClassificationCaseContext {
+  transactionDirection: 'in' | 'out' | 'unknown';
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  sourceAccountName: string | null;
+  businessPurpose: string | null;
+}
+
+export interface ClassificationReviewer {
+  userId: string | null;
+  configVersion: string;
+  decision: 'approved';
+}
+
+/** Immutable verified evidence for one Recat/QBO outcome. */
+export interface ClassificationCase {
+  id: string;
+  companyId: string;
+  transactionId: string;
+  vendorIdentityId: string | null;
+  qboMutationAttemptId: string;
+  action: ClassificationAction;
+  actionFingerprint: string;
+  originIntent: ClassificationOriginIntent;
+  rationale: string;
+  requiredEvidence: string[];
+  examples: string[];
+  counterexamples: string[];
+  citations: ClassificationCitation[];
+  reviewer: ClassificationReviewer;
+  jurisdiction: ClassificationJurisdiction;
+  currency: string;
+  context: ClassificationCaseContext;
+  provenance: ClassificationProvenance;
+  verifiedAt: string;
+  invalidatedAt: string | null;
+  invalidationReason: string | null;
+}
+
+export interface ClassificationSearchHit {
+  /** Stable canonical hit ID and source ID are both returned for rehydration. */
+  id: string;
+  sourceId: string;
+  kind: ClassificationKnowledgeKind;
+  companyId: string;
+  companyName: string;
+  companyRelation: ClassificationCompanyRelation;
+  /** Foreign-company results are advisory and can never be executable. */
+  executable: boolean;
+  advisory: boolean;
+  matchedIn: ClassificationMatchReason[];
+  score: number;
+  vendorIdentityId: string | null;
+  vendorName: string | null;
+  action: ClassificationAction | null;
+  actionSummary: ClassificationActionSummary | null;
+  originIntent: ClassificationOriginIntent | null;
+  evidenceCount: number;
+  conflictingEvidenceCount: number;
+  conflicts: ClassificationConflict[];
+  provenance: ClassificationProvenance;
+  rationale: string | null;
+  examples: string[];
+  counterexamples: string[];
+  jurisdiction: ClassificationJurisdiction | null;
+  currency: string | null;
+  verifiedAt: string | null;
+  ruleRevision: number | null;
+}
+
+export interface ClassificationSearchResult {
+  query: string;
+  companyId: string;
+  scope: ClassificationSearchScope;
+  mode: ClassificationEffectiveSearchMode;
+  /** The requested mode can differ from the effective mode only after auto fallback. */
+  requestedMode: ClassificationSearchMode;
+  degraded: boolean;
+  degradedReason:
+    | 'semantic_unavailable'
+    | 'vector_capability_unavailable'
+    | 'embedding_not_configured'
+    | 'lexical_only'
+    | 'semantic_error'
+    | null;
+  /** No match is a successful, explicit result—not an exception or empty error. */
+  status: 'matched' | 'no_match';
+  noMatch: boolean;
+  hits: ClassificationSearchHit[];
+  total: number;
+}
+
+export type RuleRevisionState = 'enabled' | 'disabled' | 'retired';
+
+export interface RuleRevision {
+  id: string;
+  ruleId: string;
+  companyId: string;
+  revision: number;
+  state: RuleRevisionState;
+  condition: ClassificationRuleCondition;
+  action: ClassificationAction;
+  categoryName: string;
+  taxCodeName: string | null;
+  priority: number;
+  autoPost: boolean;
+  originIntent: RuleOriginIntent;
+  sourceCaseId: string | null;
+  sourceCandidateId: string | null;
+  changedBy: string | null;
+  createdAt: string;
+  retiredAt: string | null;
+}
+
+export interface RuleMutationSample {
+  transactionId: string;
+  payee: string;
+  date: string;
+  amountCents: number;
+  status: 'PENDING' | 'POSTED';
+}
+
+export interface RuleMutationPreview {
+  operationId: string;
+  companyId: string;
+  ruleId: string | null;
+  candidateId: string | null;
+  mutation: RuleMutationKind;
+  originIntent: RuleOriginIntent;
+  currentRevision: number;
+  proposedRevision: number;
+  condition: ClassificationRuleCondition;
+  action: ClassificationAction;
+  categoryName: string;
+  taxCodeName: string | null;
+  priority: number;
+  autoPost: boolean;
+  affectedPendingCount: number;
+  affectedPostedCount: number;
+  sampleTransactions: RuleMutationSample[];
+  conflicts: ClassificationConflict[];
+  warnings: string[];
+  expiresAt: string;
+  preparationDigest: string;
+}
+
+export type ClassificationErrorCode =
+  | 'INVALID_INPUT'
+  | 'FORBIDDEN'
+  | 'NOT_FOUND'
+  | 'COMPANY_UNAVAILABLE'
+  | 'UNKNOWN_JURISDICTION'
+  | 'SEMANTIC_UNAVAILABLE'
+  | 'CONFLICT'
+  | 'STALE_REVISION'
+  | 'INTERNAL';
+
+export interface ClassificationError {
+  code: ClassificationErrorCode;
+  message: string;
+}
+
+export interface RuleCandidateMutationResult {
+  candidateId: string;
+  state: 'dismissed' | 'activated';
+  ruleId: string | null;
+}
+
+export interface RuleMutationResult {
+  ok: boolean;
+  operationId: string;
+  companyId: string;
+  mutation: RuleMutationKind;
+  originIntent: RuleOriginIntent;
+  status: RuleMutationStatus;
+  ruleId: string | null;
+  revision: number | null;
+  rule: RuleRevision | null;
+  candidate: RuleCandidateMutationResult | null;
+  preview: RuleMutationPreview | null;
+  error: ClassificationError | null;
+}
+
 export interface SavedReportConfig {
   range: string; // 'all' | 'YYYY-MM'
   flow: 'in' | 'out' | 'both';
