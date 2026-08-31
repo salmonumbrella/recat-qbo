@@ -22,8 +22,11 @@ import {
 import { refreshSuggestions } from './suggestions.js';
 import { postTransaction } from './writeback.js';
 import {
+  actionabilityObservationFromRow,
+  effectiveProviderDisposition,
   ensureUnknownProviderActionability,
-  providerActionabilityWhere,
+  transactionIdentityFromRow,
+  type ProviderActionabilityDb,
 } from './providerActionability.js';
 
 export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
@@ -134,32 +137,6 @@ function isStaleProviderToken(
 ): boolean {
   const order = syncTokenOrder(incoming, current);
   return order === null || order < 0;
-}
-
-/** Keep the read-only provider index bound to the mirror after every sync
- * write.  This is deliberately feature-detected so a rolling deployment can
- * sync transactions before the new migration has reached its database. */
-async function syncProviderActionabilityBinding(
-  companyId: string,
-  qboType: string,
-  qboId: string,
-): Promise<void> {
-  const actionability = (prisma as unknown as { transactionActionability?: unknown }).transactionActionability;
-  if (!actionability) return;
-  const txn = await prisma.transaction.findUnique({
-    where: { companyId_qboType_qboId: { companyId, qboType, qboId } },
-    select: {
-      id: true,
-      companyId: true,
-      revision: true,
-      qboSyncToken: true,
-      qboType: true,
-      qboId: true,
-      date: true,
-    },
-  });
-  if (!txn) return;
-  await ensureUnknownProviderActionability(txn);
 }
 
 /** SUPERSEDED + audit, atomically. Lazy audit import (other agent's module). */
@@ -382,7 +359,7 @@ async function runSyncCompany(
             },
           });
           if (current === null) {
-            await tx.transaction.upsert({
+            const mirrored = await tx.transaction.upsert({
               where: {
                 companyId_qboType_qboId: {
                   companyId,
@@ -398,13 +375,26 @@ async function runSyncCompany(
                 ...mirror,
               },
               update: mirror,
+              select: {
+                id: true,
+                companyId: true,
+                revision: true,
+                qboSyncToken: true,
+                qboType: true,
+                qboId: true,
+                date: true,
+              },
             });
+            await ensureUnknownProviderActionability(
+              mirrored,
+              tx as unknown as ProviderActionabilityDb,
+            );
             return { created: true };
           }
           if (isStaleProviderToken(t.syncToken, current.qboSyncToken)) {
             return { created: false };
           }
-          await tx.transaction.updateMany({
+          const updated = await tx.transaction.updateMany({
             where: {
               id: current.id,
               revision: current.revision,
@@ -415,16 +405,26 @@ async function runSyncCompany(
             },
             data: mirror,
           });
+          if (updated.count === 1) {
+            await ensureUnknownProviderActionability(
+              {
+                id: current.id,
+                companyId,
+                revision: current.revision,
+                qboSyncToken: t.syncToken,
+                qboType: t.qboType,
+                qboId: t.qboId,
+                date: new Date(t.date),
+              },
+              tx as unknown as ProviderActionabilityDb,
+            );
+          }
           return { created: false };
         }),
       );
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
-      // A changed SyncToken or local revision invalidates any cached safety
-      // evidence.  The helper uses the current mirror as the binding fence;
-      // it never calls QBO and never grants write authority.
-      await syncProviderActionabilityBinding(companyId, t.qboType, t.qboId);
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -466,16 +466,20 @@ async function runSyncCompany(
     const hasActionabilityIndex = Boolean(
       (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
     );
-    const pending = await prisma.transaction.findMany({
-      where: {
-        companyId,
-        status: 'PENDING',
-        ...(hasActionabilityIndex
-          ? { providerActionability: providerActionabilityWhere('WRITABLE') }
-          : {}),
+    const pendingCandidates = await prisma.transaction.findMany({
+      where: { companyId, status: 'PENDING' },
+      include: {
+        txnTags: true,
+        providerActionability: true,
+        _count: { select: { splitLines: true } },
       },
-      include: { txnTags: true, _count: { select: { splitLines: true } } },
     });
+    const pending = hasActionabilityIndex
+      ? pendingCandidates.filter((txn) => effectiveProviderDisposition(
+          actionabilityObservationFromRow(txn.providerActionability),
+          transactionIdentityFromRow(txn),
+        ) === 'WRITABLE')
+      : pendingCandidates;
     const rules = await prisma.rule.findMany({ where: { companyId }, include: { ruleTags: true } });
     for (const txn of pending) {
       const suggestion = txn.suggestion as unknown as SuggestionDto | null;

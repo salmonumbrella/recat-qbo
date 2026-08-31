@@ -16,22 +16,6 @@ export const PROVIDER_ACTIONABILITY_DISPOSITIONS: readonly ProviderActionability
   'UNAVAILABLE',
 ];
 
-/** Prisma relation predicate for a disposition read. Provider observations
- * are only trusted while their safety read remains inside the bounded TTL;
- * UNKNOWN is the migration/default state and has no checkedAt requirement. */
-export function providerActionabilityWhere(
-  disposition: ProviderActionabilityDisposition,
-  now = new Date(),
-): Record<string, unknown> {
-  if (disposition === 'UNKNOWN') return { is: { disposition } };
-  return {
-    is: {
-      disposition,
-      checkedAt: { gte: new Date(now.getTime() - PROVIDER_ACTIONABILITY_TTL_MS) },
-    },
-  };
-}
-
 export type ProviderActionabilityDispositionLike = ProviderActionabilityDisposition;
 
 export interface ProviderActionabilityObservation {
@@ -79,9 +63,8 @@ interface ActionabilityTransactionModel {
 }
 
 export interface ProviderActionabilityDb {
-  /** Optional so legacy unit-test stores and older deployments can continue
-   * to use the read paths while the migration is rolling out.  The real
-   * Prisma client exposes this delegate once the migration is applied. */
+  /** Optional only for legacy unit-test stores. Production starts with
+   * `prisma migrate deploy` before loading code that joins this relation. */
   transactionActionability?: ActionabilityModel;
   transaction: ActionabilityTransactionModel;
   $transaction?<T>(callback: (tx: ProviderActionabilityDb) => Promise<T>): Promise<T>;
@@ -244,6 +227,9 @@ export async function ensureUnknownProviderActionability(
         OR: [
           { revision: { not: txn.revision } },
           { qboSyncToken: { not: txn.qboSyncToken } },
+          { qboId: { not: txn.qboId } },
+          { qboType: { not: txn.qboType } },
+          { txnDate: { not: toDateOnlyValue(txn.date) } },
         ],
       },
       data: unknownData(txn),
@@ -284,6 +270,7 @@ export async function invalidateProviderActionability(
         { qboSyncToken: { not: txn.qboSyncToken } },
         { qboId: { not: txn.qboId } },
         { qboType: { not: txn.qboType } },
+        { txnDate: { not: toDateOnlyValue(txn.date) } },
       ],
     },
     data: unknownData(txn),
@@ -335,30 +322,10 @@ export async function persistProviderActionability(
   db: ProviderActionabilityDb = defaultDb,
 ): Promise<boolean> {
   if (!db.transactionActionability) return false;
-  const source = await db.transaction.findFirst({
-    where: {
-      id: input.id,
-      companyId: input.companyId,
-      revision: input.revision,
-      qboSyncToken: input.qboSyncToken,
-    },
-    select: {
-      id: true,
-      companyId: true,
-      revision: true,
-      qboSyncToken: true,
-      qboType: true,
-      qboId: true,
-      date: true,
-    },
-  });
-  if (source === null || !sameBinding(source, input)) return false;
-
   const data = persistedData(input);
-  // The source identity is also the optimistic-concurrency fence.  An
-  // updateMany with the complete binding is atomic in the database, so a
-  // refresh that loses a revision/SyncToken race cannot overwrite evidence
-  // from a newer mirror.  Do not replace this with an unconditional upsert.
+  // One SQL statement predicates both the cached row and its current parent
+  // Transaction binding. A sync that wins any identity/revision race makes
+  // this update affect zero rows; no read-then-write window exists.
   const updated = await db.transactionActionability.updateMany({
     where: {
       transactionId: input.id,
@@ -368,29 +335,20 @@ export async function persistProviderActionability(
       qboType: input.qboType,
       qboId: input.qboId,
       txnDate: toDateOnlyValue(input.date),
+      transaction: {
+        is: {
+          companyId: input.companyId,
+          revision: input.revision,
+          qboSyncToken: input.qboSyncToken,
+          qboType: input.qboType,
+          qboId: input.qboId,
+          date: toDateOnlyValue(input.date),
+        },
+      },
     },
     data,
   });
-  if (updated.count === 1) return true;
-
-  const existing = await db.transactionActionability.findUnique({
-    where: { transactionId: input.id },
-  });
-  if (existing) {
-    // The provider mirror moved while this refresh was in flight.  Do not
-    // clobber the new binding (or an observation another refresh just wrote);
-    // its next bounded refresh will establish state.
-    return false;
-  }
-  if (!db.transactionActionability.create) return false;
-  try {
-    await db.transactionActionability.create({ data });
-    return true;
-  } catch {
-    // A concurrent refresh won the unique transactionId insert.  The caller
-    // can checkpoint and retry; no stale evidence is allowed through.
-    return false;
-  }
+  return updated.count === 1;
 }
 
 export function providerDispositionIsBlocked(
@@ -423,6 +381,39 @@ export function assertProviderActionabilityAllowsPrepare(
     default:
       throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
   }
+}
+
+/** Server-side gate for every new local or provider mutation entrypoint.
+ * Durable commit/reconcile/replay paths intentionally do not call this: they
+ * must remain able to finish or inspect an already-created operation. */
+export async function assertTransactionProviderActionability(
+  companyId: string,
+  transactionId: string,
+  db: ProviderActionabilityDb = defaultDb,
+  now = new Date(),
+): Promise<void> {
+  if (!db.transactionActionability) {
+    // Legacy unit-test stores predate the additive relation. Production runs
+    // migrate-deploy before the process starts and therefore never uses this.
+    return;
+  }
+  const txn = await db.transaction.findFirst({
+    where: { id: transactionId, companyId },
+    select: {
+      id: true,
+      companyId: true,
+      revision: true,
+      qboSyncToken: true,
+      qboType: true,
+      qboId: true,
+      date: true,
+    },
+  });
+  if (!txn) throw new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE');
+  const observation = await db.transactionActionability.findUnique({
+    where: { transactionId },
+  });
+  assertProviderActionabilityAllowsPrepare(observation, txn, now);
 }
 
 export function actionabilityObservationFromRow(
@@ -471,4 +462,34 @@ export function transactionIdentityFromRow(row: {
   date: Date | string;
 }): ActionabilityTransactionIdentity {
   return row;
+}
+
+export interface EffectiveProviderActionabilityCounts {
+  total: number;
+  actionable: number;
+  blocked: number;
+  unknown: number;
+}
+
+/** Count the same effective disposition exposed by DTOs and mutation gates.
+ * Callers must pass the current transaction identity with its joined index
+ * row; this deliberately avoids weaker disposition-only SQL counts. */
+export function effectiveProviderActionabilityCounts(
+  rows: Array<ActionabilityTransactionIdentity & { providerActionability?: unknown }>,
+  now = new Date(),
+): EffectiveProviderActionabilityCounts {
+  let actionable = 0;
+  let blocked = 0;
+  let unknown = 0;
+  for (const row of rows) {
+    const disposition = effectiveProviderDisposition(
+      actionabilityObservationFromRow(row.providerActionability),
+      row,
+      now,
+    );
+    if (disposition === 'WRITABLE') actionable += 1;
+    else if (providerDispositionIsBlocked(disposition)) blocked += 1;
+    else unknown += 1;
+  }
+  return { total: rows.length, actionable, blocked, unknown };
 }

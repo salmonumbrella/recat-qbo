@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   company: { findUnique: vi.fn() },
   qboAccount: { findMany: vi.fn() },
   rule: { findMany: vi.fn() },
-  transaction: { findMany: vi.fn() },
+  transaction: { findMany: vi.fn(), update: vi.fn() },
 }));
 
 vi.mock('./instanceSettings.js', () => ({ getInstanceSettings: mocks.getInstanceSettings }));
@@ -16,6 +16,7 @@ vi.mock('../lib/prisma.js', () => ({
     qboAccount: mocks.qboAccount,
     rule: mocks.rule,
     transaction: mocks.transaction,
+    transactionActionability: {},
   },
 }));
 
@@ -23,6 +24,7 @@ import {
   historySuggestion,
   normalizePayee,
   pickSuggestion,
+  refreshSuggestions,
   ruleSuggestion,
   suggestFor,
   type HistoryTxnLike,
@@ -234,5 +236,45 @@ describe('AI suggestion model', () => {
     await expect(suggestFor('company-1', { payee: 'BLANK MODEL ANSWER', amount: -12.34 })).resolves.toBeNull();
 
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('refreshSuggestions provider eligibility', () => {
+  it('clears a blocked snapshot and never sends it to the AI provider', async () => {
+    const now = new Date();
+    mocks.transaction.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        id: 'txn-blocked',
+        companyId: 'company-1',
+        revision: 0,
+        qboSyncToken: '1',
+        qboType: 'Purchase',
+        qboId: '100',
+        date: now,
+        payee: 'PRIVATE BLOCKED PAYEE',
+        memo: null,
+        amount: -10,
+        suggestion: { category: 'Old', source: 'ai' },
+        providerActionability: {
+          companyId: 'company-1',
+          transactionId: 'txn-blocked',
+          disposition: 'BLOCKED_CLEARED',
+          checkedAt: now,
+          revision: 0,
+          qboSyncToken: '1',
+          qboType: 'Purchase',
+          qboId: '100',
+          txnDate: now,
+        },
+      }]);
+
+    await refreshSuggestions('company-1');
+
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.transaction.update).toHaveBeenCalledWith({
+      where: { id: 'txn-blocked' },
+      data: { suggestion: expect.anything() },
+    });
   });
 });

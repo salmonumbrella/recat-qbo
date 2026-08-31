@@ -145,6 +145,47 @@ function harness() {
 }
 
 describe('MCP transfer preparation', () => {
+  it('rejects a fresh blocked leg before creating a transfer operation', async () => {
+    const h = harness();
+    const identity = (id: string) => ({
+      id,
+      companyId: coordinator.companyId,
+      revision: id === firstId ? 3 : 4,
+      qboSyncToken: id === firstId ? '7' : '8',
+      qboType: id === firstId ? 'Purchase' : 'Deposit',
+      qboId: id === firstId ? 'qbo-first' : 'qbo-second',
+      date: new Date('2026-07-29T00:00:00.000Z'),
+    });
+    Object.assign(h.store, {
+      transaction: {
+        findFirst: vi.fn(async ({ where }: { where: { id: string } }) => identity(where.id)),
+      },
+      transactionActionability: {
+        findUnique: vi.fn(async ({ where }: { where: { transactionId: string } }) => ({
+          ...identity(where.transactionId),
+          transactionId: where.transactionId,
+          txnDate: new Date('2026-07-29T00:00:00.000Z'),
+          disposition: where.transactionId === firstId ? 'BLOCKED_CLEARED' : 'WRITABLE',
+          checkedAt: NOW,
+        })),
+      },
+    });
+
+    await expect(prepareMcpTransfer(principal, {
+      companyId: coordinator.companyId,
+      transactionId: firstId,
+      counterpartTransactionId: secondId,
+      expectedRevision: 3,
+      counterpartExpectedRevision: 4,
+      idempotencyKey: 'blocked-transfer',
+    }, {
+      prepare: h.prepare,
+      createOperation: createPreparedOperation,
+      now: () => NOW,
+    })).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+    expect(h.operations).toHaveLength(0);
+  });
+
   it('stores the complete private pair binding in the shared final transaction and returns only a bounded preview', async () => {
     const h = harness();
     const result = await prepareMcpTransfer(principal, {
@@ -209,6 +250,12 @@ describe('MCP transfer preparation', () => {
       prepare: h.prepare,
       createOperation: createPreparedOperation,
       now: () => NOW,
+    });
+    Object.assign(h.store, {
+      transaction: { findFirst: vi.fn(async () => { throw new Error('replay must not re-gate'); }) },
+      transactionActionability: {
+        findUnique: vi.fn(async () => { throw new Error('replay must not re-gate'); }),
+      },
     });
     const replay = await prepareMcpTransfer(principal, input, {
       prepare: h.prepare,

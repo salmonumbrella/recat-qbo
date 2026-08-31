@@ -11,6 +11,11 @@ import { Prisma } from '@prisma/client';
 import type { SuggestionDto, SuggestionSetting } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { completeCategory } from './ai/provider.js';
+import {
+  actionabilityObservationFromRow,
+  effectiveProviderDisposition,
+  transactionIdentityFromRow,
+} from './providerActionability.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -248,9 +253,32 @@ export async function refreshSuggestions(companyId: string): Promise<void> {
   const historyEnabled = settings.suggestionSource !== 'off';
   const rules = await loadRules(companyId);
   const history = historyEnabled ? await loadHistory(companyId) : [];
-  const pending = await prisma.transaction.findMany({ where: { companyId, status: 'PENDING' } });
+  // Production applies the additive actionability migration before starting
+  // the app. The delegate fallback exists only for legacy unit-test stores.
+  const supportsActionability = Boolean(
+    (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
+  );
+  const pending = await prisma.transaction.findMany({
+    where: { companyId, status: 'PENDING' },
+    ...(supportsActionability ? { include: { providerActionability: true } } : {}),
+  });
 
   for (const t of pending) {
+    const providerWritable = !supportsActionability || effectiveProviderDisposition(
+      actionabilityObservationFromRow(
+        (t as unknown as { providerActionability?: unknown }).providerActionability,
+      ),
+      transactionIdentityFromRow(t),
+    ) === 'WRITABLE';
+    if (!providerWritable) {
+      if (t.suggestion !== null) {
+        await prisma.transaction.update({
+          where: { id: t.id },
+          data: { suggestion: Prisma.DbNull },
+        });
+      }
+      continue;
+    }
     const input = { payee: t.payee, memo: t.memo, amount: Number(t.amount) };
     let suggestion = pickSuggestion(t.payee, rules, history, historyEnabled);
     if (!suggestion && settings.suggestionSource === 'ai') {

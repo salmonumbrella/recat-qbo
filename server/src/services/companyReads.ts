@@ -25,12 +25,10 @@ import { transferCandidates as defaultTransferCandidates } from './transferCandi
 import {
   PROVIDER_ACTIONABILITY_DISPOSITIONS,
   actionabilityObservationFromRow,
+  effectiveProviderActionabilityCounts,
   effectiveProviderDisposition,
-  providerActionabilityWhere,
   providerActionabilityDto,
 } from './providerActionability.js';
-
-export { providerActionabilityWhere } from './providerActionability.js';
 
 export const DEFAULT_READ_LIMIT = 20;
 export const MAX_READ_LIMIT = 100;
@@ -50,11 +48,6 @@ const TXN_STATUSES: readonly TxnStatus[] = [
   'REVERTED',
 ];
 const QUEUE_STATUSES = ['PENDING', 'ERROR'] as const;
-const BLOCKED_PROVIDER_DISPOSITIONS: readonly ProviderActionabilityDisposition[] = [
-  'BLOCKED_CLEARED',
-  'BLOCKED_RECONCILED',
-  'BLOCKED_PERIOD_CLOSED',
-];
 
 type DbMethod = (args: Record<string, unknown>) => Promise<unknown>;
 
@@ -63,8 +56,8 @@ export interface CompanyReadDb {
   membership: { findUnique: DbMethod };
   company: { findUnique: DbMethod; findMany: DbMethod };
   transaction: { findUnique: DbMethod; findMany: DbMethod; count: DbMethod };
-  /** Optional during migration; the deployed Prisma client exposes this
-   * delegate once TransactionActionability has been applied. */
+  /** Optional only for legacy unit-test adapters. Production applies the
+   * additive migration before starting the application process. */
   transactionActionability?: { findMany?: DbMethod; count?: DbMethod };
   qboAccount: { findMany: DbMethod };
   qboTaxCode: { findMany: DbMethod };
@@ -374,8 +367,8 @@ function rowProviderDisposition(
   supportsActionability: boolean,
   now = new Date(),
 ): ProviderActionabilityDisposition | null {
-  // Legacy test stores and pre-migration deployments have no index at all;
-  // retain their historical read behavior until the migration is present.
+  // Legacy test stores may omit the index; production never does because the
+  // container applies migrations before loading application code.
   if (!supportsActionability) return null;
   const observation = actionabilityObservationFromRow(row.providerActionability);
   if (observation === null) return 'UNKNOWN';
@@ -401,36 +394,6 @@ function rowProviderActionabilityDto(
     rowActionabilityIdentity(row),
   );
   return disposition === dto.disposition ? dto : { ...dto, disposition };
-}
-
-/** Append an AND condition without trampling the cursor's OR condition. */
-function appendWhereAnd(where: Record<string, unknown>, condition: Record<string, unknown>): void {
-  const prior = where.AND;
-  where.AND = Array.isArray(prior) ? [...prior, condition] : prior ? [prior, condition] : [condition];
-}
-
-function addProviderQueueSelector(
-  where: Record<string, unknown>,
-  supportsActionability: boolean,
-  requested: ProviderActionabilityDisposition | undefined,
-  role: Role,
-  now = new Date(),
-): void {
-  if (!supportsActionability) return;
-  if (requested !== undefined) {
-    appendWhereAnd(where, { providerActionability: providerActionabilityWhere(requested, now) });
-    return;
-  }
-  // Viewers never receive queue statuses, but keeping this guard makes the
-  // selector explicit and prevents a future viewer-status change from
-  // accidentally exposing blocked rows as actionable.
-  if (role === 'viewer') return;
-  appendWhereAnd(where, {
-    OR: [
-      { status: { notIn: QUEUE_STATUSES } },
-      { providerActionability: providerActionabilityWhere('WRITABLE', now) },
-    ],
-  });
 }
 
 function filterRowsForProviderQueue(
@@ -467,6 +430,7 @@ function transactionDto(
   const operation = attempt?.operation;
   const attemptStatus = attempt?.status;
   const actionability = rowProviderActionabilityDto(row, supportsActionability);
+  const providerWritable = !supportsActionability || actionability?.disposition === 'WRITABLE';
   const activeCategorizationAttempt: TransactionDto['activeCategorizationAttempt'] =
     attempt &&
     typeof attempt.requestId === 'string' &&
@@ -519,7 +483,7 @@ function transactionDto(
           })),
     tagIds: Array.isArray(row.txnTags) ? (row.txnTags as Row[]).map((tag) => String(tag.tagId)) : [],
     suggestion:
-      row.status === 'PENDING'
+      row.status === 'PENDING' && providerWritable
         ? (liveSuggestion ?? suggestionDto(row.suggestion))
         : null,
     error:
@@ -535,7 +499,7 @@ function transactionDto(
     ...(actionability !== undefined
       ? { providerActionability: actionability }
       : {}),
-    transferCandidateId,
+    transferCandidateId: providerWritable ? transferCandidateId : null,
   };
 }
 
@@ -1047,13 +1011,12 @@ export function createCompanyReadService(
       where.OR = after;
     }
     const supportsActionability = hasProviderActionability(db);
-    addProviderQueueSelector(
-      where,
-      supportsActionability,
-      normalized.providerDisposition,
-      role,
-    );
-    const scanLimit = normalized.search ? MAX_READ_LIMIT : normalized.limit;
+    // Provider eligibility is a TTL- and transaction-binding-aware derived
+    // value. Filter it after reading rows so list semantics exactly match the
+    // DTO and counts instead of relying on a stale literal SQL disposition.
+    const scanLimit = supportsActionability || normalized.search
+      ? MAX_READ_LIMIT
+      : normalized.limit;
     const [rawRows, queueCounts] = await Promise.all([
       db.transaction.findMany({
         where,
@@ -1062,7 +1025,7 @@ export function createCompanyReadService(
         take: scanLimit,
       }) as Promise<Row[]>,
       role === 'viewer'
-        ? Promise.resolve({ total: 0, actionable: 0, blocked: 0 })
+        ? Promise.resolve({ total: 0, actionable: 0, blocked: 0, unknown: 0 })
         : (async () => {
             const totalWhere = { companyId, status: { in: QUEUE_STATUSES } };
             if (!supportsActionability) {
@@ -1070,24 +1033,26 @@ export function createCompanyReadService(
                 total: await db.transaction.count({ where: totalWhere }) as number,
                 actionable: 0,
                 blocked: 0,
+                unknown: 0,
               };
             }
-            const [total, actionable, blocked] = await Promise.all([
-              db.transaction.count({ where: totalWhere }) as Promise<number>,
-              db.transaction.count({
-                where: {
-                  ...totalWhere,
-                  providerActionability: providerActionabilityWhere('WRITABLE'),
-                },
-              }) as Promise<number>,
-              db.transaction.count({
-                where: {
-                  ...totalWhere,
-                  providerActionability: { is: { disposition: { in: BLOCKED_PROVIDER_DISPOSITIONS } } },
-                },
-              }) as Promise<number>,
-            ]);
-            return { total, actionable, blocked };
+            const actionabilityRows = await db.transaction.findMany({
+              where: totalWhere,
+              select: {
+                id: true,
+                companyId: true,
+                revision: true,
+                qboSyncToken: true,
+                qboType: true,
+                qboId: true,
+                date: true,
+                providerActionability: true,
+              },
+            }) as Row[];
+            return effectiveProviderActionabilityCounts(actionabilityRows.map((row) => ({
+              ...rowActionabilityIdentity(row),
+              providerActionability: row.providerActionability,
+            })));
           })(),
     ]);
     const visibleRows = rawRows.filter((row) =>
@@ -1160,10 +1125,7 @@ export function createCompanyReadService(
         ? {
             actionableCount: Number(queueCounts.actionable),
             blockedCount: Number(queueCounts.blocked),
-            unknownCount: Math.max(
-              0,
-              Number(queueCounts.total) - Number(queueCounts.actionable) - Number(queueCounts.blocked),
-            ),
+            unknownCount: Number(queueCounts.unknown),
           }
         : {}),
     };

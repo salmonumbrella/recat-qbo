@@ -29,7 +29,6 @@ import { ruleSuggestion, suggestForMany, type RuleLike } from '../services/sugge
 import { recordTransfer, transferCandidates } from '../services/transfers.js';
 import {
   filterTransactionDtos,
-  providerActionabilityWhere,
   sortTransactionRows,
   transactionDtos,
   transactionReadInclude,
@@ -37,6 +36,8 @@ import {
 } from '../services/companyReads.js';
 import {
   PROVIDER_ACTIONABILITY_DISPOSITIONS,
+  assertTransactionProviderActionability,
+  effectiveProviderActionabilityCounts,
 } from '../services/providerActionability.js';
 import { refreshProviderActionability } from '../services/providerActionabilityRefresh.js';
 
@@ -156,29 +157,27 @@ companyTransactionsRouter.get(
       companyId: company.id,
       status: { in: ['PENDING', 'ERROR'] as TxnStatus[] },
     };
-    const totalPending = await prisma.transaction.count({ where: pendingWhere });
-    const actionableCount = supportsActionability
-      ? await prisma.transaction.count({
-          where: {
-            ...pendingWhere,
-            providerActionability: { ...providerActionabilityWhere('WRITABLE') },
-          },
-        })
-      : totalPending;
-    const blockedCount = supportsActionability
-      ? await prisma.transaction.count({
-          where: {
-            ...pendingWhere,
-            providerActionability: {
-              is: {
-                disposition: {
-                  in: ['BLOCKED_CLEARED', 'BLOCKED_RECONCILED', 'BLOCKED_PERIOD_CLOSED'],
-                },
-              },
+    const providerCounts = supportsActionability
+      ? effectiveProviderActionabilityCounts(
+          await prisma.transaction.findMany({
+            where: pendingWhere,
+            select: {
+              id: true,
+              companyId: true,
+              revision: true,
+              qboSyncToken: true,
+              qboType: true,
+              qboId: true,
+              date: true,
+              providerActionability: true,
             },
-          },
-        })
-      : 0;
+          }),
+        )
+      : null;
+    const totalPending = providerCounts?.total
+      ?? await prisma.transaction.count({ where: pendingWhere });
+    const actionableCount = providerCounts?.actionable ?? totalPending;
+    const blockedCount = providerCounts?.blocked ?? 0;
     const pendingCount = supportsActionability ? actionableCount : totalPending;
     if (query.countOnly) {
       res.json({
@@ -189,7 +188,7 @@ companyTransactionsRouter.get(
           ? {
               actionableCount,
               blockedCount,
-              unknownCount: Math.max(0, totalPending - actionableCount - blockedCount),
+              unknownCount: providerCounts?.unknown ?? 0,
             }
           : {}),
       });
@@ -202,11 +201,6 @@ companyTransactionsRouter.get(
       companyId: company.id,
       status: { not: 'SUPERSEDED' },
     };
-    if (supportsActionability) {
-      if (query.providerDisposition !== undefined) {
-        queueWhere.AND = [{ providerActionability: providerActionabilityWhere(query.providerDisposition) }];
-      }
-    }
     const rows = await prisma.transaction.findMany({
       where: queueWhere,
       include: transactionReadInclude,
@@ -232,7 +226,7 @@ companyTransactionsRouter.get(
         ? {
             actionableCount,
             blockedCount,
-            unknownCount: Math.max(0, totalPending - actionableCount - blockedCount),
+            unknownCount: providerCounts?.unknown ?? 0,
           }
         : {}),
     });
@@ -294,6 +288,13 @@ transferCandidatesRouter.get(
       const first = byId.get(idA);
       const second = byId.get(idB);
       if (!first || !second) continue;
+      const hasProviderIndex = first.providerActionability !== undefined
+        || second.providerActionability !== undefined;
+      if (
+        hasProviderIndex
+        && (first.providerActionability?.disposition !== 'WRITABLE'
+          || second.providerActionability?.disposition !== 'WRITABLE')
+      ) continue;
       // Money-out leg first, for a stable presentation.
       const [a, b] = first.amount < 0 ? [first, second] : [second, first];
       pairs.push({ a, b });
@@ -606,6 +607,14 @@ function throwMappedServiceError(error: unknown): never {
   throw error;
 }
 
+async function assertProviderWritable(companyId: string, transactionId: string): Promise<void> {
+  try {
+    await assertTransactionProviderActionability(companyId, transactionId);
+  } catch (error) {
+    throwMappedServiceError(error);
+  }
+}
+
 const SAFE_OUTCOME_ERRORS: Partial<Record<
   DurableMutationResult['outcome'],
   { code: string; message: string }
@@ -691,6 +700,7 @@ transactionActionsRouter.post(
     await assertCategorizationRouteAccess(requestUser(req), scope.companyId);
     await assertCompanyConnected(scope.companyId);
     try {
+      await assertProviderWritable(scope.companyId, scope.transactionId);
       const staged = await stageCategorization({
         transactionId: scope.transactionId,
         companyId: scope.companyId,
@@ -829,6 +839,7 @@ transactionActionsRouter.post(
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
     const companyId = txn.companyId;
+    await assertProviderWritable(companyId, id);
     const amount = Number(txn.amount);
     const data: Prisma.TransactionUpdateInput = {};
     let stagedCategory: string | null = null;
@@ -922,6 +933,7 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id); // 404 before the write-back service's plain Errors
     await assertCategorizerFor(user, txn.companyId);
+    await assertProviderWritable(txn.companyId, id);
 
     let result;
     try {
@@ -982,6 +994,7 @@ transactionActionsRouter.post(
     if (!id) throw new HttpError(400, 'Missing transaction id', 'BAD_REQUEST');
     const txn = await loadTxn(id);
     await assertCategorizerFor(requestUser(req), txn.companyId);
+    await assertProviderWritable(txn.companyId, id);
     try {
       await retryError(id);
     } catch (err) {
@@ -1000,6 +1013,8 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    await assertProviderWritable(txn.companyId, id);
+    await assertProviderWritable(txn.companyId, counterpartTxnId);
     try {
       await recordTransfer(id, counterpartTxnId, actorFor(user));
     } catch (err) {
@@ -1022,13 +1037,15 @@ transactionActionsRouter.post(
     const user = requestUser(req);
 
     // Role gate BEFORE any write: categorizer+ in every company touched.
-    const companyIds = await prisma.transaction.findMany({
+    const scopedTransactions = await prisma.transaction.findMany({
       where: { id: { in: ids } },
-      select: { companyId: true },
-      distinct: ['companyId'],
+      select: { id: true, companyId: true },
     });
-    for (const { companyId } of companyIds) {
+    for (const companyId of new Set(scopedTransactions.map((txn) => txn.companyId))) {
       await assertCategorizerFor(user, companyId);
+    }
+    for (const txn of scopedTransactions) {
+      await assertProviderWritable(txn.companyId, txn.id);
     }
 
     const results = await bulkPost(ids, actorFor(user));

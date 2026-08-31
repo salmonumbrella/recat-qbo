@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertProviderActionabilityAllowsPrepare,
+  assertTransactionProviderActionability,
   dispositionFromWriteSafety,
+  effectiveProviderActionabilityCounts,
   effectiveProviderDisposition,
   isFreshProviderActionability,
   persistProviderActionability,
-  providerActionabilityWhere,
   type ProviderActionabilityDb,
   type ProviderActionabilityObservation,
 } from './providerActionability.js';
@@ -89,22 +90,6 @@ describe('provider actionability', () => {
     )).toBe(true);
   });
 
-  it('uses a fresh WRITABLE selector but does not treat a stale row as writable', () => {
-    const now = new Date('2026-08-30T18:15:00.000Z');
-    expect(providerActionabilityWhere('WRITABLE', now)).toEqual({
-      is: {
-        disposition: 'WRITABLE',
-        checkedAt: { gte: new Date('2026-08-30T18:00:00.000Z') },
-      },
-    });
-    expect(providerActionabilityWhere('BLOCKED_CLEARED', now)).toEqual({
-      is: {
-        disposition: 'BLOCKED_CLEARED',
-        checkedAt: { gte: new Date('2026-08-30T18:00:00.000Z') },
-      },
-    });
-  });
-
   it('rejects known blocked or unknown prepare before any operation is created', () => {
     const now = new Date('2026-08-30T18:00:00.000Z');
     expect(() => assertProviderActionabilityAllowsPrepare(
@@ -119,6 +104,57 @@ describe('provider actionability', () => {
     )).toThrowError(new QboWriteSafetyError('QBO_TRANSACTION_LOCKED'));
     expect(() => assertProviderActionabilityAllowsPrepare(null, TXN, now))
       .toThrowError(new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE'));
+  });
+
+  it('uses one full-binding effective definition for actionable, blocked, and unknown counts', () => {
+    const now = new Date('2026-08-30T18:00:00.000Z');
+    const rows = [
+      { ...TXN, providerActionability: observation({ checkedAt: now }) },
+      {
+        ...TXN,
+        id: 'txn-2',
+        qboId: 'qbo-2',
+        providerActionability: observation({
+          transactionId: 'txn-2',
+          qboId: 'qbo-2',
+          disposition: 'BLOCKED_CLEARED',
+          checkedAt: now,
+        }),
+      },
+      {
+        ...TXN,
+        id: 'txn-3',
+        qboId: 'qbo-3',
+        providerActionability: observation({
+          transactionId: 'txn-3',
+          qboId: 'stale-qbo-id',
+          disposition: 'BLOCKED_RECONCILED',
+          checkedAt: now,
+        }),
+      },
+    ];
+    expect(effectiveProviderActionabilityCounts(rows, now)).toEqual({
+      total: 3,
+      actionable: 1,
+      blocked: 1,
+      unknown: 1,
+    });
+  });
+
+  it('gates a transaction by its current joined cache binding', async () => {
+    const now = new Date('2026-08-30T18:00:00.000Z');
+    const db = {
+      transaction: { findFirst: async () => ({ ...TXN }) },
+      transactionActionability: {
+        findUnique: async () => observation({ disposition: 'BLOCKED_RECONCILED', checkedAt: now }),
+      },
+    } as ProviderActionabilityDb;
+    await expect(assertTransactionProviderActionability(
+      TXN.companyId,
+      TXN.id,
+      db,
+      now,
+    )).rejects.toThrowError(new QboWriteSafetyError('QBO_TRANSACTION_LOCKED'));
   });
 
   it('persists only when the transaction and actionability bindings still match (bounded CAS)', async () => {
@@ -167,6 +203,16 @@ describe('provider actionability', () => {
       qboSyncToken: TXN.qboSyncToken,
       qboType: TXN.qboType,
       qboId: TXN.qboId,
+      transaction: {
+        is: {
+          companyId: TXN.companyId,
+          revision: TXN.revision,
+          qboSyncToken: TXN.qboSyncToken,
+          qboType: TXN.qboType,
+          qboId: TXN.qboId,
+          date: TXN.date,
+        },
+      },
     });
     expect(actionability?.disposition).toBe('BLOCKED_CLEARED');
 

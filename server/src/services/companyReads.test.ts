@@ -338,6 +338,56 @@ describe('company read services', () => {
     ).resolves.toMatchObject({ items: [], nextCursor: null });
   });
 
+  it('uses the same full-binding effective disposition for queue views and counts', async () => {
+    const db = makeDb();
+    const now = new Date();
+    const withActionability = (
+      id: string,
+      disposition: string,
+      overrides: Record<string, unknown> = {},
+    ) => transaction({
+      id,
+      qboId: id,
+      qboSyncToken: '1',
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: id,
+        disposition,
+        checkedAt: now,
+        revision: 2,
+        qboSyncToken: '1',
+        qboType: 'Purchase',
+        qboId: id,
+        txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        ...overrides,
+      },
+    });
+    const rows = [
+      withActionability('writable', 'WRITABLE'),
+      withActionability('blocked', 'BLOCKED_CLEARED'),
+      withActionability('stale', 'BLOCKED_RECONCILED', { qboId: 'old-provider-id' }),
+    ];
+    Object.assign(db, { transactionActionability: {} });
+    db.transaction.findMany.mockImplementation(async (args: Record<string, unknown>) => {
+      if ('select' in args && !('include' in args)) return rows;
+      return rows;
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      transferCandidates: async () => new Map(),
+      suggestForMany: async (_companyId, txns) => txns.map(() => null),
+    });
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      providerDisposition: 'UNKNOWN',
+    })).resolves.toMatchObject({
+      items: [{ id: 'stale', providerActionability: { disposition: 'UNKNOWN' } }],
+      pendingCount: 1,
+      actionableCount: 1,
+      blockedCount: 1,
+      unknownCount: 1,
+    });
+  });
+
   it('returns scoped not-found for direct SUPERSEDED gets for viewers and admins', async () => {
     const db = makeDb();
     db.transaction.findUnique.mockResolvedValue(
