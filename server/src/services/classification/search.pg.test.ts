@@ -884,10 +884,15 @@ describePostgres('classification search on PostgreSQL', () => {
       [data.current.id],
       [`rule:${data.rule.id}`],
     ))[0];
-    expect(rule?.hit.action?.tagIds).toHaveLength(50);
-    expect(rule?.hit.action?.tagIds[0]).toBe(zuluTag.id);
-    expect(rule?.hit.actionSummary?.tagNames).toHaveLength(50);
-    expect(rule?.hit.actionSummary?.tagNames[0]).toBe('Zulu tag');
+    const expectedTagPairs = [
+      [zuluTag.id, 'Zulu tag'],
+      ...middleTags.map((tag) => [tag.id, tag.name]),
+      [alphaTag.id, 'Alpha tag'],
+    ];
+    const actionTagIds = rule?.hit.action?.tagIds ?? [];
+    const actionTagNames = rule?.hit.actionSummary?.tagNames ?? [];
+    expect(actionTagIds.map((tagId, index) => [tagId, actionTagNames[index]]))
+      .toEqual(expectedTagPairs);
     expect(rule?.document?.text.indexOf('Zulu tag'))
       .toBeLessThan(rule?.document?.text.indexOf('Alpha tag') ?? -1);
     const candidate = (await repository.rehydrate(
@@ -951,10 +956,10 @@ describePostgres('classification search on PostgreSQL', () => {
         expect(record?.hit.actionSummary?.tagNames ?? [], testCase.label).toHaveLength(0);
       }
 
-      const guardedExpansions = observedRuleSql.match(
-        /jsonb_array_elements(?:_text)?\(CASE WHEN jsonb_typeof\(revision\."tagIds"\) = 'array'\s+AND jsonb_array_length\(revision\."tagIds"\) <= 50/gu,
+      const safelyGuardedExpansions = observedRuleSql.match(
+        /jsonb_array_elements(?:_text)?\(CASE WHEN jsonb_typeof\(revision\."tagIds"\) = 'array'\s+THEN CASE WHEN jsonb_array_length\(revision\."tagIds"\) <= 50\s+THEN revision\."tagIds" ELSE '\[\]'::jsonb END\s+ELSE '\[\]'::jsonb END/gu,
       ) ?? [];
-      expect(guardedExpansions).toHaveLength(2);
+      expect(safelyGuardedExpansions).toHaveLength(2);
       expect(observedRuleSql).toMatch(
         /AND CASE WHEN jsonb_typeof\(revision\."tagIds"\) = 'array'\s+THEN jsonb_array_length\(revision\."tagIds"\) <= 50 ELSE false END AS "tagsExist"/u,
       );
