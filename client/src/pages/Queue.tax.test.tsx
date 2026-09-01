@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -1410,6 +1410,41 @@ describe('tax-aware manual queue', () => {
       '00000000-0000-4000-8000-000000000101',
     ));
     expect(mocks.legacyUndo).not.toHaveBeenCalled();
+  });
+
+  it('shows Undo through exactly 30 days and hides it 1 ms later', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-08-31T12:00:00.000Z'));
+    try {
+      await renderQueue([
+        deposit({
+          id: 'TRANSACTION_AT_UNDO_BOUNDARY',
+          payee: 'Customer receipt at undo boundary',
+          status: 'POSTED',
+          postedAt: '2026-08-01T12:00:00.000Z',
+        }),
+        deposit({
+          id: 'TRANSACTION_PAST_UNDO_BOUNDARY',
+          payee: 'Customer receipt past undo boundary',
+          status: 'POSTED',
+          postedAt: '2026-08-01T11:59:59.999Z',
+        }),
+      ]);
+
+      const atBoundaryRow = screen
+        .getByText('Customer receipt at undo boundary')
+        .closest<HTMLElement>('.interactive-surface');
+      const pastBoundaryRow = screen
+        .getByText('Customer receipt past undo boundary')
+        .closest<HTMLElement>('.interactive-surface');
+
+      expect(atBoundaryRow).not.toBeNull();
+      expect(pastBoundaryRow).not.toBeNull();
+      expect(within(atBoundaryRow!).getByRole('button', { name: /^undo$/i })).toBeInTheDocument();
+      expect(within(pastBoundaryRow!).queryByRole('button', { name: /^undo$/i })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects the entire mixed bulk selection when a sales-ready Deposit is selected', async () => {
