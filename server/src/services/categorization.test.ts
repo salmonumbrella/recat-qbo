@@ -1069,6 +1069,48 @@ describe('stageCategorization', () => {
     expect(db.state.splits[0]).toMatchObject({ taxCode: null, taxCodeQboId: null });
   });
 
+  it('stages an explicit NON on every set NotApplicable Purchase split line', async () => {
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [
+        {
+          grossCents: -500,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+        {
+          grossCents: -550,
+          categoryQboId: 'EXPENSE_ACCOUNT',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged.lines.map((line) => line.taxCodeQboId)).toEqual(['NON', 'NON']);
+    expect(db.state.splits.map((line) => line.taxCodeQboId)).toEqual(['NON', 'NON']);
+  });
+
+  it('rejects explicit NON staging for a non-Purchase transaction', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 10.5;
+
+    await expectCode(stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: 1_050,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db)), 'TAX_REQUIRES_PURCHASE');
+  });
+
   it('stages one Purchase category change with its literal current tax code intact', async () => {
     configureValidPreserveSource(db);
 

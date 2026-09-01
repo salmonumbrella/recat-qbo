@@ -13,12 +13,13 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import type { PrismaClient, Prisma } from '@prisma/client';
-import type {
-  AuditAction,
-  SplitDto,
-  StagedCategorization,
-  TaxDisposition,
-  TxnStatus,
+import {
+  QBO_NOT_APPLICABLE_TAX_CODE,
+  type AuditAction,
+  type SplitDto,
+  type StagedCategorization,
+  type TaxDisposition,
+  type TxnStatus,
 } from '@recat/shared';
 import {
   QboSyncTokenConflict,
@@ -1365,7 +1366,12 @@ async function loadAuthorizedStage(
         );
       }
     } else if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
-      lifecycleError('INVALID_STAGE', 'NotApplicable lines cannot retain tax references.');
+      const explicitNon = txn.splitLines.every(
+        (line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE,
+      );
+      if (txn.qboType !== 'Purchase' || !explicitNon) {
+        lifecycleError('INVALID_STAGE', 'NotApplicable lines cannot retain tax references.');
+      }
     }
     calculatedLines = grossCents.map((totalCents) => ({
       subtotalCents: totalCents,
@@ -1548,6 +1554,95 @@ function evidenceProposal(staged: StagedCategorization): VerifiedCategorizationP
     })),
     tagIds: [...staged.tagIds],
   };
+}
+
+interface ExplicitNotApplicableNonIntentLine {
+  readonly subtotalCents: number;
+  readonly totalCents: number;
+  readonly categoryQboId: string;
+  readonly memo: string | null;
+}
+
+function explicitNotApplicableNonIntent(
+  staged: StagedCategorization,
+): readonly ExplicitNotApplicableNonIntentLine[] | null {
+  if (
+    staged.taxDisposition !== 'preserve_current'
+    && staged.taxCalculation === 'NotApplicable'
+    && staged.lines.length > 0
+    && staged.lines.every((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE)
+  ) {
+    return staged.lines.map((line) => ({
+      subtotalCents: line.subtotalCents,
+      totalCents: line.totalCents,
+      categoryQboId: line.categoryQboId,
+      memo: line.memo,
+    }));
+  }
+  return null;
+}
+
+/**
+ * A literal NON request is an explicit provider instruction, unlike the
+ * ordinary null NotApplicable form. Bind it to both the prepared target and
+ * emitted Purchase body before either can become durable or reach QBO.
+ */
+function assertExplicitNotApplicableNonPreparedBinding(
+  intent: readonly ExplicitNotApplicableNonIntentLine[] | null,
+  prepared: QboPreparedWrite,
+  code: 'ATTEMPT_CORRUPT' | 'QBO_STATE_DRIFT',
+): void {
+  if (intent === null || prepared.qboType !== 'Purchase') return;
+  if (
+    prepared.body.GlobalTaxCalculation !== 'NotApplicable'
+    || prepared.expected.globalTaxCalculation !== 'NotApplicable'
+    || prepared.expected.totalTaxCents !== 0
+    || prepared.expected.targetLines.length !== intent.length
+  ) {
+    lifecycleError(
+      code,
+      'QuickBooks did not prepare the explicit NON Purchase tax intent.',
+    );
+  }
+
+  const unmatchedBodyLines = [...prepared.body.Line!];
+  for (const [index, stagedLine] of intent.entries()) {
+    const target = prepared.expected.targetLines[index];
+    if (
+      target === undefined
+      || target.amountCents !== stagedLine.subtotalCents
+      || target.description !== stagedLine.memo
+      || target.accountQboId !== stagedLine.categoryQboId
+      || target.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE
+      || target.taxAmountCents !== null
+      || target.taxInclusiveCents !== null
+    ) {
+      lifecycleError(
+        code,
+        'QuickBooks expected state did not preserve the explicit NON Purchase tax intent.',
+      );
+    }
+    const bodyIndex = unmatchedBodyLines.findIndex((line) => {
+      const detail = line.AccountBasedExpenseLineDetail;
+      return (
+        line.DetailType === 'AccountBasedExpenseLineDetail'
+        && line.Amount !== undefined
+        && exactMoneyCents(line.Amount) === Math.abs(stagedLine.totalCents)
+        && (line.Description ?? null) === stagedLine.memo
+        && detail?.AccountRef?.value === stagedLine.categoryQboId
+        && detail.TaxCodeRef?.value === QBO_NOT_APPLICABLE_TAX_CODE
+        && detail.TaxAmount === undefined
+        && detail.TaxInclusiveAmt === undefined
+      );
+    });
+    if (bodyIndex === -1) {
+      lifecycleError(
+        code,
+        'QuickBooks body did not preserve the explicit NON Purchase tax intent.',
+      );
+    }
+    unmatchedBodyLines.splice(bodyIndex, 1);
+  }
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -2934,20 +3029,24 @@ async function loadAuthorizedAttempt(
   expectedStageHash?: string,
   expectedQboBinding?: ExpectedQboBinding,
   expectedTaxDisposition: TaxDisposition = 'set',
-): Promise<{ txn: DurableTransaction }> {
-  if (expectedStageHash === undefined) {
-    const txn = await loadAuthorizedTransactionState(
-      attempt.transactionId,
-      companyId,
-      attempt.expectedRevision,
-      actorId,
-      d,
-      allowedStatusesForAttempt(attempt),
-      authorization,
-      expectedQboBinding,
-    );
-    return { txn };
-  }
+): Promise<{ txn: DurableTransaction; staged?: StagedCategorization }> {
+  const txn = await loadAuthorizedTransactionState(
+    attempt.transactionId,
+    companyId,
+    attempt.expectedRevision,
+    actorId,
+    d,
+    allowedStatusesForAttempt(attempt),
+    authorization,
+    expectedQboBinding,
+  );
+  const hasExplicitNon = (
+    txn.qboType === 'Purchase'
+    && txn.taxCalculation === 'NotApplicable'
+    && txn.splitLines.length > 0
+    && txn.splitLines.every((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE)
+  );
+  if (expectedStageHash === undefined && !hasExplicitNon) return { txn };
   return loadAuthorizedStage(
     attempt.transactionId,
     companyId,
@@ -3009,7 +3108,7 @@ async function enterCommitting(
     // every mutable authorization fact only after it returns so a stage that
     // committed while we waited cannot authorize this prepared revision.
     await d.renewLease(leaseKey(txn), owner);
-    const { txn: currentTxn } = await loadAuthorizedAttempt(
+    const { txn: currentTxn, staged } = await loadAuthorizedAttempt(
       d,
       attempt,
       txn.companyId,
@@ -3020,6 +3119,13 @@ async function enterCommitting(
       expectedTaxDisposition,
     );
     validatePreparedBinding(attempt, currentTxn);
+    if (staged !== undefined) {
+      assertExplicitNotApplicableNonPreparedBinding(
+        explicitNotApplicableNonIntent(staged),
+        validateAttemptPersistence(attempt),
+        'ATTEMPT_CORRUPT',
+      );
+    }
     if (finalQboProof) await finalQboProof(currentTxn);
   } catch (error) {
     const retryable = await markRetryable(
@@ -3527,9 +3633,10 @@ async function commitStagedCategorizationInternal(
         return recordedAttemptResultWithOutcome(d, existing, txn);
       }
       let txn: DurableTransaction;
+      let staged: StagedCategorization | undefined;
       let client: QboClient;
       try {
-        ({ txn } = await loadAuthorizedAttempt(
+        ({ txn, staged } = await loadAuthorizedAttempt(
           d,
           existing,
           input.companyId,
@@ -3557,6 +3664,13 @@ async function commitStagedCategorizationInternal(
         throw error;
       }
       const prepared = validatePreparedBinding(existing, txn);
+      if (staged !== undefined) {
+        assertExplicitNotApplicableNonPreparedBinding(
+          explicitNotApplicableNonIntent(staged),
+          prepared,
+          'ATTEMPT_CORRUPT',
+        );
+      }
       const before = persistedSnapshot(existing.beforeSnapshot, prepared.qboType);
       const entered = await enterCommitting(
         d,
@@ -3672,6 +3786,11 @@ async function commitStagedCategorizationInternal(
         txn,
         before,
       },
+    );
+    assertExplicitNotApplicableNonPreparedBinding(
+      explicitNotApplicableNonIntent(staged),
+      prepared,
+      'QBO_STATE_DRIFT',
     );
     const persisted = await persistPrepared(
       d,

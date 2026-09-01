@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { StagedCategorization, TaxCalculation } from '@recat/shared';
+import { QBO_NOT_APPLICABLE_TAX_CODE, type StagedCategorization, type TaxCalculation } from '@recat/shared';
 import {
   QboSyncTokenConflict,
   type QboPreparedWrite,
@@ -1077,6 +1077,8 @@ function stagedLineToRaw(
     if (taxCalculation === 'TaxInclusive') {
       detail.TaxInclusiveAmt = moneyFromCents(line.totalCents);
     }
+  } else if (line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE) {
+    detail.TaxCodeRef = { value: QBO_NOT_APPLICABLE_TAX_CODE };
   } else if (line.taxCodeQboId !== null) {
     preparationError('QBO_PURCHASE_UNSUPPORTED', 'NotApplicable Purchase lines cannot carry a tax code.');
   }
@@ -1099,7 +1101,11 @@ function stagedLineToSnapshot(
     accountQboId: line.categoryQboId,
     customerQboId: null,
     classQboId: null,
-    taxCodeQboId: taxCalculation === 'NotApplicable' ? null : line.taxCodeQboId,
+    taxCodeQboId: taxCalculation === 'NotApplicable'
+      ? line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
+        ? QBO_NOT_APPLICABLE_TAX_CODE
+        : null
+      : line.taxCodeQboId,
     taxAmountCents: taxCalculation === 'NotApplicable' ? null : line.taxCents,
     taxInclusiveCents:
       taxCalculation === 'TaxInclusive' ? line.totalCents : null,

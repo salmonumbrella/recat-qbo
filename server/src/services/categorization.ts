@@ -1,10 +1,11 @@
-import type {
-  CategorizationProposal,
-  StageCategorizationInput,
-  StagedCategorization,
-  TaxCalculation,
-  TaxDisposition,
-  TaxReadinessDto,
+import {
+  QBO_NOT_APPLICABLE_TAX_CODE,
+  type CategorizationProposal,
+  type StageCategorizationInput,
+  type StagedCategorization,
+  type TaxCalculation,
+  type TaxDisposition,
+  type TaxReadinessDto,
 } from '@recat/shared';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -100,7 +101,6 @@ interface ReloadedTransaction {
 
 type WhereIn<T> = { in: T[] };
 const ACTIVE_ATTEMPT_STATUSES = ['PREPARED', 'COMMITTING', 'UNCERTAIN'] as const;
-const QBO_NOT_APPLICABLE_TAX_CODE = 'NON';
 
 /** The complete external persistence seam used by staging. */
 export interface CategorizationDb {
@@ -332,13 +332,24 @@ const proposalSchema = z.object({
   }
 
   if (proposal.taxCalculation !== 'NotApplicable') return;
+  const explicitNon = proposal.lines.some(
+    (line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE,
+  );
   for (const [lineIndex, line] of proposal.lines.entries()) {
-    if (line.taxCodeQboId == null) continue;
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'NotApplicable lines must not select a tax code.',
-      path: ['lines', lineIndex, 'taxCodeQboId'],
-    });
+    if (line.taxCodeQboId != null && line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'NotApplicable lines can select only the literal NON tax code.',
+        path: ['lines', lineIndex, 'taxCodeQboId'],
+      });
+    }
+    if (explicitNon && line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Explicit NON requires the literal NON tax code on every line.',
+        path: ['lines', lineIndex, 'taxCodeQboId'],
+      });
+    }
   }
 });
 
@@ -547,6 +558,15 @@ async function validateStage(
   }
   const transactionCents = decimalToCents(transaction.amount);
   assertSignedLines(transactionCents, proposal, transaction.qboType);
+  const explicitNon = proposal.taxDisposition === 'set'
+    && proposal.taxCalculation === 'NotApplicable'
+    && proposal.lines.every((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE);
+  if (explicitNon && transaction.qboType !== 'Purchase') {
+    throw new CategorizationError(
+      'TAX_REQUIRES_PURCHASE',
+      'The literal NON tax code is supported only for Purchases.',
+    );
+  }
   let preservedSource: PreserveCurrentSource | null = null;
   if (proposal.taxDisposition === 'preserve_current') {
     if (transaction.qboType !== 'Purchase') {
@@ -592,15 +612,17 @@ async function validateStage(
   let calculatedLines: CalculatedLine[];
 
   if (proposal.taxCalculation === 'NotApplicable') {
-    if (preservedSource !== null) {
+    if (preservedSource !== null || explicitNon) {
+      const requiredTaxCodeQboId = preservedSource?.taxCodeQboId
+        ?? QBO_NOT_APPLICABLE_TAX_CODE;
       const taxCodes = await db.qboTaxCode.findMany({
         where: {
           companyId: input.companyId,
-          qboId: { in: [preservedSource.taxCodeQboId] },
+          qboId: { in: [requiredTaxCodeQboId] },
         },
       });
       const preservedTaxCode = taxCodes[0] ?? (
-        preservedSource.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
+        requiredTaxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
           ? {
               qboId: QBO_NOT_APPLICABLE_TAX_CODE,
               name: QBO_NOT_APPLICABLE_TAX_CODE,
@@ -616,7 +638,7 @@ async function validateStage(
       if (
         taxCodes.length > 1
         || preservedTaxCode === null
-        || preservedTaxCode.qboId !== preservedSource.taxCodeQboId
+        || preservedTaxCode.qboId !== requiredTaxCodeQboId
         || preservedTaxCode.active !== true
       ) {
         throw new CategorizationError(
@@ -905,6 +927,9 @@ async function stageWithOwner<T>(
       throw new EntityLeaseError();
     }
     const { proposal } = validated.input;
+    const explicitNon = proposal.taxDisposition === 'set'
+      && proposal.taxCalculation === 'NotApplicable'
+      && proposal.lines.every((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE);
     if (proposal.taxDisposition === 'preserve_current') {
       const currentGraph = await tx.transaction.findUniqueOrThrow({
         where: { id: validated.input.transactionId },
@@ -927,12 +952,12 @@ async function stageWithOwner<T>(
       proposal.lines.flatMap((line) => line.taxCodeQboId ?? []),
     );
     const transactionTaxCodeId =
-      proposal.taxDisposition === 'preserve_current'
+      proposal.taxDisposition === 'preserve_current' || explicitNon
         ? selectedTaxCodeIds[0]!
         : proposal.taxCalculation !== 'NotApplicable' && selectedTaxCodeIds.length === 1
         ? selectedTaxCodeIds[0]!
         : null;
-    const transactionTaxCode = proposal.taxDisposition === 'preserve_current'
+    const transactionTaxCode = proposal.taxDisposition === 'preserve_current' || explicitNon
       ? validated.taxCodesById.get(transactionTaxCodeId!)?.name ?? null
       : transactionTaxCodeId === null
         ? null
@@ -1010,10 +1035,10 @@ async function stageWithOwner<T>(
           amount: validated.calculatedLines[idx]!.totalCents / 100,
           category: account.fullName,
           categoryQboId: account.qboId,
-          taxCode: proposal.taxDisposition === 'preserve_current'
+          taxCode: proposal.taxDisposition === 'preserve_current' || explicitNon
             ? taxCode?.name ?? null
             : proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.name ?? null,
-          taxCodeQboId: proposal.taxDisposition === 'preserve_current'
+          taxCodeQboId: proposal.taxDisposition === 'preserve_current' || explicitNon
             ? line.taxCodeQboId!
             : proposal.taxCalculation === 'NotApplicable' ? null : taxCode?.qboId ?? null,
           memo: line.memo ?? null,

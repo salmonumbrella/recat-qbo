@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import type {
-  ClassificationCaseContext,
-  ClassificationCitation,
-  ClassificationOriginIntent,
-  ClassificationReviewer,
+import {
+  QBO_NOT_APPLICABLE_TAX_CODE,
+  type ClassificationCaseContext,
+  type ClassificationCitation,
+  type ClassificationOriginIntent,
+  type ClassificationReviewer,
 } from '@recat/shared';
 import { z } from 'zod';
 import type {
@@ -344,7 +345,10 @@ function isVerifiedCategorizationProposal(
       && isEvidenceQboReference(line.categoryQboId)
       && (
         value.taxCalculation === 'NotApplicable'
-          ? line.taxCodeQboId === null
+          ? (
+              line.taxCodeQboId === null
+              || line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE
+            )
           : isEvidenceQboReference(line.taxCodeQboId)
       )
       && (

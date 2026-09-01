@@ -620,6 +620,73 @@ describe('Recat MCP mutation tools', () => {
     expect(operations.prepareCategorization).not.toHaveBeenCalled();
   });
 
+  it('accepts an explicit literal NON for a set NotApplicable split', async () => {
+    const operations = mutations();
+    const proposal = {
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [
+        {
+          grossCents: -400,
+          categoryQboId: 'expense-a',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+        {
+          grossCents: -600,
+          categoryQboId: 'expense-b',
+          taxCodeQboId: 'NON',
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 2,
+        idempotencyKey: 'explicit-non-split',
+        proposal,
+      },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareCategorization).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({ proposal }),
+    );
+  });
+
+  it('rejects a non-NON tax reference for a set NotApplicable split', async () => {
+    const operations = mutations();
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 2,
+        idempotencyKey: 'not-non-split',
+        proposal: {
+          taxDisposition: 'set',
+          taxCalculation: 'NotApplicable',
+          lines: [{
+            grossCents: -1_000,
+            categoryQboId: 'expense',
+            taxCodeQboId: 'OTHER',
+            tagIds: [],
+          }],
+          tagIds: [],
+        },
+      },
+    });
+
+    expect(response.result.isError).toBe(true);
+    expect(operations.prepareCategorization).not.toHaveBeenCalled();
+  });
+
   it('fails closed on invalid service output without logging payload details', async () => {
     const sentinel = 'PRIVATE_MUTATION_OUTPUT_SENTINEL';
     const operations = mutations({

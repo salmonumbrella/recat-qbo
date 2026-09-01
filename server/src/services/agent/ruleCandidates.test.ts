@@ -89,6 +89,9 @@ describe('rule candidate pattern model', () => {
         taxCodeQboId: 'tax-neutral',
       }],
     }))).toBeNull();
+    expect(candidatePatternFor('Northwind Market', proposal({
+      lines: [{ ...proposal().lines[0]!, taxCodeQboId: 'NON' }],
+    }))).toBeNull();
     expect(candidatePatternFor('  ', proposal())).toBeNull();
     expect(candidatePatternFor('ab', proposal())).toBeNull();
     expect(candidatePatternFor(`line\nbreak`, proposal())).toBeNull();

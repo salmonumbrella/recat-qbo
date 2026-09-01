@@ -1,4 +1,5 @@
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
+import { QBO_NOT_APPLICABLE_TAX_CODE } from '@recat/shared';
 import { z } from 'zod-v4';
 import {
   prepareMcpCategorization,
@@ -229,14 +230,28 @@ const proposal = z.strictObject({
     return;
   }
 
+  const explicitNon = value.taxCalculation === 'NotApplicable'
+    && value.lines.some((line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE);
   for (const [index, line] of value.lines.entries()) {
-    if (
-      value.taxCalculation === 'NotApplicable'
-      && line.taxCodeQboId != null
-    ) {
+    if (value.taxCalculation === 'NotApplicable' && line.taxCodeQboId != null) {
+      if (line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'NotApplicable lines can select only the literal NON tax code.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+      if (explicitNon && line.taxCodeQboId !== QBO_NOT_APPLICABLE_TAX_CODE) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Explicit NON requires the literal NON tax code on every line.',
+          path: ['lines', index, 'taxCodeQboId'],
+        });
+      }
+    } else if (explicitNon) {
       context.addIssue({
         code: 'custom',
-        message: 'NotApplicable lines cannot select a tax code.',
+        message: 'Explicit NON requires the literal NON tax code on every line.',
         path: ['lines', index, 'taxCodeQboId'],
       });
     }

@@ -842,6 +842,73 @@ function preserveCurrentFixture(): {
 }
 
 describe('preparePurchaseRecategorization', () => {
+  it('prepares exact NON tax references for every set NotApplicable Purchase split line', () => {
+    const { raw, before, preserved } = preserveCurrentFixture();
+    const staged: StagedCategorization = {
+      ...preserved,
+      taxDisposition: 'set',
+      lines: [
+        {
+          ...preserved.lines[0]!,
+          idx: 0,
+          subtotalCents: -30_000,
+          totalCents: -30_000,
+          categoryQboId: '42',
+          taxCodeQboId: 'NON',
+        },
+        {
+          ...preserved.lines[0]!,
+          idx: 1,
+          subtotalCents: -45_000,
+          totalCents: -45_000,
+          categoryQboId: '43',
+          taxCodeQboId: 'NON',
+        },
+      ],
+      totals: { subtotalCents: -75_000, taxCents: 0, totalCents: -75_000 },
+    };
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged,
+      before,
+      requestId: 'REQUEST_EXPLICIT_NON_SPLIT',
+    });
+
+    expect(prepared.body.GlobalTaxCalculation).toBe('NotApplicable');
+    expect(prepared.body.Line!.map((line) =>
+      line.AccountBasedExpenseLineDetail!.TaxCodeRef?.value,
+    )).toEqual(['NON', 'NON']);
+    expect(prepared.expected.targetLines.map((line) => line.taxCodeQboId))
+      .toEqual(['NON', 'NON']);
+    const actual = mapPurchaseTaxSnapshot(prepared.body);
+    expect(prepared.expected.targetLines.every((line, index) => purchaseTargetLineMatches(
+      prepared.expected.globalTaxCalculation,
+      prepared.expected.totalTaxCents,
+      actual.totalTaxCents,
+      line,
+      actual.lines[index]!,
+    ))).toBe(true);
+    const providerDefaulted = structuredClone(actual);
+    providerDefaulted.lines[0]!.taxCodeQboId = 'PROVIDER_DEFAULT_NON_TAX';
+    expect(purchaseTargetLineMatches(
+      prepared.expected.globalTaxCalculation,
+      prepared.expected.totalTaxCents,
+      providerDefaulted.totalTaxCents,
+      prepared.expected.targetLines[0]!,
+      providerDefaulted.lines[0]!,
+    )).toBe(false);
+
+    const restore = preparePurchaseRestore({
+      current: { ...prepared.body, SyncToken: '8' },
+      prepared,
+      requestId: 'REQUEST_EXPLICIT_NON_SPLIT_RESTORE',
+    });
+    expect(restore.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef)
+      .toEqual({ value: 'NON' });
+  });
+
   it('changes only the category reference on a 6477-shaped preserve-current Purchase', () => {
     const { raw, before, preserved } = preserveCurrentFixture();
 

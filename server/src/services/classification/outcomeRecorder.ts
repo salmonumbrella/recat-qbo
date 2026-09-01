@@ -75,7 +75,7 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
 
-function caseAction(
+export function caseAction(
   proposal: NonNullable<VerifiedCategorizationOutcome['proposal']>,
 ): ClassificationAction | null {
   const line = proposal.lines[0];
@@ -83,7 +83,9 @@ function caseAction(
   return {
     categoryQboId: line.categoryQboId,
     taxCalculation: proposal.taxCalculation,
-    taxCodeQboId: line.taxCodeQboId,
+    taxCodeQboId: proposal.taxCalculation === 'NotApplicable'
+      ? null
+      : line.taxCodeQboId,
     tagIds: [...new Set([...proposal.tagIds, ...line.tagIds])].sort(),
     memo: line.memo,
   };

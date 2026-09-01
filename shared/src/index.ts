@@ -56,6 +56,8 @@ export type SyncMode = 'polling' | 'webhook';
 export type QboEnv = 'sandbox' | 'production';
 export type TaxCalculation = 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
 export type TaxDisposition = 'set' | 'preserve_current';
+/** QBO's literal non-tax tax-code sentinel. */
+export const QBO_NOT_APPLICABLE_TAX_CODE = 'NON' as const;
 export type TaxSupportStatus = 'unsupported' | 'needs_setup' | 'ready';
 
 export interface TaxCodeDto {

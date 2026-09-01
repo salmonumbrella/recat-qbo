@@ -8,6 +8,7 @@ import {
   type QboDepositPreparedWrite,
   type QboDepositSnapshot,
   type QboPreparedWrite,
+  type QboPurchasePreparedWrite,
   type QboPurchaseSnapshot,
   type QboTxn,
 } from '../lib/qbo/types.js';
@@ -1093,6 +1094,79 @@ function preparedWrite(
   };
 }
 
+function explicitNonPreparedWrite(
+  requestId: string,
+): QboPurchasePreparedWrite {
+  const before: QboPurchaseSnapshot = {
+    ...structuredClone(beforePurchase),
+    globalTaxCalculation: 'NotApplicable',
+    totalTaxCents: 0,
+  };
+  const body: QboPurchasePreparedWrite['body'] = {
+    Id: 'purchase-generic',
+    SyncToken: '7',
+    TxnDate: '2026-07-28',
+    TotalAmt: 10.5,
+    AccountRef: { value: 'payment-generic' },
+    GlobalTaxCalculation: 'NotApplicable',
+    Line: [{
+      Amount: 4,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'expense-generic' },
+        TaxCodeRef: { value: 'NON' },
+      },
+    }, {
+      Amount: 6.5,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: 'expense-second' },
+        TaxCodeRef: { value: 'NON' },
+      },
+    }],
+  };
+  return {
+    operation: 'recategorize',
+    qboType: 'Purchase',
+    qboId: 'purchase-generic',
+    requestId,
+    requestHash: hashPreparedWriteBody(body),
+    body,
+    before,
+    expected: {
+      qboId: 'purchase-generic',
+      totalCents: -1050,
+      accountQboId: 'payment-generic',
+      date: '2026-07-28',
+      direction: 'purchase',
+      globalTaxCalculation: 'NotApplicable',
+      totalTaxCents: 0,
+      targetLines: [{
+        id: null,
+        amountCents: -400,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+      }, {
+        id: null,
+        amountCents: -650,
+        description: null,
+        accountQboId: 'expense-second',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+      }],
+      untouchedLineHashes: [],
+    },
+  };
+}
+
 function restoredWrite(
   original: QboPreparedWrite,
   requestId: string,
@@ -1875,6 +1949,49 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
+  it('rejects a resumed PREPARED explicit NON attempt whose body no longer matches its staged intent', async () => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      { idx: 0, amount: -4, category: 'Bank Charges', categoryQboId: 'expense-generic', taxCode: 'NON', taxCodeQboId: 'NON', memo: null, tags: [] },
+      { idx: 1, amount: -6.5, category: 'Office expense', categoryQboId: 'expense-second', taxCode: 'NON', taxCodeQboId: 'NON', memo: null, tags: [] },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        { idx: 0, subtotalCents: -400, taxCents: 0, totalCents: -400, categoryQboId: 'expense-generic', taxCodeQboId: 'NON', memo: null, tagIds: [] },
+        { idx: 1, subtotalCents: -650, taxCents: 0, totalCents: -650, categoryQboId: 'expense-second', taxCodeQboId: 'NON', memo: null, tagIds: [] },
+      ],
+      tagIds: [],
+    };
+    const prepared = explicitNonPreparedWrite('request-explicit-non-resume');
+    delete prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef;
+    prepared.requestHash = hashPreparedWriteBody(prepared.body);
+    const attempt = seedAttempt(fixture.db, 'PREPARED', 'request-explicit-non-resume');
+    attempt.requestPayload = structuredClone(prepared);
+    attempt.beforeSnapshot = structuredClone(prepared.before);
+    attempt.requestHash = prepared.requestHash;
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValue(structuredClone(prepared.before));
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-resume'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).rejects.toMatchObject({ code: 'ATTEMPT_CORRUPT' });
+
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('rejects unbounded, unsafe, unapproved, or transaction-mismatched decision context before QBO access', async () => {
     const base = decisionContext();
     const invalidContexts = [
@@ -2057,6 +2174,202 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.db.attempts[0]!.requestPayload).toEqual(persistedBody);
     expect(fixture.prepareRecategorization).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconstructs an exact set NotApplicable Purchase stage with NON on every split', async () => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      {
+        idx: 0,
+        amount: -4,
+        category: 'Bank Charges',
+        categoryQboId: 'expense-generic',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+      {
+        idx: 1,
+        amount: -6.5,
+        category: 'Office expense',
+        categoryQboId: 'expense-second',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        {
+          idx: 0,
+          subtotalCents: -400,
+          taxCents: 0,
+          totalCents: -400,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+        {
+          idx: 1,
+          subtotalCents: -650,
+          taxCents: 0,
+          totalCents: -650,
+          categoryQboId: 'expense-second',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+
+    const prepared = explicitNonPreparedWrite('request-explicit-non-split');
+    fixture.prepareRecategorization.mockResolvedValue(structuredClone(prepared));
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(prepared.before))
+      .mockResolvedValue({
+        ...structuredClone(prepared.before),
+        syncToken: '8',
+        lines: prepared.expected.targetLines.map((line, index) => ({
+          ...line,
+          id: `line-posted-${index}`,
+        })),
+      });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-split'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).resolves.toMatchObject({ outcome: 'VERIFIED', status: 'POSTED' });
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        taxCalculation: 'NotApplicable',
+        lines: staged.lines,
+      }),
+      expect.anything(),
+      'request-explicit-non-split',
+    );
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal: expect.objectContaining({
+          taxCalculation: 'NotApplicable',
+          lines: staged.lines,
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    ['omits a target TaxCodeRef', (prepared: QboPurchasePreparedWrite) => {
+      delete prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef;
+    }],
+    ['uses an arbitrary target TaxCodeRef', (prepared: QboPurchasePreparedWrite) => {
+      prepared.body.Line![0]!.AccountBasedExpenseLineDetail!.TaxCodeRef = { value: 'OTHER' };
+    }],
+    ['uses a mismatched expected target tax code', (prepared: QboPurchasePreparedWrite) => {
+      prepared.expected.targetLines[0]!.taxCodeQboId = 'OTHER';
+    }],
+  ])('rejects an explicit NON stage when preparation %s before persist or send', async (
+    _case,
+    mutate,
+  ) => {
+    const fixture = durableDeps();
+    fixture.db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'expense-generic', active: true },
+      { qboId: 'expense-second', active: true },
+    ]);
+    fixture.db.transactionRow.taxCalculation = 'NotApplicable';
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.transactionRow.splitLines = [
+      {
+        idx: 0,
+        amount: -4,
+        category: 'Bank Charges',
+        categoryQboId: 'expense-generic',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+      {
+        idx: 1,
+        amount: -6.5,
+        category: 'Office expense',
+        categoryQboId: 'expense-second',
+        taxCode: 'NON',
+        taxCodeQboId: 'NON',
+        memo: null,
+        tags: [],
+      },
+    ];
+    const staged: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      totals: { subtotalCents: -1_050, taxCents: 0, totalCents: -1_050 },
+      lines: [
+        {
+          idx: 0,
+          subtotalCents: -400,
+          taxCents: 0,
+          totalCents: -400,
+          categoryQboId: 'expense-generic',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+        {
+          idx: 1,
+          subtotalCents: -650,
+          taxCents: 0,
+          totalCents: -650,
+          categoryQboId: 'expense-second',
+          taxCodeQboId: 'NON',
+          memo: null,
+          tagIds: [],
+        },
+      ],
+      tagIds: [],
+    };
+    const prepared = explicitNonPreparedWrite('request-explicit-non-invalid');
+    mutate(prepared);
+    prepared.requestHash = hashPreparedWriteBody(prepared.body);
+    fixture.prepareRecategorization.mockResolvedValue(structuredClone(prepared));
+    fixture.fetchPreparedSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(structuredClone(prepared.before))
+      .mockResolvedValue({
+        ...structuredClone(prepared.before),
+        syncToken: '8',
+        lines: prepared.expected.targetLines.map((line, index) => ({
+          ...line,
+          id: `line-posted-${index}`,
+        })),
+      });
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-explicit-non-invalid'),
+      expectedStageHash: hashStagedCategorization(staged),
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_STATE_DRIFT' });
+
+    expect(fixture.db.attempts).toHaveLength(0);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
   });
 
   it('rejects a mismatched expected stage hash before QBO access on PREPARED resume', async () => {
