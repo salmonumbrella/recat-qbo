@@ -999,7 +999,7 @@ describe('company read services', () => {
       providerDisposition: 'UNKNOWN',
     })).resolves.toMatchObject({
       items: [{ id: 'stale', providerActionability: { disposition: 'UNKNOWN' } }],
-      pendingCount: 1,
+      pendingCount: 3,
       actionableCount: 1,
       blockedCount: 1,
       unknownCount: 1,

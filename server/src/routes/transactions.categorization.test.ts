@@ -68,6 +68,7 @@ vi.mock('../lib/prisma.js', () => ({
     ruleTag: { findMany: mocks.ruleTagFindMany },
     session: { findUnique: mocks.sessionFindUnique },
     tag: { findMany: mocks.tagFindMany },
+    transactionActionability: {},
     transaction: {
       count: mocks.transactionCount,
       findMany: mocks.transactionFindMany,
@@ -260,6 +261,45 @@ beforeEach(() => {
 });
 
 describe('tax-aware categorization action routes', () => {
+  it('counts every pending and error transaction while retaining provider observation metadata', async () => {
+    const checkedAt = new Date();
+    const providerRow = (id: string, disposition: string, qboId = id) => ({
+      ...transactionRow,
+      id,
+      qboId,
+      revision: 1,
+      qboSyncToken: '7',
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 1,
+        qboSyncToken: '7',
+        qboType: 'Purchase',
+        qboId: id,
+        txnDate: transactionRow.date,
+      },
+    });
+    mocks.transactionFindMany.mockResolvedValue([
+      providerRow('WRITABLE_TXN', 'WRITABLE'),
+      providerRow('BLOCKED_TXN', 'BLOCKED_CLEARED'),
+      providerRow('UNKNOWN_TXN', 'BLOCKED_RECONCILED', 'CHANGED_PROVIDER_ID'),
+    ]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions?countOnly=true`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      pendingCount: 3,
+      actionableCount: 1,
+      blockedCount: 1,
+      unknownCount: 1,
+    });
+  });
+
   it('keeps explicit SUPERSEDED queue reads empty', async () => {
     mocks.transactionFindMany.mockResolvedValue([]);
 
@@ -464,6 +504,41 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(202);
     expect(mocks.postTransaction).toHaveBeenCalledTimes(1);
+    expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
+  });
+
+  it('lets bulk post perform fresh per-transaction write-safety checks instead of trusting the cache', async () => {
+    mocks.assertTransactionProviderActionability.mockRejectedValue({
+      code: 'QBO_WRITE_SAFETY_UNAVAILABLE',
+    });
+    mocks.transactionFindMany.mockResolvedValue([transactionRow]);
+    mocks.bulkPost.mockResolvedValue([{ id: TRANSACTION_ID, ok: true }]);
+
+    const response = await request(testApp())
+      .post('/api/transactions/bulk-post')
+      .set(sessionHeaders)
+      .send({ ids: [TRANSACTION_ID] });
+
+    expect(response.status).toBe(200);
+    expect(mocks.bulkPost).toHaveBeenCalledWith([TRANSACTION_ID], {
+      id: 'transaction-route-user',
+      label: 'Generic categorizer',
+    });
+    expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
+  });
+
+  it('retries a local Recat error without trusting the cached provider observation', async () => {
+    mocks.assertTransactionProviderActionability.mockRejectedValue({
+      code: 'QBO_WRITE_SAFETY_UNAVAILABLE',
+    });
+    mocks.retryError.mockResolvedValue(undefined);
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/retry`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(mocks.retryError).toHaveBeenCalledWith(TRANSACTION_ID);
     expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
   });
 

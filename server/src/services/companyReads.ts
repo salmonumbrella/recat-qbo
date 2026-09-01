@@ -2056,9 +2056,7 @@ export function createCompanyReadService(
       nextCursor: cursorPosition
         ? encodeCursor(cursorSecret, { v: 1, ...expected, position: cursorPosition })
         : null,
-      pendingCount: supportsActionability
-        ? Number(queueCounts.actionable)
-        : Number(queueCounts.total),
+      pendingCount: Number(queueCounts.total),
       ...(supportsActionability
         ? {
             actionableCount: Number(queueCounts.actionable),

@@ -153,9 +153,8 @@ companyTransactionsRouter.get(
       (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
     );
 
-    // Queue badge: only a fresh provider WRITABLE observation is actionable.
-    // The total remains useful to account for stale/unknown rows without
-    // conflating them with a local TxnStatus.
+    // Queue badge: every local PENDING or ERROR row belongs to the one queue.
+    // Provider observations remain additive metadata, not a visibility gate.
     const pendingWhere: Prisma.TransactionWhereInput = {
       companyId: company.id,
       status: { in: ['PENDING', 'ERROR'] as TxnStatus[] },
@@ -181,7 +180,7 @@ companyTransactionsRouter.get(
       ?? await prisma.transaction.count({ where: pendingWhere });
     const actionableCount = providerCounts?.actionable ?? totalPending;
     const blockedCount = providerCounts?.blocked ?? 0;
-    const pendingCount = supportsActionability ? actionableCount : totalPending;
+    const pendingCount = totalPending;
     if (query.countOnly) {
       res.json({
         transactions: [],
@@ -1000,8 +999,9 @@ transactionActionsRouter.post(
     if (!id) throw new HttpError(400, 'Missing transaction id', 'BAD_REQUEST');
     const txn = await loadTxn(id);
     await assertCategorizerFor(requestUser(req), txn.companyId);
-    await assertProviderWritable(txn.companyId, id);
     try {
+      // retryError refreshes the provider snapshot but only changes Recat
+      // state; a cached actionability observation is not a gate.
       await retryError(id);
     } catch (err) {
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'RETRY_FAILED');
@@ -1050,10 +1050,8 @@ transactionActionsRouter.post(
     for (const companyId of new Set(scopedTransactions.map((txn) => txn.companyId))) {
       await assertCategorizerFor(user, companyId);
     }
-    for (const txn of scopedTransactions) {
-      await assertProviderWritable(txn.companyId, txn.id);
-    }
-
+    // bulkPost delegates each item to postTransaction, which fetches current
+    // QBO state and enforces write safety immediately before the provider call.
     const results = await bulkPost(ids, actorFor(user));
 
     const rows = await prisma.transaction.findMany({
