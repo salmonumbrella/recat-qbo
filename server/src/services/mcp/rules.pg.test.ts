@@ -797,6 +797,127 @@ describePostgres('MCP rule lifecycle PostgreSQL behavior', () => {
     });
   });
 
+  it('reduces authority for structurally incomplete legacy rules and candidates', async () => {
+    const fixture = await seed();
+    const makeLegacyRule = (matchText: string, priority: number) => db.rule.create({
+      data: {
+        companyId: fixture.company.id,
+        matchText,
+        category: 'Legacy category label',
+        categoryQboId: null,
+        taxCalculation: null,
+        taxCode: 'Legacy tax label',
+        taxCodeQboId: null,
+        priority,
+        revision: 2,
+        originIntent: 'make_recurring',
+        createdById: fixture.user.id,
+      },
+    });
+    const [disableRule, retireRule] = await Promise.all([
+      makeLegacyRule('Incomplete disable', 0),
+      makeLegacyRule('Incomplete retire', 1),
+    ]);
+    const legacyTagShape = { legacy: true, retained: ['historical-label'] };
+    const candidate = await db.autopilotRuleCandidate.create({
+      data: {
+        companyId: fixture.company.id,
+        conditionFingerprint: createHash('sha256').update(randomUUID()).digest('hex'),
+        schemaVersion: 'classification-rule-v1',
+        configVersion: 'legacy-import',
+        matchText: 'Incomplete candidate',
+        state: 'stale',
+        winningActionFingerprint: null,
+        categoryQboId: null,
+        taxCalculation: null,
+        taxCodeQboId: null,
+        tagIds: legacyTagShape,
+      },
+    });
+    const run = async (input: PrepareMcpRuleChangeInput) => {
+      const prepared = await prepareMcpRuleChange(fixture.principal, input, { db, now: () => NOW });
+      const committed = await commitMcpRuleChange(fixture.principal, {
+        operationId: prepared.operationId,
+        idempotencyKey: input.idempotencyKey,
+      }, { db, now: () => new Date(NOW.getTime() + 1_000) });
+      return { prepared, committed };
+    };
+
+    const disabled = await run({
+      companyId: fixture.company.id,
+      mutation: 'disable',
+      ruleId: disableRule.id,
+      expectedRevision: 2,
+      idempotencyKey: `incomplete-disable-${randomUUID()}`,
+    });
+    expect(disabled.prepared.preview).toMatchObject({
+      action: null,
+      categoryName: 'Legacy category label',
+      taxCodeName: 'Legacy tax label',
+    });
+    expect(disabled.committed.rule).toMatchObject({
+      ruleId: disableRule.id,
+      state: 'disabled',
+      revision: 3,
+      action: null,
+      categoryName: 'Legacy category label',
+      taxCodeName: 'Legacy tax label',
+      changedBy: fixture.user.id,
+    });
+
+    const retired = await run({
+      companyId: fixture.company.id,
+      mutation: 'retire',
+      ruleId: retireRule.id,
+      expectedRevision: 2,
+      idempotencyKey: `incomplete-retire-${randomUUID()}`,
+    });
+    expect(retired.committed.rule).toMatchObject({
+      ruleId: retireRule.id,
+      state: 'retired',
+      revision: 3,
+      action: null,
+      categoryName: 'Legacy category label',
+      taxCodeName: 'Legacy tax label',
+      changedBy: fixture.user.id,
+    });
+
+    const dismissed = await run({
+      companyId: fixture.company.id,
+      mutation: 'dismiss_candidate',
+      candidateId: candidate.id,
+      expectedRevision: 0,
+      idempotencyKey: `incomplete-dismiss-${randomUUID()}`,
+    });
+    expect(dismissed.prepared.preview).toMatchObject({
+      action: null,
+      categoryName: 'Unavailable category',
+    });
+    expect(dismissed.committed.candidate).toEqual({
+      candidateId: candidate.id,
+      state: 'dismissed',
+      ruleId: null,
+    });
+    await expect(db.autopilotRuleCandidate.findUniqueOrThrow({ where: { id: candidate.id } }))
+      .resolves.toMatchObject({
+        state: 'dismissed',
+        categoryQboId: null,
+        taxCalculation: null,
+        tagIds: legacyTagShape,
+        dismissedByUserId: fixture.user.id,
+      });
+    const revisions = await db.ruleRevision.findMany({
+      where: { ruleId: { in: [disableRule.id, retireRule.id] }, revision: 3 },
+      orderBy: { ruleId: 'asc' },
+    });
+    expect(revisions).toHaveLength(2);
+    expect(revisions.every((revision) => (
+      revision.categoryQboId === null
+      && revision.taxCalculation === null
+      && revision.changedBy === fixture.user.id
+    ))).toBe(true);
+  });
+
   it('rejects invalidated or no-longer-verified source cases', async () => {
     const fixture = await seed();
     const transaction = await db.transaction.findFirstOrThrow({
@@ -1049,5 +1170,31 @@ describePostgres('MCP rule lifecycle PostgreSQL behavior', () => {
     await expect(db.rule.count({ where: { companyId: fixture.company.id } })).resolves.toBe(0);
     await expect(db.mcpRuleOperation.findUniqueOrThrow({ where: { id: prepared.operationId } }))
       .resolves.toMatchObject({ committedAt: null, commitResult: null });
+    await expect(db.autopilotRuleCandidate.findUniqueOrThrow({ where: { id: candidate.id } }))
+      .resolves.toMatchObject({
+        state: 'ready',
+        categoryQboId: accountB.qboId,
+        evidenceCount: 3,
+        conflictingEvidenceCount: 0,
+      });
+
+    const correctedInput: PrepareMcpRuleChangeInput = {
+      ...input,
+      idempotencyKey: `candidate-corrected-${randomUUID()}`,
+    };
+    const corrected = await prepareMcpRuleChange(
+      fixture.principal,
+      correctedInput,
+      { db, now: () => new Date(NOW.getTime() + 2_000) },
+    );
+    expect(corrected.preview?.action).toMatchObject({ categoryQboId: accountB.qboId });
+    await expect(commitMcpRuleChange(fixture.principal, {
+      operationId: corrected.operationId,
+      idempotencyKey: correctedInput.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 3_000) })).resolves.toMatchObject({
+      status: 'COMMITTED',
+      rule: { action: { categoryQboId: accountB.qboId } },
+      candidate: { candidateId: candidate.id, state: 'activated' },
+    });
   });
 });

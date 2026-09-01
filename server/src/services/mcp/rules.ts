@@ -149,7 +149,7 @@ interface PreparedPlan {
   currentRevision: number;
   proposedRevision: number;
   condition: { matchField: 'payee'; matchText: string };
-  action: ClassificationAction;
+  action: ClassificationAction | null;
   categoryName: string;
   taxCodeName: string | null;
   priority: number;
@@ -233,25 +233,54 @@ function deterministicRuleId(principal: McpPrincipal, request: NormalizedRuleCha
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-function existingAction(rule: RuleRow): {
-  categoryQboId: string;
-  taxCalculation: TaxCalculation;
-  taxCodeQboId: string | null;
-  tagIds: string[];
-} {
+function storedRuleAction(rule: RuleRow): ClassificationAction | null {
+  const tagIds = parseActionTagIds(rule.ruleTags.map(({ tagId }) => tagId));
   if (
     rule.categoryQboId === null
+    || tagIds === null
     || (
       rule.taxCalculation !== 'TaxInclusive'
       && rule.taxCalculation !== 'TaxExcluded'
       && rule.taxCalculation !== 'NotApplicable'
     )
-  ) fail('INVALID_INPUT');
+    || ((rule.taxCalculation === 'NotApplicable') !== (rule.taxCodeQboId === null))
+  ) return null;
   return {
     categoryQboId: rule.categoryQboId,
     taxCalculation: rule.taxCalculation,
     taxCodeQboId: rule.taxCodeQboId,
-    tagIds: rule.ruleTags.map(({ tagId }) => tagId).sort(),
+    tagIds: tagIds.sort(),
+  };
+}
+
+function existingAction(rule: RuleRow): ClassificationAction {
+  const action = storedRuleAction(rule);
+  if (action === null) fail('INVALID_INPUT');
+  return action;
+}
+
+function storedCandidateAction(candidate: {
+  categoryQboId: string | null;
+  taxCalculation: string | null;
+  taxCodeQboId: string | null;
+  tagIds: Prisma.JsonValue;
+}): ClassificationAction | null {
+  const tagIds = parseActionTagIds(candidate.tagIds);
+  if (
+    candidate.categoryQboId === null
+    || tagIds === null
+    || (
+      candidate.taxCalculation !== 'TaxInclusive'
+      && candidate.taxCalculation !== 'TaxExcluded'
+      && candidate.taxCalculation !== 'NotApplicable'
+    )
+    || ((candidate.taxCalculation === 'NotApplicable') !== (candidate.taxCodeQboId === null))
+  ) return null;
+  return {
+    categoryQboId: candidate.categoryQboId,
+    taxCalculation: candidate.taxCalculation,
+    taxCodeQboId: candidate.taxCodeQboId,
+    tagIds: tagIds.sort(),
   };
 }
 
@@ -367,21 +396,14 @@ async function buildPlan(
       if (candidate === null) fail('NOT_FOUND');
       if (request.expectedRevision !== 0) fail('STALE_REVISION');
       if (candidate.state === 'activated') fail('CONFLICT');
-      const tagIds = parseActionTagIds(candidate.tagIds);
-      if (
-        candidate.categoryQboId === null
-        || tagIds === null
-        || (
-          candidate.taxCalculation !== 'TaxInclusive'
-          && candidate.taxCalculation !== 'TaxExcluded'
-          && candidate.taxCalculation !== 'NotApplicable'
-        )
-      ) fail('INVALID_INPUT');
+      const action = storedCandidateAction(candidate);
       const [category, taxCode] = await Promise.all([
-        tx.qboAccount.findFirst({
-          where: { companyId: request.companyId, qboId: candidate.categoryQboId },
-          select: { name: true },
-        }),
+        candidate.categoryQboId === null
+          ? null
+          : tx.qboAccount.findFirst({
+              where: { companyId: request.companyId, qboId: candidate.categoryQboId },
+              select: { name: true },
+            }),
         candidate.taxCodeQboId === null
           ? null
           : tx.qboTaxCode.findFirst({
@@ -389,12 +411,6 @@ async function buildPlan(
               select: { name: true },
             }),
       ]);
-      const action: ClassificationAction = {
-        categoryQboId: candidate.categoryQboId,
-        taxCalculation: candidate.taxCalculation,
-        taxCodeQboId: candidate.taxCodeQboId,
-        tagIds,
-      };
       return {
         resourceType: 'rule_candidate', resourceId: candidate.id, ruleId: null,
         candidateId: candidate.id, originIntent: 'auto_candidate',
@@ -407,10 +423,13 @@ async function buildPlan(
           candidateUpdatedAt: candidate.updatedAt.toISOString(),
           evidenceCount: candidate.evidenceCount,
           conflictingEvidenceCount: candidate.conflictingEvidenceCount,
+          action: action === null
+            ? null
+            : JSON.parse(JSON.stringify(action)) as McpOperationJsonObject,
           ruleId: null,
           state: 'dismissed',
         },
-        warnings: [],
+        warnings: action === null ? ['Stored legacy action is non-executable.'] : [],
       };
     }
 
@@ -472,32 +491,36 @@ async function buildPlan(
       : []);
     const rule = await loadCompanyRule(tx, request.companyId, request.ruleId!);
     if (rule.revision !== request.expectedRevision) fail('STALE_REVISION');
-    const base = existingAction(rule);
     const patch = request.proposal;
-    if (request.mutation === 'update' && Object.keys(patch).length === 0) fail('INVALID_INPUT');
-    if (rule.autoPost === false && patch.autoPost === true) {
-      if (Object.keys(patch).some((key) => key !== 'autoPost')) fail('INVALID_INPUT');
-    }
     if (request.mutation === 'disable' || request.mutation === 'retire') {
       if (request.mutation === 'disable' && !rule.enabled) fail('CONFLICT');
+      const action = storedRuleAction(rule);
       return {
         resourceType: 'rule', resourceId: rule.id, ruleId: rule.id, candidateId: null,
         originIntent: rule.originIntent as RuleOriginIntent,
         currentRevision: rule.revision, proposedRevision: rule.revision + 1,
         condition: { matchField: 'payee', matchText: rule.matchText },
-        action: base, categoryName: rule.category, taxCodeName: rule.taxCode,
+        action, categoryName: rule.category, taxCodeName: rule.taxCode,
         priority: rule.priority, autoPost: rule.autoPost,
         snapshot: {
           ruleId: rule.id,
           condition: { matchField: 'payee', matchText: rule.matchText },
-          action: JSON.parse(JSON.stringify(base)) as McpOperationJsonObject,
+          action: action === null
+            ? null
+            : JSON.parse(JSON.stringify(action)) as McpOperationJsonObject,
+          ruleUpdatedAt: rule.updatedAt.toISOString(),
           priority: rule.priority,
           autoPost: rule.autoPost,
           enabled: false,
           retired: request.mutation === 'retire',
         },
-        warnings: [],
+        warnings: action === null ? ['Stored legacy action is non-executable.'] : [],
       };
+    }
+    const base = existingAction(rule);
+    if (request.mutation === 'update' && Object.keys(patch).length === 0) fail('INVALID_INPUT');
+    if (rule.autoPost === false && patch.autoPost === true) {
+      if (Object.keys(patch).some((key) => key !== 'autoPost')) fail('INVALID_INPUT');
     }
     const resolved = await resolveRuleAction(tx, request.companyId, {
       categoryQboId: patch.categoryQboId ?? base.categoryQboId,
@@ -726,6 +749,7 @@ async function executePlan(
   let candidate: RuleMutationResult['candidate'] = null;
   switch (request.mutation) {
     case 'create': {
+      if (plan.action === null) fail('OPERATION_CORRUPT');
       rule = await createRuleInTransaction(tx, request.companyId, changedBy, {
         id: plan.ruleId!,
         matchText: plan.condition.matchText,
@@ -819,6 +843,48 @@ async function executePlan(
   };
 }
 
+async function persistCandidateReconciliationBeforeCommit(
+  db: PrismaClient,
+  principal: McpPrincipal,
+  loaded: McpRuleOperationRecord,
+  idempotencyKey: string,
+  checkedAt: Date,
+): Promise<void> {
+  const reconciliation = await db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, loaded.companyId);
+    await tx.$queryRaw`SELECT "id" FROM "McpRuleOperation" WHERE "id" = ${loaded.id} FOR UPDATE`;
+    const operation = await tx.mcpRuleOperation.findFirst({
+      where: { id: loaded.id, tokenId: principal.tokenId, userId: principal.userId },
+    }) as McpRuleOperationRecord | null;
+    if (operation === null) fail('NOT_FOUND');
+    if (!hasValidMcpRuleOperationIntegrity(operation)) fail('OPERATION_CORRUPT');
+    if (operation.idempotencyKey !== idempotencyKey) fail('IDEMPOTENCY_CONFLICT');
+    if (operation.commitResult !== null) return { saturated: false };
+    if (operation.expiresAt.getTime() <= checkedAt.getTime()) fail('OPERATION_EXPIRED');
+    await assertCurrentMcpCategorizationAuthorization(
+      tx as unknown as McpCategorizationAuthorizationStore,
+      principal,
+      operation.companyId,
+      checkedAt,
+    );
+    const request = requestFromOperation(operation);
+    if (request.mutation !== 'activate_candidate') return { saturated: false };
+    try {
+      return await reconcileRuleCandidateActivationInTransaction(
+        tx,
+        request.companyId,
+        request.candidateId!,
+      );
+    } catch (error) {
+      if (error instanceof RuleCandidateError) {
+        fail(error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'CONFLICT');
+      }
+      throw error;
+    }
+  }, { maxWait: 30_000, timeout: 30_000 });
+  if (reconciliation.saturated) fail('CONFLICT');
+}
+
 export async function commitMcpRuleChange(
   principal: McpPrincipal,
   input: CommitMcpRuleChangeInput,
@@ -837,6 +903,15 @@ export async function commitMcpRuleChange(
     loaded.companyId,
     checkedAt,
   );
+  if (loaded.mutation === 'activate_candidate') {
+    await persistCandidateReconciliationBeforeCommit(
+      db,
+      principal,
+      loaded,
+      idempotencyKey,
+      checkedAt,
+    );
+  }
   return db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, loaded.companyId);
     await tx.$queryRaw`SELECT "id" FROM "McpRuleOperation" WHERE "id" = ${loaded.id} FOR UPDATE`;
@@ -858,20 +933,6 @@ export async function commitMcpRuleChange(
       checkedAt,
     );
     const request = requestFromOperation(operation);
-    if (request.mutation === 'activate_candidate') {
-      try {
-        await reconcileRuleCandidateActivationInTransaction(
-          tx,
-          request.companyId,
-          request.candidateId!,
-        );
-      } catch (error) {
-        if (error instanceof RuleCandidateError) {
-          fail(error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'CONFLICT');
-        }
-        throw error;
-      }
-    }
     const plan = await buildPlan(
       tx,
       principal,

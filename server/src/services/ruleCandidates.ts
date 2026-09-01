@@ -530,18 +530,13 @@ export async function reconcileRuleCandidateActivationInTransaction(
   tx: Prisma.TransactionClient,
   companyId: string,
   candidateId: string,
-): Promise<void> {
+): Promise<{ saturated: boolean }> {
   await lockCompanyAndCandidate(tx, companyId, candidateId);
   const candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
     where: { id: candidateId },
   });
   const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
-  if (reconciliation.saturated) {
-    throw new RuleCandidateError(
-      'CANDIDATE_STALE',
-      'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
-    );
-  }
+  return { saturated: reconciliation.saturated };
 }
 
 export async function activateRuleCandidateInTransaction(

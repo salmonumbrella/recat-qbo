@@ -431,4 +431,56 @@ describe('classification public contracts', () => {
       retiredAt: null,
     }).success).toBe(true);
   });
+
+  it('represents structurally legacy safety reductions as non-executable history', () => {
+    const legacyRevision = {
+      id: 'revision-legacy-incomplete',
+      ruleId: 'rule-legacy-incomplete',
+      companyId: 'company-a',
+      revision: 3,
+      state: 'disabled' as const,
+      condition: { matchField: 'payee' as const, matchText: 'Legacy incomplete vendor' },
+      action: null,
+      categoryName: 'Legacy category label',
+      taxCodeName: 'Legacy tax label',
+      priority: 0,
+      autoPost: false,
+      originIntent: 'make_recurring' as const,
+      sourceCaseId: null,
+      sourceCandidateId: null,
+      changedBy: 'user-1',
+      createdAt: at,
+      retiredAt: null,
+    };
+    expect(ruleRevisionSchema.safeParse(legacyRevision).success).toBe(true);
+
+    const legacyPreview = {
+      operationId: 'operation-legacy-disable',
+      companyId: 'company-a',
+      ruleId: 'rule-legacy-incomplete',
+      candidateId: null,
+      mutation: 'disable' as const,
+      originIntent: 'make_recurring' as const,
+      currentRevision: 2,
+      proposedRevision: 3,
+      condition: legacyRevision.condition,
+      action: null,
+      categoryName: legacyRevision.categoryName,
+      taxCodeName: legacyRevision.taxCodeName,
+      priority: 0,
+      autoPost: false,
+      affectedPendingCount: 0,
+      affectedPostedCount: 0,
+      sampleTransactions: [],
+      conflicts: [],
+      warnings: ['Stored legacy action is non-executable.'],
+      expiresAt: at,
+      preparationDigest: digest,
+    };
+    expect(ruleMutationPreviewSchema.safeParse(legacyPreview).success).toBe(true);
+    expect(ruleMutationPreviewSchema.safeParse({
+      ...legacyPreview,
+      mutation: 'update',
+    }).success).toBe(false);
+  });
 });

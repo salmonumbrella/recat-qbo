@@ -1166,7 +1166,8 @@ export interface RuleRevision {
   revision: number;
   state: RuleRevisionState;
   condition: ClassificationRuleCondition;
-  action: ClassificationAction;
+  /** Null only for readable, non-executable history from structurally legacy rows. */
+  action: ClassificationAction | null;
   categoryName: string;
   taxCodeName: string | null;
   priority: number;
@@ -1197,7 +1198,8 @@ export interface RuleMutationPreview {
   currentRevision: number;
   proposedRevision: number;
   condition: ClassificationRuleCondition;
-  action: ClassificationAction;
+  /** Null only when a safety-reducing mutation preserves a legacy non-executable action. */
+  action: ClassificationAction | null;
   categoryName: string;
   taxCodeName: string | null;
   priority: number;

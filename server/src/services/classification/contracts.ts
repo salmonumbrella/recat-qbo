@@ -586,7 +586,7 @@ export const ruleRevisionSchema = z.object({
   revision,
   state: ruleRevisionState,
   condition: classificationRuleConditionSchema,
-  action: classificationActionSchema,
+  action: classificationActionSchema.nullable(),
   categoryName: text,
   taxCodeName: nullableText,
   priority: z.number().int().min(0).max(MAX_REVISION),
@@ -613,7 +613,8 @@ export const ruleRevisionSchema = z.object({
     });
   }
   if (
-    (value.action.taxCalculation === 'NotApplicable')
+    value.action !== null
+    && (value.action.taxCalculation === 'NotApplicable')
       !== (value.taxCodeName === null)
   ) {
     context.addIssue({
@@ -642,7 +643,7 @@ export const ruleMutationPreviewSchema = z.object({
   currentRevision: revision,
   proposedRevision: revision,
   condition: classificationRuleConditionSchema,
-  action: classificationActionSchema,
+  action: classificationActionSchema.nullable(),
   categoryName: text,
   taxCodeName: nullableText,
   priority: z.number().int().min(0).max(MAX_REVISION),
@@ -657,6 +658,18 @@ export const ruleMutationPreviewSchema = z.object({
   expiresAt: dateTime,
   preparationDigest: z.string().regex(SHA256),
 }).strict().superRefine((value, context) => {
+  if (
+    value.action === null
+    && value.mutation !== 'disable'
+    && value.mutation !== 'retire'
+    && value.mutation !== 'dismiss_candidate'
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['action'],
+      message: 'Only safety-reducing mutations may carry non-executable history.',
+    });
+  }
   if (value.proposedRevision !== value.currentRevision + 1) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -692,7 +705,8 @@ export const ruleMutationPreviewSchema = z.object({
     });
   }
   if (
-    (value.action.taxCalculation === 'NotApplicable')
+    value.action !== null
+    && (value.action.taxCalculation === 'NotApplicable')
       !== (value.taxCodeName === null)
   ) {
     context.addIssue({

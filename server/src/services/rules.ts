@@ -552,15 +552,22 @@ export async function readCanonicalRuleRevision(
     orderBy: { revision: 'desc' },
   });
   if (row === null) throw new RuleServiceError('NOT_FOUND', 'Rule revision was not found.');
-  const tagIds = normalizeActionTagIds(row.tagIds);
-  if (
-    row.categoryQboId === null
-    || (
-      row.taxCalculation !== 'TaxInclusive'
-      && row.taxCalculation !== 'TaxExcluded'
-      && row.taxCalculation !== 'NotApplicable'
+  const tagIds = parseActionTagIds(row.tagIds);
+  const action = (
+    row.categoryQboId !== null
+    && tagIds !== null
+    && (
+      row.taxCalculation === 'TaxInclusive'
+      || row.taxCalculation === 'TaxExcluded'
+      || row.taxCalculation === 'NotApplicable'
     )
-  ) invalid('Rule revision is not executable.');
+    && ((row.taxCalculation === 'NotApplicable') === (row.taxCodeQboId === null))
+  ) ? {
+      categoryQboId: row.categoryQboId,
+      taxCalculation: row.taxCalculation,
+      taxCodeQboId: row.taxCodeQboId,
+      tagIds: tagIds.sort(),
+    } : null;
   return parseRuleRevision({
     id: row.id,
     ruleId: row.ruleId,
@@ -568,12 +575,7 @@ export async function readCanonicalRuleRevision(
     revision: row.revision,
     state: row.state,
     condition: { matchField: 'payee', matchText: row.matchText },
-    action: {
-      categoryQboId: row.categoryQboId,
-      taxCalculation: row.taxCalculation,
-      taxCodeQboId: row.taxCodeQboId,
-      tagIds,
-    },
+    action,
     categoryName: row.category,
     taxCodeName: row.taxCode,
     priority: row.priority,
