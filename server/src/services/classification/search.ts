@@ -1175,7 +1175,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                  OR NOT EXISTS (SELECT 1 FROM "Tag" current_tag
                    WHERE current_tag."id" = value #>> '{}' AND current_tag."companyId" = rule."companyId")
              ) AND jsonb_typeof(revision."tagIds") = 'array' AS "tagsExist",
-             COALESCE(tags."ids", '[]'::jsonb) AS "tagIds",
+             revision."tagIds" AS "tagIds",
              COALESCE(tags."namesArray", '[]'::jsonb) AS "tagNames",
              ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "Rule" rule
@@ -1773,6 +1773,7 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
 function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
   return () => {
     const revisedAt = row.revisedAt.toISOString();
+    const invalidTags = parseActionTagIds(row.tagIds) === null;
     const rawAction = actionFromColumns(row);
     const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName, jsonStrings(row.tagNames));
     const referencesValid = rawAction !== null && classificationReferenceReasons(rawAction, {
@@ -1801,7 +1802,8 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
       originIntent: row.originIntent as ClassificationSearchHit['originIntent'],
       evidenceCount: 0, conflictingEvidenceCount: conflict.length, conflicts: conflict,
       provenance: { source: 'rule', sourceId: row.id, actorId: row.updatedById, recordedAt: revisedAt },
-      rationale: historicalRuleRationale(row, rawAction), jurisdiction: taxed ? 'unknown' : null,
+      rationale: invalidTags ? 'Historical rule action is unavailable because its tag IDs are invalid.'
+        : historicalRuleRationale(row, rawAction), jurisdiction: taxed ? 'unknown' : null,
       ruleRevision: row.revision,
     });
     return {

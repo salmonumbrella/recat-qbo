@@ -7,3 +7,7 @@ export function parseActionTagIds(value: unknown): string[] | null {
   const tags = value as string[];
   return new Set(tags).size === tags.length ? [...tags] : null;
 }
+
+export function actionTagIdsReason(value: unknown): string | null {
+  return parseActionTagIds(value) === null ? 'Action tag IDs are invalid.' : null;
+}

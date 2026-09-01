@@ -109,6 +109,7 @@ function reads(): CompanyReadOperations {
       id: 'candidate-a', companyId: 'company-a', state: 'conflict', matchField: 'payee',
       matchText: 'Coffee', categoryName: 'Meals', taxCodeName: null,
       action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      invalidReasons: [],
       executable: false, advisory: true, evidenceCount: 3, conflictingEvidenceCount: 1,
       schemaVersion: 'rule-candidate-v1', configVersion: 'config-a', activatedRuleId: null,
       updatedAt: '2026-01-01T00:00:00.000Z', evidence: [],
@@ -453,6 +454,7 @@ describe('Recat MCP read tools', () => {
     vi.mocked(operations.getRuleCandidate).mockResolvedValueOnce({
       id: 'candidate-gathering', companyId: 'company-a', state: 'gathering', matchField: 'payee',
       matchText: 'Coffee', categoryName: null, taxCodeName: null, action: null,
+      invalidReasons: [],
       executable: false, advisory: true, evidenceCount: 1, conflictingEvidenceCount: 0,
       schemaVersion: 'v1', configVersion: 'v1', activatedRuleId: null,
       updatedAt: '2026-01-01T00:00:00.000Z', evidence: [],

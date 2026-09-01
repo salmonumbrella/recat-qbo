@@ -35,7 +35,7 @@ import {
   type ClassificationSearchSnapshot,
 } from './classification/search.js';
 import type { RuleRevision } from '@recat/shared';
-import { parseActionTagIds } from './classification/actionTagIds.js';
+import { actionTagIdsReason, parseActionTagIds } from './classification/actionTagIds.js';
 import { classificationReferenceReasons } from './classification/referenceReadiness.js';
 
 export const DEFAULT_READ_LIMIT = 20;
@@ -173,6 +173,7 @@ export interface RuleCandidateReadDto {
     taxCodeQboId: string | null;
     tagIds: string[];
   } | null;
+  invalidReasons: string[];
   executable: false;
   advisory: true;
   evidenceCount: number;
@@ -1159,6 +1160,8 @@ export function createCompanyReadService(
       const categoryQboId = typeof row.categoryQboId === 'string' ? row.categoryQboId : null;
       const taxCodeQboId = typeof row.taxCodeQboId === 'string' ? row.taxCodeQboId : null;
       const tagIds = parseActionTagIds(row.tagIds);
+      const invalidReasons = actionTagIdsReason(row.tagIds) === null
+        ? [] : [actionTagIdsReason(row.tagIds)!];
       const validAction = categoryQboId !== null
         && tagIds !== null
         && (calculation === 'TaxInclusive' || calculation === 'TaxExcluded' || calculation === 'NotApplicable')
@@ -1177,6 +1180,7 @@ export function createCompanyReadService(
           taxCodeQboId,
           tagIds,
         } : null,
+        invalidReasons,
         executable: false,
         advisory: true,
         evidenceCount: Math.max(0, Number(row.evidenceCount) || 0),

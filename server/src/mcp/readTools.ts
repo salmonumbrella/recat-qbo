@@ -555,6 +555,7 @@ const candidateOutput = z.strictObject({
   categoryName: nullableText,
   taxCodeName: nullableText,
   action: action.nullable(),
+  invalidReasons: z.array(text).max(4),
   executable: z.literal(false),
   advisory: z.literal(true),
   evidenceCount: z.number().int().nonnegative().max(10_000),
