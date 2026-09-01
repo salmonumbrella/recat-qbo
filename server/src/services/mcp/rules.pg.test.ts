@@ -395,6 +395,43 @@ describePostgres('MCP rule lifecycle PostgreSQL behavior', () => {
         changedBy: fixture.user.id,
       },
     });
+    await db.rule.createMany({
+      data: [
+        {
+          companyId: fixture.company.id,
+          matchText: 'Vancouver',
+          category: fixture.account.name,
+          categoryQboId: fixture.account.qboId,
+          taxCalculation: 'NotApplicable',
+          autoPost: false,
+          priority: -1,
+          originIntent: 'make_recurring',
+        },
+        {
+          companyId: fixture.company.id,
+          matchText: 'Victoria',
+          category: fixture.account.name,
+          categoryQboId: fixture.account.qboId,
+          taxCalculation: 'NotApplicable',
+          autoPost: false,
+          priority: 10,
+          originIntent: 'make_recurring',
+        },
+      ],
+    });
+    await db.transaction.create({
+      data: {
+        companyId: fixture.company.id,
+        qboId: `pending-victoria-${randomUUID()}`,
+        qboType: 'Purchase',
+        qboSyncToken: '0',
+        date: new Date('2026-08-31T00:00:00.000Z'),
+        payee: 'Harbour Supply Victoria',
+        amount: '-90.00',
+        bankAccount: 'Operating',
+        status: 'PENDING',
+      },
+    });
 
     const prepared = await prepareMcpRuleChange(fixture.principal, {
       companyId: fixture.company.id,
@@ -407,11 +444,17 @@ describePostgres('MCP rule lifecycle PostgreSQL behavior', () => {
     expect(prepared.preview).toMatchObject({
       autoPost: true,
       affectedPendingCount: 1,
-      conflicts: [],
+      affectedPostedCount: 1,
       warnings: expect.arrayContaining([
         'Enabling auto-post affects matching pending transactions.',
       ]),
     });
+    expect(prepared.preview.sampleTransactions.map(({ payee }) => payee)).toEqual(
+      expect.arrayContaining(['Harbour Supply Victoria', 'Harbour Supply Burnaby']),
+    );
+    expect(prepared.preview.sampleTransactions.map(({ payee }) => payee)).not.toContain(
+      'Harbour Supply Vancouver',
+    );
 
     await expect(prepareMcpRuleChange(fixture.principal, {
       companyId: fixture.company.id,

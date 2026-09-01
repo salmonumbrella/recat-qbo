@@ -1,4 +1,4 @@
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import type {
   ClassificationAction,
   RuleMutationKind,
@@ -70,6 +70,7 @@ const RULE_MUTATIONS = new Set<RuleMutationKind>([
   'dismiss_candidate',
 ]);
 const MAX_REVISION = 2_147_483_646;
+const AUTO_POST_ELEVATION_WARNING = 'Enabling auto-post affects matching pending transactions.';
 
 export interface RuleChangeProposal {
   matchText?: string;
@@ -632,7 +633,7 @@ async function buildPlan(
         retired: false,
       },
       warnings: rule.autoPost === false && patch.autoPost === true
-        ? ['Enabling auto-post affects matching pending transactions.']
+        ? [AUTO_POST_ELEVATION_WARNING]
         : [],
     };
   } catch (error) {
@@ -662,6 +663,10 @@ async function buildPreviewBasis(
         : plan.ruleId ?? undefined,
     },
   );
+  const autoPostElevation = plan.warnings.includes(AUTO_POST_ELEVATION_WARNING);
+  const winnerImpact = autoPostElevation
+    ? await exactWinnerImpact(tx, plan)
+    : null;
   return {
     companyId: plan.snapshot.companyId as string,
     ruleId: plan.ruleId,
@@ -676,11 +681,80 @@ async function buildPreviewBasis(
     taxCodeName: plan.taxCodeName,
     priority: plan.priority,
     autoPost: plan.autoPost,
-    affectedPendingCount: tested.pendingCount,
-    affectedPostedCount: tested.postedCount,
-    sampleTransactions: tested.samples,
+    affectedPendingCount: winnerImpact?.pendingCount ?? tested.pendingCount,
+    affectedPostedCount: winnerImpact?.postedCount ?? tested.postedCount,
+    sampleTransactions: winnerImpact?.samples ?? tested.samples,
     conflicts: tested.conflicts,
     warnings: plan.warnings,
+  };
+}
+
+async function exactWinnerImpact(
+  tx: RuleTransaction,
+  plan: PreparedPlan,
+): Promise<{
+  pendingCount: number;
+  postedCount: number;
+  samples: RuleMutationPreview['sampleTransactions'];
+}> {
+  if (plan.ruleId === null || plan.snapshot.enabled !== true) {
+    return { pendingCount: 0, postedCount: 0, samples: [] };
+  }
+  const target = await tx.rule.findFirst({
+    where: { id: plan.ruleId, companyId: plan.snapshot.companyId as string },
+    select: { createdAt: true },
+  });
+  if (target === null) fail('CONFLICT');
+  const companyId = plan.snapshot.companyId as string;
+  const winningWhere = Prisma.sql`
+    t."companyId" = ${companyId}
+    AND t."status" IN ('PENDING', 'POSTED', 'DRY_RUN')
+    AND strpos(lower(t."payee"), lower(${plan.condition.matchText})) > 0
+    AND NOT EXISTS (
+      SELECT 1
+      FROM "Rule" r
+      WHERE r."companyId" = ${companyId}
+        AND r."id" <> ${plan.ruleId}
+        AND r."enabled" = true
+        AND r."retiredAt" IS NULL
+        AND length(trim(r."matchText")) > 0
+        AND strpos(lower(t."payee"), lower(trim(r."matchText"))) > 0
+        AND (
+          r."priority" < ${plan.priority}
+          OR (r."priority" = ${plan.priority} AND r."createdAt" > ${target.createdAt})
+        )
+    )
+  `;
+  const counts = await tx.$queryRaw<Array<{ pendingCount: number; postedCount: number }>>(Prisma.sql`
+    SELECT
+      COUNT(*) FILTER (WHERE t."status" = 'PENDING')::int AS "pendingCount",
+      COUNT(*) FILTER (WHERE t."status" IN ('POSTED', 'DRY_RUN'))::int AS "postedCount"
+    FROM "Transaction" t
+    WHERE ${winningWhere}
+  `);
+  const rows = await tx.$queryRaw<Array<{
+    id: string;
+    payee: string;
+    date: Date;
+    amount: Prisma.Decimal;
+    status: 'PENDING' | 'POSTED' | 'DRY_RUN';
+  }>>(Prisma.sql`
+    SELECT t."id", t."payee", t."date", t."amount", t."status"
+    FROM "Transaction" t
+    WHERE ${winningWhere}
+    ORDER BY t."date" DESC, t."id" DESC
+    LIMIT 20
+  `);
+  return {
+    pendingCount: counts[0]?.pendingCount ?? 0,
+    postedCount: counts[0]?.postedCount ?? 0,
+    samples: rows.map((row) => ({
+      transactionId: row.id,
+      payee: row.payee,
+      date: row.date.toISOString(),
+      amountCents: Math.round(Number(row.amount) * 100),
+      status: row.status === 'PENDING' ? 'PENDING' : 'POSTED',
+    })),
   };
 }
 

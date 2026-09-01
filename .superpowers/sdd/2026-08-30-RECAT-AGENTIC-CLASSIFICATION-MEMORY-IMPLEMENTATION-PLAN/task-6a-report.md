@@ -277,6 +277,145 @@ npm run test:server:unit -- middleware/originCheck.test.ts
 Exit 0: 9/9. New mutation routes reject absent, malformed, and unapproved
 origins while the existing global middleware remains curl compatible.
 
+## Independent review fix round 1
+
+### Bidirectional rolling MCP compatibility
+
+Production break named: Task 6A initially emitted a discriminator-aware MCP
+`inputHash`; a base `149749d` committer only knows the legacy token-bound hash
+and would reject that new preparation as corrupt during rolling deployment.
+
+RED:
+
+```bash
+npm run test:server:unit -- services/mcp/rules.test.ts
+```
+
+Exit 1: 1 failed, 4 passed. The executable validator copied from base computed
+`8de937...`, while the new writer emitted `741da9...`.
+
+GREEN:
+
+```bash
+npm run test:server:unit -- services/mcp/rules.test.ts
+```
+
+Exit 0: 5/5. MCP writers now continue emitting the exact legacy hash until old
+instances drain; session rows use the discriminator-aware hash. New readers
+accept legacy MCP rows and the discriminator-aware MCP rows emitted by the
+initial Task 6A build. The test executes the complete base integrity decision,
+not a source-text assertion.
+
+### Viewer canonical rule detail and history
+
+Production break named: a router-wide categorizer gate and duplicate service
+gate prevented viewers from reading lifecycle state and history even though
+these are company-scoped read models.
+
+RED:
+
+```bash
+npm run test:server:unit -- routes/rules.test.ts services/companyReads.test.ts
+```
+
+Exit 1: the disconnected viewer route returned 403 instead of 200, and both
+viewer detail tests failed at the service categorizer gate. A separate focused
+history RED returned `FORBIDDEN` instead of an empty bounded history page.
+
+The first route split still loaded a guessed company before the membership
+gate. A tenant-oracle RED proved a missing guessed company returned 404 while
+an existing inaccessible company returned 403. The route now checks membership
+before loading the disconnected-readable company, so both guesses fail with
+the same 403 response.
+
+GREEN:
+
+```bash
+npm run test:server:unit -- routes/rules.test.ts services/companyReads.test.ts
+```
+
+Exit 0: 48/48 after the final history and tenant-oracle cases. Detail/history now require viewer;
+list, test, and every legacy write migration response remain categorizer-only.
+Tenant IDs remain in the canonical queries, foreign rule IDs return scoped
+404, and disconnected-company reads remain available.
+
+### Stable REST operation-envelope errors
+
+Production break named: `McpOperationError` thrown by operation create/load
+bypassed `RuleChangeError` mapping and reached the generic HTTP 500 adapter.
+
+RED:
+
+```bash
+npm run test:server:unit -- routes/ruleOperations.test.ts
+```
+
+Exit 1: four authored cases returned 500 rather than 400/404/409.
+
+GREEN:
+
+```bash
+npm run test:server:unit -- routes/ruleOperations.test.ts
+```
+
+Exit 0: 8/8. `OPERATION_INVALID_INPUT` maps to 400 `INVALID_INPUT`,
+`OPERATION_NOT_FOUND` to 404 `NOT_FOUND`, idempotency conflict to 409
+`IDEMPOTENCY_CONFLICT`, and concurrent store conflict to 409 `CONFLICT`.
+Focused HTTP cases cover wrong-session commit lookup and an oversized nested
+proposal without leaking an unhandled error.
+
+### Exact auto-post final-winner impact
+
+Production break named: standalone auto-post preview counted every substring
+match, including transactions won by a higher-priority enabled rule.
+
+RED:
+
+```bash
+cd server
+DATABASE_URL="$TASK6A_DATABASE_URL" TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npx vitest run --config vitest.pg.config.ts \
+  src/services/mcp/rules.pg.test.ts -t 'makes false-to-true autoPost'
+```
+
+Exit 1: preview returned two affected pending rows; only one was won by the
+target rule after considering a higher-priority Vancouver rule and a
+lower-priority Victoria rule.
+
+GREEN with the same command: 1/1 passed. Counts now use an uncapped PostgreSQL
+winner predicate over the target's final condition and priority, excluding any
+matching enabled/nonretired rule that wins by priority and creation tiebreak.
+Only true winning pending/posted rows are counted; only the newest 20 winners
+are returned as samples. Conflict cards remain independently bounded.
+
+### Additional session-specific PostgreSQL evidence
+
+```bash
+cd server
+DATABASE_URL="$TASK6A_DATABASE_URL" TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npx vitest run --config vitest.pg.config.ts src/services/ruleChanges.pg.test.ts
+```
+
+Exit 0: 7/7. In addition to exact-session ownership, logout, role drift,
+membership, canonical readback, and immutable attribution, coverage now proves
+foreign route-company rejection, disconnect drift, session-expiry drift,
+same-session concurrent prepare/commit (one envelope, one rule, one replay),
+and expired-create retry with the exact parent resource identity.
+
+Focused fix-round aggregate:
+
+```bash
+npm run test:server:unit -- services/mcp/rules.test.ts routes/rules.test.ts \
+  services/companyReads.test.ts routes/ruleOperations.test.ts
+
+cd server
+DATABASE_URL="$TASK6A_DATABASE_URL" TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npx vitest run --config vitest.pg.config.ts \
+  src/services/ruleChanges.pg.test.ts src/services/mcp/rules.pg.test.ts
+```
+
+Exit 0: 61/61 focused unit tests and 24/24 focused PostgreSQL tests.
+
 ## Migration reasoning and proof
 
 The migration is additive and rolling-compatible:
@@ -320,9 +459,11 @@ temporary database and files were removed afterward.
 - `server/src/services/mcp/operations.ts`
 - `server/src/services/mcp/rules.ts`
 - `server/src/services/mcp/rules.test.ts`
+- `server/src/services/mcp/rules.pg.test.ts`
 - `server/src/services/ruleChanges.ts`
 - `server/src/services/ruleChanges.pg.test.ts`
 - `server/src/services/companyReads.ts`
+- `server/src/services/companyReads.test.ts`
 - `server/src/routes/classification.ts`
 - `server/src/routes/classification.test.ts`
 - `server/src/routes/ruleOperations.ts`
@@ -360,7 +501,7 @@ TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
 npm run test:server:pg -- services/mcp/rules.pg.test.ts
 ```
 
-Exit 0: 4/4 session tests and 17/17 MCP lifecycle tests.
+Exit 0 after the review round: 7/7 session tests and 17/17 MCP lifecycle tests.
 
 Full root test gate:
 
@@ -373,8 +514,8 @@ npm test
 Exit 0:
 
 - package-script contract: 1/1 passed;
-- server unit: 133 files, 2,227/2,227 passed;
-- server PostgreSQL: 35 files, 328 passed, 20 intentionally skipped;
+- server unit: 133 files, 2,237/2,237 passed;
+- server PostgreSQL: 35 files, 331 passed, 20 intentionally skipped;
 - client: 21 files, 207/207 passed, including `Queue.tax.test.tsx` 66/66.
 
 The PostgreSQL package has a pre-existing environment forwarding quirk. This
@@ -434,10 +575,12 @@ Final hygiene:
 
 ```bash
 git diff --check
+git diff | betterleaks stdin --no-banner --redact=100
 git status --short
 ```
 
-`git diff --check` exited 0. The Prisma schema diff contains only eight lines
+Both diff checks exited 0, and betterleaks reported no leaks. The Prisma
+schema diff contains only eight lines
 for the new discriminator/nullability/session indexes; there is no formatter
 churn. The rule/candidate route deletions are intentional removal of direct
 write implementations and now-unused schemas/imports, not formatting churn.

@@ -489,24 +489,17 @@ export async function createPreparedRuleOperation(
   const payloadHash = sha256(canonical);
   const expiresAt = new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
   if (!isValidDate(expiresAt)) invalidInput();
-  const inputHash = hashOperationPayload({
-    authKind,
-    tokenId,
-    tokenPrefix,
-    sessionId,
-    userId,
-    companyId,
-    resourceType,
-    resourceId,
-    mutation,
-    idempotencyKey,
-    payloadHash,
-    sourceRevision,
-    proposedRevision,
-    proposedSnapshotHash,
-    expiresAt: expiresAt.toISOString(),
-    retryOfId,
-  });
+  const hashInput = {
+    tokenId, tokenPrefix, userId, companyId, resourceType, resourceId,
+    mutation, idempotencyKey, payloadHash, sourceRevision, proposedRevision,
+    proposedSnapshotHash, expiresAt: expiresAt.toISOString(), retryOfId,
+  };
+  // During rolling deployment, a pre-Task-6A committer must be able to read
+  // MCP preparations emitted by a new instance. Session rows have no legacy
+  // representation and therefore use the discriminator-aware hash.
+  const inputHash = hashOperationPayload(authKind === 'mcp'
+    ? hashInput
+    : { authKind, ...hashInput, sessionId });
   const data: McpRuleOperationCreateData = {
     authKind,
     tokenId,

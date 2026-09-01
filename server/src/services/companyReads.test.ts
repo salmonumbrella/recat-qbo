@@ -398,6 +398,7 @@ describe('company read services', () => {
 
   it('reads the canonical rule revision and marks a retired rule non-executable', async () => {
     const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
     db.rule.findFirst.mockResolvedValue({
       id: 'rule-1', companyId: COMPANY_ID, revision: 3, enabled: true,
       retiredAt: null,
@@ -418,6 +419,36 @@ describe('company read services', () => {
       active: false,
       executable: false,
       revision: { id: 'revision-3', state: 'retired', sourceCaseId: 'case-1' },
+    });
+  });
+
+  it('keeps viewer rule detail tenant-scoped', async () => {
+    const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
+    db.rule.findFirst.mockImplementation(async ({ where }: { where: { companyId: string } }) => (
+      where.companyId === COMPANY_ID ? null : {
+        id: 'foreign-rule', companyId: 'company-2', revision: 1, enabled: true,
+        retiredAt: null, reviewRequiredAt: null, reviewReason: null,
+      }
+    ));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.getRule(USER_ID, COMPANY_ID, 'foreign-rule')).rejects.toMatchObject({
+      status: 404,
+      code: 'RULE_NOT_FOUND',
+    });
+  });
+
+  it('lets a viewer read bounded revision history for a company-owned rule', async () => {
+    const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
+    db.rule.findFirst.mockResolvedValue({ id: 'rule-1' });
+    db.ruleRevision.findMany = vi.fn(async () => []);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.listRuleRevisions(USER_ID, COMPANY_ID, 'rule-1')).resolves.toEqual({
+      items: [],
+      nextCursor: null,
     });
   });
 

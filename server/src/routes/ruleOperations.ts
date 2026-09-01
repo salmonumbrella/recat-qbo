@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { requireBrowserMutationOrigin, requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { McpOperationError } from '../services/mcp/operations.js';
 import {
   commitRuleChange,
   prepareRuleChange,
@@ -31,6 +32,18 @@ function principal(req: Express.Request): RuleChangePrincipal {
 }
 async function mapped<T>(operation: () => Promise<T>): Promise<T> {
   try { return await operation(); } catch (error) {
+    if (error instanceof McpOperationError) {
+      if (error.code === 'OPERATION_INVALID_INPUT') {
+        throw new HttpError(400, error.message, 'INVALID_INPUT');
+      }
+      if (error.code === 'OPERATION_NOT_FOUND') {
+        throw new HttpError(404, error.message, 'NOT_FOUND');
+      }
+      if (error.code === 'IDEMPOTENCY_CONFLICT') {
+        throw new HttpError(409, error.message, 'IDEMPOTENCY_CONFLICT');
+      }
+      throw new HttpError(409, error.message, 'CONFLICT');
+    }
     if (!(error instanceof RuleChangeError)) throw error;
     if (error.code === 'UNAUTHORIZED') throw new HttpError(401, error.message, error.code);
     if (error.code === 'FORBIDDEN') throw new HttpError(403, error.message, error.code);

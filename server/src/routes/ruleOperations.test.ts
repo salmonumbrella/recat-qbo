@@ -3,6 +3,7 @@ import express from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { errorMiddleware } from '../lib/http.js';
+import { McpOperationError } from '../services/mcp/operations.js';
 
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(), prepare: vi.fn(), commit: vi.fn(), fromCase: vi.fn(),
@@ -64,5 +65,39 @@ describe('browser two-phase rule operations', () => {
       { kind: 'session', sessionId: 'session-a', userId: 'user-a' }, 'company-a', 'case-a',
       { matchText: 'Chevron', priority: 3, idempotencyKey: 'case-a' },
     );
+  });
+
+  it.each([
+    ['OPERATION_INVALID_INPUT', 400, 'INVALID_INPUT'],
+    ['OPERATION_NOT_FOUND', 404, 'NOT_FOUND'],
+    ['IDEMPOTENCY_CONFLICT', 409, 'IDEMPOTENCY_CONFLICT'],
+    ['OPERATION_CONFLICT', 409, 'CONFLICT'],
+  ] as const)('maps %s to a stable REST rejection', async (operationCode, status, code) => {
+    mocks.prepare.mockRejectedValueOnce(new McpOperationError(operationCode));
+
+    const response = await request(app()).post('/api/companies/company-a/rule-operations/prepare').set(auth).send({
+      mutation: 'disable', ruleId: 'rule-a', expectedRevision: 4, idempotencyKey: 'disable-a',
+    });
+
+    expect(response.status).toBe(status);
+    expect(response.body).toEqual({ error: expect.any(String), code });
+  });
+
+  it('maps wrong-session commit lookup and oversized nested preparation failures without a 500', async () => {
+    mocks.commit.mockRejectedValueOnce(new McpOperationError('OPERATION_NOT_FOUND'));
+    const wrongSession = await request(app())
+      .post('/api/companies/company-a/rule-operations/op-a/commit')
+      .set(auth)
+      .send({ idempotencyKey: 'commit-a' });
+    expect(wrongSession.status).toBe(404);
+    expect(wrongSession.body.code).toBe('NOT_FOUND');
+
+    mocks.prepare.mockRejectedValueOnce(new McpOperationError('OPERATION_INVALID_INPUT'));
+    const oversized = await request(app()).post('/api/companies/company-a/rule-operations/prepare').set(auth).send({
+      mutation: 'update', ruleId: 'rule-a', expectedRevision: 4, idempotencyKey: 'oversized-a',
+      proposal: { tagIds: ['x'.repeat(70_000)] },
+    });
+    expect(oversized.status).toBe(400);
+    expect(oversized.body.code).toBe('INVALID_INPUT');
   });
 });

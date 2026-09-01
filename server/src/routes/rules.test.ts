@@ -36,11 +36,43 @@ beforeEach(() => {
 
 describe('governed rule REST', () => {
   it('reads canonical detail and signed-cursor history while disconnected', async () => {
+    mocks.membership.mockResolvedValue({ role: 'viewer' });
     const detail = await request(app()).get('/api/companies/company-a/rules/rule-a').set('Cookie', 'recat_session=x');
     const history = await request(app()).get('/api/companies/company-a/rules/rule-a/revisions?limit=10').set('Cookie', 'recat_session=x');
     expect(detail.status).toBe(200); expect(history.status).toBe(200);
     expect(mocks.detail).toHaveBeenCalledWith('user-a', 'company-a', 'rule-a');
     expect(mocks.history).toHaveBeenCalledWith('user-a', 'company-a', 'rule-a', { limit: 10 });
+  });
+
+  it('keeps list, test, and legacy write migration responses categorizer-only', async () => {
+    mocks.membership.mockResolvedValue({ role: 'viewer' });
+    for (const [method, path] of [
+      ['get', '/api/companies/company-a/rules'],
+      ['post', '/api/companies/company-a/rules/test'],
+      ['patch', '/api/companies/company-a/rules/rule-a'],
+    ] as const) {
+      const response = await request(app())[method](path).set('Cookie', 'recat_session=x').send({});
+      expect(response.status).toBe(403);
+      expect(response.body.code).toBe('FORBIDDEN');
+    }
+  });
+
+  it('does not reveal whether a guessed company exists before the viewer gate', async () => {
+    mocks.membership.mockResolvedValue(null);
+    mocks.company.mockImplementation(async ({ where }: { where: { id: string } }) => (
+      where.id === 'company-missing' ? null : { id: where.id, disconnectedAt: new Date() }
+    ));
+    const existing = await request(app())
+      .get('/api/companies/company-a/rules/rule-a')
+      .set('Cookie', 'recat_session=x');
+    const missing = await request(app())
+      .get('/api/companies/company-missing/rules/rule-a')
+      .set('Cookie', 'recat_session=x');
+
+    expect(existing.status).toBe(403);
+    expect(missing.status).toBe(403);
+    expect(existing.body.code).toBe('FORBIDDEN');
+    expect(missing.body.code).toBe('FORBIDDEN');
   });
 
   it.each([

@@ -42,6 +42,21 @@ describePostgres('session rule lifecycle PostgreSQL behavior', () => {
     return { result, idempotencyKey };
   }
 
+  function createInput(fixture: Awaited<ReturnType<typeof seed>>, idempotencyKey: string, retryOfId?: string) {
+    return {
+      companyId: fixture.company.id,
+      mutation: 'create' as const,
+      expectedRevision: 0,
+      idempotencyKey,
+      ...(retryOfId === undefined ? {} : { retryOfId }),
+      proposal: {
+        matchText: 'Chevron', categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable' as const, taxCodeQboId: null, tagIds: [],
+        priority: 0, autoPost: false as const,
+      },
+    };
+  }
+
   it('binds ownership to one real session and commits canonical readback', async () => {
     const fixture = await seed();
     const { result, idempotencyKey } = await prepared(fixture);
@@ -99,5 +114,82 @@ describePostgres('session rule lifecycle PostgreSQL behavior', () => {
     });
     await expect(db.mcpRuleOperation.update({ where: { id: result.operationId }, data: { sessionId: fixture.otherSession.id } }))
       .rejects.toThrow('McpRuleOperation immutable fields cannot be changed');
+  });
+
+  it('rejects a foreign route company and disconnect or session-expiry drift without writes', async () => {
+    const foreign = await seed();
+    const first = await prepared(foreign);
+    const otherCompany = await db.company.create({ data: {
+      realmId: `rule-session-other-${randomUUID()}`, legalName: 'Other company', nickname: randomUUID().slice(0, 8),
+    } });
+    await db.membership.create({ data: {
+      userId: foreign.user.id, companyId: otherCompany.id, role: 'categorizer',
+    } });
+    await expect(commitRuleChange(foreign.principal, {
+      companyId: otherCompany.id, operationId: first.result.operationId, idempotencyKey: first.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 1_000) })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    await db.company.update({ where: { id: foreign.company.id }, data: { disconnectedAt: NOW } });
+    await expect(commitRuleChange(foreign.principal, {
+      companyId: foreign.company.id, operationId: first.result.operationId, idempotencyKey: first.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 2_000) })).rejects.toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+    await expect(db.rule.count({ where: { companyId: foreign.company.id } })).resolves.toBe(0);
+
+    const expired = await seed();
+    const second = await prepared(expired);
+    await db.session.update({ where: { id: expired.session.id }, data: { expiresAt: NOW } });
+    await expect(commitRuleChange(expired.principal, {
+      companyId: expired.company.id, operationId: second.result.operationId, idempotencyKey: second.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 1_000) })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    await expect(db.rule.count({ where: { companyId: expired.company.id } })).resolves.toBe(0);
+  });
+
+  it('serializes same-session concurrent prepare and commit into one rule and one replay', async () => {
+    const fixture = await seed();
+    const idempotencyKey = `session-concurrent-${randomUUID()}`;
+    const input = createInput(fixture, idempotencyKey);
+    const [first, second] = await Promise.all([
+      prepareRuleChange(fixture.principal, input, { db, now: () => NOW }),
+      prepareRuleChange(fixture.principal, input, { db, now: () => NOW }),
+    ]);
+    expect(second.operationId).toBe(first.operationId);
+
+    const committed = await Promise.all([
+      commitRuleChange(fixture.principal, {
+        companyId: fixture.company.id, operationId: first.operationId, idempotencyKey,
+      }, { db, now: () => new Date(NOW.getTime() + 1_000) }),
+      commitRuleChange(fixture.principal, {
+        companyId: fixture.company.id, operationId: first.operationId, idempotencyKey,
+      }, { db, now: () => new Date(NOW.getTime() + 1_000) }),
+    ]);
+    expect(committed.map(({ status }) => status).sort()).toEqual(['COMMITTED', 'REPLAYED']);
+    await expect(db.rule.count({ where: { companyId: fixture.company.id } })).resolves.toBe(1);
+    await expect(db.mcpRuleOperation.count({ where: {
+      authKind: 'session', sessionId: fixture.session.id, companyId: fixture.company.id, idempotencyKey,
+    } })).resolves.toBe(1);
+  });
+
+  it('retries an expired session create with a new key and the exact parent resource identity', async () => {
+    const fixture = await seed();
+    const firstKey = `session-expired-${randomUUID()}`;
+    const first = await prepareRuleChange(
+      fixture.principal, createInput(fixture, firstKey), { db, now: () => NOW },
+    );
+    const retryAt = new Date(NOW.getTime() + 16 * 60 * 1_000);
+    await expect(commitRuleChange(fixture.principal, {
+      companyId: fixture.company.id, operationId: first.operationId, idempotencyKey: firstKey,
+    }, { db, now: () => retryAt })).rejects.toMatchObject({ code: 'OPERATION_EXPIRED' });
+
+    const retryKey = `session-retry-${randomUUID()}`;
+    const retry = await prepareRuleChange(
+      fixture.principal,
+      createInput(fixture, retryKey, first.operationId),
+      { db, now: () => retryAt },
+    );
+    expect(retry.ruleId).toBe(first.ruleId);
+    const committed = await commitRuleChange(fixture.principal, {
+      companyId: fixture.company.id, operationId: retry.operationId, idempotencyKey: retryKey,
+    }, { db, now: () => new Date(retryAt.getTime() + 1_000) });
+    expect(committed).toMatchObject({ status: 'COMMITTED', ruleId: first.ruleId });
   });
 });

@@ -1039,7 +1039,7 @@ export function createCompanyReadService(
     companyId: string,
     ruleId: string,
   ): Promise<CompanyRuleReadDto> {
-    await authorizeCompany(userId, companyId, 'categorizer');
+    await authorizeCompany(userId, companyId, 'viewer');
     boundedId(ruleId, 'ruleId');
     if (db.rule.findFirst === undefined || db.ruleRevision === undefined) {
       throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
@@ -1160,7 +1160,7 @@ export function createCompanyReadService(
     ruleId: string,
     input: PageInput = {},
   ): Promise<Page<CompanyRuleRevisionReadDto>> {
-    await authorizeCompany(userId, companyId, 'categorizer');
+    await authorizeCompany(userId, companyId, 'viewer');
     boundedId(ruleId, 'ruleId');
     if (db.rule.findFirst === undefined || db.ruleRevision?.findMany === undefined) {
       throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');

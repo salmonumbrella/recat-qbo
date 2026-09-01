@@ -84,6 +84,42 @@ function createStore(): McpRuleOperationStore {
   };
 }
 
+/** Exact pre-Task-6A input-hash validator copied from base 149749d. */
+function baseMcpInputHash(operation: McpRuleOperationRecord): string {
+  return hashOperationPayload({
+    tokenId: operation.tokenId,
+    tokenPrefix: operation.tokenPrefix,
+    userId: operation.userId,
+    companyId: operation.companyId,
+    resourceType: operation.resourceType,
+    resourceId: operation.resourceId,
+    mutation: operation.mutation,
+    idempotencyKey: operation.idempotencyKey,
+    payloadHash: operation.payloadHash,
+    sourceRevision: operation.sourceRevision,
+    proposedRevision: operation.proposedRevision,
+    proposedSnapshotHash: operation.proposedSnapshotHash,
+    expiresAt: operation.expiresAt.toISOString(),
+    retryOfId: operation.retryOfId,
+  });
+}
+
+/** Exact pre-Task-6A integrity decision copied from base 149749d. */
+function baseHasValidMcpRuleOperationIntegrity(operation: McpRuleOperationRecord): boolean {
+  try {
+    const payloadHash = hashOperationPayload(operation.payload);
+    if (payloadHash !== operation.payloadHash || Number.isNaN(operation.expiresAt.getTime())) return false;
+    if (operation.inputHash !== baseMcpInputHash(operation)) return false;
+    const commitFields = [operation.committedAt, operation.commitResult, operation.commitResultHash];
+    if (commitFields.every((value) => value === null)) return true;
+    if (commitFields.some((value) => value === null)) return false;
+    return !Number.isNaN(operation.committedAt!.getTime())
+      && operation.commitResultHash === hashOperationPayload(operation.commitResult);
+  } catch {
+    return false;
+  }
+}
+
 describe('dedicated MCP rule operation envelope', () => {
   it('binds a browser preparation to its real session without inventing MCP attribution', async () => {
     const sessionPrincipal: RuleOperationPrincipal = {
@@ -151,6 +187,39 @@ describe('dedicated MCP rule operation envelope', () => {
       'qboSyncToken',
     ]));
     expect(hasValidMcpRuleOperationIntegrity(operation)).toBe(true);
+  });
+
+  it('emits an MCP hash accepted by the base committer while accepting both rolling writer formats', async () => {
+    const operation = await createPreparedRuleOperation(input(), {
+      store: createStore(),
+      now: () => NOW,
+    });
+
+    expect(baseHasValidMcpRuleOperationIntegrity(operation)).toBe(true);
+    expect(hasValidMcpRuleOperationIntegrity(operation)).toBe(true);
+
+    const discriminatorAware = {
+      ...operation,
+      inputHash: hashOperationPayload({
+        authKind: operation.authKind,
+        tokenId: operation.tokenId,
+        tokenPrefix: operation.tokenPrefix,
+        sessionId: operation.sessionId,
+        userId: operation.userId,
+        companyId: operation.companyId,
+        resourceType: operation.resourceType,
+        resourceId: operation.resourceId,
+        mutation: operation.mutation,
+        idempotencyKey: operation.idempotencyKey,
+        payloadHash: operation.payloadHash,
+        sourceRevision: operation.sourceRevision,
+        proposedRevision: operation.proposedRevision,
+        proposedSnapshotHash: operation.proposedSnapshotHash,
+        expiresAt: operation.expiresAt.toISOString(),
+        retryOfId: operation.retryOfId,
+      }),
+    };
+    expect(hasValidMcpRuleOperationIntegrity(discriminatorAware)).toBe(true);
   });
 
   it('returns one exact idempotent replay and rejects a changed resource or proposed snapshot', async () => {
