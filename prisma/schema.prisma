@@ -1110,8 +1110,10 @@ model McpOperation {
 /// Attribution and target identifiers remain scalar provenance after deletion.
 model McpRuleOperation {
   id                   String    @id @default(uuid())
-  tokenId              String
-  tokenPrefix          String    @db.VarChar(12)
+  authKind             String    @default("mcp") @db.VarChar(16)
+  tokenId              String?
+  tokenPrefix          String?   @db.VarChar(12)
+  sessionId            String?
   userId               String
   companyId            String
   resourceType         String    @db.VarChar(32)
@@ -1133,7 +1135,9 @@ model McpRuleOperation {
   updatedAt            DateTime  @updatedAt
 
   @@unique([tokenId, companyId, idempotencyKey])
+  @@unique([sessionId, companyId, idempotencyKey])
   @@index([tokenId, createdAt])
+  @@index([sessionId, createdAt])
   @@index([userId, createdAt])
   @@index([companyId, resourceType, resourceId])
 }

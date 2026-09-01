@@ -5,40 +5,18 @@ import type { Company } from '@prisma/client';
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler, HttpError, validate } from '../lib/http.js';
-import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
 import {
-  createRule,
   listRules,
-  reorderRules,
-  resolveCategoryReference,
-  retireRule,
   RuleServiceError,
   testRule,
   toRuleDto,
-  updateRule,
-  type RuleActor,
 } from '../services/rules.js';
+import { getRule, listRuleRevisions } from '../services/companyReads.js';
 
 export { toRuleDto } from '../services/rules.js';
 
-const createBody = z.object({
-  matchText: z.string().trim().min(1).max(200),
-  category: z.string().trim().min(1).max(200),
-  categoryQboId: z.string().min(1).nullish(),
-  tagIds: z.array(z.string().min(1)).optional(),
-  autoPost: z.boolean().optional(),
-});
-const patchBody = z.object({
-  matchText: z.string().trim().min(1).max(200).optional(),
-  category: z.string().trim().min(1).max(200).optional(),
-  categoryQboId: z.string().min(1).nullish(),
-  tagIds: z.array(z.string().min(1)).optional(),
-  autoPost: z.boolean().optional(),
-  priority: z.number().int().optional(),
-});
-const orderBody = z.object({ ids: z.array(z.string().min(1)).min(1) });
 const testBody = z.object({
   matchText: z.string().trim().min(1).max(200),
   priorityTop: z.boolean().optional().default(true),
@@ -49,11 +27,8 @@ function scopedCompany(req: { company?: Company }): Company {
   return req.company;
 }
 
-function actor(req: Express.Request): RuleActor {
-  return {
-    id: req.user?.id ?? null,
-    label: req.user?.name?.trim() || req.user?.email || 'system',
-  };
+function operationRequired(): never {
+  throw new HttpError(409, 'Use the two-phase rule operation API', 'RULE_OPERATION_REQUIRED');
 }
 
 async function mapped<T>(operation: () => Promise<T>): Promise<T> {
@@ -80,26 +55,7 @@ rulesRouter.get('/', asyncHandler(async (req, res) => {
 }));
 
 rulesRouter.post('/', asyncHandler(async (req, res) => {
-  const company = scopedCompany(req);
-  const body = validate(createBody)(req.body);
-  const categoryQboId = await mapped(() => resolveCategoryReference(
-    prisma,
-    company.id,
-    body.category,
-    body.categoryQboId,
-  ));
-  const rule = await mapped(() => createRule(company.id, actor(req), {
-    matchText: body.matchText,
-    categoryQboId,
-    taxCalculation: 'NotApplicable',
-    taxCodeQboId: null,
-    tagIds: [...new Set(body.tagIds ?? [])],
-    autoPost: body.autoPost ?? false,
-    originIntent: null,
-    sourceCaseId: null,
-    sourceCandidateId: null,
-  }));
-  res.status(201).json(toRuleDto(rule));
+  operationRequired();
 }));
 
 rulesRouter.post('/test', asyncHandler(async (req, res) => {
@@ -109,40 +65,27 @@ rulesRouter.post('/test', asyncHandler(async (req, res) => {
 }));
 
 rulesRouter.put('/order', asyncHandler(async (req, res) => {
-  const company = scopedCompany(req);
-  const { ids } = validate(orderBody)(req.body);
-  const rules = await mapped(() => reorderRules(company.id, ids, actor(req)));
-  res.json(rules.map(toRuleDto));
+  operationRequired();
+}));
+
+rulesRouter.get('/:id/revisions', asyncHandler(async (req, res) => {
+  if (!req.user) throw new HttpError(401, 'Not signed in', 'UNAUTHENTICATED');
+  const limit = req.query.limit === undefined ? undefined : Number(req.query.limit);
+  res.json(await listRuleRevisions(req.user.id, scopedCompany(req).id, req.params.id ?? '', {
+    ...(limit === undefined ? {} : { limit }),
+    ...(typeof req.query.cursor === 'string' ? { cursor: req.query.cursor } : {}),
+  }));
+}));
+
+rulesRouter.get('/:id', asyncHandler(async (req, res) => {
+  if (!req.user) throw new HttpError(401, 'Not signed in', 'UNAUTHENTICATED');
+  res.json(await getRule(req.user.id, scopedCompany(req).id, req.params.id ?? ''));
 }));
 
 rulesRouter.patch('/:id', asyncHandler(async (req, res) => {
-  const company = scopedCompany(req);
-  const patch = validate(patchBody)(req.body);
-  const categoryQboId = patch.category !== undefined || patch.categoryQboId !== undefined
-    ? await mapped(() => resolveCategoryReference(
-        prisma,
-        company.id,
-        patch.category ?? '',
-        patch.categoryQboId,
-      ))
-    : undefined;
-  const updated = await mapped(() => updateRule(
-    company.id,
-    req.params.id ?? '',
-    actor(req),
-    {
-      ...(patch.matchText !== undefined ? { matchText: patch.matchText } : {}),
-      ...(categoryQboId !== undefined ? { categoryQboId } : {}),
-      ...(patch.tagIds !== undefined ? { tagIds: [...new Set(patch.tagIds)] } : {}),
-      ...(patch.autoPost !== undefined ? { autoPost: patch.autoPost } : {}),
-      ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
-    },
-  ));
-  res.json(toRuleDto(updated));
+  operationRequired();
 }));
 
 rulesRouter.delete('/:id', asyncHandler(async (req, res) => {
-  const company = scopedCompany(req);
-  await mapped(() => retireRule(company.id, req.params.id ?? '', actor(req)));
-  res.json({ ok: true });
+  operationRequired();
 }));

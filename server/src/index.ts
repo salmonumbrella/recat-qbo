@@ -41,6 +41,8 @@ import { mcpTokensRouter } from './routes/mcpTokens.js';
 import { receiptsRouter } from './routes/receipts.js';
 import { receiptSettingsRouter } from './routes/receiptSettings.js';
 import { healthRouter } from './routes/health.js';
+import { classificationRouter } from './routes/classification.js';
+import { ruleOperationsRouter } from './routes/ruleOperations.js';
 import { createRecatBearerAuth, createRecatTokenVerifier } from './mcp/auth.js';
 import { createMcpHttpGuards } from './mcp/httpGuards.js';
 import {
@@ -130,6 +132,8 @@ app.use('/api/companies/:companyId/tags', tagsRouter);
 app.use('/api/companies/:companyId/tax', taxRouter);
 app.use('/api/companies/:companyId/rule-candidates', ruleCandidatesRouter);
 app.use('/api/companies/:companyId/rules', rulesRouter);
+app.use('/api/companies/:companyId/classification', classificationRouter);
+app.use('/api/companies/:companyId/rule-operations', ruleOperationsRouter);
 app.use('/api/companies/:companyId/reports', reportsRouter);
 app.use('/api/companies/:companyId/dashboard', dashboardRouter);
 app.use('/api/companies/:companyId/audit', auditRouter);

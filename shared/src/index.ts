@@ -876,6 +876,29 @@ export interface RuleDto {
   } | null;
 }
 
+export type RuleLifecycleState = 'enabled' | 'disabled' | 'retired';
+
+/** A canonical revision stays readable when legacy references are no longer
+ * executable; in that case action is null and invalidReasons explain why. */
+export interface RuleRevisionReadDto extends Omit<RuleRevision, 'action'> {
+  action: RuleRevision['action'] | null;
+  valid: boolean;
+  invalidReasons: string[];
+}
+
+export interface RuleDetailDto {
+  active: boolean;
+  executable: boolean;
+  reviewRequiredAt: string | null;
+  reviewReason: string | null;
+  revision: RuleRevisionReadDto;
+}
+
+export interface RuleRevisionPageDto {
+  items: RuleRevisionReadDto[];
+  nextCursor: string | null;
+}
+
 export type RuleCandidateState =
   | 'ready'
   | 'conflict'

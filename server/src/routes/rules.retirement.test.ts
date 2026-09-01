@@ -110,7 +110,7 @@ describe('DELETE /api/companies/:companyId/rules/:id', () => {
     };
   });
 
-  it('retires the rule and appends a retirement revision while preserving the response contract', async () => {
+  it('requires governed preparation and leaves the rule unchanged', async () => {
     const app = express();
     app.use(express.json());
     app.use('/api/companies/:companyId/rules', rulesRouter);
@@ -118,26 +118,14 @@ describe('DELETE /api/companies/:companyId/rules/:id', () => {
     const response = await request(app)
       .delete('/api/companies/company-synthetic/rules/rule-synthetic');
 
-    expect(response.status).toBe(200);
-    expect(response.body).toEqual({ ok: true });
+    expect(response.status).toBe(409);
     expect(state.rule).toMatchObject({
       id: 'rule-synthetic',
-      enabled: false,
-      revision: 1,
-      updatedById: 'user-synthetic',
+      enabled: true,
+      revision: 0,
+      updatedById: null,
     });
-    expect(state.rule?.retiredAt).toBeInstanceOf(Date);
-    expect(state.revisions).toEqual([
-      expect.objectContaining({
-        ruleId: 'rule-synthetic',
-        companyId: 'company-synthetic',
-        revision: 1,
-        state: 'retired',
-        tagIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
-        autoPost: true,
-        changedBy: 'user-synthetic',
-        retiredAt: state.rule?.retiredAt,
-      }),
-    ]);
+    expect(state.rule?.retiredAt).toBeNull();
+    expect(state.revisions).toEqual([]);
   });
 });

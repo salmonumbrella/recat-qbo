@@ -52,6 +52,7 @@ import {
   normalizeMcpOperationIdempotencyKey,
   type McpOperationJsonObject,
   type McpRuleOperationRecord,
+  type RuleOperationPrincipal,
 } from './operations.js';
 import {
   assertCurrentMcpCategorizationAuthorization,
@@ -96,6 +97,7 @@ export interface PrepareMcpRuleChangeInput {
 export interface CommitMcpRuleChangeInput {
   operationId: string;
   idempotencyKey: string;
+  companyId?: string;
 }
 
 export interface McpRuleChangeDependencies {
@@ -103,7 +105,23 @@ export interface McpRuleChangeDependencies {
   now?: () => Date;
 }
 
+export type RuleChangePrincipal = RuleOperationPrincipal;
+export type PrepareRuleChangeInput = PrepareMcpRuleChangeInput;
+export type CommitRuleChangeInput = CommitMcpRuleChangeInput;
+
+interface RuleChangeAuthorizationStore extends McpCategorizationAuthorizationStore {
+  session: {
+    findFirst(args: {
+      where: { id: string; userId: string; expiresAt: { gt: Date } };
+      select: { id: true; user: { select: { isInstanceAdmin: true } } };
+    }): Promise<{ id: string; user: { isInstanceAdmin: boolean } } | null>;
+  };
+}
+
 export type McpRuleChangeErrorCode =
+  | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'COMPANY_DISCONNECTED'
   | 'INVALID_INPUT'
   | 'NOT_FOUND'
   | 'CONFLICT'
@@ -113,6 +131,9 @@ export type McpRuleChangeErrorCode =
   | 'IDEMPOTENCY_CONFLICT';
 
 const ERROR_MESSAGES: Readonly<Record<McpRuleChangeErrorCode, string>> = {
+  UNAUTHORIZED: 'Rule operation credential is no longer authorized.',
+  FORBIDDEN: 'Current company role cannot change rules.',
+  COMPANY_DISCONNECTED: 'This company is disconnected from QuickBooks.',
   INVALID_INPUT: CLASSIFICATION_SAFE_ERROR_MESSAGES.INVALID_INPUT,
   NOT_FOUND: CLASSIFICATION_SAFE_ERROR_MESSAGES.NOT_FOUND,
   CONFLICT: CLASSIFICATION_SAFE_ERROR_MESSAGES.CONFLICT,
@@ -220,13 +241,66 @@ function requestJson(request: NormalizedRuleChangeRequest): McpOperationJsonObje
   return JSON.parse(JSON.stringify(request)) as McpOperationJsonObject;
 }
 
-function actor(principal: McpPrincipal): RuleActor {
-  return { id: principal.userId, label: `MCP ${principal.tokenPrefix}` };
+function isSessionPrincipal(
+  principal: RuleOperationPrincipal,
+): principal is Extract<RuleOperationPrincipal, { kind: 'session' }> {
+  return principal.kind === 'session';
 }
 
-function deterministicRuleId(principal: McpPrincipal, request: NormalizedRuleChangeRequest): string {
+function operationOwner(principal: RuleOperationPrincipal): Record<string, unknown> {
+  return isSessionPrincipal(principal)
+    ? { authKind: 'session', sessionId: principal.sessionId, userId: principal.userId }
+    : { authKind: 'mcp', tokenId: principal.tokenId, userId: principal.userId };
+}
+
+async function assertCurrentRuleAuthorization(
+  store: RuleChangeAuthorizationStore,
+  principal: RuleOperationPrincipal,
+  companyId: string,
+  checkedAt: Date,
+): Promise<void> {
+  if (!isSessionPrincipal(principal)) {
+    await assertCurrentMcpCategorizationAuthorization(store, principal as McpPrincipal, companyId, checkedAt);
+    return;
+  }
+  const session = await store.session.findFirst({
+    where: { id: principal.sessionId, userId: principal.userId, expiresAt: { gt: checkedAt } },
+    select: { id: true, user: { select: { isInstanceAdmin: true } } },
+  });
+  if (session === null) fail('UNAUTHORIZED');
+  const membership = await store.membership.findUnique({
+    where: { userId_companyId: { userId: principal.userId, companyId } },
+    select: { role: true },
+  });
+  if (membership?.role !== 'categorizer' && membership?.role !== 'admin') fail('FORBIDDEN');
+  const company = await store.company.findUnique({ where: { id: companyId } });
+  if (company === null || company.disconnectedAt !== null) fail('COMPANY_DISCONNECTED');
+}
+
+async function lockRuleAuthorizationRows(
+  tx: RuleTransaction,
+  principal: RuleOperationPrincipal,
+  companyId: string,
+): Promise<void> {
+  if (isSessionPrincipal(principal)) {
+    await tx.$queryRaw`SELECT "id" FROM "Session" WHERE "id" = ${principal.sessionId} AND "userId" = ${principal.userId} FOR SHARE`;
+  } else {
+    await tx.$queryRaw`SELECT "id" FROM "McpToken" WHERE "id" = ${principal.tokenId} AND "userId" = ${principal.userId} FOR SHARE`;
+  }
+  await tx.$queryRaw`SELECT "userId" FROM "Membership" WHERE "userId" = ${principal.userId} AND "companyId" = ${companyId} FOR SHARE`;
+  await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${principal.userId} FOR SHARE`;
+}
+
+function actor(principal: RuleOperationPrincipal): RuleActor {
+  return {
+    id: principal.userId,
+    label: isSessionPrincipal(principal) ? 'Browser session' : `MCP ${principal.tokenPrefix}`,
+  };
+}
+
+function deterministicRuleId(principal: RuleOperationPrincipal, request: NormalizedRuleChangeRequest): string {
   const hex = hashOperationPayload({
-    tokenId: principal.tokenId,
+    owner: isSessionPrincipal(principal) ? `session:${principal.sessionId}` : `mcp:${principal.tokenId}`,
     companyId: request.companyId,
     idempotencyKey: request.idempotencyKey,
   });
@@ -294,7 +368,7 @@ function requireNoUnexpectedProposal(
 
 async function buildPlan(
   tx: RuleTransaction,
-  principal: McpPrincipal,
+  principal: RuleOperationPrincipal,
   request: NormalizedRuleChangeRequest,
   resourceIdOverride?: string,
 ): Promise<PreparedPlan> {
@@ -648,8 +722,8 @@ function preparedResult(operation: McpRuleOperationRecord): RuleMutationResult {
   });
 }
 
-export async function prepareMcpRuleChange(
-  principal: McpPrincipal,
+export async function prepareRuleChange(
+  principal: RuleOperationPrincipal,
   input: PrepareMcpRuleChangeInput,
   dependencies: McpRuleChangeDependencies = {},
 ): Promise<RuleMutationResult> {
@@ -658,23 +732,24 @@ export async function prepareMcpRuleChange(
   const request = normalizeRequest(input);
   const checkedAt = now();
   if (Number.isNaN(checkedAt.getTime())) fail('INVALID_INPUT');
-  await assertCurrentMcpCategorizationAuthorization(
-    db as unknown as McpCategorizationAuthorizationStore,
+  await assertCurrentRuleAuthorization(
+    db as unknown as RuleChangeAuthorizationStore,
     principal,
     request.companyId,
     checkedAt,
   );
   return db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, request.companyId);
-    await assertCurrentMcpCategorizationAuthorization(
-      tx as unknown as McpCategorizationAuthorizationStore,
+    await lockRuleAuthorizationRows(tx, principal, request.companyId);
+    await assertCurrentRuleAuthorization(
+      tx as unknown as RuleChangeAuthorizationStore,
       principal,
       request.companyId,
       checkedAt,
     );
     const existing = await tx.mcpRuleOperation.findFirst({
       where: {
-        tokenId: principal.tokenId,
+        ...operationOwner(principal),
         companyId: request.companyId,
         idempotencyKey: request.idempotencyKey,
       },
@@ -691,8 +766,7 @@ export async function prepareMcpRuleChange(
       retryParent = await tx.mcpRuleOperation.findFirst({
         where: {
           id: request.retryOfId,
-          tokenId: principal.tokenId,
-          userId: principal.userId,
+          ...operationOwner(principal),
         },
       }) as McpRuleOperationRecord | null;
       if (retryParent === null) fail('NOT_FOUND');
@@ -739,7 +813,7 @@ function requestFromOperation(operation: McpRuleOperationRecord): NormalizedRule
 
 async function executePlan(
   tx: RuleTransaction,
-  principal: McpPrincipal,
+  principal: RuleOperationPrincipal,
   request: NormalizedRuleChangeRequest,
   plan: PreparedPlan,
   committedAt: Date,
@@ -845,24 +919,25 @@ async function executePlan(
 
 async function persistCandidateReconciliationBeforeCommit(
   db: PrismaClient,
-  principal: McpPrincipal,
+  principal: RuleOperationPrincipal,
   loaded: McpRuleOperationRecord,
   idempotencyKey: string,
   checkedAt: Date,
 ): Promise<void> {
   const reconciliation = await db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, loaded.companyId);
+    await lockRuleAuthorizationRows(tx, principal, loaded.companyId);
     await tx.$queryRaw`SELECT "id" FROM "McpRuleOperation" WHERE "id" = ${loaded.id} FOR UPDATE`;
     const operation = await tx.mcpRuleOperation.findFirst({
-      where: { id: loaded.id, tokenId: principal.tokenId, userId: principal.userId },
+      where: { id: loaded.id, ...operationOwner(principal) },
     }) as McpRuleOperationRecord | null;
     if (operation === null) fail('NOT_FOUND');
     if (!hasValidMcpRuleOperationIntegrity(operation)) fail('OPERATION_CORRUPT');
     if (operation.idempotencyKey !== idempotencyKey) fail('IDEMPOTENCY_CONFLICT');
     if (operation.commitResult !== null) return { saturated: false };
     if (operation.expiresAt.getTime() <= checkedAt.getTime()) fail('OPERATION_EXPIRED');
-    await assertCurrentMcpCategorizationAuthorization(
-      tx as unknown as McpCategorizationAuthorizationStore,
+    await assertCurrentRuleAuthorization(
+      tx as unknown as RuleChangeAuthorizationStore,
       principal,
       operation.companyId,
       checkedAt,
@@ -885,8 +960,8 @@ async function persistCandidateReconciliationBeforeCommit(
   if (reconciliation.saturated) fail('CONFLICT');
 }
 
-export async function commitMcpRuleChange(
-  principal: McpPrincipal,
+export async function commitRuleChange(
+  principal: RuleOperationPrincipal,
   input: CommitMcpRuleChangeInput,
   dependencies: McpRuleChangeDependencies = {},
 ): Promise<RuleMutationResult> {
@@ -895,10 +970,11 @@ export async function commitMcpRuleChange(
   const idempotencyKey = normalizeMcpOperationIdempotencyKey(input.idempotencyKey);
   if (idempotencyKey === null) fail('INVALID_INPUT');
   const loaded = await loadOwnedRuleOperation(input.operationId, principal, { store: db });
+  if (input.companyId !== undefined && input.companyId !== loaded.companyId) fail('NOT_FOUND');
   const checkedAt = now();
   if (Number.isNaN(checkedAt.getTime())) fail('INVALID_INPUT');
-  await assertCurrentMcpCategorizationAuthorization(
-    db as unknown as McpCategorizationAuthorizationStore,
+  await assertCurrentRuleAuthorization(
+    db as unknown as RuleChangeAuthorizationStore,
     principal,
     loaded.companyId,
     checkedAt,
@@ -914,9 +990,10 @@ export async function commitMcpRuleChange(
   }
   return db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, loaded.companyId);
+    await lockRuleAuthorizationRows(tx, principal, loaded.companyId);
     await tx.$queryRaw`SELECT "id" FROM "McpRuleOperation" WHERE "id" = ${loaded.id} FOR UPDATE`;
     const operation = await tx.mcpRuleOperation.findFirst({
-      where: { id: loaded.id, tokenId: principal.tokenId, userId: principal.userId },
+      where: { id: loaded.id, ...operationOwner(principal) },
     }) as McpRuleOperationRecord | null;
     if (operation === null) fail('NOT_FOUND');
     if (!hasValidMcpRuleOperationIntegrity(operation)) fail('OPERATION_CORRUPT');
@@ -926,8 +1003,8 @@ export async function commitMcpRuleChange(
       return parseRuleMutationResult({ ...committed, status: 'REPLAYED' });
     }
     if (operation.expiresAt.getTime() <= checkedAt.getTime()) fail('OPERATION_EXPIRED');
-    await assertCurrentMcpCategorizationAuthorization(
-      tx as unknown as McpCategorizationAuthorizationStore,
+    await assertCurrentRuleAuthorization(
+      tx as unknown as RuleChangeAuthorizationStore,
       principal,
       operation.companyId,
       checkedAt,
@@ -974,4 +1051,20 @@ export async function commitMcpRuleChange(
     });
     return result;
   }, { maxWait: 30_000, timeout: 30_000 });
+}
+
+export function prepareMcpRuleChange(
+  principal: McpPrincipal,
+  input: PrepareMcpRuleChangeInput,
+  dependencies: McpRuleChangeDependencies = {},
+): Promise<RuleMutationResult> {
+  return prepareRuleChange({ ...principal, kind: 'mcp' }, input, dependencies);
+}
+
+export function commitMcpRuleChange(
+  principal: McpPrincipal,
+  input: CommitMcpRuleChangeInput,
+  dependencies: McpRuleChangeDependencies = {},
+): Promise<RuleMutationResult> {
+  return commitRuleChange({ ...principal, kind: 'mcp' }, input, dependencies);
 }

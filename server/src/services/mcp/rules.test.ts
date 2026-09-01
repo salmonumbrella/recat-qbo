@@ -7,6 +7,7 @@ import {
   type CreatePreparedRuleOperationInput,
   type McpRuleOperationRecord,
   type McpRuleOperationStore,
+  type RuleOperationPrincipal,
 } from './operations.js';
 
 const NOW = new Date('2026-08-31T12:00:00.000Z');
@@ -84,6 +85,28 @@ function createStore(): McpRuleOperationStore {
 }
 
 describe('dedicated MCP rule operation envelope', () => {
+  it('binds a browser preparation to its real session without inventing MCP attribution', async () => {
+    const sessionPrincipal: RuleOperationPrincipal = {
+      kind: 'session',
+      sessionId: '55555555-5555-4555-8555-555555555555',
+      userId: principal.userId,
+    };
+
+    const operation = await createPreparedRuleOperation(input({
+      principal: sessionPrincipal,
+      idempotencyKey: 'browser-update',
+    }), { store: createStore(), now: () => NOW });
+
+    expect(operation).toMatchObject({
+      authKind: 'session',
+      sessionId: sessionPrincipal.sessionId,
+      tokenId: null,
+      tokenPrefix: null,
+      userId: sessionPrincipal.userId,
+    });
+    expect(hasValidMcpRuleOperationIntegrity(operation)).toBe(true);
+  });
+
   it('binds company resource, actor, token, revisions, proposed hash, expiry, and idempotency without QBO fields', async () => {
     const store = createStore();
 

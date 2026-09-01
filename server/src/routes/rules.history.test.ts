@@ -166,14 +166,14 @@ function app() {
   return value;
 }
 
-describe('REST rule revision history', () => {
+describe('legacy REST rule revision writes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.rules = [];
     state.revisions = [];
   });
 
-  it('creates revision zero with the creator and complete initial tags', async () => {
+  it('requires governed preparation instead of creating revision zero directly', async () => {
     const response = await request(app())
       .post('/api/companies/company-synthetic/rules')
       .send({
@@ -187,24 +187,12 @@ describe('REST rule revision history', () => {
         autoPost: true,
       });
 
-    expect(response.status).toBe(201);
-    expect(state.rules[0]).toMatchObject({ revision: 0, updatedById: 'user-synthetic' });
-    expect(state.revisions).toEqual([
-      expect.objectContaining({
-        ruleId: state.rules[0]?.id,
-        revision: 0,
-        state: 'enabled',
-        changedBy: 'user-synthetic',
-        autoPost: true,
-        tagIds: [
-          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-          'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-        ],
-      }),
-    ]);
+    expect(response.status).toBe(409);
+    expect(state.rules).toEqual([]);
+    expect(state.revisions).toEqual([]);
   });
 
-  it('increments revision and snapshots the edited rule after replacing tags', async () => {
+  it('requires governed preparation instead of editing a rule directly', async () => {
     state.rules = [rule('rule-edit', 2, ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'])];
 
     const response = await request(app())
@@ -214,24 +202,12 @@ describe('REST rule revision history', () => {
         tagIds: ['dddddddd-dddd-4ddd-8ddd-dddddddddddd'],
       });
 
-    expect(response.status).toBe(200);
-    expect(state.rules[0]).toMatchObject({
-      matchText: 'Edited Vendor',
-      revision: 1,
-      updatedById: 'user-synthetic',
-    });
-    expect(state.revisions).toEqual([
-      expect.objectContaining({
-        ruleId: 'rule-edit',
-        revision: 1,
-        matchText: 'Edited Vendor',
-        tagIds: ['dddddddd-dddd-4ddd-8ddd-dddddddddddd'],
-        changedBy: 'user-synthetic',
-      }),
-    ]);
+    expect(response.status).toBe(409);
+    expect(state.rules[0]).toMatchObject({ matchText: 'Synthetic Vendor rule-edit', revision: 0 });
+    expect(state.revisions).toEqual([]);
   });
 
-  it('versions every rule whose priority changes during ordering', async () => {
+  it('requires governed preparation instead of reordering directly', async () => {
     state.rules = [
       rule('rule-a', 0, ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']),
       rule('rule-b', 1, ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']),
@@ -241,20 +217,11 @@ describe('REST rule revision history', () => {
       .put('/api/companies/company-synthetic/rules/order')
       .send({ ids: ['rule-b', 'rule-a'] });
 
-    expect(response.status).toBe(200);
-    expect(state.rules).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'rule-a', priority: 1, revision: 1, updatedById: 'user-synthetic' }),
-      expect.objectContaining({ id: 'rule-b', priority: 0, revision: 1, updatedById: 'user-synthetic' }),
-    ]));
-    expect(state.revisions).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        ruleId: 'rule-a', priority: 1, revision: 1,
-        tagIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
-      }),
-      expect.objectContaining({
-        ruleId: 'rule-b', priority: 0, revision: 1,
-        tagIds: ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'],
-      }),
-    ]));
+    expect(response.status).toBe(409);
+    expect(state.rules.map(({ id, priority, revision }) => ({ id, priority, revision }))).toEqual([
+      { id: 'rule-a', priority: 0, revision: 0 },
+      { id: 'rule-b', priority: 1, revision: 0 },
+    ]);
+    expect(state.revisions).toEqual([]);
   });
 });
