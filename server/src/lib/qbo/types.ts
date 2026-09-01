@@ -453,6 +453,16 @@ export class QboRequestTimeout extends Error {
   }
 }
 
+export class QboHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'QboHttpError';
+    this.status = status;
+  }
+}
+
 /**
  * QuickBooks rejected a request because the provider rate limit was reached.
  * The delay is deliberately bounded before it reaches callers, so an

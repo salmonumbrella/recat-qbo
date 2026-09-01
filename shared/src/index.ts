@@ -1525,6 +1525,7 @@ export interface CompanyPatchBody {
 export interface ApiError {
   error: string;
   code?: string;
+  requestId?: string;
 }
 
 // QuickBooks localizes these: a British company returns "Uncategorised".

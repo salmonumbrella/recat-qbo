@@ -18,6 +18,7 @@ import { Readable } from 'node:stream';
 import {
   QboAttachmentNotFoundError,
   QboAuthError,
+  QboHttpError,
   QboRateLimitError,
   QboRequestTimeout,
   QboSyncTokenConflict,
@@ -1418,7 +1419,7 @@ export class RealQboClient implements QboClient {
       return new QboAuthError(first?.Message ?? `QuickBooks auth error (${status})`);
     }
     const message = firstNonEmpty(first?.Detail, first?.Message) ?? `QuickBooks API error (${status})`;
-    return new Error(message);
+    return new QboHttpError(status, message);
   }
 
   private async query<T extends keyof NonNullable<QueryBody['QueryResponse']>>(

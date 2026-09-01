@@ -90,18 +90,21 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
   readonly mutationResult: CategorizationMutationResult | undefined;
+  readonly requestId: string | undefined;
 
   constructor(
     status: number,
     message: string,
     code?: string,
     mutationResult?: CategorizationMutationResult,
+    requestId?: string,
   ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.mutationResult = mutationResult;
+    this.requestId = requestId;
   }
 }
 
@@ -176,12 +179,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     let message = res.statusText || `Request failed (${res.status})`;
     let code: string | undefined;
     let mutationResult: CategorizationMutationResult | undefined;
+    let requestId: string | undefined;
     try {
       const data = await res.json() as unknown;
       if (typeof data === 'object' && data !== null) {
         const errorBody = data as Partial<ApiErrorBody>;
         if (typeof errorBody.error === 'string') message = errorBody.error;
         if (typeof errorBody.code === 'string') code = errorBody.code;
+        if (typeof errorBody.requestId === 'string') requestId = errorBody.requestId;
       }
       mutationResult = boundedMutationResult(data);
       if (mutationResult?.error) {
@@ -191,7 +196,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     } catch {
       // non-JSON error body — keep the status text
     }
-    throw new ApiError(res.status, message, code, mutationResult);
+    throw new ApiError(res.status, message, code, mutationResult, requestId);
   }
   const text = await res.text();
   return (text ? JSON.parse(text) : undefined) as T;
