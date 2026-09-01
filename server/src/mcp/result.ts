@@ -5,6 +5,7 @@ import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
+import { McpRuleChangeError } from '../services/mcp/rules.js';
 import { McpUndoError } from '../services/mcp/undo.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
@@ -12,6 +13,7 @@ import { TransferOperationError } from '../services/transferOperations.js';
 import { WritebackLifecycleError } from '../services/writeback.js';
 import { AttachmentError } from '../services/attachments/types.js';
 import { ReceiptError } from '../services/receipts/types.js';
+import { RuleCandidateError } from '../services/ruleCandidates.js';
 import { McpSchemaBoundsError } from './schemaBounds.js';
 
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -77,6 +79,12 @@ const WRITEBACK_INVALID_CODES = new Set([
 ]);
 
 function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof McpRuleChangeError) {
+    return error.code === 'NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
+  if (error instanceof RuleCandidateError) {
+    return error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
   if (error instanceof ReceiptError) {
     if (error.code === 'RECEIPT_FORBIDDEN') return 'FORBIDDEN';
     if (error.code === 'RECEIPT_NOT_FOUND') return 'NOT_FOUND';

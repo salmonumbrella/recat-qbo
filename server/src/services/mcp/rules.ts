@@ -15,6 +15,7 @@ import {
   parseRuleMutationPreview,
   parseRuleMutationResult,
 } from '../classification/contracts.js';
+import { parseActionTagIds } from '../classification/actionTagIds.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
 import {
   assertPriorityAvailable,
@@ -39,6 +40,8 @@ import {
   activateRuleCandidateInTransaction,
   dismissRuleCandidateInTransaction,
   getRuleCandidate,
+  reconcileRuleCandidateActivationInTransaction,
+  RuleCandidateError,
   validateRuleCandidateActivationInTransaction,
 } from '../ruleCandidates.js';
 import {
@@ -264,6 +267,7 @@ async function buildPlan(
   tx: RuleTransaction,
   principal: McpPrincipal,
   request: NormalizedRuleChangeRequest,
+  resourceIdOverride?: string,
 ): Promise<PreparedPlan> {
   try {
     if (request.mutation === 'create') {
@@ -288,7 +292,7 @@ async function buildPlan(
       });
       await validateSourceCase(tx, request.companyId, proposal.sourceCaseId);
       await assertPriorityAvailable(tx, request.companyId, proposal.priority);
-      const resourceId = deterministicRuleId(principal, request);
+      const resourceId = resourceIdOverride ?? deterministicRuleId(principal, request);
       const collision = await tx.rule.findUnique({ where: { id: resourceId }, select: { id: true } });
       if (collision !== null) fail('CONFLICT');
       return {
@@ -343,12 +347,74 @@ async function buildPlan(
         action: resolved.action, categoryName: resolved.categoryName,
         taxCodeName: resolved.taxCodeName, priority: representative.priority,
         autoPost: representative.rule.autoPost,
-        snapshot: { orderIds: ids, representativeRuleId: representative.rule.id },
+        snapshot: {
+          orderIds: ids,
+          orderState: ids.map((id) => {
+            const rule = rules.find((row) => row.id === id)!;
+            return { id, revision: rule.revision, priority: rule.priority };
+          }),
+          representativeRuleId: representative.rule.id,
+        },
         warnings: [],
       };
     }
 
-    if (request.mutation === 'activate_candidate' || request.mutation === 'dismiss_candidate') {
+    if (request.mutation === 'dismiss_candidate') {
+      requireNoUnexpectedProposal(request.proposal, []);
+      const candidate = await tx.autopilotRuleCandidate.findFirst({
+        where: { id: request.candidateId!, companyId: request.companyId },
+      });
+      if (candidate === null) fail('NOT_FOUND');
+      if (request.expectedRevision !== 0) fail('STALE_REVISION');
+      if (candidate.state === 'activated') fail('CONFLICT');
+      const tagIds = parseActionTagIds(candidate.tagIds);
+      if (
+        candidate.categoryQboId === null
+        || tagIds === null
+        || (
+          candidate.taxCalculation !== 'TaxInclusive'
+          && candidate.taxCalculation !== 'TaxExcluded'
+          && candidate.taxCalculation !== 'NotApplicable'
+        )
+      ) fail('INVALID_INPUT');
+      const [category, taxCode] = await Promise.all([
+        tx.qboAccount.findFirst({
+          where: { companyId: request.companyId, qboId: candidate.categoryQboId },
+          select: { name: true },
+        }),
+        candidate.taxCodeQboId === null
+          ? null
+          : tx.qboTaxCode.findFirst({
+              where: { companyId: request.companyId, qboId: candidate.taxCodeQboId },
+              select: { name: true },
+            }),
+      ]);
+      const action: ClassificationAction = {
+        categoryQboId: candidate.categoryQboId,
+        taxCalculation: candidate.taxCalculation,
+        taxCodeQboId: candidate.taxCodeQboId,
+        tagIds,
+      };
+      return {
+        resourceType: 'rule_candidate', resourceId: candidate.id, ruleId: null,
+        candidateId: candidate.id, originIntent: 'auto_candidate',
+        currentRevision: 0, proposedRevision: 1,
+        condition: { matchField: 'payee', matchText: candidate.matchText },
+        action, categoryName: category?.name ?? 'Unavailable category',
+        taxCodeName: taxCode?.name ?? null, priority: 0, autoPost: false,
+        snapshot: {
+          candidateId: candidate.id,
+          candidateUpdatedAt: candidate.updatedAt.toISOString(),
+          evidenceCount: candidate.evidenceCount,
+          conflictingEvidenceCount: candidate.conflictingEvidenceCount,
+          ruleId: null,
+          state: 'dismissed',
+        },
+        warnings: [],
+      };
+    }
+
+    if (request.mutation === 'activate_candidate') {
       requireNoUnexpectedProposal(request.proposal, []);
       const candidate = await getRuleCandidate(
         request.companyId,
@@ -356,7 +422,7 @@ async function buildPlan(
         tx as unknown as PrismaClient,
       );
       if (request.expectedRevision !== 0) fail('STALE_REVISION');
-      if (request.mutation === 'activate_candidate' && !candidate.canActivate) fail('CONFLICT');
+      if (!candidate.canActivate) fail('CONFLICT');
       if (candidate.state === 'activated') fail('CONFLICT');
       if (
         candidate.categoryQboId === null
@@ -370,23 +436,17 @@ async function buildPlan(
         taxCodeQboId: candidate.taxCodeQboId,
         tagIds: candidate.tagIds,
       });
-      if (request.mutation === 'activate_candidate') {
-        await validateRuleCandidateActivationInTransaction(
-          tx,
-          request.companyId,
-          candidate.id,
-        );
-      }
+      await validateRuleCandidateActivationInTransaction(
+        tx,
+        request.companyId,
+        candidate.id,
+      );
       const priorityRow = await tx.rule.aggregate({
         where: { companyId: request.companyId, enabled: true, retiredAt: null },
         _max: { priority: true },
       });
-      const priority = request.mutation === 'activate_candidate'
-        ? (priorityRow._max.priority ?? -1) + 1
-        : 0;
-      const ruleId = request.mutation === 'activate_candidate'
-        ? deterministicRuleId(principal, request)
-        : null;
+      const priority = (priorityRow._max.priority ?? -1) + 1;
+      const ruleId = deterministicRuleId(principal, request);
       return {
         resourceType: 'rule_candidate', resourceId: candidate.id, ruleId,
         candidateId: candidate.id, originIntent: 'auto_candidate',
@@ -399,8 +459,9 @@ async function buildPlan(
           candidateUpdatedAt: candidate.updatedAt,
           evidenceCount: candidate.evidenceCount,
           conflictingEvidenceCount: candidate.conflictingEvidenceCount,
+          action: JSON.parse(JSON.stringify(resolved.action)) as McpOperationJsonObject,
           ruleId,
-          state: request.mutation === 'activate_candidate' ? 'activated' : 'dismissed',
+          state: 'activated',
         },
         warnings: [],
       };
@@ -417,6 +478,27 @@ async function buildPlan(
     if (rule.autoPost === false && patch.autoPost === true) {
       if (Object.keys(patch).some((key) => key !== 'autoPost')) fail('INVALID_INPUT');
     }
+    if (request.mutation === 'disable' || request.mutation === 'retire') {
+      if (request.mutation === 'disable' && !rule.enabled) fail('CONFLICT');
+      return {
+        resourceType: 'rule', resourceId: rule.id, ruleId: rule.id, candidateId: null,
+        originIntent: rule.originIntent as RuleOriginIntent,
+        currentRevision: rule.revision, proposedRevision: rule.revision + 1,
+        condition: { matchField: 'payee', matchText: rule.matchText },
+        action: base, categoryName: rule.category, taxCodeName: rule.taxCode,
+        priority: rule.priority, autoPost: rule.autoPost,
+        snapshot: {
+          ruleId: rule.id,
+          condition: { matchField: 'payee', matchText: rule.matchText },
+          action: JSON.parse(JSON.stringify(base)) as McpOperationJsonObject,
+          priority: rule.priority,
+          autoPost: rule.autoPost,
+          enabled: false,
+          retired: request.mutation === 'retire',
+        },
+        warnings: [],
+      };
+    }
     const resolved = await resolveRuleAction(tx, request.companyId, {
       categoryQboId: patch.categoryQboId ?? base.categoryQboId,
       taxCalculation: patch.taxCalculation ?? base.taxCalculation,
@@ -428,15 +510,10 @@ async function buildPlan(
       await assertPriorityAvailable(tx, request.companyId, patch.priority, rule.id);
     }
     if (request.mutation === 'enable' && rule.enabled) fail('CONFLICT');
-    if (request.mutation === 'disable' && !rule.enabled) fail('CONFLICT');
     if (request.mutation === 'enable') {
       await assertPriorityAvailable(tx, request.companyId, priority, rule.id);
     }
-    const enabled = request.mutation === 'enable'
-      ? true
-      : request.mutation === 'disable' || request.mutation === 'retire'
-        ? false
-        : rule.enabled;
+    const enabled = request.mutation === 'enable' ? true : rule.enabled;
     return {
       resourceType: 'rule', resourceId: rule.id, ruleId: rule.id, candidateId: null,
       originIntent: rule.originIntent as RuleOriginIntent,
@@ -455,7 +532,7 @@ async function buildPlan(
         priority,
         autoPost: patch.autoPost ?? rule.autoPost,
         enabled,
-        retired: request.mutation === 'retire',
+        retired: false,
       },
       warnings: rule.autoPost === false && patch.autoPost === true
         ? ['Enabling auto-post affects matching pending transactions.']
@@ -465,6 +542,9 @@ async function buildPlan(
     if (error instanceof McpRuleChangeError) throw error;
     if (error instanceof RuleServiceError) {
       fail(error.code);
+    }
+    if (error instanceof RuleCandidateError) {
+      fail(error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'CONFLICT');
     }
     throw error;
   }
@@ -583,7 +663,27 @@ export async function prepareMcpRuleChange(
       ) fail('IDEMPOTENCY_CONFLICT');
       return preparedResult(existing as McpRuleOperationRecord);
     }
-    const plan = await buildPlan(tx, principal, request);
+    let retryParent: McpRuleOperationRecord | null = null;
+    if (request.retryOfId !== null) {
+      retryParent = await tx.mcpRuleOperation.findFirst({
+        where: {
+          id: request.retryOfId,
+          tokenId: principal.tokenId,
+          userId: principal.userId,
+        },
+      }) as McpRuleOperationRecord | null;
+      if (retryParent === null) fail('NOT_FOUND');
+      if (
+        retryParent.commitResult !== null
+        || retryParent.expiresAt.getTime() > checkedAt.getTime()
+      ) fail('INVALID_INPUT');
+    }
+    const plan = await buildPlan(
+      tx,
+      principal,
+      request,
+      request.mutation === 'create' ? retryParent?.resourceId : undefined,
+    );
     plan.snapshot.companyId = request.companyId;
     plan.snapshot.mutation = request.mutation;
     const preview = await buildPreviewBasis(tx, plan);
@@ -686,7 +786,12 @@ async function executePlan(
         request.companyId,
         request.candidateId!,
         { id: principal.userId, label: changedBy.label },
-        { ruleId: plan.ruleId!, priority: plan.priority, initialRevision: plan.proposedRevision },
+        {
+          ruleId: plan.ruleId!,
+          priority: plan.priority,
+          initialRevision: plan.proposedRevision,
+          skipReconciliation: true,
+        },
       );
       rule = activated.rule;
       candidate = {
@@ -753,7 +858,26 @@ export async function commitMcpRuleChange(
       checkedAt,
     );
     const request = requestFromOperation(operation);
-    const plan = await buildPlan(tx, principal, request);
+    if (request.mutation === 'activate_candidate') {
+      try {
+        await reconcileRuleCandidateActivationInTransaction(
+          tx,
+          request.companyId,
+          request.candidateId!,
+        );
+      } catch (error) {
+        if (error instanceof RuleCandidateError) {
+          fail(error.code === 'CANDIDATE_NOT_FOUND' ? 'NOT_FOUND' : 'CONFLICT');
+        }
+        throw error;
+      }
+    }
+    const plan = await buildPlan(
+      tx,
+      principal,
+      request,
+      request.mutation === 'create' ? operation.resourceId : undefined,
+    );
     plan.snapshot.companyId = request.companyId;
     plan.snapshot.mutation = request.mutation;
     if (

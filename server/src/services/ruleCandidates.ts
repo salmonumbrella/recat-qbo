@@ -523,6 +523,25 @@ export interface ActivateRuleCandidateOptions {
   ruleId?: string;
   priority?: number;
   initialRevision?: number;
+  skipReconciliation?: boolean;
+}
+
+export async function reconcileRuleCandidateActivationInTransaction(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  candidateId: string,
+): Promise<void> {
+  await lockCompanyAndCandidate(tx, companyId, candidateId);
+  const candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+    where: { id: candidateId },
+  });
+  const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
+  if (reconciliation.saturated) {
+    throw new RuleCandidateError(
+      'CANDIDATE_STALE',
+      'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
+    );
+  }
 }
 
 export async function activateRuleCandidateInTransaction(
@@ -539,16 +558,18 @@ export async function activateRuleCandidateInTransaction(
   let candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
     where: { id: candidateId },
   });
-  const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
-  if (reconciliation.saturated) {
-    throw new RuleCandidateError(
-      'CANDIDATE_STALE',
-      'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
-    );
+  if (options.skipReconciliation !== true) {
+    const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
+    if (reconciliation.saturated) {
+      throw new RuleCandidateError(
+        'CANDIDATE_STALE',
+        'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
+      );
+    }
+    candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+      where: { id: candidateId },
+    });
   }
-  candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
-    where: { id: candidateId },
-  });
   if (
     candidate.state !== 'ready'
     || candidate.evidenceCount < RULE_CANDIDATE_EVIDENCE_THRESHOLD

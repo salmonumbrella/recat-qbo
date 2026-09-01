@@ -2,6 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PrismaClient, type Prisma } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { McpPrincipal } from '../../mcp/auth.js';
+import type {
+  VerifiedCategorizationOutcome,
+  VerifiedCategorizationProposal,
+} from '../agent/evaluation.js';
+import {
+  recordVerifiedRuleCandidateOutcome,
+} from '../agent/ruleCandidatePersistence.js';
+import { candidateContextFor } from '../agent/ruleCandidates.js';
+import {
+  invalidateClassificationCase,
+  recordVerifiedClassificationCase,
+} from '../classification/cases.js';
 import {
   createPreparedRuleOperation,
   hashOperationPayload,
@@ -675,5 +687,367 @@ describePostgres('MCP rule lifecycle PostgreSQL behavior', () => {
     } finally {
       await second.$disconnect();
     }
+  });
+
+  it('counts the complete matching population while bounding returned samples', async () => {
+    const fixture = await seed();
+    await db.transaction.createMany({
+      data: Array.from({ length: 205 }, (_, index) => ({
+        companyId: fixture.company.id,
+        qboId: `bulk-pending-${index}-${randomUUID()}`,
+        qboType: 'Purchase',
+        qboSyncToken: '0',
+        date: new Date(2026, 6, 1, 0, index),
+        payee: `Harbour Supply bulk ${index}`,
+        amount: '-1.00',
+        bankAccount: 'Operating',
+        status: 'PENDING',
+      })),
+    });
+
+    const prepared = await prepareMcpRuleChange(fixture.principal, {
+      companyId: fixture.company.id,
+      mutation: 'create',
+      expectedRevision: 0,
+      idempotencyKey: `complete-count-${randomUUID()}`,
+      proposal: {
+        matchText: 'Harbour Supply',
+        categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable',
+        taxCodeQboId: null,
+        tagIds: [],
+        priority: 0,
+        autoPost: false,
+      },
+    }, { db, now: () => NOW });
+
+    expect(prepared.preview).toMatchObject({
+      affectedPendingCount: 206,
+      affectedPostedCount: 1,
+    });
+    expect(prepared.preview?.sampleTransactions).toHaveLength(20);
+  });
+
+  it('allows dismiss, disable, and retire when stored references are no longer ready', async () => {
+    const fixture = await seed();
+    await db.qboAccount.update({
+      where: { companyId_qboId: { companyId: fixture.company.id, qboId: fixture.account.qboId } },
+      data: { active: false },
+    });
+    const makeRule = (matchText: string, priority: number) => db.rule.create({
+      data: {
+        companyId: fixture.company.id,
+        matchText,
+        category: fixture.account.name,
+        categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable',
+        priority,
+        revision: 2,
+        originIntent: 'make_recurring',
+      },
+    });
+    const [disableRule, retireRule] = await Promise.all([
+      makeRule('Legacy disable', 0),
+      makeRule('Legacy retire', 1),
+    ]);
+    const candidate = await db.autopilotRuleCandidate.create({
+      data: {
+        companyId: fixture.company.id,
+        conditionFingerprint: createHash('sha256').update(randomUUID()).digest('hex'),
+        schemaVersion: 'classification-rule-v2',
+        configVersion: 'verified-writeback-v1',
+        matchText: 'Legacy candidate',
+        state: 'stale',
+        winningActionFingerprint: 'a'.repeat(64),
+        categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable',
+        tagIds: [],
+      },
+    });
+
+    const run = async (input: PrepareMcpRuleChangeInput) => {
+      const prepared = await prepareMcpRuleChange(fixture.principal, input, { db, now: () => NOW });
+      return commitMcpRuleChange(fixture.principal, {
+        operationId: prepared.operationId,
+        idempotencyKey: input.idempotencyKey,
+      }, { db, now: () => new Date(NOW.getTime() + 1_000) });
+    };
+    await expect(run({
+      companyId: fixture.company.id,
+      mutation: 'disable',
+      ruleId: disableRule.id,
+      expectedRevision: 2,
+      idempotencyKey: `legacy-disable-${randomUUID()}`,
+    })).resolves.toMatchObject({ rule: { state: 'disabled', revision: 3 } });
+    await expect(run({
+      companyId: fixture.company.id,
+      mutation: 'retire',
+      ruleId: retireRule.id,
+      expectedRevision: 2,
+      idempotencyKey: `legacy-retire-${randomUUID()}`,
+    })).resolves.toMatchObject({ rule: { state: 'retired', revision: 3 } });
+    await expect(run({
+      companyId: fixture.company.id,
+      mutation: 'dismiss_candidate',
+      candidateId: candidate.id,
+      expectedRevision: 0,
+      idempotencyKey: `legacy-dismiss-${randomUUID()}`,
+    })).resolves.toMatchObject({
+      candidate: { candidateId: candidate.id, state: 'dismissed' },
+    });
+  });
+
+  it('rejects invalidated or no-longer-verified source cases', async () => {
+    const fixture = await seed();
+    const transaction = await db.transaction.findFirstOrThrow({
+      where: { companyId: fixture.company.id, status: 'POSTED' },
+    });
+    const createCase = async () => {
+      const attempt = await db.qboMutationAttempt.create({
+        data: {
+          transactionId: transaction.id,
+          requestId: `case-${randomUUID()}`,
+          operation: 'recategorize',
+          status: 'VERIFIED',
+          expectedRevision: transaction.revision,
+          expectedSyncToken: transaction.qboSyncToken,
+          requestHash: `case-hash-${randomUUID()}`,
+          requestPayload: {},
+          beforeSnapshot: {},
+          verification: { outcome: 'VERIFIED', status: 'POSTED' },
+        },
+      });
+      const recorded = await recordVerifiedClassificationCase({
+        companyId: fixture.company.id,
+        transactionId: transaction.id,
+        qboMutationAttemptId: attempt.id,
+        action: {
+          categoryQboId: fixture.account.qboId,
+          taxCalculation: 'NotApplicable',
+          taxCodeQboId: null,
+          tagIds: [],
+        },
+        originIntent: 'make_recurring',
+        rationale: 'Verified recurring decision.',
+        requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+        reviewer: { userId: fixture.user.id, configVersion: 'fixture', decision: 'approved' },
+        jurisdiction: 'unknown', currency: 'CAD',
+        context: {
+          transactionDirection: 'out', qboType: 'Purchase',
+          sourceAccountName: 'Operating', businessPurpose: null,
+        },
+        provenance: {
+          source: 'qbo_verified', sourceId: attempt.id,
+          actorId: fixture.user.id, recordedAt: NOW.toISOString(),
+        },
+      }, db);
+      return { attempt, recorded };
+    };
+    const invalidated = await createCase();
+    await invalidateClassificationCase(
+      fixture.company.id,
+      invalidated.recorded.id,
+      'Superseded by a corrected outcome.',
+      db,
+    );
+    const noLongerVerified = await createCase();
+    await db.qboMutationAttempt.update({
+      where: { id: noLongerVerified.attempt.id },
+      data: { status: 'RETRYABLE' },
+    });
+    const inputFor = (sourceCaseId: string): PrepareMcpRuleChangeInput => ({
+      companyId: fixture.company.id,
+      mutation: 'create', expectedRevision: 0,
+      idempotencyKey: `source-case-${randomUUID()}`,
+      proposal: {
+        matchText: 'Source Case Vendor', categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [],
+        priority: 0, autoPost: false, sourceCaseId,
+      },
+    });
+
+    await expect(prepareMcpRuleChange(
+      fixture.principal,
+      inputFor(invalidated.recorded.id),
+      { db, now: () => NOW },
+    )).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(prepareMcpRuleChange(
+      fixture.principal,
+      inputFor(noLongerVerified.recorded.id),
+      { db, now: () => NOW },
+    )).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    const invalidatedAfterPrepare = await createCase();
+    const invalidatedAfterPrepareInput = inputFor(invalidatedAfterPrepare.recorded.id);
+    const prepared = await prepareMcpRuleChange(
+      fixture.principal,
+      invalidatedAfterPrepareInput,
+      { db, now: () => NOW },
+    );
+    await invalidateClassificationCase(
+      fixture.company.id,
+      invalidatedAfterPrepare.recorded.id,
+      'Superseded after preparation.',
+      db,
+    );
+    await expect(commitMcpRuleChange(fixture.principal, {
+      operationId: prepared.operationId,
+      idempotencyKey: invalidatedAfterPrepareInput.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 1_000) }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('rejects reorder commit when a non-representative rule drifts', async () => {
+    const fixture = await seed();
+    const createRule = (matchText: string, priority: number, revision: number) => db.rule.create({
+      data: {
+        companyId: fixture.company.id, matchText,
+        category: fixture.account.name, categoryQboId: fixture.account.qboId,
+        taxCalculation: 'NotApplicable', priority, revision,
+        originIntent: 'make_recurring',
+      },
+    });
+    const representative = await createRule('Representative', 0, 7);
+    const drifting = await createRule('Drifting', 1, 2);
+    const input: PrepareMcpRuleChangeInput = {
+      companyId: fixture.company.id,
+      mutation: 'reorder', expectedRevision: 7,
+      idempotencyKey: `reorder-drift-${randomUUID()}`,
+      proposal: { orderIds: [drifting.id, representative.id] },
+    };
+    const prepared = await prepareMcpRuleChange(fixture.principal, input, { db, now: () => NOW });
+    await db.rule.update({
+      where: { id: drifting.id },
+      data: { matchText: 'Drifted after prepare', revision: { increment: 1 } },
+    });
+
+    await expect(commitMcpRuleChange(fixture.principal, {
+      operationId: prepared.operationId,
+      idempotencyKey: input.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 1_000) }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(db.rule.findMany({
+      where: { id: { in: [representative.id, drifting.id] } },
+      select: { id: true, priority: true }, orderBy: { priority: 'asc' },
+    })).resolves.toEqual([
+      { id: representative.id, priority: 0 },
+      { id: drifting.id, priority: 1 },
+    ]);
+  });
+
+  it('reuses the resource identity when retrying an expired create', async () => {
+    const fixture = await seed();
+    const proposal = {
+      matchText: 'Retry Harbour', categoryQboId: fixture.account.qboId,
+      taxCalculation: 'NotApplicable' as const, taxCodeQboId: null,
+      tagIds: [] as string[], priority: 0, autoPost: false,
+    };
+    const firstInput: PrepareMcpRuleChangeInput = {
+      companyId: fixture.company.id, mutation: 'create', expectedRevision: 0,
+      idempotencyKey: `expired-create-${randomUUID()}`, proposal,
+    };
+    const first = await prepareMcpRuleChange(fixture.principal, firstInput, { db, now: () => NOW });
+    const retry = await prepareMcpRuleChange(fixture.principal, {
+      ...firstInput,
+      idempotencyKey: `expired-create-retry-${randomUUID()}`,
+      retryOfId: first.operationId,
+    }, { db, now: () => new Date(NOW.getTime() + 16 * 60 * 1_000) });
+
+    expect(retry).toMatchObject({
+      status: 'PREPARED',
+      ruleId: first.ruleId,
+      preview: { ruleId: first.ruleId },
+    });
+    expect(retry.operationId).not.toBe(first.operationId);
+  });
+
+  it('aborts candidate activation when reconciliation changes the winning action', async () => {
+    const fixture = await seed();
+    const accountB = await db.qboAccount.create({
+      data: {
+        companyId: fixture.company.id, qboId: `corrected-${randomUUID()}`,
+        name: 'Corrected expense', fullName: 'Expenses · Corrected expense',
+        classification: 'Expenses',
+      },
+    });
+    const transactions = await Promise.all([0, 1, 2].map((index) => db.transaction.create({
+      data: {
+        companyId: fixture.company.id, qboId: `candidate-drift-${index}-${randomUUID()}`,
+        qboType: 'Purchase', qboSyncToken: '1', date: NOW,
+        payee: 'Candidate Drift Vendor', amount: '-10.00', bankAccount: 'Operating',
+        status: 'POSTED', revision: 1,
+      },
+    })));
+    const context = candidateContextFor(
+      'Candidate Drift Vendor',
+      'verified-writeback-v1',
+      'mcp',
+    );
+    if (context === null) throw new Error('Candidate fixture context is invalid.');
+    const proposal = (categoryQboId: string): VerifiedCategorizationProposal => ({
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        idx: 0, subtotalCents: -1000, taxCents: 0, totalCents: -1000,
+        categoryQboId, taxCodeQboId: null, memo: null, tagIds: [],
+      }],
+      tagIds: [],
+    });
+    for (const transaction of transactions) {
+      const requestId = randomUUID();
+      await db.qboMutationAttempt.create({
+        data: {
+          transactionId: transaction.id, requestId, operation: 'recategorize',
+          status: 'VERIFIED', expectedRevision: 1, expectedSyncToken: '0',
+          requestHash: `old-${requestId}`,
+          requestPayload: {
+            ruleCandidateFold: { version: 1 },
+            categorizationEvidence: { version: 1, proposal: proposal(fixture.account.qboId) },
+            ruleCandidateEvidence: { version: 1, ...context },
+          },
+          beforeSnapshot: {},
+        },
+      });
+      const outcome: VerifiedCategorizationOutcome = {
+        companyId: fixture.company.id, transactionId: transaction.id,
+        inputRevision: 1, requestId, operation: 'posted',
+        proposal: proposal(fixture.account.qboId), candidateContext: context,
+      };
+      await recordVerifiedRuleCandidateOutcome(outcome, { db, now: () => NOW });
+    }
+    const candidate = await db.autopilotRuleCandidate.findFirstOrThrow({
+      where: { companyId: fixture.company.id, matchText: 'candidate drift vendor' },
+    });
+    expect(candidate).toMatchObject({ state: 'ready', categoryQboId: fixture.account.qboId });
+    const input: PrepareMcpRuleChangeInput = {
+      companyId: fixture.company.id, mutation: 'activate_candidate',
+      candidateId: candidate.id, expectedRevision: 0,
+      idempotencyKey: `candidate-drift-${randomUUID()}`,
+    };
+    const prepared = await prepareMcpRuleChange(fixture.principal, input, { db, now: () => NOW });
+    for (const transaction of transactions) {
+      const requestId = randomUUID();
+      await db.qboMutationAttempt.create({
+        data: {
+          transactionId: transaction.id, requestId, operation: 'recategorize',
+          status: 'VERIFIED', expectedRevision: 1, expectedSyncToken: '0',
+          requestHash: `new-${requestId}`,
+          requestPayload: {
+            ruleCandidateFold: { version: 1 },
+            categorizationEvidence: { version: 1, proposal: proposal(accountB.qboId) },
+            ruleCandidateEvidence: { version: 1, ...context },
+          },
+          beforeSnapshot: {},
+        },
+      });
+    }
+
+    await expect(commitMcpRuleChange(fixture.principal, {
+      operationId: prepared.operationId,
+      idempotencyKey: input.idempotencyKey,
+    }, { db, now: () => new Date(NOW.getTime() + 1_000) }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(db.rule.count({ where: { companyId: fixture.company.id } })).resolves.toBe(0);
+    await expect(db.mcpRuleOperation.findUniqueOrThrow({ where: { id: prepared.operationId } }))
+      .resolves.toMatchObject({ committedAt: null, commitResult: null });
   });
 });

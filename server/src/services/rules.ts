@@ -168,7 +168,12 @@ export async function validateSourceCase(
 ): Promise<void> {
   if (sourceCaseId == null) return;
   const source = await tx.classificationCase.findFirst({
-    where: { id: sourceCaseId, companyId },
+    where: {
+      id: sourceCaseId,
+      companyId,
+      invalidation: null,
+      qboMutationAttempt: { status: 'VERIFIED' },
+    },
     select: { id: true },
   });
   if (source === null) {
@@ -425,7 +430,7 @@ export async function setRuleEnabledInTransaction(
   if (current.revision !== expectedRevision) {
     throw new RuleServiceError('STALE_REVISION', 'Rule revision changed.');
   }
-  await validateExistingRuleAction(tx, companyId, current);
+  if (enabled) await validateExistingRuleAction(tx, companyId, current);
   if (current.enabled === enabled) {
     throw new RuleServiceError('CONFLICT', 'Rule already has the requested state.');
   }
@@ -462,7 +467,6 @@ export async function retireRuleInTransaction(
   if (current.revision !== expectedRevision) {
     throw new RuleServiceError('STALE_REVISION', 'Rule revision changed.');
   }
-  await validateExistingRuleAction(tx, companyId, current);
   const updated = await tx.rule.update({
     where: { id: current.id },
     data: {
@@ -596,9 +600,13 @@ export async function testRuleCondition(
   legacy: RuleTestResult;
 }> {
   const needle = safeText(matchText, 200, 'Rule condition').toLowerCase();
-  const [transactions, existingRules] = await Promise.all([
+  const matchingWhere = {
+    companyId,
+    payee: { contains: needle, mode: 'insensitive' as const },
+  };
+  const [transactions, existingRules, pendingCount, postedCount] = await Promise.all([
     db.transaction.findMany({
-      where: { companyId, status: { in: ['PENDING', 'POSTED', 'DRY_RUN'] } },
+      where: { ...matchingWhere, status: { in: ['PENDING', 'POSTED', 'DRY_RUN'] } },
       select: { id: true, payee: true, date: true, amount: true, status: true },
       orderBy: { date: 'desc' },
       take: 200,
@@ -613,8 +621,12 @@ export async function testRuleCondition(
       include: { ruleTags: true },
       orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
     }),
+    db.transaction.count({ where: { ...matchingWhere, status: 'PENDING' } }),
+    db.transaction.count({
+      where: { ...matchingWhere, status: { in: ['POSTED', 'DRY_RUN'] } },
+    }),
   ]);
-  const matched = transactions.filter(({ payee }) => payee.toLowerCase().includes(needle));
+  const matched = transactions;
   const legacyMatches: RuleTestMatch[] = matched.map((transaction) => {
     const existingWinner = ruleSuggestion(transaction.payee, existingRules);
     return {
@@ -675,8 +687,6 @@ export async function testRuleCondition(
     amountCents: Math.round(Number(transaction.amount) * 100),
     status: transaction.status === 'PENDING' ? 'PENDING' : 'POSTED',
   }));
-  const pendingCount = matched.filter(({ status }) => status === 'PENDING').length;
-  const postedCount = matched.length - pendingCount;
   return {
     samples,
     pendingCount,

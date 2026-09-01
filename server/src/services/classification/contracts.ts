@@ -114,6 +114,7 @@ const safeInteger = z.number()
   .min(-MAX_SAFE_INTEGER)
   .max(MAX_SAFE_INTEGER);
 const nonNegativeCount = z.number().int().min(0).max(CLASSIFICATION_CONTRACT_LIMITS.total);
+const ruleImpactCount = z.number().int().min(0).max(MAX_REVISION);
 const revision = z.number().int().min(0).max(MAX_REVISION);
 const score = z.number().finite().min(0).max(1_000_000);
 const tagIds = z.array(z.string().uuid())
@@ -646,8 +647,8 @@ export const ruleMutationPreviewSchema = z.object({
   taxCodeName: nullableText,
   priority: z.number().int().min(0).max(MAX_REVISION),
   autoPost: z.boolean(),
-  affectedPendingCount: nonNegativeCount,
-  affectedPostedCount: nonNegativeCount,
+  affectedPendingCount: ruleImpactCount,
+  affectedPostedCount: ruleImpactCount,
   sampleTransactions: z.array(ruleMutationSampleSchema)
     .max(CLASSIFICATION_CONTRACT_LIMITS.samples),
   conflicts: z.array(classificationConflictSchema)
