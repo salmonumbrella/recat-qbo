@@ -12,6 +12,7 @@ import {
   type ActiveCategorizationAttemptDto,
   type CategorizationMutationOutcome,
   type CategorizationMutationResult,
+  type RuleMutationResult,
   type SplitDto,
   type StageCategorizationBody,
   type StagedCategorization,
@@ -22,8 +23,10 @@ import {
 import { useApp } from '../state/AppContext';
 import {
   ApiError,
+  classificationMemory,
   companies as companiesApi,
   createCategorizationRequestId,
+  ruleOperations,
   rules as rulesApi,
   transactions as txnApi,
 } from '../lib/api';
@@ -35,7 +38,8 @@ import TagPicker from '../components/TagPicker';
 import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
 import BulkBar from '../components/BulkBar';
-import RulePrompt from '../components/RulePrompt';
+import ClassificationMemoryPanel from '../components/ClassificationMemoryPanel';
+import ConfirmDialog from '../components/ConfirmDialog';
 import TaxCodePicker, {
   isUsableTaxCodeForDirection,
   usableTaxCodesForDirection,
@@ -119,13 +123,12 @@ function errText(e: unknown): string {
 
 const stopMouse = (e: ReactMouseEvent) => e.stopPropagation();
 
-/** The post endpoint may flag rule-prompt eligibility on top of the dto. */
-type PostResponseDto = TransactionDto & { rulePromptEligible?: boolean };
-
-interface RulePromptState {
+interface RecurringPromptState {
+  caseId: string;
   payee: string;
-  category: string;
-  categoryQboId: string | null;
+  idempotencyKey: string | null;
+  prepared: RuleMutationResult | null;
+  busy: boolean;
 }
 
 interface TaxMutationState {
@@ -233,7 +236,7 @@ export default function Queue() {
   const [pickIdx, setPickIdx] = useState(0);
   const [tagPicker, setTagPicker] = useState<string | null>(null);
   const [errOpenId, setErrOpenId] = useState<string | null>(null);
-  const [rulePrompt, setRulePrompt] = useState<RulePromptState | null>(null);
+  const [recurringPrompt, setRecurringPrompt] = useState<RecurringPromptState | null>(null);
   const [splitEditId, setSplitEditId] = useState<string | null>(null);
   const [bulkCat, setBulkCat] = useState<string | null>(null);
   const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
@@ -250,6 +253,7 @@ export default function Queue() {
   useEffect(() => {
     setAttachmentOpenId(null);
     setAttachmentCounts({});
+    setRecurringPrompt(null);
   }, [activeCompanyId]);
 
   const taxState = useCallback(
@@ -807,6 +811,29 @@ export default function Queue() {
     ],
   );
 
+  const offerRecurring = useCallback((companyId: string, transactionId: string, payee: string) => {
+    void classificationMemory.currentCase(companyId, transactionId)
+      .then((classificationCase) => {
+        if (
+          !aliveRef.current
+          || activeCompanyIdRef.current !== companyId
+          || classificationCase === null
+          || classificationCase.invalidatedAt !== null
+        ) return;
+        setRecurringPrompt((current) => current ?? {
+          caseId: classificationCase.id,
+          payee,
+          idempotencyKey: null,
+          prepared: null,
+          busy: false,
+        });
+      })
+      .catch(() => {
+        // The categorization remains an applied-once result. A missing memory
+        // read must never imply or manufacture recurring intent.
+      });
+  }, []);
+
   const recordTaxMutation = useCallback(
     (
       t: TransactionDto,
@@ -835,8 +862,12 @@ export default function Queue() {
           reconciled,
         },
       }));
+      if (result.ok && result.outcome === 'VERIFIED' && mutation.kind === 'commit') {
+        const companyId = activeCompanyIdRef.current;
+        if (companyId) offerRecurring(companyId, t.id, t.payee);
+      }
     },
-    [patchRow, updateTaxState],
+    [offerRecurring, patchRow, updateTaxState],
   );
 
   const recordTaxMutationFailure = useCallback(
@@ -1181,21 +1212,12 @@ export default function Queue() {
         .post(id)
         .then((res) => {
           if (!aliveRef.current) return;
-          const dto = res as PostResponseDto;
+          const dto = res;
           updateRow(dto);
           setSel((s) => ({ ...s, [id]: false }));
-          if (
-            dto.rulePromptEligible &&
-            (dto.status === 'POSTED' || dto.status === 'DRY_RUN')
-          ) {
-            setRulePrompt(
-              (rp) =>
-                rp ?? {
-                  payee: dto.payee,
-                  category: dto.category ?? '',
-                  categoryQboId: dto.categoryQboId,
-                },
-            );
+          if (dto.status === 'POSTED' || dto.status === 'DRY_RUN') {
+            const companyId = activeCompanyIdRef.current;
+            if (companyId) offerRecurring(companyId, dto.id, dto.payee);
           }
         })
         .catch((e) => {
@@ -1208,6 +1230,7 @@ export default function Queue() {
       rows,
       hasActiveMutation,
       taxReadyFor,
+      offerRecurring,
       commitTax,
       tagsRequired,
       patchRow,
@@ -1416,19 +1439,58 @@ export default function Queue() {
     toast,
   ]);
 
-  const createRule = useCallback(() => {
-    if (!activeCompanyId || !rulePrompt) return;
-    const rp = rulePrompt;
-    setRulePrompt(null);
-    rulesApi
-      .create(activeCompanyId, {
-        matchText: rp.payee,
-        category: rp.category,
-        categoryQboId: rp.categoryQboId,
-      })
-      .then(() => toast('Rule created — matching payees will be pre-filled'))
-      .catch((e) => toast(errText(e)));
-  }, [activeCompanyId, rulePrompt, toast]);
+  const prepareRecurring = useCallback(async () => {
+    if (!activeCompanyId || !recurringPrompt || recurringPrompt.busy) return;
+    const companyId = activeCompanyId;
+    const idempotencyKey = recurringPrompt.idempotencyKey ?? createCategorizationRequestId();
+    setRecurringPrompt((current) => current ? { ...current, idempotencyKey, busy: true } : current);
+    try {
+      const lifecycle = await rulesApi.lifecycle(companyId, 'enabled', undefined, 1);
+      const priority = lifecycle.items.length === 0
+        ? 0
+        : Math.min(...lifecycle.items.map((item) => item.revision.priority)) - 1;
+      const prepared = await ruleOperations.prepareFromCase(
+        companyId,
+        recurringPrompt.caseId,
+        { matchText: recurringPrompt.payee, priority, idempotencyKey },
+      );
+      if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+      if (!prepared.ok || prepared.preview === null) {
+        throw new Error(prepared.error?.message ?? 'Recurring suggestion could not be prepared.');
+      }
+      setRecurringPrompt((current) => current ? { ...current, prepared, busy: false } : current);
+    } catch (error) {
+      if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+      setRecurringPrompt((current) => current ? { ...current, busy: false } : current);
+      toast(errText(error));
+    }
+  }, [activeCompanyId, recurringPrompt, toast]);
+
+  const commitRecurring = useCallback(async () => {
+    if (
+      !activeCompanyId
+      || !recurringPrompt?.prepared
+      || !recurringPrompt.idempotencyKey
+      || recurringPrompt.busy
+    ) return;
+    const companyId = activeCompanyId;
+    setRecurringPrompt((current) => current ? { ...current, busy: true } : current);
+    try {
+      const committed = await ruleOperations.commit(
+        companyId,
+        recurringPrompt.prepared.operationId,
+        recurringPrompt.idempotencyKey,
+      );
+      if (!committed.ok) throw new Error(committed.error?.message ?? 'Recurring suggestion was rejected.');
+      if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+      setRecurringPrompt(null);
+      toast('Recurring suggestion created — auto-post remains off');
+    } catch (error) {
+      if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+      setRecurringPrompt((current) => current ? { ...current, busy: false } : current);
+      toast(errText(error));
+    }
+  }, [activeCompanyId, recurringPrompt, toast]);
 
   // Prototype cycleSort: first press asc, second desc, third back to original.
   const cycleSort = useCallback(
@@ -1470,7 +1532,7 @@ export default function Queue() {
       setSel({});
       setTagPicker(null);
       setErrOpenId(null);
-      setRulePrompt(null);
+      setRecurringPrompt(null);
       setSplitEditId(null);
       return;
     }
@@ -2190,6 +2252,17 @@ export default function Queue() {
         />
       )}
 
+      {activeCompanyId && activeRow && (
+        <ClassificationMemoryPanel
+          key={`${activeCompanyId}:${activeRow.id}`}
+          companyId={activeCompanyId}
+          initialQuery={[activeRow.payee, activeRow.memo].filter(Boolean).join(' ')}
+          transactionId={activeRow.id}
+          title="Similar Decisions"
+          autoSearch
+        />
+      )}
+
       {taxReadiness?.status !== 'ready' && (
         <div
           role="status"
@@ -2815,15 +2888,53 @@ export default function Queue() {
         />
       )}
 
-      {/* rule prompt */}
-      {rulePrompt && (
-        <RulePrompt
-          payee={rulePrompt.payee}
-          category={rulePrompt.category}
-          onCreate={createRule}
-          onDismiss={() => setRulePrompt(null)}
-        />
+      {recurringPrompt && recurringPrompt.prepared === null && (
+        <div
+          role="status"
+          style={{
+            position: 'fixed', left: '50%', bottom: 26, transform: 'translateX(-50%)',
+            zIndex: 24, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10,
+            background: 'var(--dark)', color: 'var(--darkInk)', borderRadius: 11,
+            padding: '12px 18px', maxWidth: 'calc(100vw - 24px)', boxSizing: 'border-box',
+          }}
+        >
+          <span>Verified classification for <strong>{recurringPrompt.payee}</strong>.</span>
+          <button className="btn-ghost" onClick={() => setRecurringPrompt(null)}>Apply once</button>
+          <button
+            className="btn-primary"
+            onClick={() => void prepareRecurring()}
+            disabled={recurringPrompt.busy}
+          >
+            {recurringPrompt.busy ? 'Preparing…' : 'Make recurring suggestion'}
+          </button>
+        </div>
       )}
+
+      <ConfirmDialog
+        open={recurringPrompt?.prepared?.preview != null}
+        title="Make recurring suggestion?"
+        confirmLabel="Confirm recurring suggestion"
+        tone="primary"
+        busy={recurringPrompt?.busy ?? false}
+        onConfirm={() => void commitRecurring()}
+        onCancel={() => setRecurringPrompt((current) => current ? { ...current, prepared: null } : current)}
+      >
+        {recurringPrompt?.prepared?.preview && (
+          <>
+            <div>
+              {recurringPrompt.prepared.preview.condition.matchText} →{' '}
+              {recurringPrompt.prepared.preview.categoryName}
+              {recurringPrompt.prepared.preview.taxCodeName
+                ? ` · ${recurringPrompt.prepared.preview.taxCodeName}` : ''}
+            </div>
+            <div>
+              {recurringPrompt.prepared.preview.affectedPendingCount} pending ·{' '}
+              {recurringPrompt.prepared.preview.affectedPostedCount} posted
+            </div>
+            <div>Auto-post remains off. This creates a suggestion-only rule.</div>
+          </>
+        )}
+      </ConfirmDialog>
 
       {/* split editor */}
       {splitTxn && (
