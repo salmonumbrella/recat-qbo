@@ -19,16 +19,17 @@ function readable(value: string): string {
   return value.replaceAll('_', ' ');
 }
 
-function sourceLabel(hit: ClassificationSearchHit): string {
-  if (hit.kind === 'classification_case') return 'case';
-  if (hit.kind === 'rule_candidate') return 'candidate';
-  if (hit.kind === 'rule') return 'rule';
-  return 'knowledge record';
-}
-
-function sourceHref(hit: ClassificationSearchHit): string {
+function sourceNavigation(hit: ClassificationSearchHit): { href: string; label: string } | null {
+  const label = hit.kind === 'classification_case'
+    ? 'case'
+    : hit.kind === 'rule_candidate'
+      ? 'candidate'
+      : hit.kind === 'rule'
+        ? 'rule'
+        : null;
+  if (label === null) return null;
   const query = new URLSearchParams({ source: hit.kind, sourceId: hit.sourceId });
-  return `/rules?${query.toString()}`;
+  return { href: `/rules?${query.toString()}`, label };
 }
 
 function verifiedLabel(value: string | null): string {
@@ -66,14 +67,26 @@ export default function ClassificationMemoryPanel({
   autoSearch = false,
 }: ClassificationMemoryPanelProps) {
   const [query, setQuery] = useState(initialQuery);
-  const [mode, setMode] = useState<ClassificationSearchMode>('hybrid');
+  const [mode, setMode] = useState<ClassificationSearchMode>('auto');
   const [result, setResult] = useState<ClassificationSearchPageDto | null>(null);
   const [health, setHealth] = useState<ClassificationSemanticHealthDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const requestRef = useRef(0);
+  const searchContextRef = useRef<{
+    companyId: string;
+    query: string;
+    mode: ClassificationSearchMode;
+    transactionId?: string;
+  } | null>(null);
 
-  useEffect(() => setQuery(initialQuery), [initialQuery]);
+  useEffect(() => {
+    requestRef.current += 1;
+    setQuery(initialQuery);
+    setBusy(false);
+    setLoadingMore(false);
+  }, [initialQuery]);
 
   useEffect(() => {
     requestRef.current += 1;
@@ -81,13 +94,26 @@ export default function ClassificationMemoryPanel({
     setHealth(null);
     setError(null);
     setBusy(false);
+    setLoadingMore(false);
+    searchContextRef.current = null;
+    return () => {
+      requestRef.current += 1;
+    };
   }, [companyId, transactionId]);
 
   const search = useCallback(async (overrideQuery?: string) => {
     const requestedQuery = (overrideQuery ?? query).trim();
     if (!requestedQuery) return;
     const requestId = ++requestRef.current;
+    const context = {
+      companyId,
+      query: requestedQuery,
+      mode,
+      ...(transactionId === undefined ? {} : { transactionId }),
+    };
+    searchContextRef.current = context;
     setBusy(true);
+    setLoadingMore(false);
     setError(null);
     setResult(null);
     const [searchOutcome, healthOutcome] = await Promise.allSettled([
@@ -109,6 +135,55 @@ export default function ClassificationMemoryPanel({
       : 'Classification search is unavailable.');
     setBusy(false);
   }, [companyId, mode, query, transactionId]);
+
+  const loadMore = useCallback(async () => {
+    const context = searchContextRef.current;
+    if (!context || !result?.nextCursor || loadingMore || result.items.length >= 100) return;
+    const cursor = result.nextCursor;
+    const requestId = ++requestRef.current;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await classificationMemory.search(context.companyId, {
+        query: context.query,
+        mode: context.mode,
+        scope: 'current_company',
+        ...(context.transactionId === undefined ? {} : { transactionId: context.transactionId }),
+        limit: 20,
+        cursor,
+      });
+      if (requestRef.current !== requestId || searchContextRef.current !== context) return;
+      if (
+        page.companyId !== context.companyId
+        || page.query !== context.query
+        || page.requestedMode !== context.mode
+      ) throw new Error('Classification search page no longer matches the active search.');
+      setResult((current) => {
+        if (!current || current.nextCursor !== cursor) return current;
+        const ids = new Set(current.items.map((hit) => hit.id));
+        const items = [
+          ...current.items,
+          ...page.items.filter((hit) => !ids.has(hit.id)),
+        ].slice(0, 100);
+        return { ...current, items, total: page.total, nextCursor: page.nextCursor };
+      });
+    } catch (loadError) {
+      if (requestRef.current === requestId && searchContextRef.current === context) {
+        setError(loadError instanceof Error ? loadError.message : 'More classification results are unavailable.');
+      }
+    } finally {
+      if (requestRef.current === requestId && searchContextRef.current === context) setLoadingMore(false);
+    }
+  }, [loadingMore, result]);
+
+  const invalidatePendingRequest = () => {
+    requestRef.current += 1;
+    searchContextRef.current = null;
+    setResult(null);
+    setError(null);
+    setBusy(false);
+    setLoadingMore(false);
+  };
 
   useEffect(() => {
     if (!autoSearch || !initialQuery.trim()) return;
@@ -132,7 +207,10 @@ export default function ClassificationMemoryPanel({
           <input
             className="input"
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              invalidatePendingRequest();
+              setQuery(event.target.value);
+            }}
             placeholder="Search vendors, rationale, categories…"
             maxLength={256}
             style={{ width: '100%', boxSizing: 'border-box' }}
@@ -144,8 +222,12 @@ export default function ClassificationMemoryPanel({
             aria-label="Search mode"
             className="select"
             value={mode}
-            onChange={(event) => setMode(event.target.value as ClassificationSearchMode)}
+            onChange={(event) => {
+              invalidatePendingRequest();
+              setMode(event.target.value as ClassificationSearchMode);
+            }}
           >
+            <option value="auto">Auto</option>
             <option value="exact">Exact</option>
             <option value="lexical">Lexical</option>
             <option value="hybrid">Hybrid</option>
@@ -169,8 +251,9 @@ export default function ClassificationMemoryPanel({
       )}
       {result && !result.noMatch && (
         <div style={{ display: 'grid', gap: 10, marginTop: 12 }}>
-          {result.items.slice(0, 20).map((hit) => {
+          {result.items.slice(0, 100).map((hit) => {
             const summary = hit.actionSummary;
+            const source = sourceNavigation(hit);
             return (
               <article
                 key={hit.id}
@@ -201,13 +284,26 @@ export default function ClassificationMemoryPanel({
                     {conflict.reason}
                   </div>
                 ))}
-                <a href={sourceHref(hit)} style={{ display: 'inline-block', marginTop: 8, fontSize: 12.5 }}>
-                  Open source {sourceLabel(hit)}
-                </a>
+                {source && (
+                  <a href={source.href} style={{ display: 'inline-block', marginTop: 8, fontSize: 12.5 }}>
+                    Open source {source.label}
+                  </a>
+                )}
               </article>
             );
           })}
         </div>
+      )}
+      {result?.nextCursor && result.items.length < Math.min(result.total, 100) && (
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={loadingMore}
+          onClick={() => void loadMore()}
+          style={{ marginTop: 12 }}
+        >
+          {loadingMore ? 'Loading more…' : `Load more · ${result.items.length} of ${result.total}`}
+        </button>
       )}
     </section>
   );

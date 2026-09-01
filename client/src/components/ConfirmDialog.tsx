@@ -3,7 +3,7 @@
 // editor): rgba scrim, 12px-radius card, Spectral title, ghost cancel +
 // danger/primary confirm.
 
-import { useEffect } from 'react';
+import { useEffect, useId, useRef } from 'react';
 import type { ReactNode } from 'react';
 
 interface ConfirmDialogProps {
@@ -29,20 +29,55 @@ export default function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const busyRef = useRef(busy);
+  const cancelHandlerRef = useRef(onCancel);
+  busyRef.current = busy;
+  cancelHandlerRef.current = onCancel;
+
   useEffect(() => {
     if (!open) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    cancelRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Escape') {
+        if (!busyRef.current) cancelHandlerRef.current();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ) ?? []);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (e.shiftKey && (document.activeElement === first || !dialogRef.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (document.activeElement === last || !dialogRef.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, onCancel]);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      opener?.focus();
+    };
+  }, [open]);
 
   if (!open) return null;
 
   return (
     <div
-      onClick={onCancel}
+      data-testid="confirm-dialog-backdrop"
+      onClick={() => { if (!busy) onCancel(); }}
       style={{
         position: 'fixed',
         top: 0,
@@ -63,6 +98,11 @@ export default function ConfirmDialog({
         .rr .cfm-primary:not(:disabled):not([aria-disabled="true"]):hover { background: var(--accH); }
       `}</style>
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 440,
@@ -75,13 +115,15 @@ export default function ConfirmDialog({
           boxSizing: 'border-box',
         }}
       >
-        <div style={{ fontFamily: "'Spectral',serif", fontSize: 20, fontWeight: 500 }}>{title}</div>
+        <div id={titleId} style={{ fontFamily: "'Spectral',serif", fontSize: 20, fontWeight: 500 }}>{title}</div>
         <div style={{ fontSize: 13.5, color: 'var(--mut)', margin: '8px 0 0', lineHeight: 1.55 }}>
           {children}
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
           <button
+            ref={cancelRef}
             onClick={onCancel}
+            disabled={busy}
             className="cfm-cancel"
             style={{
               border: '1px solid var(--bd)',
@@ -93,6 +135,7 @@ export default function ConfirmDialog({
               fontWeight: 600,
               cursor: 'pointer',
               fontFamily: 'inherit',
+              opacity: busy ? 0.6 : 1,
             }}
           >
             Cancel

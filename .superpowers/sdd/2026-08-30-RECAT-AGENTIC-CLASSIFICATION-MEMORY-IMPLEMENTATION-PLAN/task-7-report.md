@@ -6,7 +6,8 @@ last_edited: 2026-09-01
 
 ## Status
 
-Complete locally on top of Task 6A commit `c87ca8a`. Rules now browses the
+Complete locally, including independent-review fix round 1, on top of original
+Task 7 commit `da07032`. Rules now browses the
 canonical durable lifecycle and searchable provenance, while Queue shows
 transaction-aware similar decisions and offers recurring intent only after a
 verified case is read back from the server. Every policy change uses the
@@ -20,10 +21,11 @@ work and all relevant Task 6A unit route contracts passed.
 
 ## Implemented behavior
 
-- Added exact, lexical, hybrid, and semantic knowledge search with explicit
+- Added auto, exact, lexical, hybrid, and semantic knowledge search with explicit
   requested/effective mode, degradation reason, semantic configuration,
   backfill progress, no-match, and unavailable states.
-- Bounded results at 20 hits, conflicts at 10 per hit, preview samples at 20,
+- Bounded search pages at 20 and rendered search results at 100, conflicts at
+  10 per hit, preview samples at 20,
   lifecycle pages at 100, and revision pages at 20.
 - Displays company, match reason, category, tax treatment/code, rationale,
   evidence and conflict counts, conflict reasons, verification time,
@@ -112,12 +114,17 @@ npm test -w client -- Rules.candidates.test.tsx ClassificationMemoryPanel.test.t
   requirements remain visible as text.
 - Rendering and navigation are bounded. Disabled/retired rules remain
   rediscoverable through lifecycle filters and signed-cursor pagination.
+- Confirmation dialogs use a labelled `role=dialog`, `aria-modal`, initial
+  focus, a focus trap, and opener-focus restoration. Escape, backdrop, and
+  Cancel cannot dismiss an in-flight commit.
 
 ## Changed files
 
 - `client/src/lib/api.ts`
 - `client/src/components/ClassificationMemoryPanel.tsx`
 - `client/src/components/ClassificationMemoryPanel.test.tsx`
+- `client/src/components/ConfirmDialog.tsx`
+- `client/src/components/ConfirmDialog.test.tsx`
 - `client/src/pages/Queue.tsx`
 - `client/src/pages/Queue.tax.test.tsx`
 - `client/src/pages/Rules.tsx`
@@ -127,9 +134,9 @@ npm test -w client -- Rules.candidates.test.tsx ClassificationMemoryPanel.test.t
 
 ## Verification
 
-- Focused Task 7: 4 files, 88 tests passed.
-- Full client: 22 files, 221 tests passed.
-- Task 6A route contracts: 4 files, 24 tests passed.
+- Focused Task 7: 5 files, 100 tests passed.
+- Full client: 23 files, 233 tests passed.
+- Task 6A route contracts: 4 files, 23 tests passed.
 - Root unit suite: 133 files, 2,241 tests passed.
 - Root PostgreSQL discovery: 37 files / 374 tests skipped because no test
   database URL was configured.
@@ -141,6 +148,72 @@ npm test -w client -- Rules.candidates.test.tsx ClassificationMemoryPanel.test.t
   using a shared button style. The Rules rewrite reduced the production file
   from 857 removed lines to 460 added lines while adding durable lifecycle
   scope.
+
+## Independent review fix round 1
+
+### Search mode, navigation, and bounded pagination
+
+RED: the new search regressions first exposed four failures: the panel still
+defaulted to strict hybrid, auto fallback was represented with an impossible
+requested mode, no Load more path existed, and vendor identities received a
+false Rules link.
+
+GREEN: the panel now defaults to server-supported `auto`. Only auto may report
+lexical degradation; explicit hybrid rejection remains an unavailable alert.
+Load more reuses the exact company/query/mode/transaction context and signed
+cursor, deduplicates by hit ID, renders at most 100 hits, and fences late work
+on query, mode, company, transaction, or unmount changes. Changing query or
+mode also clears the old page and cursor. Links exist only for canonical case,
+rule, and candidate sources. Focused panel tests pass 7/7.
+
+### Complete ordering, lifecycle recovery, and operation intent
+
+RED: seven focused Rules cases failed against the review findings: a 101-rule
+enabled set was truncated to the visible all-state page, old-company pages
+could race the snapshot, committed deep links stayed actionable, initial
+collection failures disappeared into toasts, prepare double-clicks minted two
+intents, and revision history omitted its action/provenance/validity context.
+
+GREEN: reorder stays disabled until every signed enabled page is drained with
+a 20-page/2,000-rule fail-closed ceiling, cursor-repeat detection, deduplication,
+and company/request fencing. The exact complete order is prepared. Successful
+retire/activate/dismiss commits clear deep-link overlays and reload lifecycle,
+ordering, and candidates. Rules and candidates expose independent persistent
+alerts and retries. One user intent keeps one idempotency key through prepare
+transport failure and retry, while synchronous busy guards reject repeated
+clicks. History now shows nullable legacy action, category/tax/tags/priority/
+auto-post, lifecycle changes, source case/candidate, actor, origin intent, and
+validity reasons. Focused Rules tests pass 22/22 plus Rules tax 1/1.
+
+### Modal safety and recurring commit
+
+RED: dedicated dialog tests could not find an accessible dialog and proved
+Cancel remained active while busy; Queue's page-level Escape handler could
+also erase an in-flight recurring commit.
+
+GREEN: `ConfirmDialog` now has modal/name semantics, initial focus, a bounded
+focus trap, and focus restoration. Both the component and Queue page ignore
+Escape/backdrop/Cancel while commit is in flight. The recurring operation
+remains visible until its authoritative commit resolves. Dialog tests pass
+2/2 and the full Queue tax boundary passes 68/68. Queue production churn for
+this fix is only two guarded lines (+2/-2).
+
+### Fix-round verification
+
+```text
+Focused Task 7: 5 files, 100/100
+Full client: 23 files, 233/233
+Task 6A HTTP contracts: 4 files, 23/23
+Server unit: 133 files, 2,241/2,241
+Package-script contract: 1/1
+Root shared/server/client typecheck: passed
+Root shared/server/client production build: passed (Vite 84 modules)
+git diff --check: passed
+```
+
+No PostgreSQL suite was rerun because no disposable test database URL was
+provided. The approved Task 6A PostgreSQL evidence remains authoritative; this
+fix round changed only client files and this report.
 
 ## Concerns
 

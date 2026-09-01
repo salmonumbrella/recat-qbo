@@ -234,10 +234,9 @@ describe('Rules candidate review', () => {
 
   it('explains verified provenance and activates an inert candidate explicitly', async () => {
     const ready = candidate();
-    mocks.listCandidates.mockResolvedValue({
-      candidates: [ready],
-      nextCursor: null,
-    });
+    mocks.listCandidates
+      .mockResolvedValueOnce({ candidates: [ready], nextCursor: null })
+      .mockResolvedValue({ candidates: [], nextCursor: null });
     mocks.prepare.mockResolvedValue(prepared('activate_candidate'));
     mocks.commit.mockResolvedValue({
       ...prepared('activate_candidate'), status: 'COMMITTED', preview: null,
@@ -267,7 +266,7 @@ describe('Rules candidate review', () => {
       '99999999-9999-4999-8999-999999999999',
     ));
     expect(screen.queryByText('northwind market')).not.toBeInTheDocument();
-    expect(mocks.lifecycleRules).toHaveBeenCalledTimes(2);
+    expect(mocks.lifecycleRules).toHaveBeenCalledTimes(4);
   });
 
   it('shows conflicts and stale references without an activation control', async () => {
@@ -342,6 +341,52 @@ describe('Rules candidate review', () => {
     expect(screen.getByText('Linked source supplier')).toBeInTheDocument();
   });
 
+  it('clears a deep-linked rule after retirement so stale actions cannot reappear', async () => {
+    const source = ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        ruleId: 'rule-source',
+        condition: { matchField: 'payee', matchText: 'Linked source supplier' },
+      },
+    });
+    mocks.detail.mockResolvedValue(source);
+    mocks.lifecycleRules.mockResolvedValue({ items: [], nextCursor: null });
+    mocks.prepare.mockResolvedValue(prepared('retire'));
+    mocks.commit.mockResolvedValue({ ...prepared('retire'), status: 'COMMITTED', preview: null });
+    window.history.replaceState({}, '', '/rules?source=rule&sourceId=rule-source');
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'Retire Linked source supplier' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm retire rule' }));
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Retire Linked source supplier' })).not.toBeInTheDocument());
+    expect(mocks.detail).toHaveBeenCalledTimes(1);
+    expect(mocks.listCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears a deep-linked candidate after activation so stale actions cannot reappear', async () => {
+    const source = candidate();
+    mocks.getCandidate.mockResolvedValue(source);
+    mocks.listCandidates.mockResolvedValue({ candidates: [], nextCursor: null });
+    mocks.prepare.mockResolvedValue(prepared('activate_candidate'));
+    mocks.commit.mockResolvedValue({
+      ...prepared('activate_candidate'), status: 'COMMITTED', preview: null,
+      candidate: { candidateId: source.id, state: 'activated', ruleId: 'created-rule' },
+    });
+    window.history.replaceState({}, '', `/rules?source=rule_candidate&sourceId=${source.id}`);
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'Activate rule' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm activate candidate' }));
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Activate rule' })).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    expect(mocks.getCandidate).toHaveBeenCalledTimes(1);
+    expect(mocks.listCandidates).toHaveBeenCalledTimes(2);
+  });
+
   it('prepares and commits disablement using the server preview', async () => {
     mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
     mocks.prepare.mockResolvedValue(prepared('disable'));
@@ -359,6 +404,27 @@ describe('Rules candidate review', () => {
     expect(mocks.commit).toHaveBeenCalledWith(
       'COMPANY_GENERIC', 'operation-disable', '99999999-9999-4999-8999-999999999999',
     );
+  });
+
+  it('blocks duplicate preparation and retries a transport failure with one intent key', async () => {
+    let rejectPrepare!: (error: Error) => void;
+    mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
+    mocks.prepare.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectPrepare = reject; }));
+    mocks.prepare.mockResolvedValueOnce(prepared('disable'));
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    const disable = await screen.findByRole('button', { name: 'Disable Generic supplier' });
+    await user.dblClick(disable);
+    expect(mocks.prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.intentId).toHaveBeenCalledTimes(1);
+    rejectPrepare(new Error('Network interrupted'));
+
+    await user.click(await screen.findByRole('button', { name: 'Retry preparation' }));
+    expect(mocks.prepare).toHaveBeenCalledTimes(2);
+    expect(mocks.prepare.mock.calls[1]).toEqual(mocks.prepare.mock.calls[0]);
+    expect(mocks.intentId).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole('button', { name: 'Confirm disable rule' })).toBeInTheDocument();
   });
 
   it('prepares enablement and retirement instead of mutating lifecycle directly', async () => {
@@ -420,6 +486,71 @@ describe('Rules candidate review', () => {
     });
   });
 
+  it('drains every enabled lifecycle page before allowing a complete reorder', async () => {
+    const enabled = Array.from({ length: 101 }, (_, priority) => ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        id: `revision-${priority}`,
+        ruleId: `rule-${priority}`,
+        revision: priority + 1,
+        priority,
+        condition: { matchField: 'payee', matchText: `Supplier ${priority}` },
+      },
+    }));
+    mocks.lifecycleRules.mockImplementation(async (
+      _companyId: string,
+      state: string,
+      cursor?: string,
+    ) => {
+      if (state === 'all') return { items: enabled.slice(0, 2), nextCursor: null };
+      return cursor
+        ? { items: enabled.slice(100), nextCursor: null }
+        : { items: enabled.slice(0, 100), nextCursor: 'enabled-page-2' };
+    });
+    mocks.prepare.mockResolvedValue(prepared('reorder'));
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    const move = await screen.findByRole('button', { name: 'Move Supplier 0 down' });
+    await waitFor(() => expect(move).toBeEnabled());
+    await user.click(move);
+
+    expect(mocks.lifecycleRules).toHaveBeenCalledWith(
+      'COMPANY_GENERIC', 'enabled', 'enabled-page-2', 100,
+    );
+    const preparedBody = mocks.prepare.mock.calls.at(-1)?.[1];
+    expect(preparedBody).toMatchObject({ mutation: 'reorder', expectedRevision: 2 });
+    expect(preparedBody.proposal.orderIds).toHaveLength(101);
+    expect(preparedBody.proposal.orderIds.slice(0, 3)).toEqual(['rule-1', 'rule-0', 'rule-2']);
+    expect(preparedBody.proposal.orderIds.at(-1)).toBe('rule-100');
+  });
+
+  it('fails ordering closed when the enabled snapshot belongs to the prior company', async () => {
+    let resolveOldPage!: (value: { items: RuleDetailDto[]; nextCursor: null }) => void;
+    mocks.lifecycleRules.mockImplementation((companyId: string, state: string, cursor?: string) => {
+      if (state === 'all') return Promise.resolve({ items: companyId === 'COMPANY_GENERIC' ? [ruleDetail()] : [], nextCursor: null });
+      if (companyId === 'COMPANY_GENERIC' && cursor) {
+        return new Promise((resolve) => { resolveOldPage = resolve; });
+      }
+      if (companyId === 'COMPANY_GENERIC') {
+        return Promise.resolve({ items: [ruleDetail()], nextCursor: 'old-page-2' });
+      }
+      return Promise.resolve({ items: [], nextCursor: null });
+    });
+    const view = render(<Rules />);
+    expect(await screen.findByRole('button', { name: 'Move Generic supplier down' })).toBeDisabled();
+
+    mocks.activeCompanyId = 'COMPANY_OTHER';
+    view.rerender(<Rules />);
+    await waitFor(() => expect(mocks.lifecycleRules).toHaveBeenCalledWith(
+      'COMPANY_OTHER', 'enabled', undefined, 100,
+    ));
+    resolveOldPage({ items: [ruleDetail()], nextCursor: null });
+
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    expect(mocks.prepare).not.toHaveBeenCalled();
+  });
+
   it('tests a lifecycle rule and shows bounded impact and conflicts', async () => {
     mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
     mocks.testRule.mockResolvedValue({
@@ -433,6 +564,58 @@ describe('Rules candidate review', () => {
     expect(mocks.testRule).toHaveBeenCalledWith('COMPANY_GENERIC', 'Generic supplier');
     expect(await screen.findByText(/4 pending.*2 posted.*1 conflicts/i)).toBeInTheDocument();
     expect(screen.getByText(/supplier.*Travel/i)).toBeInTheDocument();
+  });
+
+  it('keeps initial rule and candidate failures visible and retries them independently', async () => {
+    mocks.lifecycleRules.mockRejectedValueOnce(new Error('Rule lifecycle unavailable'));
+    mocks.listCandidates.mockRejectedValueOnce(new Error('Candidates unavailable'));
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    expect(await screen.findByRole('alert', { name: 'Rules unavailable' })).toHaveTextContent(/rule lifecycle unavailable/i);
+    expect(screen.getByRole('alert', { name: 'Candidates unavailable' })).toHaveTextContent(/candidates unavailable/i);
+    expect(screen.queryByText(/no rules in this lifecycle state/i)).not.toBeInTheDocument();
+
+    mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
+    mocks.listCandidates.mockResolvedValue({ candidates: [candidate()], nextCursor: null });
+    await user.click(screen.getByRole('button', { name: 'Retry rules' }));
+    expect(await screen.findByText('Generic supplier')).toBeInTheDocument();
+    expect(screen.getByRole('alert', { name: 'Candidates unavailable' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Retry candidates' }));
+    expect(await screen.findByText('northwind market')).toBeInTheDocument();
+  });
+
+  it('renders complete revision action, provenance, validity, and change context', async () => {
+    const current = ruleDetail();
+    const previous = {
+      ...current.revision,
+      id: 'revision-2',
+      revision: 2,
+      state: 'disabled' as const,
+      action: null,
+      categoryName: 'Historical category',
+      taxCodeName: 'Historical tax',
+      priority: 4,
+      autoPost: true,
+      originIntent: 'make_recurring' as const,
+      sourceCaseId: 'case-source',
+      changedBy: 'reviewer@example.com',
+      valid: false,
+      invalidReasons: ['Historical category is inactive.'],
+    };
+    mocks.lifecycleRules.mockResolvedValue({ items: [current], nextCursor: null });
+    mocks.revisions.mockResolvedValue({ items: [current.revision, previous], nextCursor: null });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'View history for Generic supplier' }));
+    const revision3 = screen.getByRole('article', { name: 'Revision 3' });
+    expect(revision3).toHaveTextContent(/Office expense.*NotApplicable.*priority 0.*auto-post off/i);
+    expect(revision3).toHaveTextContent(/changed.*disabled.*enabled.*priority 4.*0.*auto-post on.*off/i);
+    const revision2 = screen.getByRole('article', { name: 'Revision 2' });
+    expect(revision2).toHaveTextContent(/legacy action unavailable/i);
+    expect(revision2).toHaveTextContent(/make recurring.*case-source.*reviewer@example.com/i);
+    expect(revision2).toHaveTextContent(/historical category is inactive/i);
   });
 
   it('requires a standalone auto-post preview with truthful affected counts', async () => {
@@ -556,7 +739,7 @@ describe('Rules candidate review', () => {
 
     expect(
       mocks.lifecycleRules.mock.calls.filter(([companyId]) => companyId === 'COMPANY_GENERIC'),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
     expect(mocks.toast).not.toHaveBeenCalledWith('Rule activated — auto-post remains off');
   });
 });

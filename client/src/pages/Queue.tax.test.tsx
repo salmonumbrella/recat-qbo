@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   CategorizationMutationResult,
+  RuleMutationResult,
   StagedCategorization,
   TaxReadinessDto,
   TransactionDto,
@@ -366,7 +367,7 @@ beforeEach(() => {
   });
   mocks.classificationSearch.mockResolvedValue({
     query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company',
-    mode: 'hybrid', requestedMode: 'hybrid', degraded: false, degradedReason: null,
+    mode: 'hybrid', requestedMode: 'auto', degraded: false, degradedReason: null,
     status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
   });
   mocks.currentCase.mockResolvedValue(null);
@@ -377,7 +378,7 @@ describe('tax-aware manual queue', () => {
   it('shows transaction-aware similar decisions for the active row', async () => {
     mocks.classificationSearch.mockResolvedValue({
       query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company',
-      mode: 'hybrid', requestedMode: 'hybrid', degraded: false, degradedReason: null,
+      mode: 'hybrid', requestedMode: 'auto', degraded: false, degradedReason: null,
       status: 'matched', noMatch: false, total: 1, nextCursor: null,
       items: [{
         id: 'hit-1', sourceId: 'case-1', kind: 'classification_case',
@@ -409,7 +410,7 @@ describe('tax-aware manual queue', () => {
       'COMPANY_GENERIC',
       expect.objectContaining({
         query: 'Generic supplier',
-        mode: 'hybrid',
+        mode: 'auto',
         transactionId: 'TRANSACTION_GENERIC',
       }),
     ));
@@ -444,11 +445,13 @@ describe('tax-aware manual queue', () => {
         expiresAt: '2026-08-31T01:00:00.000Z', preparationDigest: 'digest',
       },
     });
-    mocks.commitRuleOperation.mockResolvedValue({
+    let resolveCommit!: (value: RuleMutationResult) => void;
+    mocks.commitRuleOperation.mockReturnValue(new Promise<RuleMutationResult>((resolve) => { resolveCommit = resolve; }));
+    const committed = {
       ok: true, operationId: 'operation-1', companyId: 'COMPANY_GENERIC', mutation: 'create',
       originIntent: 'make_recurring', status: 'COMMITTED', ruleId: 'rule-1', revision: 1,
       rule: null, candidate: null, preview: null, error: null,
-    });
+    } as const;
     const user = userEvent.setup();
     await renderQueue();
 
@@ -478,6 +481,14 @@ describe('tax-aware manual queue', () => {
       'operation-1',
       '00000000-0000-4000-8000-000000000202',
     ));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    await user.click(screen.getByTestId('confirm-dialog-backdrop'));
+    expect(screen.getByRole('dialog', { name: 'Make recurring suggestion?' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Make recurring suggestion' })).not.toBeInTheDocument();
+
+    await act(async () => resolveCommit(committed));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
   it('shows a pointer cursor over clickable transaction rows', async () => {
     const style = installGlobalStyles();

@@ -1532,7 +1532,7 @@ export default function Queue() {
       setSel({});
       setTagPicker(null);
       setErrOpenId(null);
-      setRecurringPrompt(null);
+      setRecurringPrompt((current) => current?.busy ? current : null);
       setSplitEditId(null);
       return;
     }
@@ -2917,7 +2917,7 @@ export default function Queue() {
         tone="primary"
         busy={recurringPrompt?.busy ?? false}
         onConfirm={() => void commitRecurring()}
-        onCancel={() => setRecurringPrompt((current) => current ? { ...current, prepared: null } : current)}
+        onCancel={() => setRecurringPrompt((current) => current && !current.busy ? { ...current, prepared: null } : current)}
       >
         {recurringPrompt?.prepared?.preview && (
           <>
