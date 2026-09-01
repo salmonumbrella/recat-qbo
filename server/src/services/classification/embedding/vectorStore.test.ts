@@ -53,6 +53,7 @@ describe('classification pgvector capability', () => {
     const db = {
       async $queryRaw() {
         return [{
+          companyId: 'company-a',
           expectedFingerprint: 'a'.repeat(64),
           activeFingerprint: null,
           expectedState: 'failed',
@@ -87,6 +88,7 @@ describe('classification pgvector capability', () => {
     const db = {
       async $queryRaw() {
         return [{
+          companyId: 'company-a',
           expectedFingerprint: expected,
           activeFingerprint: expected,
           expectedState: 'active',

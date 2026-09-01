@@ -98,6 +98,34 @@ function expectSafeToolError(error: unknown, code: AgentToolError['code'], secre
   if (secret !== undefined) expect((error as Error).message).not.toContain(secret);
 }
 
+function conflictingCandidate(conflictingEvidenceCount: number) {
+  return {
+    id: 'rule_candidate:candidate-1', sourceId: 'candidate-1', kind: 'rule_candidate' as const,
+    companyId: 'company-a', companyName: 'Company A', companyRelation: 'current' as const,
+    executable: false, advisory: true, matchedIn: ['candidate' as const], score: 0.5,
+    vendorIdentityId: null, vendorName: 'Example merchant',
+    action: {
+      categoryQboId: 'category-01', taxCalculation: 'NotApplicable' as const,
+      taxCodeQboId: null, tagIds: [],
+    },
+    actionSummary: {
+      categoryName: 'Expense 01', taxCalculation: 'NotApplicable' as const,
+      taxCodeName: null, tagNames: [],
+    },
+    originIntent: 'auto_candidate' as const, evidenceCount: 5, conflictingEvidenceCount,
+    conflicts: [{
+      id: 'conflict-1', companyId: 'company-a', sourceId: 'evidence-1', kind: 'case' as const,
+      reason: 'A bounded returned contradiction.', action: null, actionSummary: null, evidenceCount: 1,
+    }],
+    provenance: {
+      source: 'candidate' as const, sourceId: 'candidate-1', actorId: null,
+      recordedAt: '2026-08-31T00:00:00.000Z',
+    },
+    rationale: null, examples: [], counterexamples: [], jurisdiction: null, currency: null,
+    verifiedAt: null, ruleRevision: null,
+  };
+}
+
 describe('createSnapshotTools', () => {
   it('publishes strict OpenAI-compatible function definitions', () => {
     const tools = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()));
@@ -181,6 +209,30 @@ describe('createSnapshotTools', () => {
     }).catch((failure: unknown) => failure);
 
     expectSafeToolError(error, 'AGENT_TOOL_INVALID_OUTPUT', secret);
+  });
+
+  it('accepts aggregate conflict counts above bounded returned conflicts and rejects undercounts', async () => {
+    const result = (conflictingEvidenceCount: number) => ({
+      query: 'merchant', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      hits: [conflictingCandidate(conflictingEvidenceCount)], total: 1,
+    });
+    const accepted = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(3),
+    });
+    await expect(accepted.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).resolves.toMatchObject({
+      items: [{ conflictingEvidenceCount: 3, conflicts: [expect.any(Object)] }],
+    });
+
+    const rejected = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(0),
+    });
+    await expect(rejected.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).rejects.toMatchObject({ code: 'AGENT_TOOL_INVALID_OUTPUT' });
   });
 
   it('reports an unavailable canonical search dependency without relabelling it invalid output', async () => {

@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ClassificationSearchHit } from '@recat/shared';
 import {
   ClassificationSearchError,
+  PrismaClassificationSearchRepository,
   classificationSemanticRuntime,
   searchClassificationMemory,
   searchClassificationMemorySnapshot,
@@ -153,6 +154,62 @@ describe('classification memory search', () => {
       .rejects.toMatchObject({ code: 'COMPANY_UNAVAILABLE' });
   });
 
+  it('loads revisions for one hundred accessible companies in one set-based query', async () => {
+    const companyIds = Array.from({ length: 100 }, (_, index) => `company-${String(index).padStart(3, '0')}`);
+    const queryRaw = vi.fn(async () => companyIds.map((companyId, index) => ({
+      companyId,
+      revision: BigInt(index + 1),
+    })));
+    const repository = new PrismaClassificationSearchRepository({ $queryRaw: queryRaw } as never);
+
+    const revisions = await repository.revisions([...companyIds].reverse());
+
+    expect(queryRaw).toHaveBeenCalledTimes(1);
+    expect(Object.keys(revisions)).toEqual(companyIds);
+    expect(revisions['company-099']).toBe('100');
+  });
+
+  it.each(['hybrid', 'auto'] as const)(
+    'checks semantic health for one hundred accessible companies in one batched call for %s',
+    async (mode) => {
+    const companyIds = Array.from({ length: 100 }, (_, index) => `company-${String(index).padStart(3, '0')}`);
+    const healthMany = vi.fn(async () => companyIds.map(() => ({
+      activeGeneration: generation.fingerprint,
+      expectedGeneration: generation.fingerprint,
+      expectedState: 'succeeded',
+      embedded: 1, skipped: 0, backlog: 0, progress: 1,
+      lastSuccessAt: '2026-08-31T00:00:00.000Z', lastError: null,
+      latestAttemptGeneration: generation.fingerprint, latestAttemptState: 'succeeded',
+      latestAttemptAt: '2026-08-31T00:00:00.000Z', latestAttemptError: null,
+      currentCorpusRevision: '1', indexedCorpusRevision: '1', expectedCorpusRevision: '1',
+      latestAttemptCorpusRevision: '1',
+    })));
+    const current = record({ hit: { companyId: companyIds[0] } });
+    const result = await searchClassificationMemory({
+      query: 'Coach', companyId: companyIds[0]!, scope: 'accessible_companies', mode,
+      limit: 10, accessibleCompanyIds: companyIds,
+    }, {
+      repository: repository([current]),
+      semantic: {
+        generation,
+        client: {
+          async embedDocuments() { throw new Error('not used'); },
+          async embedQuery() { return Array.from({ length: 1024 }, () => 0); },
+        },
+        store: {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          healthMany,
+          async search() { return []; },
+        },
+      },
+    });
+
+    expect(result.mode).toBe('hybrid');
+    expect(healthMany).toHaveBeenCalledTimes(1);
+    expect(healthMany).toHaveBeenCalledWith(companyIds, generation.fingerprint);
+    },
+  );
+
   it('returns immediately consistent exact and lexical matches without semantic configuration', async () => {
     const records = [
       record(),
@@ -215,6 +272,16 @@ describe('classification memory search', () => {
       lexicalScore: 0.4,
       exactReasons: [],
     });
+    const explicitUnknown = record({
+      hit: { id: 'classification_case:unknown-direction', sourceId: 'unknown-direction', kind: 'classification_case' },
+      lexicalScore: 0.45,
+      exactReasons: [],
+      context: {
+        transactionDirection: 'unknown', qboType: 'Purchase', sourceAccountName: 'Operating',
+        currency: 'CAD', transactionDate: '2026-08-10', jurisdiction: 'unknown',
+        taxCalculation: 'TaxExcluded',
+      },
+    });
 
     const result = await searchClassificationMemory({
       query: 'same vendor', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
@@ -224,10 +291,11 @@ describe('classification memory search', () => {
         currency: 'CAD', transactionPeriod: '2026-08', jurisdiction: 'CA-AB',
         taxCalculation: 'TaxExcluded',
       },
-    }, { repository: repository([mismatching, matching, unknownRule]), semantic: null });
+    }, { repository: repository([mismatching, matching, explicitUnknown, unknownRule]), semantic: null });
 
     expect(result.hits.map((candidate) => candidate.id)).toEqual([
       'classification_case:matching',
+      'classification_case:unknown-direction',
       'rule:unknown',
     ]);
   });
@@ -311,8 +379,8 @@ describe('classification memory search', () => {
       },
       store: {
         async ensureAvailable() { return { available: true as const, reason: null }; },
-        async health() {
-          return {
+        async healthMany() {
+          return [{
             activeGeneration: generation.fingerprint,
             expectedGeneration: generation.fingerprint,
             expectedState: 'failed',
@@ -326,7 +394,7 @@ describe('classification memory search', () => {
             latestAttemptState: 'failed',
             latestAttemptAt: '2026-08-31T00:01:00.000Z',
             latestAttemptError: 'semantic_error',
-          };
+          }];
         },
         async search() { throw new Error('must not rank stale vectors'); },
       },
@@ -364,8 +432,8 @@ describe('classification memory search', () => {
       },
       store: {
         async ensureAvailable() { return { available: true as const, reason: null }; },
-        async health() {
-          return {
+        async healthMany() {
+          return [{
             activeGeneration: generation.fingerprint,
             expectedGeneration: generation.fingerprint,
             expectedState: 'succeeded',
@@ -383,7 +451,7 @@ describe('classification memory search', () => {
             latestAttemptAt: '2026-08-31T00:01:00.000Z',
             latestAttemptError: null,
             latestAttemptCorpusRevision: '1',
-          };
+          }];
         },
         async search() { throw new Error('must not rank stale vectors'); },
       },
@@ -444,8 +512,8 @@ describe('classification memory search', () => {
         },
         store: {
           async ensureAvailable() { return { available: true, reason: null }; },
-          async health() {
-            return {
+          async healthMany() {
+            return [{
               activeGeneration: generation.fingerprint,
               expectedGeneration: generation.fingerprint,
               expectedState: 'succeeded',
@@ -459,7 +527,7 @@ describe('classification memory search', () => {
               latestAttemptState: 'succeeded',
               latestAttemptAt: '2026-08-31T00:00:00.000Z',
               latestAttemptError: null,
-            };
+            }];
           },
           async search() {
             semanticStarted = true;
@@ -541,8 +609,8 @@ describe('classification memory search', () => {
         },
         store: {
           async ensureAvailable() { return { available: true, reason: null }; },
-          async health() {
-            return {
+          async healthMany() {
+            return [{
               activeGeneration: generation.fingerprint,
               expectedGeneration: generation.fingerprint,
               expectedState: 'succeeded',
@@ -560,7 +628,7 @@ describe('classification memory search', () => {
               indexedCorpusRevision: '1',
               expectedCorpusRevision: '1',
               latestAttemptCorpusRevision: '1',
-            };
+            }];
           },
           async search() {
             return [{

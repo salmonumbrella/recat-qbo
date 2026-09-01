@@ -59,6 +59,10 @@ export interface ClassificationEmbeddingAttempt {
 export interface ClassificationEmbeddingStore {
   ensureAvailable(): Promise<VectorCapability>;
   health?(companyId: string, expectedFingerprint: string): Promise<VectorGenerationHealth>;
+  healthMany?(
+    companyIds: readonly string[],
+    expectedFingerprint: string,
+  ): Promise<VectorGenerationHealth[]>;
   beginAttempt?(input: {
     companyId: string;
     fingerprint: string;
@@ -672,11 +676,21 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
     }
   }
 
-  async health(companyId: string, expectedFingerprint: string): Promise<VectorGenerationHealth> {
+  async healthMany(
+    companyIds: readonly string[],
+    expectedFingerprint: string,
+  ): Promise<VectorGenerationHealth[]> {
     try {
-      const checkedCompanyId = checkedIdentifier(companyId);
+      if (!Array.isArray(companyIds) || companyIds.length < 1 || companyIds.length > 100) {
+        throw new VectorStoreError('GENERATION_CONFLICT');
+      }
+      const checkedCompanyIds = [...new Set(companyIds.map(checkedIdentifier))];
+      if (checkedCompanyIds.length !== companyIds.length) {
+        throw new VectorStoreError('GENERATION_CONFLICT');
+      }
       const checkedExpectedFingerprint = checkedIdentifier(expectedFingerprint);
       const rows = await this.db.$queryRaw<Array<{
+        companyId: string;
         expectedFingerprint: string | null;
         activeFingerprint: string | null;
         expectedState: string | null;
@@ -695,21 +709,11 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
         expectedCorpusRevision: bigint | null;
         latestAttemptCorpusRevision: bigint | null;
       }>>(Prisma.sql`
-        WITH expected AS (
-          SELECT * FROM "ClassificationEmbeddingGeneration"
-          WHERE "companyId" = ${checkedCompanyId}
-            AND "fingerprint" = ${checkedExpectedFingerprint}
-        ), active AS (
-          SELECT * FROM "ClassificationEmbeddingGeneration"
-          WHERE "companyId" = ${checkedCompanyId} AND "state" = 'active'
-          LIMIT 1
-        ), latest_attempt AS (
-          SELECT * FROM "ClassificationEmbeddingGeneration"
-          WHERE "companyId" = ${checkedCompanyId} AND "attemptedAt" IS NOT NULL
-          ORDER BY "attemptedAt" DESC, "fingerprint" ASC
-          LIMIT 1
+        WITH requested("companyId") AS (
+          VALUES ${Prisma.join(checkedCompanyIds.map((companyId) => Prisma.sql`(${companyId})`))}
         )
-        SELECT expected."fingerprint" AS "expectedFingerprint",
+        SELECT requested."companyId",
+               expected."fingerprint" AS "expectedFingerprint",
                active."fingerprint" AS "activeFingerprint",
                expected."attemptState" AS "expectedState",
                COALESCE(expected."embeddedDocuments", 0) AS "embeddedDocuments",
@@ -725,40 +729,66 @@ export class PgClassificationVectorStore implements ClassificationEmbeddingStore
                active."indexedCorpusRevision" AS "indexedCorpusRevision",
                expected."attemptCorpusRevision" AS "expectedCorpusRevision",
                latest_attempt."attemptCorpusRevision" AS "latestAttemptCorpusRevision"
-        FROM (SELECT 1) anchor
+        FROM requested
         LEFT JOIN LATERAL (
           SELECT "revision" FROM "ClassificationCorpusRevision"
-          WHERE "companyId" = ${checkedCompanyId}
+          WHERE "companyId" = requested."companyId"
           ORDER BY "revision" DESC
           LIMIT 1
         ) corpus ON true
-        LEFT JOIN expected ON true
-        LEFT JOIN active ON true
-        LEFT JOIN latest_attempt ON true
+        LEFT JOIN LATERAL (
+          SELECT * FROM "ClassificationEmbeddingGeneration"
+          WHERE "companyId" = requested."companyId"
+            AND "fingerprint" = ${checkedExpectedFingerprint}
+          LIMIT 1
+        ) expected ON true
+        LEFT JOIN LATERAL (
+          SELECT * FROM "ClassificationEmbeddingGeneration"
+          WHERE "companyId" = requested."companyId" AND "state" = 'active'
+          ORDER BY "fingerprint" ASC
+          LIMIT 1
+        ) active ON true
+        LEFT JOIN LATERAL (
+          SELECT * FROM "ClassificationEmbeddingGeneration"
+          WHERE "companyId" = requested."companyId" AND "attemptedAt" IS NOT NULL
+          ORDER BY "attemptedAt" DESC, "fingerprint" ASC
+          LIMIT 1
+        ) latest_attempt ON true
+        ORDER BY requested."companyId" ASC
       `);
-      const row = rows[0]!;
-      const completed = row.embeddedDocuments + row.skippedDocuments;
-      return {
-        activeGeneration: row.activeFingerprint,
-        expectedGeneration: row.expectedFingerprint,
-        expectedState: row.expectedState,
-        embedded: row.embeddedDocuments,
-        skipped: row.skippedDocuments,
-        backlog: row.backlogDocuments,
-        progress: row.totalDocuments === 0 ? 1 : completed / row.totalDocuments,
-        lastSuccessAt: row.lastSuccessAt?.toISOString() ?? null,
-        lastError: row.lastErrorCode,
-        latestAttemptGeneration: row.latestAttemptFingerprint,
-        latestAttemptState: row.latestAttemptState,
-        latestAttemptAt: row.latestAttemptAt?.toISOString() ?? null,
-        latestAttemptError: row.latestAttemptErrorCode,
-        currentCorpusRevision: row.currentCorpusRevision?.toString() ?? null,
-        indexedCorpusRevision: row.indexedCorpusRevision?.toString() ?? null,
-        expectedCorpusRevision: row.expectedCorpusRevision?.toString() ?? null,
-        latestAttemptCorpusRevision: row.latestAttemptCorpusRevision?.toString() ?? null,
-      };
+      const byCompany = new Map(rows.map((row) => [row.companyId, row]));
+      if (byCompany.size !== checkedCompanyIds.length) throw new VectorStoreError('GENERATION_CONFLICT');
+      return checkedCompanyIds.map((companyId) => {
+        const row = byCompany.get(companyId)!;
+        const completed = row.embeddedDocuments + row.skippedDocuments;
+        return {
+          activeGeneration: row.activeFingerprint,
+          expectedGeneration: row.expectedFingerprint,
+          expectedState: row.expectedState,
+          embedded: row.embeddedDocuments,
+          skipped: row.skippedDocuments,
+          backlog: row.backlogDocuments,
+          progress: row.totalDocuments === 0 ? 1 : completed / row.totalDocuments,
+          lastSuccessAt: row.lastSuccessAt?.toISOString() ?? null,
+          lastError: row.lastErrorCode,
+          latestAttemptGeneration: row.latestAttemptFingerprint,
+          latestAttemptState: row.latestAttemptState,
+          latestAttemptAt: row.latestAttemptAt?.toISOString() ?? null,
+          latestAttemptError: row.latestAttemptErrorCode,
+          currentCorpusRevision: row.currentCorpusRevision?.toString() ?? null,
+          indexedCorpusRevision: row.indexedCorpusRevision?.toString() ?? null,
+          expectedCorpusRevision: row.expectedCorpusRevision?.toString() ?? null,
+          latestAttemptCorpusRevision: row.latestAttemptCorpusRevision?.toString() ?? null,
+        };
+      });
     } catch {
       throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');
     }
+  }
+
+  async health(companyId: string, expectedFingerprint: string): Promise<VectorGenerationHealth> {
+    const [health] = await this.healthMany([companyId], expectedFingerprint);
+    if (health === undefined) throw new VectorStoreError('VECTOR_STORE_UNAVAILABLE');
+    return health;
   }
 }

@@ -44,9 +44,13 @@ describePostgres('classification search on PostgreSQL', () => {
     return created;
   }
 
-  async function fixtures() {
+  async function fixtures(transactionDirection: 'in' | 'out' | 'unknown' = 'out') {
     const current = await company('Delicious Milk');
     const foreign = await company('Amy Canada');
+    await db.company.update({
+      where: { id: current.id },
+      data: { taxSupportStatus: 'ready', taxUsingSalesTax: true },
+    });
     const account = await db.qboAccount.create({
       data: {
         companyId: current.id,
@@ -63,8 +67,12 @@ describePostgres('classification search on PostgreSQL', () => {
         name: 'HST ON 13%',
         active: true,
         taxable: true,
-        purchaseTaxRateList: [],
+        purchaseTaxRateList: [{ taxRateQboId: 'rate-hst-13', taxTypeApplicable: 'TaxOnAmount' }],
+        combinedPurchaseRate: 13,
       },
+    });
+    const tag = await db.tag.create({
+      data: { companyId: current.id, name: 'Inventory', color: '#112233' },
     });
     const vendor = await db.vendorIdentity.create({
       data: {
@@ -111,6 +119,7 @@ describePostgres('classification search on PostgreSQL', () => {
         originIntent: 'make_recurring',
       },
     });
+    await db.ruleTag.create({ data: { ruleId: rule.id, tagId: tag.id } });
     await db.rule.create({
       data: {
         companyId: current.id,
@@ -188,7 +197,7 @@ describePostgres('classification search on PostgreSQL', () => {
           categoryQboId: account.qboId,
           taxCalculation: 'TaxExcluded',
           taxCodeQboId: taxCode.qboId,
-          tagIds: [],
+          tagIds: [tag.id],
         },
         actionFingerprint: 'c'.repeat(64),
         originIntent: 'apply_once',
@@ -201,7 +210,7 @@ describePostgres('classification search on PostgreSQL', () => {
         jurisdiction: 'CA-ON',
         currency: 'CAD',
         context: {
-          transactionDirection: 'out',
+          transactionDirection,
           qboType: 'Purchase',
           sourceAccountName: 'Synthetic Bank',
           businessPurpose: 'Inventory resale',
@@ -228,7 +237,7 @@ describePostgres('classification search on PostgreSQL', () => {
         verifiedAt: new Date('2026-06-15T00:00:00.000Z'),
       },
     });
-    return { current, foreign, alias, rule, candidate, classificationCase, transaction };
+    return { current, foreign, account, taxCode, tag, alias, rule, candidate, classificationCase, transaction };
   }
 
   it('finds live aliases, rules, candidates, and case evidence while excluding inactive rows', async () => {
@@ -279,6 +288,17 @@ describePostgres('classification search on PostgreSQL', () => {
     }, { repository, semantic: null });
     expect(mismatchingContext.hits.map((candidate) => candidate.id))
       .not.toContain(`classification_case:${data.classificationCase.id}`);
+
+    const unknownData = await fixtures('unknown');
+    for (const transactionDirection of ['in', 'out'] as const) {
+      const explicitUnknownDirection = await searchClassificationMemory({
+        query: 'Ontario thirteen percent inventory', companyId: unknownData.current.id,
+        scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [unknownData.current.id],
+        context: { transactionDirection },
+      }, { repository, semantic: null });
+      expect(explicitUnknownDirection.hits.map((candidate) => candidate.id))
+        .toContain(`classification_case:${unknownData.classificationCase.id}`);
+    }
 
     const activeOnly = await repository.search(
       [data.current.id],
@@ -487,8 +507,8 @@ describePostgres('classification search on PostgreSQL', () => {
         },
         store: {
           async ensureAvailable() { return { available: true, reason: null }; },
-          async health() {
-            return {
+          async healthMany() {
+            return [{
               activeGeneration: generation.fingerprint,
               expectedGeneration: generation.fingerprint,
               expectedState: 'succeeded',
@@ -506,7 +526,7 @@ describePostgres('classification search on PostgreSQL', () => {
               indexedCorpusRevision: revision,
               expectedCorpusRevision: revision,
               latestAttemptCorpusRevision: revision,
-            };
+            }];
           },
           async search() {
             return [{
@@ -623,6 +643,96 @@ describePostgres('classification search on PostgreSQL', () => {
       [data.current.id],
       [`classification_case:${data.classificationCase.id}`],
     )).resolves.toEqual([]);
+  });
+
+  it('gates rule and case actions on current account, tax, tag, lifecycle, and tenant readiness', async () => {
+    const data = await fixtures();
+    const repository = new PrismaClassificationSearchRepository(db);
+    const ids = [`rule:${data.rule.id}`, `classification_case:${data.classificationCase.id}`];
+    const cards = async () => (await repository.rehydrate([data.current.id], ids))
+      .map((record) => record.hit);
+
+    await expect(cards()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: ids[0], action: expect.any(Object), advisory: true }),
+      expect.objectContaining({ id: ids[1], action: expect.any(Object), executable: true, advisory: false }),
+    ]));
+
+    await db.qboAccount.update({
+      where: { companyId_qboId: { companyId: data.current.id, qboId: data.account.qboId } },
+      data: { active: false },
+    });
+    for (const card of await cards()) {
+      expect(card).toMatchObject({ action: null, executable: false, advisory: true });
+      expect(card.actionSummary).toMatchObject({ categoryName: data.account.name });
+    }
+
+    await db.qboAccount.update({
+      where: { companyId_qboId: { companyId: data.current.id, qboId: data.account.qboId } },
+      data: { active: true },
+    });
+    await db.qboTaxCode.update({
+      where: { companyId_qboId: { companyId: data.current.id, qboId: data.taxCode.qboId } },
+      data: { active: false },
+    });
+    for (const card of await cards()) {
+      expect(card).toMatchObject({ action: null, executable: false, advisory: true });
+      expect(card.actionSummary).toMatchObject({ taxCodeName: data.taxCode.name });
+    }
+
+    await db.qboTaxCode.update({
+      where: { companyId_qboId: { companyId: data.current.id, qboId: data.taxCode.qboId } },
+      data: { active: true },
+    });
+    await db.company.update({
+      where: { id: data.current.id }, data: { taxSupportStatus: 'needs_setup' },
+    });
+    for (const card of await cards()) {
+      expect(card).toMatchObject({ action: null, executable: false, advisory: true });
+    }
+    await db.company.update({
+      where: { id: data.current.id }, data: { taxSupportStatus: 'ready' },
+    });
+    await db.tag.delete({ where: { id: data.tag.id } });
+    const caseAfterTagDeletion = (await cards()).find((card) => card.id === ids[1]);
+    expect(caseAfterTagDeletion).toMatchObject({ action: null, executable: false, advisory: true });
+
+    const foreignAccount = await db.qboAccount.create({
+      data: {
+        companyId: data.foreign.id, qboId: 'foreign-account', name: 'Foreign category',
+        fullName: 'Foreign category', classification: 'Expenses', active: true,
+      },
+    });
+    const foreignRule = await db.rule.create({
+      data: {
+        companyId: data.foreign.id, matchText: 'Foreign readiness needle',
+        category: foreignAccount.name, categoryQboId: foreignAccount.qboId,
+        taxCalculation: 'NotApplicable', revision: 1,
+      },
+    });
+    const foreign = await searchClassificationMemory({
+      query: 'Foreign readiness needle', companyId: data.current.id, scope: 'accessible_companies',
+      mode: 'exact', accessibleCompanyIds: [data.current.id, data.foreign.id],
+    }, { repository, semantic: null });
+    expect(foreign.hits).toContainEqual(expect.objectContaining({
+      id: `rule:${foreignRule.id}`, companyRelation: 'foreign', action: null,
+      executable: false, advisory: true,
+    }));
+  });
+
+  it('keeps deleted-account historical evidence readable but never executable', async () => {
+    const data = await fixtures();
+    await db.qboAccount.delete({
+      where: { companyId_qboId: { companyId: data.current.id, qboId: data.account.qboId } },
+    });
+    const cards = await new PrismaClassificationSearchRepository(db).rehydrate(
+      [data.current.id],
+      [`rule:${data.rule.id}`, `classification_case:${data.classificationCase.id}`],
+    );
+    expect(cards.map((record) => record.hit)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: null, executable: false, advisory: true }),
+      expect.objectContaining({ action: null, executable: false, advisory: true }),
+    ]));
+    expect(cards.every((record) => record.hit.actionSummary?.categoryName === data.account.name)).toBe(true);
   });
 
   it('keeps rule tags tenant-owned and searches immutable bounded case snapshots', async () => {

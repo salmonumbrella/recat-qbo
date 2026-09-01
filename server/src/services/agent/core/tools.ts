@@ -371,8 +371,8 @@ const classificationEvidenceCardSchema = z.object({
     && value.action.taxCalculation !== value.actionSummary.taxCalculation) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Tax summaries must agree.' });
   }
-  if (value.conflictingEvidenceCount !== value.conflicts.length) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ['conflictingEvidenceCount'], message: 'Conflict count mismatch.' });
+  if (value.conflictingEvidenceCount < value.conflicts.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['conflictingEvidenceCount'], message: 'Conflict count underflow.' });
   }
   if (value.action?.taxCalculation !== 'NotApplicable'
     && value.action !== null

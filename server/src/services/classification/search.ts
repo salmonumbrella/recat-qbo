@@ -38,6 +38,7 @@ import {
   type RankedDocumentList,
 } from './rrf.js';
 import { normalizeVendorLookupKey } from './vendorIdentity.js';
+import { classificationReferenceReasons } from './referenceReadiness.js';
 
 const MAX_ACCESSIBLE_COMPANIES = 100;
 const SEARCH_FETCH_MULTIPLIER = 5;
@@ -114,7 +115,7 @@ export interface ClassificationSemanticSearch {
   client: VoyageEmbeddingClient;
   store: Pick<
     PgClassificationVectorStore,
-    'ensureAvailable' | 'health' | 'search'
+    'ensureAvailable' | 'healthMany' | 'search'
   >;
 }
 
@@ -251,6 +252,7 @@ function recordsMatchingContext(
     if (value === undefined) return true;
     if (filter.transactionDirection !== undefined
       && value.transactionDirection !== undefined
+      && value.transactionDirection !== 'unknown'
       && value.transactionDirection !== filter.transactionDirection) return false;
     if (filter.qboType !== undefined && value.qboType !== undefined && value.qboType !== filter.qboType) return false;
     if (filter.sourceAccountName !== undefined
@@ -362,9 +364,7 @@ async function semanticLeg(
   }
   let health: VectorGenerationHealth[];
   try {
-    health = await Promise.all(companyIds.map((companyId) => (
-      semantic.store.health(companyId, semantic.generation.fingerprint)
-    )));
+    health = await semantic.store.healthMany(companyIds, semantic.generation.fingerprint);
   } catch {
     throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'semantic_error');
   }
@@ -654,10 +654,18 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
 
   async revisions(companyIds: readonly string[]): Promise<Readonly<Record<string, string>>> {
     const checked = checkedCompanyList(companyIds).sort();
-    const pairs = await Promise.all(checked.map(async (companyId) => (
-      [companyId, await this.corpusRevision(companyId)] as const
-    )));
-    return Object.fromEntries(pairs);
+    const rows = await this.db.$queryRaw<Array<{ companyId: string; revision: bigint }>>(Prisma.sql`
+      SELECT DISTINCT ON (revision."companyId")
+             revision."companyId", revision."revision"
+        FROM "ClassificationCorpusRevision" revision
+       WHERE revision."companyId" IN (${Prisma.join(checked)})
+       ORDER BY revision."companyId" ASC, revision."revision" DESC
+    `);
+    const byCompany = new Map(rows.map((row) => [row.companyId, row.revision.toString()]));
+    if (byCompany.size !== checked.length || checked.some((companyId) => !byCompany.has(companyId))) {
+      throw new ClassificationSearchError('COMPANY_UNAVAILABLE');
+    }
+    return Object.fromEntries(checked.map((companyId) => [companyId, byCompany.get(companyId)!]));
   }
 
   async exact(
@@ -1034,7 +1042,8 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       ELSE left(transaction."memo", 500)
     END`;
     const text = Prisma.sql`concat_ws(' ', ${snapshotPayee}, ${snapshotMemo}, identity."displayName",
-      account."fullName", tax."name", memory."rationale", memory."requiredEvidence"::text,
+      account."fullName", transaction."category", tax."name", transaction."taxCode",
+      memory."rationale", memory."requiredEvidence"::text,
       memory."examples"::text, memory."counterexamples"::text, memory."citations"::text,
       memory."context"::text)`;
     const queryFilter = query === null ? Prisma.empty : Prisma.sql`
@@ -1051,8 +1060,40 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              memory."counterexamples", memory."reviewer", memory."jurisdiction", memory."currency",
              memory."context", memory."provenance", memory."verifiedAt", memory."verifiedAt" AS "revisedAt",
              transaction."date" AS "transactionDate",
-             ${snapshotPayee} AS "payee", ${snapshotMemo} AS "memo", account."name" AS "categoryName",
-             tax."name" AS "taxCodeName", ${text} AS "searchText", ${score} AS "lexicalScore"
+             ${snapshotPayee} AS "payee", ${snapshotMemo} AS "memo",
+             COALESCE(account."name", transaction."category") AS "categoryName",
+             COALESCE(tax."name", transaction."taxCode") AS "taxCodeName",
+             account."active" IS TRUE AS "categoryActive",
+             company."taxSupportStatus" = 'ready' AS "taxReady",
+             CASE
+               WHEN memory."action"->>'taxCalculation' = 'NotApplicable'
+                 THEN memory."action"->>'taxCodeQboId' IS NULL
+               WHEN memory."action"->>'taxCalculation' IN ('TaxInclusive', 'TaxExcluded')
+                 THEN tax."active" IS TRUE
+                  AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
+                  AND (
+                    (tax."taxable" IS TRUE
+                     AND jsonb_array_length(tax."purchaseTaxRateList") = 1
+                     AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
+                    OR (tax."taxable" IS FALSE
+                        AND jsonb_array_length(tax."purchaseTaxRateList") = 0
+                        AND tax."combinedPurchaseRate" IS NULL)
+                  )
+               ELSE false
+             END AS "taxCodeEligible",
+             NOT EXISTS (
+               SELECT 1
+               FROM jsonb_array_elements_text(
+                 CASE WHEN jsonb_typeof(memory."action"->'tagIds') = 'array'
+                      THEN memory."action"->'tagIds' ELSE '[]'::jsonb END
+               ) requested_tag("id")
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM "Tag" current_tag
+                 WHERE current_tag."companyId" = memory."companyId"
+                   AND current_tag."id" = requested_tag."id"
+               )
+             ) AS "tagsExist",
+             ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "ClassificationCase" memory
       JOIN "Company" company ON company."id" = memory."companyId"
       JOIN "Transaction" transaction ON transaction."companyId" = memory."companyId"
@@ -1101,8 +1142,33 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       SELECT rule."id", rule."companyId", company."nickname" AS "companyName",
              rule."matchText", rule."categoryQboId", rule."taxCalculation", rule."taxCodeQboId",
              rule."originIntent", rule."revision", rule."updatedById", rule."updatedAt" AS "revisedAt",
-             rule."reviewRequiredAt", rule."reviewReason", account."name" AS "categoryName",
-             tax."name" AS "taxCodeName", COALESCE(tags."ids", '[]'::jsonb) AS "tagIds",
+             rule."reviewRequiredAt", rule."reviewReason",
+             COALESCE(account."name", rule."category") AS "categoryName",
+             COALESCE(tax."name", rule."taxCode") AS "taxCodeName",
+             account."active" IS TRUE AS "categoryActive",
+             company."taxSupportStatus" = 'ready' AS "taxReady",
+             CASE
+               WHEN rule."taxCalculation" = 'NotApplicable' THEN rule."taxCodeQboId" IS NULL
+               WHEN rule."taxCalculation" IN ('TaxInclusive', 'TaxExcluded')
+                 THEN tax."active" IS TRUE
+                  AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
+                  AND (
+                    (tax."taxable" IS TRUE
+                     AND jsonb_array_length(tax."purchaseTaxRateList") = 1
+                     AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
+                    OR (tax."taxable" IS FALSE
+                        AND jsonb_array_length(tax."purchaseTaxRateList") = 0
+                        AND tax."combinedPurchaseRate" IS NULL)
+                  )
+               ELSE false
+             END AS "taxCodeEligible",
+             NOT EXISTS (
+               SELECT 1 FROM "RuleTag" current_relation
+               JOIN "Tag" current_tag ON current_tag."id" = current_relation."tagId"
+               WHERE current_relation."ruleId" = rule."id"
+                 AND current_tag."companyId" <> rule."companyId"
+             ) AS "tagsExist",
+             COALESCE(tags."ids", '[]'::jsonb) AS "tagIds",
              COALESCE(tags."namesArray", '[]'::jsonb) AS "tagNames",
              ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "Rule" rule
@@ -1234,6 +1300,10 @@ type ClassificationCaseSearchRow = BaseSearchRow & {
   memo: string | null;
   categoryName: string | null;
   taxCodeName: string | null;
+  categoryActive: boolean;
+  taxReady: boolean;
+  taxCodeEligible: boolean;
+  tagsExist: boolean;
   searchText: string;
 };
 
@@ -1251,6 +1321,10 @@ type RuleSearchRow = BaseSearchRow & {
   taxCodeName: string | null;
   tagIds: Prisma.JsonValue;
   tagNames: Prisma.JsonValue;
+  categoryActive: boolean;
+  taxReady: boolean;
+  taxCodeEligible: boolean;
+  tagsExist: boolean;
   searchText: string;
 };
 
@@ -1291,6 +1365,7 @@ function classificationCaseSqlFilter(
     AND (
       NOT (memory."context" ? 'transactionDirection')
       OR jsonb_typeof(memory."context"->'transactionDirection') <> 'string'
+      OR memory."context"->>'transactionDirection' = 'unknown'
       OR memory."context"->>'transactionDirection' = ${context.transactionDirection}
     )
   `);
@@ -1617,8 +1692,15 @@ function aliasRecord(row: VendorAliasSearchRow): () => ClassificationSearchRecor
 function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearchRecord {
   return () => {
     const revisedAt = row.revisedAt.toISOString();
-    const action = actionFromJson(row.action);
-    const summary = actionSummary(action, row.categoryName, row.taxCodeName);
+    const rawAction = actionFromJson(row.action);
+    const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName);
+    const referencesValid = rawAction !== null && classificationReferenceReasons(rawAction, {
+      categoryActive: row.categoryActive,
+      taxReady: row.taxReady,
+      taxCodeEligible: row.taxCodeEligible,
+      tagsExist: row.tagsExist,
+    }).length === 0;
+    const action = referencesValid ? rawAction : null;
     const provenance = row.provenance as unknown as ClassificationSearchHit['provenance'];
     const hit = baseHit({
       row, kind: 'classification_case', vendorIdentityId: row.vendorIdentityId, vendorName: row.vendorName,
@@ -1656,7 +1738,7 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
         currency: row.currency,
         transactionDate: row.transactionDate.toISOString().slice(0, 10),
         jurisdiction: row.jurisdiction,
-        ...(action === null ? {} : { taxCalculation: action.taxCalculation }),
+        ...(rawAction === null ? {} : { taxCalculation: rawAction.taxCalculation }),
       },
     };
   };
@@ -1665,9 +1747,16 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
 function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
   return () => {
     const revisedAt = row.revisedAt.toISOString();
-    const action = actionFromColumns(row);
-    const summary = actionSummary(action, row.categoryName, row.taxCodeName, jsonStrings(row.tagNames));
-    const taxed = action !== null && action.taxCalculation !== 'NotApplicable';
+    const rawAction = actionFromColumns(row);
+    const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName, jsonStrings(row.tagNames));
+    const referencesValid = rawAction !== null && classificationReferenceReasons(rawAction, {
+      categoryActive: row.categoryActive,
+      taxReady: row.taxReady,
+      taxCodeEligible: row.taxCodeEligible,
+      tagsExist: row.tagsExist,
+    }).length === 0;
+    const action = referencesValid ? rawAction : null;
+    const taxed = rawAction !== null && rawAction.taxCalculation !== 'NotApplicable';
     const conflicted = row.reviewRequiredAt !== null;
     const conflict = conflicted ? [{
       id: `rule-review:${row.id}`,

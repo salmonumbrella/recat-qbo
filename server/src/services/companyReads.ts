@@ -35,6 +35,7 @@ import {
   type ClassificationSearchSnapshot,
 } from './classification/search.js';
 import type { RuleRevision } from '@recat/shared';
+import { classificationReferenceReasons } from './classification/referenceReadiness.js';
 
 export const DEFAULT_READ_LIMIT = 20;
 export const MAX_READ_LIMIT = 100;
@@ -762,33 +763,15 @@ function ruleReferenceReasons(
   existingTags: ReadonlySet<string>,
   readiness: TaxReadinessDto | null,
 ): string[] {
-  const reasons: string[] = [];
-  if (rule.categoryQboId === null || !activeAccounts.has(rule.categoryQboId)) {
-    reasons.push('Category account is missing or inactive.');
-  }
-  const calculation = rule.taxCalculation;
-  if (calculation !== 'TaxInclusive'
-    && calculation !== 'TaxExcluded'
-    && calculation !== 'NotApplicable') {
-    reasons.push('Tax treatment is missing or invalid.');
-  }
-  const taxed = calculation === 'TaxInclusive' || calculation === 'TaxExcluded';
-  if (taxed && readiness?.status !== 'ready') {
-    reasons.push('Tax reference is not ready.');
-  }
   const eligibleCodes = new Set(
     readiness === null ? [] : eligibleTaxCodes(readiness).map((code) => code.qboId),
   );
-  if (taxed && (rule.taxCodeQboId === null || !eligibleCodes.has(rule.taxCodeQboId))) {
-    reasons.push('Tax code is missing or ineligible.');
-  }
-  if (calculation === 'NotApplicable' && rule.taxCodeQboId !== null) {
-    reasons.push('Tax treatment is missing or invalid.');
-  }
-  if (rule.tagIds.some((tagId) => !existingTags.has(tagId))) {
-    reasons.push('One or more tags no longer exist.');
-  }
-  return reasons.slice(0, 4);
+  return classificationReferenceReasons(rule, {
+    categoryActive: rule.categoryQboId !== null && activeAccounts.has(rule.categoryQboId),
+    taxReady: readiness?.status === 'ready',
+    taxCodeEligible: rule.taxCodeQboId !== null && eligibleCodes.has(rule.taxCodeQboId),
+    tagsExist: rule.tagIds.every((tagId) => existingTags.has(tagId)),
+  });
 }
 
 export function boundedTaxReadiness(

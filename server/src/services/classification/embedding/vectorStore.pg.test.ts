@@ -209,6 +209,41 @@ describePgvector('classification vector store on PostgreSQL with pgvector', () =
     })).revision;
   }
 
+  it('loads semantic health for one hundred companies with one database round trip', async () => {
+    const prefix = `vector-health-many-${randomUUID()}`;
+    await db.company.createMany({
+      data: Array.from({ length: 100 }, (_unused, index) => ({
+        realmId: `${prefix}-${index}`,
+        legalName: `Health Many ${index} Legal`,
+        nickname: `Health Many ${index}`,
+      })),
+    });
+    const owners = await db.company.findMany({
+      where: { realmId: { startsWith: prefix } },
+      orderBy: { id: 'asc' },
+    });
+    owners.forEach((owner) => companyIds.add(owner.id));
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: 'health-many',
+    });
+    await new PgClassificationVectorStore(db).ensureAvailable();
+    let queryCount = 0;
+    const measuredDb = {
+      async $queryRaw(query: unknown) {
+        queryCount += 1;
+        return db.$queryRaw(query as never);
+      },
+      async $executeRaw() { throw new Error('not expected'); },
+    };
+
+    const health = await new PgClassificationVectorStore(measuredDb as never)
+      .healthMany(owners.map((owner) => owner.id), generation.fingerprint);
+
+    expect(health).toHaveLength(100);
+    expect(health.every((state) => state.currentCorpusRevision !== null)).toBe(true);
+    expect(queryCount).toBe(1);
+  });
+
   async function expectSemanticGuardRejectsStale(
     store: PgClassificationVectorStore,
     companyId: string,

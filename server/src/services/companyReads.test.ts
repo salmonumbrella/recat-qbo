@@ -237,6 +237,53 @@ describe('company read services', () => {
     expect(JSON.stringify(result)).not.toMatch(/categoryQboId|taxCodeQboId|tagIds/);
   });
 
+  it('keeps concurrent principals isolated with one hundred refreshed memberships', async () => {
+    const db = makeDb();
+    const secondUser = 'user-2';
+    const secondCompany = 'company-b';
+    const firstCompanies = [
+      COMPANY_ID,
+      ...Array.from({ length: 99 }, (_unused, index) => `company-a-${String(index).padStart(3, '0')}`),
+    ].sort();
+    db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) => ({
+      id: args.where.id, isInstanceAdmin: false,
+    }));
+    db.membership.findMany.mockImplementation(async (args: { where: { userId: string } }) => (
+      args.where.userId === USER_ID
+        ? firstCompanies.map((companyId) => ({ companyId, role: 'viewer' }))
+        : [{ companyId: secondCompany, role: 'viewer' }]
+    ));
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      result: {
+        query: input.query, companyId: input.companyId, scope: 'accessible_companies' as const,
+        mode: 'lexical' as const, requestedMode: 'lexical' as const,
+        degraded: false, degradedReason: null, status: 'no_match' as const, noMatch: true,
+        total: 0, hits: [],
+      },
+      fingerprint: `fingerprint-${String(input.companyId)}`,
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await Promise.all([
+      service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+        query: 'Coffee', scope: 'accessible_companies', mode: 'lexical', limit: 10,
+      }),
+      service.searchClassificationKnowledge(secondUser, secondCompany, {
+        query: 'Tea', scope: 'accessible_companies', mode: 'lexical', limit: 10,
+      }),
+    ]);
+
+    expect(classificationSearch).toHaveBeenCalledTimes(2);
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID, accessibleCompanyIds: firstCompanies,
+    }));
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: secondCompany, accessibleCompanyIds: [secondCompany],
+    }));
+  });
+
   it('requires actual membership for accessible-company search even for an instance admin', async () => {
     const db = makeDb();
     db.user.findUnique.mockResolvedValue({ id: USER_ID, isInstanceAdmin: true });

@@ -229,6 +229,30 @@ describePostgres('classification company reads on PostgreSQL', () => {
       query: 'Coffee', mode: 'lexical', limit: 1, cursor: firstPage.nextCursor ?? undefined,
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
 
+    const expectRuleAndSearchAdvisory = async () => {
+      const [currentRule, currentSearch] = await Promise.all([
+        service.getRule(user.id, company.id, rule.id),
+        service.searchClassificationKnowledge(user.id, company.id, {
+          query: 'Coffee', mode: 'exact', limit: 20,
+        }),
+      ]);
+      expect(currentRule).toMatchObject({
+        executable: false,
+        revision: {
+          action: null, valid: false,
+          invalidReasons: expect.arrayContaining(['Category account is missing or inactive.']),
+        },
+      });
+      expect(currentSearch.items.find((item) => item.id === `rule:${rule.id}`)).toMatchObject({
+        action: null, executable: false, advisory: true,
+        actionSummary: { categoryName: account.name },
+      });
+    };
+    await db.qboAccount.update({ where: { id: account.id }, data: { active: false } });
+    await expectRuleAndSearchAdvisory();
+    await db.qboAccount.delete({ where: { id: account.id } });
+    await expectRuleAndSearchAdvisory();
+
     const legacyRule = await db.rule.create({
       data: {
         companyId: company.id, matchText: 'Legacy', category: 'Historical category',

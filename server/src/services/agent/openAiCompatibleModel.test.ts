@@ -61,6 +61,25 @@ function decisionEnvelope() {
   };
 }
 
+function boundedConflictCard() {
+  return {
+    id: 'rule_candidate:candidate-1', sourceId: 'candidate-1', kind: 'rule_candidate',
+    companyId: 'company-a', companyName: 'Company A', companyRelation: 'current',
+    executable: false, advisory: true, matchedIn: ['candidate'], score: 0.5,
+    vendorIdentityId: null, vendorName: 'Example Vendor',
+    action: { categoryQboId: 'cat.office', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+    actionSummary: { categoryName: 'Office supplies', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+    originIntent: 'auto_candidate', evidenceCount: 5, conflictingEvidenceCount: 3,
+    conflicts: [{
+      id: 'conflict-1', companyId: 'company-a', sourceId: 'case-1', kind: 'case',
+      reason: 'A bounded returned contradiction.', action: null, actionSummary: null, evidenceCount: 1,
+    }],
+    provenance: { source: 'candidate', sourceId: 'candidate-1', actorId: null, recordedAt: '2026-08-31T00:00:00.000Z' },
+    rationale: null, examples: [], counterexamples: [], jurisdiction: null, currency: null,
+    verifiedAt: null, ruleRevision: null,
+  };
+}
+
 function completionResponse(
   content: unknown = JSON.stringify(decisionEnvelope()),
   options: {
@@ -443,6 +462,41 @@ describe('OpenAiCompatibleAgentModel requests', () => {
           query: 'Coffee', requestedMode: 'lexical', scope: 'current_company', status: 'no_match', total: 0,
         },
       }),
+    });
+  });
+
+  it('serializes bounded candidate history when aggregate conflicts exceed returned details', async () => {
+    const card = boundedConflictCard();
+    const input = {
+      ...modelInput(),
+      history: [
+        {
+          role: 'assistant',
+          toolCalls: [{
+            id: 'candidate-search', name: 'search_classification_knowledge',
+            arguments: { query: 'Vendor', limit: 5, mode: 'lexical' },
+          }],
+        },
+        {
+          role: 'tool', toolCallId: 'candidate-search', name: 'search_classification_knowledge',
+          result: {
+            items: [card],
+            search: {
+              query: 'Vendor', scope: 'current_company', mode: 'lexical', requestedMode: 'lexical',
+              degraded: false, degradedReason: null, status: 'matched', noMatch: false, total: 1,
+            },
+          },
+        },
+      ],
+    } as AgentModelInput;
+    const model = new OpenAiCompatibleAgentModel({
+      provider: 'custom', model: 'local-model', baseUrl: 'https://models.invalid/v1',
+    });
+    const { body } = await capturedRequest(model, input);
+    const messages = body.messages as Array<Record<string, unknown>>;
+    const tool = messages.find((message) => message.role === 'tool');
+    expect(JSON.parse(String(tool?.content))).toMatchObject({
+      items: [{ conflictingEvidenceCount: 3, conflicts: [expect.any(Object)] }],
     });
   });
 
