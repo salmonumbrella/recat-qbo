@@ -192,6 +192,7 @@ describe('shadow worker safety boundary', () => {
       './core/snapshot.js',
       './jobs.js',
       './snapshotLoader.js',
+      './classificationSearch.js',
     ]);
     expect(source).not.toMatch(
       /stageCategorization|commitStagedCategorization|writeback|transfer|qboFactory|sendPreparedWrite|fetch\(/u,

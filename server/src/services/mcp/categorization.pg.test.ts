@@ -118,6 +118,25 @@ describePostgres('MCP categorization PostgreSQL atomicity', () => {
         bankAccount: 'Fixture bank',
       },
     });
+    await firstClient.transactionActionability.create({
+      data: {
+        companyId: company.id,
+        transactionId: transaction.id,
+        disposition: 'WRITABLE',
+        checkedAt: NOW,
+        revision: transaction.revision,
+        qboSyncToken: transaction.qboSyncToken,
+        qboType: transaction.qboType,
+        qboId: transaction.qboId,
+        txnDate: transaction.date,
+        bankAccountQboId: null,
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+        unavailableCode: null,
+        unavailableReason: null,
+      },
+    });
     return {
       userId: user.id,
       companyId: company.id,

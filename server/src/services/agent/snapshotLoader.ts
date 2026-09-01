@@ -219,6 +219,8 @@ export async function loadAgentSnapshotSourceInTransaction(
        FROM "Rule" AS rule
        LEFT JOIN "RuleTag" AS rule_tag ON rule_tag."ruleId" = rule."id"
        WHERE rule."companyId" = $1
+         AND rule."enabled" = true
+         AND rule."retiredAt" IS NULL
          AND rule."matchField" = 'payee'
          AND position(lower(rule."matchText") in lower($2)) > 0
        GROUP BY rule."id"

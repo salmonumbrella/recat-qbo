@@ -85,6 +85,13 @@ One click provisions the app + PostgreSQL with generated secrets. The setup wiza
 **MCP server — let an AI assistant work your books**
 - Recat speaks the [Model Context Protocol](https://modelcontextprotocol.io) at `/mcp`, so an MCP client (Claude, or anything else that speaks it) can read your queue and categorize through the same verified paths the UI uses
 - **Reads**: companies, transactions, categories, tags, rules, tax codes, and transfer candidates
+- **Classification memory**: company-scoped vendor identities and aliases,
+  verified classification cases, rule revisions, learned candidates, and
+  bounded evidence search. Results state whether a match came from an alias,
+  rule, case, candidate, lexical, or semantic leg; expose conflicts and
+  provenance; and label no-match or degraded lexical outcomes explicitly.
+  Cross-company matches are advisory only: Recat strips their QBO identifiers
+  and returns human-readable action summaries instead.
 - **Writes are two-phase.** A client calls `prepare_categorization` (or `prepare_transfer` / `prepare_undo`) and gets back a validated summary — per-line subtotal, tax and total, the tax disposition, exact target category/tax-code identifiers, and tag counts — then must `commit_` it as a separate step. Nothing writes to QuickBooks on a single blind tool call, and every commit is read back and verified. Memos and individual tags remain redacted from the preview.
 - **These tokens can change your books.** A token grants every MCP operation the user's roles allow — so a leaked one can recategorize real transactions. It can't reach the rest of the app: bearer auth is mounted only at `/mcp`, so user and team management, company and instance settings, and reporting stay session-only. Treat it like a password: one per client, revoked when you're done
 - Create and revoke tokens in **Settings → MCP access tokens**. They're shown once, stored only as a SHA-256 digest, expire 90 days after creation, and honour per-company roles, dry-run, and per-token rate limits. (The API accepts 1–365 days; the Settings screen always issues 90.)
@@ -172,6 +179,31 @@ npm run seed                # demo data (QBO_MOCK=true)
 npm run dev                 # server :3001 + client :5173
 npm test                    # full server + client test suite
 ```
+
+Classification-memory retrieval has a deterministic PostgreSQL end-to-end
+test. It starts a local HTTP embedding fixture, so it needs no embedding API
+key or provider account. Point it only at an anchor database on a disposable
+PostgreSQL server where the local test role may create/drop databases and
+install the already-available `vector` extension:
+
+```bash
+cd server
+TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
+  src/services/classification/search.e2e.test.ts
+```
+
+The suite creates a uniquely named database, applies all Prisma migrations,
+installs pgvector, truncates all disposable data between cases, and drops the
+database in final teardown without changing the configured anchor. A failed
+drop is reported and remains retryable; teardown records completion only after
+the anchor verifies that the database is absent. The fixture is test-only. It
+exercises exact, lexical, semantic, and hybrid search;
+embedding replacement and generation cutover; membership-derived tenant
+boundaries; explicit endpoint-down degradation; suggestion-only recurring
+rules; restart readback; and transaction rollback at every exercised
+rule-operation durability boundary. Fail-closed guards mechanically deny and
+count QBO factory/client calls and outbound network traffic other than the
+exact loopback embedding origin. It does not contact or mutate QuickBooks.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules.
 

@@ -687,7 +687,7 @@ async function resolveCategoryQboId(
 
 async function loadRuleLikes(companyId: string): Promise<RuleLike[]> {
   return prisma.rule.findMany({
-    where: { companyId },
+    where: { companyId, enabled: true, retiredAt: null },
     select: { id: true, matchText: true, category: true, categoryQboId: true, priority: true, createdAt: true },
   });
 }

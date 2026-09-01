@@ -480,7 +480,10 @@ async function runSyncCompany(
           transactionIdentityFromRow(txn),
         ) === 'WRITABLE')
       : pendingCandidates;
-    const rules = await prisma.rule.findMany({ where: { companyId }, include: { ruleTags: true } });
+    const rules = await prisma.rule.findMany({
+      where: { companyId, enabled: true, retiredAt: null },
+      include: { ruleTags: true },
+    });
     for (const txn of pending) {
       const suggestion = txn.suggestion as unknown as SuggestionDto | null;
       if (!suggestion || suggestion.source !== 'rule' || !suggestion.ruleId) continue;

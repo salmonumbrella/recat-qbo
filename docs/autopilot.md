@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-08-02
+last_edited: 2026-09-01
 ---
 
 # Autopilot shadow-provider boundary
@@ -9,6 +9,98 @@ endpoint to propose a categorization. In this release it is a pure library: it
 has no scheduler, database, MCP, or QuickBooks write dependency, and nothing
 invokes it automatically. Any caller that enables a real model sends the
 bounded context below to that external provider.
+
+## Classification-memory contract
+
+Recat's classification-memory API is the canonical, company-scoped source for
+verified decisions, vendor identities and aliases, active rule revisions, and
+learned candidates. Its public DTOs are bounded and strict. A classification
+action is one supported categorization line containing the QuickBooks category
+ID, tax calculation, a tax-code ID for taxable actions (`NotApplicable`
+requires `null`), and local transaction tag IDs. Display names
+are preview context only; a commit must revalidate the current company's QBO
+IDs and never substitute a name for an ID.
+
+Every search result reports its effective `mode`, `degraded` flag and bounded
+`degradedReason`, match reasons (`alias`, `rule`, `candidate`, `case`,
+`lexical`, or `semantic`), stable source IDs, company relation, executable or
+advisory status, evidence counts, conflicts, and provenance. A foreign-company
+hit is always advisory and non-executable. It contains only a human-readable
+action summary; its QBO category, tax-code, and tag IDs are stripped. No
+evidence is an explicit
+`status: "no_match"` result with `noMatch: true`; it is not silently treated
+as a provider or database error. In `auto` mode, a missing embedding/vector
+leg returns an explicitly degraded lexical result. Explicit `hybrid` or
+`semantic` callers receive the safe `SEMANTIC_UNAVAILABLE` error instead of a
+result that pretends semantic search ran.
+
+The origin intents `apply_once`, `make_recurring`, and `auto_candidate` record
+why evidence or a rule was proposed; they are not accounting actions.
+New recurring and candidate-origin rules always start with `autoPost: false`.
+Enabling auto-post later is a separate revision-bound, audited mutation. Rule
+previews include the exact payee condition and
+tax-aware action, current/proposed revision, category and tax labels plus QBO
+IDs, priority, affected pending/posted counts, bounded samples, conflicts,
+warnings, and the preparation digest. Safe error serialization returns only
+an allowlisted code and fixed message—never provider messages, raw QBO data,
+credentials, or private prompts.
+
+### Deterministic local verification
+
+The classification-memory end-to-end suite uses a local deterministic HTTP
+embedding fixture and a disposable PostgreSQL/pgvector server. Fixed
+accounting-purpose signals map to stable unit vectors, including separate
+vector slots for a simulated model/generation cutover. Vendor/source words do
+not choose an accounting topic: vendor-only Chevron documents map to the
+neutral vector, while stored fuel and personal case documents map to distinct
+literal topics. The fixture records only the test request method, path, input
+type, input text, and resolved synthetic topic; it has no provider credential
+and makes no outbound request.
+
+Use an anchor database on a disposable server where the local role may
+create/drop databases and install the already-available `vector` extension:
+
+```bash
+cd server
+TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
+  src/services/classification/search.e2e.test.ts
+```
+
+Each invocation creates a unique database, applies all migrations, installs
+pgvector, truncates every disposable data table between cases, and force-drops
+the database in final teardown without changing the configured anchor. A drop
+failure is surfaced without marking teardown complete, so the same handle can
+retry; successful teardown verifies absence from the anchor. Initialization
+and cleanup failures are reported together with the exact disposable database
+name. The suite verifies exact alias, distinct fuel/personal semantic queries,
+hybrid RRF retrieval, edit/re-embed and atomic generation cutover without
+stale-vector leakage, membership-derived cross-company
+redaction/authorization, and labelled lexical degradation when the embedding
+endpoint is unavailable. Its
+isolated Chevron scenario keeps recurring policy suggestion-only (`autoPost:
+false`), snapshots the synthetic transactions and QBO-mutation-attempt count
+before the rule operation, and requires both to remain deeply equal to those
+snapshots after prepare, commit, endpoint calls, client replacement, and search
+readback.
+
+Fail-closed instrumentation wraps every QBO factory method, mutating real/mock
+QBO client method, global fetch, and Node HTTP/HTTPS request path. Deliberate
+denial probes prove those guards count and throw; the real Chevron flow must
+then leave every counter at zero while only the exact loopback fixture origin
+is allowed. The candidate policy-write matrix uses already folded evidence and
+injects after each applicable activation/dismissal
+rule/candidate/revision/audit/receipt write. A separate activation scenario
+leaves one real VERIFIED outcome unfurled, commits the durable reconciliation
+transaction, and crashes before the policy transaction. It proves the four
+fold/evidence receipts survive while rules, revisions, audits, and the old
+operation receipt do not change; a fresh client observes the stale prepared
+envelope conflict, reprepares a new envelope, commits, and replays it. Together
+with faults after each durable prepare/create write and both occurrences of
+every changed reorder rule/revision/audit write, these cases verify exact
+rollback snapshots, restart recovery, idempotent replay, expiry retry,
+stale-revision and conflict rejection, append-only history, and absence of
+partial priority or policy state. This is local test evidence only; it neither
+enables semantic configuration nor deploys or restarts a running Recat service.
 
 ## Provider request
 

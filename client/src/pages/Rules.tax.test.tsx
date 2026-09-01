@@ -37,18 +37,19 @@ vi.mock('../state/AppContext', () => ({
 }));
 
 vi.mock('../lib/api', () => ({
+  createCategorizationRequestId: vi.fn(() => '99999999-9999-4999-8999-999999999999'),
+  classificationMemory: {
+    search: vi.fn(),
+    health: vi.fn(),
+  },
+  ruleOperations: { prepare: vi.fn(), commit: vi.fn() },
   rules: {
-    list: mocks.list,
-    create: vi.fn(),
-    patch: vi.fn(),
-    del: vi.fn(),
-    reorder: vi.fn(),
+    lifecycle: mocks.list,
+    revisions: vi.fn(),
     test: vi.fn(),
   },
   ruleCandidates: {
     list: vi.fn().mockResolvedValue({ candidates: [], nextCursor: null }),
-    activate: vi.fn(),
-    dismiss: vi.fn(),
   },
 }));
 
@@ -56,21 +57,21 @@ import Rules from './Rules';
 
 describe('Rules historical tax validation', () => {
   it('shows an invalid stored tax reference instead of silently applying it', async () => {
-    mocks.list.mockResolvedValue([{
-      id: 'RULE_GENERIC',
-      companyId: 'COMPANY_GENERIC',
-      priority: 0,
-      matchField: 'payee',
-      matchText: 'Generic supplier',
-      category: 'Generic expense',
-      categoryQboId: 'EXPENSE_ACCOUNT',
-      taxCalculation: 'TaxInclusive',
-      taxCode: 'Historical purchase tax',
-      taxCodeQboId: 'TAX_CODE_HISTORICAL',
-      tagIds: [],
-      autoPost: false,
-      createdAt: '2026-07-28T00:00:00.000Z',
-    }]);
+    mocks.list.mockResolvedValue({ items: [{
+      active: true,
+      executable: false,
+      reviewRequiredAt: null,
+      reviewReason: null,
+      revision: {
+        id: 'REVISION_GENERIC', ruleId: 'RULE_GENERIC', companyId: 'COMPANY_GENERIC',
+        revision: 2, state: 'enabled', condition: { matchField: 'payee', matchText: 'Generic supplier' },
+        action: null, categoryName: 'Generic expense', taxCodeName: 'Historical purchase tax',
+        priority: 0, autoPost: false, originIntent: null, sourceCaseId: null,
+        sourceCandidateId: null, changedBy: null, createdAt: '2026-07-28T00:00:00.000Z',
+        retiredAt: null, valid: false,
+        invalidReasons: ['Tax reference unavailable: Historical purchase tax.'],
+      },
+    }], nextCursor: null });
 
     render(<Rules />);
 

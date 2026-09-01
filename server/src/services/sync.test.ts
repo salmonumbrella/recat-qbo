@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+  actionabilityEnabled: vi.fn(),
   audit: vi.fn(),
   refreshTaxReference: vi.fn(),
   refreshSuggestions: vi.fn(),
@@ -34,16 +35,20 @@ vi.mock('../lib/prisma.js', () => ({
       txnTag: { upsert: mocks.txnTagUpsert },
       $queryRawUnsafe: vi.fn(),
     };
-    return {
-    company: { findUnique: mocks.companyFindUnique, update: mocks.companyUpdate },
-    qboAccount: { upsert: mocks.qboAccountUpsert },
-    transaction,
-    txnTag: client.txnTag,
-    rule: { findMany: mocks.ruleFindMany },
-    syncLog: { create: mocks.syncLogCreate },
-    $queryRawUnsafe: client.$queryRawUnsafe,
-    $transaction: vi.fn(async (callback) => callback(client)),
+    const prismaMock = {
+      company: { findUnique: mocks.companyFindUnique, update: mocks.companyUpdate },
+      qboAccount: { upsert: mocks.qboAccountUpsert },
+      transaction,
+      txnTag: client.txnTag,
+      rule: { findMany: mocks.ruleFindMany },
+      syncLog: { create: mocks.syncLogCreate },
+      $queryRawUnsafe: client.$queryRawUnsafe,
+      $transaction: vi.fn(async (callback) => callback(client)),
     };
+    Object.defineProperty(prismaMock, 'transactionActionability', {
+      get: () => mocks.actionabilityEnabled() ? {} : undefined,
+    });
+    return prismaMock;
   })(),
 }));
 vi.mock('../lib/qbo/factory.js', () => ({
@@ -114,6 +119,7 @@ function qboTxn(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.actionabilityEnabled.mockReturnValue(false);
   mocks.companyFindUnique.mockResolvedValue({ id: 'company-1', holdingAccountIds: [], lastSyncedAt: null });
   mocks.listAccounts.mockResolvedValue([]);
   mocks.listTxnsInAccounts.mockResolvedValue([]);
@@ -344,5 +350,73 @@ describe('syncCompany', () => {
     expect(pending.category).toBeNull();
     expect(mocks.txnTagUpsert).not.toHaveBeenCalled();
     expect(mocks.postTransaction).not.toHaveBeenCalled();
+  });
+
+  it('auto-posts only provider-writable transactions governed by active rules', async () => {
+    mocks.actionabilityEnabled.mockReturnValue(true);
+    const checkedAt = new Date();
+    const pending = (id: string, ruleId: string, disposition: 'WRITABLE' | 'UNKNOWN') => ({
+      ...qboTxn({ qboId: `qbo-${id}` }),
+      id,
+      companyId: 'company-1',
+      qboSyncToken: '7',
+      revision: 4,
+      status: 'PENDING',
+      suggestion: { source: 'rule', ruleId, category: 'Generic category' },
+      category: null,
+      categoryQboId: null,
+      txnTags: [],
+      _count: { splitLines: 0 },
+      providerActionability: {
+        companyId: 'company-1',
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 4,
+        qboSyncToken: '7',
+        qboType: 'Purchase',
+        qboId: `qbo-${id}`,
+        txnDate: '2026-07-29',
+        bankAccountQboId: 'bank-generic',
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+        unavailableCode: null,
+        unavailableReason: null,
+      },
+    });
+    const activeWritable = pending('active-writable', 'rule-active', 'WRITABLE');
+    const retiredWritable = pending('retired-writable', 'rule-retired', 'WRITABLE');
+    const activeUnknown = pending('active-unknown', 'rule-active', 'UNKNOWN');
+    mocks.transactionFindMany.mockImplementation(async ({ where, select }) => {
+      if (select?.qboType) return [];
+      if (where?.status?.in) return [];
+      if (where?.status === 'PENDING') return [activeWritable, retiredWritable, activeUnknown];
+      return [];
+    });
+    mocks.ruleFindMany.mockImplementation(async ({ where }) => {
+      const rules = [
+        {
+          id: 'rule-active', enabled: true, retiredAt: null, autoPost: true,
+          category: 'Generic category', categoryQboId: 'account-generic', ruleTags: [],
+        },
+        {
+          id: 'rule-retired', enabled: false, retiredAt: checkedAt, autoPost: true,
+          category: 'Retired category', categoryQboId: 'account-retired', ruleTags: [],
+        },
+      ];
+      return where.enabled === true && where.retiredAt === null
+        ? rules.filter((rule) => rule.enabled && rule.retiredAt === null)
+        : rules;
+    });
+
+    await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(mocks.postTransaction).toHaveBeenCalledTimes(1);
+    expect(mocks.postTransaction).toHaveBeenCalledWith(
+      'active-writable',
+      { id: null, label: 'system' },
+      { auto: true },
+    );
   });
 });

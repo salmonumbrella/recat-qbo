@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -5,14 +6,20 @@ import {
   MAX_READ_LIMIT,
   createCompanyReadService,
   getCompany,
+  getClassificationCase,
+  getRule,
+  getRuleCandidate,
   getTransaction,
   listCategories,
   listCompanies,
   listRules,
+  listRuleCandidates,
   listTags,
   listTaxCodes,
   listTransactions,
   listTransferCandidates,
+  searchClassificationKnowledge,
+  testRule,
   type CompanyReadDb,
 } from './companyReads.js';
 import {
@@ -77,6 +84,21 @@ function transaction(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function classificationHit(id: string) {
+  return {
+    id, sourceId: id, kind: 'classification_case' as const,
+    companyId: COMPANY_ID, companyName: 'Acme', companyRelation: 'current' as const,
+    executable: true, advisory: false, matchedIn: ['lexical'] as const, score: 1,
+    vendorIdentityId: null, vendorName: 'Coffee',
+    action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable' as const, taxCodeQboId: null, tagIds: [] },
+    actionSummary: { categoryName: 'Meals', taxCalculation: 'NotApplicable' as const, taxCodeName: null, tagNames: [] },
+    originIntent: 'apply_once' as const, evidenceCount: 1, conflictingEvidenceCount: 0,
+    conflicts: [], provenance: { source: 'qbo_verified' as const, sourceId: id, actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+    rationale: 'Verified.', examples: [], counterexamples: [], jurisdiction: 'unknown',
+    currency: 'CAD', verifiedAt: '2026-01-01T00:00:00.000Z', ruleRevision: null,
+  };
+}
+
 function makeDb() {
   const db = {
     user: {
@@ -85,6 +107,7 @@ function makeDb() {
     },
     membership: {
       findUnique: vi.fn(async () => ({ role: 'categorizer' })),
+      findMany: vi.fn(async () => [{ companyId: COMPANY_ID, role: 'categorizer' }]),
     },
     company: {
       findUnique: vi.fn(async () => company()),
@@ -99,7 +122,11 @@ function makeDb() {
     qboAccount: { findMany: vi.fn(async () => []) },
     qboTaxCode: { findMany: vi.fn(async () => []) },
     tag: { findMany: vi.fn(async () => []) },
-    rule: { findMany: vi.fn(async () => []) },
+    rule: { findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null) },
+    ruleRevision: { findFirst: vi.fn(async () => null) },
+    autopilotRuleCandidate: { findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null) },
+    autopilotRuleCandidateEvidence: { findMany: vi.fn(async () => []) },
+    classificationCase: { findFirst: vi.fn(async () => null) },
   };
   return db;
 }
@@ -112,14 +139,566 @@ describe('company read services', () => {
       createCompanyReadService,
       listCompanies,
       getCompany,
+      getClassificationCase,
+      getRule,
+      getRuleCandidate,
       listTransactions,
       getTransaction,
       listCategories,
       listTaxCodes,
       listTags,
       listRules,
+      listRuleCandidates,
       listTransferCandidates,
-    ]).toHaveLength(10);
+      searchClassificationKnowledge,
+      testRule,
+    ]).toHaveLength(16);
+  });
+
+  it('searches only refreshed memberships and preserves canonical foreign redaction', async () => {
+    const db = makeDb();
+    db.membership.findMany.mockResolvedValue([
+      { companyId: COMPANY_ID, role: 'categorizer' },
+      { companyId: 'company-2', role: 'viewer' },
+    ]);
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      query: input.query,
+      companyId: COMPANY_ID,
+      scope: 'accessible_companies',
+      mode: 'lexical',
+      requestedMode: 'lexical',
+      degraded: false,
+      degradedReason: null,
+      status: 'matched',
+      noMatch: false,
+      total: 1,
+      hits: [{
+        id: 'rule:foreign-rule',
+        sourceId: 'foreign-rule',
+        kind: 'rule',
+        companyId: 'company-2',
+        companyName: 'Foreign member company',
+        companyRelation: 'foreign',
+        executable: false,
+        advisory: true,
+        matchedIn: ['rule', 'lexical'],
+        score: 1,
+        vendorIdentityId: null,
+        vendorName: 'Coffee',
+        action: null,
+        actionSummary: {
+          categoryName: 'Meals',
+          taxCalculation: 'NotApplicable',
+          taxCodeName: null,
+          tagNames: [],
+        },
+        originIntent: 'make_recurring',
+        evidenceCount: 0,
+        conflictingEvidenceCount: 0,
+        conflicts: [],
+        provenance: {
+          source: 'rule',
+          sourceId: 'foreign-rule',
+          actorId: null,
+          recordedAt: '2026-01-01T00:00:00.000Z',
+        },
+        rationale: null,
+        examples: [],
+        counterexamples: [],
+        jurisdiction: null,
+        currency: null,
+        verifiedAt: null,
+        ruleRevision: 1,
+      }],
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    const result = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee',
+      scope: 'accessible_companies',
+      mode: 'lexical',
+      limit: 10,
+    });
+
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID,
+      accessibleCompanyIds: [COMPANY_ID, 'company-2'],
+    }));
+    expect(result.items).toEqual([
+      expect.objectContaining({
+        companyRelation: 'foreign',
+        executable: false,
+        advisory: true,
+        action: null,
+        actionSummary: expect.objectContaining({ categoryName: 'Meals' }),
+      }),
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/categoryQboId|taxCodeQboId|tagIds/);
+  });
+
+  it('keeps concurrent principals isolated with one hundred refreshed memberships', async () => {
+    const db = makeDb();
+    const secondUser = 'user-2';
+    const secondCompany = 'company-b';
+    const firstCompanies = [
+      COMPANY_ID,
+      ...Array.from({ length: 99 }, (_unused, index) => `company-a-${String(index).padStart(3, '0')}`),
+    ].sort();
+    db.user.findUnique.mockImplementation(async (args: { where: { id: string } }) => ({
+      id: args.where.id, isInstanceAdmin: false,
+    }));
+    db.membership.findMany.mockImplementation(async (args: { where: { userId: string } }) => (
+      args.where.userId === USER_ID
+        ? firstCompanies.map((companyId) => ({ companyId, role: 'viewer' }))
+        : [{ companyId: secondCompany, role: 'viewer' }]
+    ));
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      result: {
+        query: input.query, companyId: input.companyId, scope: 'accessible_companies' as const,
+        mode: 'lexical' as const, requestedMode: 'lexical' as const,
+        degraded: false, degradedReason: null, status: 'no_match' as const, noMatch: true,
+        total: 0, hits: [],
+      },
+      fingerprint: `fingerprint-${String(input.companyId)}`,
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await Promise.all([
+      service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+        query: 'Coffee', scope: 'accessible_companies', mode: 'lexical', limit: 10,
+      }),
+      service.searchClassificationKnowledge(secondUser, secondCompany, {
+        query: 'Tea', scope: 'accessible_companies', mode: 'lexical', limit: 10,
+      }),
+    ]);
+
+    expect(classificationSearch).toHaveBeenCalledTimes(2);
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID, accessibleCompanyIds: firstCompanies,
+    }));
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: secondCompany, accessibleCompanyIds: [secondCompany],
+    }));
+  });
+
+  it('requires actual membership for accessible-company search even for an instance admin', async () => {
+    const db = makeDb();
+    db.user.findUnique.mockResolvedValue({ id: USER_ID, isInstanceAdmin: true });
+    db.membership.findMany.mockResolvedValue([]);
+    const classificationSearch = vi.fn();
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee',
+      scope: 'accessible_companies',
+      mode: 'lexical',
+    })).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN' });
+    expect(classificationSearch).not.toHaveBeenCalled();
+  });
+
+  it('paginates one bounded canonical search population and binds cursors to its semantics', async () => {
+    const db = makeDb();
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      query: input.query,
+      companyId: COMPANY_ID,
+      scope: 'current_company' as const,
+      mode: 'lexical' as const,
+      requestedMode: 'auto' as const,
+      degraded: true,
+      degradedReason: 'embedding_not_configured' as const,
+      status: 'matched' as const,
+      noMatch: false,
+      total: 3,
+      hits: [classificationHit('case-3'), classificationHit('case-2'), classificationHit('case-1')],
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    const first = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'auto', limit: 2,
+    });
+    const second = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'auto', limit: 2, cursor: first.nextCursor ?? undefined,
+    });
+
+    expect(first).toMatchObject({
+      degraded: true,
+      degradedReason: 'embedding_not_configured',
+      items: [{ id: 'case-3' }, { id: 'case-2' }],
+      total: 3,
+    });
+    expect(second).toMatchObject({ items: [{ id: 'case-1' }], nextCursor: null });
+    expect(classificationSearch).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      scope: 'current_company', mode: 'auto', limit: 100,
+      accessibleCompanyIds: [COMPANY_ID],
+    }));
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Different', mode: 'auto', cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+    expect(classificationSearch).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a search cursor when the authoritative corpus fingerprint changes between pages', async () => {
+    const db = makeDb();
+    const baseResult = {
+      query: 'Coffee', companyId: COMPANY_ID, scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      total: 3, hits: [classificationHit('case-3'), classificationHit('case-2'), classificationHit('case-1')],
+    };
+    const classificationSearch = vi.fn()
+      .mockResolvedValueOnce({ result: baseResult, fingerprint: 'a'.repeat(64) })
+      .mockResolvedValueOnce({
+        result: { ...baseResult, hits: [classificationHit('case-new'), ...baseResult.hits] },
+        fingerprint: 'b'.repeat(64),
+      });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+    const first = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'lexical', limit: 2,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'lexical', limit: 2, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
+  it('binds search cursors to the refreshed membership set and requested page size', async () => {
+    const db = makeDb();
+    db.membership.findMany
+      .mockResolvedValueOnce([{ companyId: COMPANY_ID }, { companyId: 'company-2' }])
+      .mockResolvedValueOnce([{ companyId: COMPANY_ID }]);
+    const canonical = {
+      query: 'Coffee', companyId: COMPANY_ID, scope: 'accessible_companies' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      total: 2, hits: [classificationHit('case-2'), classificationHit('case-1')],
+    };
+    const classificationSearch = vi.fn(async () => ({ result: canonical, fingerprint: 'a'.repeat(64) }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+    const first = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', scope: 'accessible_companies', mode: 'lexical', limit: 1,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', scope: 'accessible_companies', mode: 'lexical', limit: 1,
+      cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+    expect(classificationSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the canonical rule revision and marks a retired rule non-executable', async () => {
+    const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
+    db.rule.findFirst.mockResolvedValue({
+      id: 'rule-1', companyId: COMPANY_ID, revision: 3, enabled: true,
+      retiredAt: null,
+      reviewRequiredAt: null, reviewReason: null,
+    });
+    db.ruleRevision.findFirst.mockResolvedValue({
+      id: 'revision-3', ruleId: 'rule-1', companyId: COMPANY_ID, revision: 3,
+      state: 'retired', matchField: 'payee', matchText: 'Coffee', category: 'Meals',
+      categoryQboId: 'account-meals', taxCalculation: 'NotApplicable', taxCode: null,
+      taxCodeQboId: null, tagIds: [], priority: 0, autoPost: false,
+      originIntent: 'make_recurring', sourceCaseId: 'case-1', sourceCandidateId: null,
+      changedBy: 'reviewer-1', createdAt: new Date('2026-01-03T00:00:00.000Z'),
+      retiredAt: new Date('2026-01-03T00:00:00.000Z'),
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.getRule(USER_ID, COMPANY_ID, 'rule-1')).resolves.toMatchObject({
+      active: false,
+      executable: false,
+      revision: { id: 'revision-3', state: 'retired', sourceCaseId: 'case-1' },
+    });
+  });
+
+  it('keeps viewer rule detail tenant-scoped', async () => {
+    const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
+    db.rule.findFirst.mockImplementation(async ({ where }: { where: { companyId: string } }) => (
+      where.companyId === COMPANY_ID ? null : {
+        id: 'foreign-rule', companyId: 'company-2', revision: 1, enabled: true,
+        retiredAt: null, reviewRequiredAt: null, reviewReason: null,
+      }
+    ));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.getRule(USER_ID, COMPANY_ID, 'foreign-rule')).rejects.toMatchObject({
+      status: 404,
+      code: 'RULE_NOT_FOUND',
+    });
+  });
+
+  it('lets a viewer read bounded revision history for a company-owned rule', async () => {
+    const db = makeDb();
+    db.membership.findUnique.mockResolvedValue({ role: 'viewer' });
+    db.rule.findFirst.mockResolvedValue({ id: 'rule-1' });
+    db.ruleRevision.findMany = vi.fn(async () => []);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.listRuleRevisions(USER_ID, COMPANY_ID, 'rule-1')).resolves.toEqual({
+      items: [],
+      nextCursor: null,
+    });
+  });
+
+  it('returns migrated legacy rule revisions as bounded invalid history instead of throwing', async () => {
+    const db = makeDb();
+    db.rule.findFirst.mockResolvedValue({
+      id: 'rule-legacy', companyId: COMPANY_ID, revision: 1, enabled: true,
+      retiredAt: null, reviewRequiredAt: null, reviewReason: null,
+    });
+    db.ruleRevision.findFirst.mockResolvedValue({
+      id: 'revision-legacy', ruleId: 'rule-legacy', companyId: COMPANY_ID, revision: 1,
+      state: 'enabled', matchText: 'Legacy', category: 'Old category',
+      categoryQboId: null, taxCalculation: null, taxCode: null, taxCodeQboId: null,
+      tagIds: [], priority: 0, autoPost: false, originIntent: null,
+      sourceCaseId: null, sourceCandidateId: null, changedBy: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'), retiredAt: null,
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.getRule(USER_ID, COMPANY_ID, 'rule-legacy')).resolves.toMatchObject({
+      active: true,
+      executable: false,
+      revision: {
+        action: null,
+        valid: false,
+        invalidReasons: expect.arrayContaining([
+          'Category account is missing or inactive.',
+          'Tax treatment is missing or invalid.',
+        ]),
+      },
+    });
+  });
+
+  it('marks stale account, tax, and tag references invalid in a current rule revision', async () => {
+    const db = makeDb();
+    db.rule.findFirst.mockResolvedValue({
+      id: 'rule-stale', companyId: COMPANY_ID, revision: 2, enabled: true,
+      retiredAt: null, reviewRequiredAt: null, reviewReason: null,
+    });
+    db.ruleRevision.findFirst.mockResolvedValue({
+      id: 'revision-stale', ruleId: 'rule-stale', companyId: COMPANY_ID, revision: 2,
+      state: 'enabled', matchText: 'Stale', category: 'Old meals',
+      categoryQboId: 'account-deleted', taxCalculation: 'TaxExcluded', taxCode: 'Old GST',
+      taxCodeQboId: 'tax-inactive', tagIds: ['11111111-1111-4111-8111-111111111111'], priority: 0, autoPost: false,
+      originIntent: 'make_recurring', sourceCaseId: null, sourceCandidateId: null,
+      changedBy: null, createdAt: new Date('2025-01-01T00:00:00.000Z'), retiredAt: null,
+    });
+    db.qboAccount.findMany.mockResolvedValue([{ qboId: 'account-deleted', active: false }]);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      getTaxReadiness: vi.fn(async () => ({
+        status: 'ready', reason: null, usingSalesTax: true, refreshedAt: null,
+        taxCodes: [], salesTaxCodes: [],
+      })) as never,
+    });
+
+    await expect(service.getRule(USER_ID, COMPANY_ID, 'rule-stale')).resolves.toMatchObject({
+      executable: false,
+      revision: {
+        action: null,
+        valid: false,
+        invalidReasons: [
+          'Category account is missing or inactive.',
+          'Tax code is missing or ineligible.',
+          'One or more tags no longer exist.',
+        ],
+      },
+    });
+  });
+
+  it('keeps conflicting candidates explicit and paginates them by updated time and id', async () => {
+    const db = makeDb();
+    db.autopilotRuleCandidate.findMany.mockResolvedValue([
+      {
+        id: 'candidate-2', companyId: COMPANY_ID, state: 'conflict', matchField: 'payee',
+        matchText: 'Coffee', categoryQboId: 'account-a', taxCalculation: 'TaxExcluded',
+        taxCodeQboId: 'tax-a', tagIds: [], evidenceCount: 3, conflictingEvidenceCount: 2,
+        schemaVersion: 'rule-candidate-v1', configVersion: 'config-1',
+        activatedRuleId: null, updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+      },
+      {
+        id: 'candidate-1', companyId: COMPANY_ID, state: 'ready', matchField: 'payee',
+        matchText: 'Fuel', categoryQboId: 'account-b', taxCalculation: 'NotApplicable',
+        taxCodeQboId: null, tagIds: [], evidenceCount: 3, conflictingEvidenceCount: 0,
+        schemaVersion: 'rule-candidate-v1', configVersion: 'config-1',
+        activatedRuleId: null, updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+      },
+    ]);
+    db.qboAccount.findMany.mockResolvedValue([
+      { qboId: 'account-a', name: 'Meals', active: true },
+      { qboId: 'account-b', name: 'Vehicle', active: true },
+    ]);
+    db.qboTaxCode.findMany.mockResolvedValue([{ qboId: 'tax-a', name: 'GST', active: true }]);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    const first = await service.listRuleCandidates(USER_ID, COMPANY_ID, { limit: 1 });
+    expect(first.items).toEqual([
+      expect.objectContaining({
+        id: 'candidate-2', state: 'conflict', executable: false,
+        conflictingEvidenceCount: 2,
+      }),
+    ]);
+    expect(first.nextCursor).toEqual(expect.any(String));
+    expect(db.qboAccount.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ companyId: COMPANY_ID }),
+    }));
+    expect(db.qboTaxCode.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ companyId: COMPANY_ID }),
+    }));
+  });
+
+  it('lists and gets gathering candidates without coercing their canonical state', async () => {
+    const db = makeDb();
+    const gathering = {
+      id: 'candidate-gathering', companyId: COMPANY_ID, state: 'gathering', matchField: 'payee',
+      matchText: 'Coffee', categoryQboId: null, taxCalculation: null, taxCodeQboId: null,
+      tagIds: [], evidenceCount: 1, conflictingEvidenceCount: 0,
+      schemaVersion: 'rule-candidate-v1', configVersion: 'config-1', activatedRuleId: null,
+      updatedAt: new Date('2026-01-03T00:00:00.000Z'),
+    };
+    db.autopilotRuleCandidate.findMany.mockResolvedValue([gathering]);
+    db.autopilotRuleCandidate.findFirst.mockResolvedValue(gathering);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.listRuleCandidates(USER_ID, COMPANY_ID, { limit: 1 })).resolves.toMatchObject({
+      items: [{ id: 'candidate-gathering', state: 'gathering', action: null }],
+    });
+    await expect(service.getRuleCandidate(USER_ID, COMPANY_ID, 'candidate-gathering')).resolves.toMatchObject({
+      id: 'candidate-gathering', state: 'gathering', action: null,
+    });
+    expect(db.autopilotRuleCandidate.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        state: { in: expect.arrayContaining(['gathering']) },
+      }),
+    }));
+  });
+
+  it('fails safely when a persisted candidate state is outside the canonical state machine', async () => {
+    const db = makeDb();
+    db.autopilotRuleCandidate.findFirst.mockResolvedValue({
+      id: 'candidate-unknown', companyId: COMPANY_ID, state: 'surprise', matchText: 'Coffee',
+      categoryQboId: null, taxCalculation: null, taxCodeQboId: null, tagIds: [], evidenceCount: 0,
+      conflictingEvidenceCount: 0, schemaVersion: 'v1', configVersion: 'v1', activatedRuleId: null,
+      updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    await expect(service.getRuleCandidate(USER_ID, COMPANY_ID, 'candidate-unknown'))
+      .rejects.toMatchObject({ status: 503, code: 'COMPANY_UNAVAILABLE' });
+  });
+
+  it('returns only the newest bounded candidate evidence with invalidation state intact', async () => {
+    const db = makeDb();
+    db.autopilotRuleCandidate.findFirst.mockResolvedValue({
+      id: 'candidate-1', companyId: COMPANY_ID, state: 'stale', matchField: 'payee',
+      matchText: 'Coffee', categoryQboId: 'account-a', taxCalculation: 'NotApplicable',
+      taxCodeQboId: null, tagIds: [], evidenceCount: 21, conflictingEvidenceCount: 1,
+      schemaVersion: 'rule-candidate-v1', configVersion: 'config-1', activatedRuleId: null,
+      updatedAt: new Date('2026-01-22T00:00:00.000Z'),
+    });
+    db.qboAccount.findMany.mockResolvedValue([{ qboId: 'account-a', name: 'Meals', active: true }]);
+    db.autopilotRuleCandidateEvidence.findMany.mockResolvedValue(Array.from({ length: 20 }, (_, index) => ({
+      id: `evidence-${20 - index}`,
+      transactionId: `transaction-${20 - index}`,
+      source: 'autopilot',
+      polarity: index === 0 ? 'negative' : 'positive',
+      active: index !== 0,
+      observedAt: new Date(`2026-01-${String(21 - index).padStart(2, '0')}T00:00:00.000Z`),
+      invalidatedAt: index === 0 ? new Date('2026-01-22T00:00:00.000Z') : null,
+      invalidationReason: index === 0 ? 'Superseded.' : null,
+    })));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    const result = await service.getRuleCandidate(USER_ID, COMPANY_ID, 'candidate-1');
+
+    expect(result).toMatchObject({ state: 'stale', executable: false, advisory: true });
+    expect(result.evidence).toHaveLength(20);
+    expect(result.evidence?.[0]).toMatchObject({
+      id: 'evidence-20', polarity: 'negative', active: false,
+      invalidatedAt: '2026-01-22T00:00:00.000Z', invalidationReason: 'Superseded.',
+    });
+    expect(db.autopilotRuleCandidateEvidence.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: COMPANY_ID, candidateId: 'candidate-1' },
+      orderBy: [{ observedAt: 'desc' }, { id: 'desc' }],
+      take: 20,
+    }));
+  });
+
+  it('tests rules read-only with deterministic samples and explicit conflict truncation', async () => {
+    const db = makeDb();
+    db.transaction.findMany.mockResolvedValue([
+      { id: 'transaction-b', payee: 'Coffee Shop', date: new Date('2026-01-02T00:00:00.000Z'), amount: -12, status: 'PENDING' },
+      { id: 'transaction-a', payee: 'Coffee Shop', date: new Date('2026-01-01T00:00:00.000Z'), amount: -10, status: 'POSTED' },
+    ]);
+    db.rule.findMany.mockResolvedValue(Array.from({ length: 21 }, (_, index) => ({
+      id: `rule-${String(index).padStart(2, '0')}`,
+      matchText: 'Coffee',
+      category: `Category ${index}`,
+      priority: index,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    })));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    const result = await service.testRule(USER_ID, COMPANY_ID, {
+      matchText: 'Coffee', priorityTop: false, limit: 1,
+    });
+
+    expect(result).toMatchObject({
+      pendingCount: 1,
+      postedCount: 0,
+      conflictsTruncated: true,
+      samples: [{ transactionId: 'transaction-b', wouldWin: false, currentWinner: 'Coffee' }],
+    });
+    expect(result.conflicts).toHaveLength(20);
+    expect(result.nextCursor).toEqual(expect.any(String));
+    expect(db.transaction.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      orderBy: [{ date: 'desc' }, { id: 'desc' }],
+      take: 2,
+    }));
+    expect(db.rule.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 201 }));
+  });
+
+  it('returns invalidation provenance for immutable classification cases without snapshots', async () => {
+    const db = makeDb();
+    db.classificationCase.findFirst.mockResolvedValue({
+      id: 'case-1', companyId: COMPANY_ID, transactionId: 'txn-1', vendorIdentityId: null,
+      qboMutationAttemptId: 'attempt-1',
+      action: { categoryQboId: 'account-a', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      actionFingerprint: 'a'.repeat(64), originIntent: 'apply_once', rationale: 'Verified purchase.',
+      requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+      reviewer: { userId: null, configVersion: 'config-1', decision: 'approved' },
+      jurisdiction: 'unknown', currency: 'CAD',
+      context: { transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: null, businessPurpose: null },
+      provenance: { source: 'qbo_verified', sourceId: 'attempt-1', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+      verifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      transactionSnapshot: { privateSnapshotSentinel: true },
+      invalidation: {
+        invalidatedAt: new Date('2026-01-02T00:00:00.000Z'),
+        reason: 'Superseded by a verified correction.',
+      },
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+
+    const result = await service.getClassificationCase(USER_ID, COMPANY_ID, 'case-1');
+    expect(result).toMatchObject({
+      id: 'case-1',
+      invalidatedAt: '2026-01-02T00:00:00.000Z',
+      invalidationReason: 'Superseded by a verified correction.',
+    });
+    expect(JSON.stringify(result)).not.toContain('privateSnapshotSentinel');
   });
 
   it('refreshes the current user and membership on every call, and hides a guessed company', async () => {
@@ -303,6 +882,45 @@ describe('company read services', () => {
     await expect(
       service.listTransactions('user-2', COMPANY_ID, { limit: 1, status: 'PENDING', cursor }),
     ).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
+  });
+
+  it('rejects textually noncanonical base64url cursor payloads and signatures', async () => {
+    const db = makeDb();
+    db.transaction.findMany.mockResolvedValue([
+      transaction({ id: 'txn-1', date: new Date('2026-01-02T00:00:00.000Z') }),
+      transaction({ id: 'txn-2', date: new Date('2026-01-01T00:00:00.000Z') }),
+    ]);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const first = await service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+    });
+    const [body, signature] = first.nextCursor!.split('.') as [string, string];
+
+    const decodedSignature = Buffer.from(signature, 'base64url');
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const alternateSignature = [...alphabet]
+      .map((last) => `${signature.slice(0, -1)}${last}`)
+      .find((candidate) => candidate !== signature
+        && Buffer.from(candidate, 'base64url').equals(decodedSignature));
+    expect(alternateSignature).toEqual(expect.any(String));
+
+    const paddedBody = `${body}=`;
+    expect(Buffer.from(paddedBody, 'base64url')).toEqual(Buffer.from(body, 'base64url'));
+    const resignedPaddedBody = createHmac('sha256', SECRET)
+      .update(paddedBody, 'utf8')
+      .digest('base64url');
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+      cursor: `${body}.${alternateSignature}`,
+    })).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+      cursor: `${paddedBody}.${resignedPaddedBody}`,
+    })).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
   });
 
   it('strictly bounds transaction strings and calendar dates', async () => {

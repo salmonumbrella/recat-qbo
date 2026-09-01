@@ -19,6 +19,10 @@ import type {
   CategorizeBody,
   CompanyDto,
   CategorizationMutationResult,
+  ClassificationCase,
+  ClassificationSearchHit,
+  ClassificationSearchMode,
+  ClassificationSearchScope,
   CommitCategorizationBody,
   ConnectMode,
   CompanyPatchBody,
@@ -51,8 +55,13 @@ import type {
   ReceiptStatsRange,
   Role,
   ReconcileCategorizationBody,
-  RuleDto,
   RuleCandidateDto,
+  RuleDetailDto,
+  RuleLifecycleFilter,
+  RuleLifecyclePageDto,
+  RuleMutationKind,
+  RuleMutationResult,
+  RuleRevisionPageDto,
   RuleTestResult,
   SavedReportConfig,
   SavedReportDto,
@@ -863,28 +872,131 @@ export const tags = {
     api.del<void>(`/api/companies/${companyId}/tags/${tagId}`),
 };
 
-export interface RuleBody {
-  matchText: string;
-  category: string;
-  categoryQboId?: string | null;
-  tagIds?: string[];
-  autoPost?: boolean;
-  /** Match order — lowest number wins when several rules match. */
-  priority?: number;
+export interface ClassificationSearchPageDto {
+  query: string;
+  companyId: string;
+  scope: ClassificationSearchScope;
+  mode: Exclude<ClassificationSearchMode, 'auto'>;
+  requestedMode: ClassificationSearchMode;
+  degraded: boolean;
+  degradedReason:
+    | 'semantic_unavailable'
+    | 'vector_capability_unavailable'
+    | 'embedding_not_configured'
+    | 'lexical_only'
+    | 'semantic_error'
+    | null;
+  status: 'matched' | 'no_match';
+  noMatch: boolean;
+  total: number;
+  items: ClassificationSearchHit[];
+  nextCursor: string | null;
 }
 
+export interface ClassificationSemanticHealthDto {
+  configured: boolean;
+  provider: string;
+  model: string;
+  dimensions: number;
+  vectorAvailable: boolean;
+  expectedGeneration: string | null;
+  indexedGeneration: string | null;
+  activeGeneration: string | null;
+  expectedState: string | null;
+  embedded: number;
+  skipped: number;
+  backlog: number;
+  progress: number;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  latestAttemptGeneration: string | null;
+  latestAttemptState: string | null;
+  latestAttemptAt: string | null;
+  latestAttemptError: string | null;
+  currentCorpusRevision: string | null;
+  indexedCorpusRevision: string | null;
+  expectedCorpusRevision: string | null;
+  latestAttemptCorpusRevision: string | null;
+}
+
+export interface ClassificationSearchParams {
+  query: string;
+  mode: ClassificationSearchMode;
+  scope?: ClassificationSearchScope;
+  transactionId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export const classificationMemory = {
+  search: (companyId: string, params: ClassificationSearchParams) =>
+    api.get<ClassificationSearchPageDto>(
+      `/api/companies/${companyId}/classification/search${qs({ ...params })}`,
+    ),
+  getCase: (companyId: string, caseId: string) =>
+    api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/${caseId}`),
+  currentCase: (companyId: string, transactionId: string) =>
+    api.get<ClassificationCase | null>(
+      `/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`,
+    ),
+  health: (companyId: string) =>
+    api.get<ClassificationSemanticHealthDto>(
+      `/api/companies/${companyId}/health/classification-search`,
+    ),
+};
+
+export interface PrepareRuleOperationBody {
+  mutation: Exclude<RuleMutationKind, 'create'>;
+  ruleId?: string;
+  candidateId?: string;
+  expectedRevision: number;
+  idempotencyKey: string;
+  retryOfId?: string;
+  proposal?: {
+    matchText?: string;
+    categoryQboId?: string;
+    taxCalculation?: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+    taxCodeQboId?: string | null;
+    tagIds?: string[];
+    priority?: number;
+    autoPost?: boolean;
+    orderIds?: string[];
+  };
+}
+
+export const ruleOperations = {
+  prepare: (companyId: string, body: PrepareRuleOperationBody) =>
+    api.post<RuleMutationResult>(`/api/companies/${companyId}/rule-operations/prepare`, body),
+  commit: (companyId: string, operationId: string, idempotencyKey: string) =>
+    api.post<RuleMutationResult>(
+      `/api/companies/${companyId}/rule-operations/${operationId}/commit`,
+      { idempotencyKey },
+    ),
+  prepareFromCase: (
+    companyId: string,
+    caseId: string,
+    body: { matchText: string; priority: number; idempotencyKey: string; retryOfId?: string },
+  ) => api.post<RuleMutationResult>(
+    `/api/companies/${companyId}/rule-operations/from-case/${caseId}/prepare`,
+    body,
+  ),
+};
+
 export const rules = {
-  /** Returns rules in match order (priority asc) — render as-is, no re-sort. */
-  list: (companyId: string) => api.get<RuleDto[]>(`/api/companies/${companyId}/rules`),
-  create: (companyId: string, body: RuleBody) =>
-    api.post<RuleDto>(`/api/companies/${companyId}/rules`, body),
-  patch: (companyId: string, ruleId: string, body: Partial<RuleBody>) =>
-    api.patch<RuleDto>(`/api/companies/${companyId}/rules/${ruleId}`, body),
-  del: (companyId: string, ruleId: string) =>
-    api.del<void>(`/api/companies/${companyId}/rules/${ruleId}`),
-  /** Persist a full match order: ids[0] = topmost (wins first). Returns the reordered list. */
-  reorder: (companyId: string, ids: string[]) =>
-    api.put<RuleDto[]>(`/api/companies/${companyId}/rules/order`, { ids }),
+  lifecycle: (
+    companyId: string,
+    state: RuleLifecycleFilter = 'all',
+    cursor?: string,
+    limit = 100,
+  ) => api.get<RuleLifecyclePageDto>(
+    `/api/companies/${companyId}/rules/lifecycle${qs({ state, cursor, limit })}`,
+  ),
+  detail: (companyId: string, ruleId: string) =>
+    api.get<RuleDetailDto>(`/api/companies/${companyId}/rules/${ruleId}`),
+  revisions: (companyId: string, ruleId: string, cursor?: string, limit = 20) =>
+    api.get<RuleRevisionPageDto>(
+      `/api/companies/${companyId}/rules/${ruleId}/revisions${qs({ cursor, limit })}`,
+    ),
   /** Dry-run a draft rule (placed at top priority) against recent transactions. */
   test: (companyId: string, matchText: string) =>
     api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),
@@ -898,14 +1010,6 @@ export const ruleCandidates = {
   get: (companyId: string, candidateId: string) =>
     api.get<RuleCandidateDto>(
       `/api/companies/${companyId}/rule-candidates/${candidateId}`,
-    ),
-  dismiss: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/dismiss`,
-    ),
-  activate: (companyId: string, candidateId: string) =>
-    api.post<RuleCandidateDto>(
-      `/api/companies/${companyId}/rule-candidates/${candidateId}/activate`,
     ),
 };
 

@@ -12,6 +12,7 @@ import {
   reconcileRuleCandidateBeforeActivation,
 } from './agent/ruleCandidatePersistence.js';
 import { runCompanyMutationTransaction } from './companyMutationScope.js';
+import { appendRuleRevision } from './ruleRevisionHistory.js';
 
 type CandidateDb = PrismaClient | Prisma.TransactionClient;
 
@@ -142,6 +143,18 @@ async function readiness(
   ) {
     reasons.push('Company tax readiness changed after this evidence was collected.');
   }
+  // Rule rows can retain tax provenance, but the current normal Rule executor
+  // does not reproduce the verified tax write. Keep any legacy/manual taxed
+  // candidate inert until CRUD validation and execution support the same exact
+  // action end to end.
+  if (
+    candidate.taxCalculation === 'TaxInclusive'
+    || candidate.taxCalculation === 'TaxExcluded'
+  ) {
+    reasons.push(
+      'Taxed candidates cannot activate until normal rules reproduce the same QBO tax write.',
+    );
+  }
   if (ownedTags !== tagIds.length) reasons.push('One or more tags are no longer available.');
   const currentConfigVersion = config?.configVersion ?? 'verified-writeback-v1';
   if (currentConfigVersion !== candidate.configVersion) {
@@ -175,6 +188,8 @@ async function hasOverlappingRule(
       SELECT rule."id"
       FROM "Rule" rule
       WHERE rule."companyId" = ${candidate.companyId}
+        AND rule."enabled" = true
+        AND rule."retiredAt" IS NULL
         AND rule."matchField" = 'payee'
         AND trim(rule."matchText") <> ''
         ${activatedRuleFilter}
@@ -191,7 +206,7 @@ async function hasOverlappingRule(
 type CandidateRow = Prisma.AutopilotRuleCandidateGetPayload<{
   include: {
     evidence: {
-      where: { active: true };
+      where: { active: true; polarity: 'positive' };
       orderBy: { observedAt: 'desc' };
       select: { transactionId: true; source: true; observedAt: true };
     };
@@ -215,7 +230,7 @@ async function toDto(db: CandidateDb, candidate: CandidateRow): Promise<RuleCand
     readiness(db, candidate),
     db.autopilotRuleCandidateEvidence.groupBy({
       by: ['source'],
-      where: { candidateId: candidate.id, active: true },
+      where: { candidateId: candidate.id, active: true, polarity: 'positive' },
       _count: { _all: true },
     }),
   ]);
@@ -266,7 +281,7 @@ async function toDto(db: CandidateDb, candidate: CandidateRow): Promise<RuleCand
 
 const candidateInclude = {
   evidence: {
-    where: { active: true },
+    where: { active: true, polarity: 'positive' },
     orderBy: { observedAt: 'desc' },
     take: RULE_CANDIDATE_PROVENANCE_LIMIT,
     select: { transactionId: true, source: true, observedAt: true },
@@ -349,7 +364,13 @@ async function assertDurableEvidence(
     where: {
       candidateId: candidate.id,
       active: true,
-      actionFingerprint: { not: candidate.winningActionFingerprint ?? '' },
+      OR: [
+        { polarity: 'negative' },
+        {
+          polarity: 'positive',
+          actionFingerprint: { not: candidate.winningActionFingerprint ?? '' },
+        },
+      ],
     },
   });
   if (conflicting > 0) {
@@ -362,6 +383,7 @@ async function assertDurableEvidence(
     where: {
       candidateId: candidate.id,
       active: true,
+      polarity: 'positive',
       actionFingerprint: candidate.winningActionFingerprint ?? '',
     },
     include: {
@@ -410,6 +432,37 @@ async function assertDurableEvidence(
   }
 }
 
+/** Read-only activation preflight for two-phase callers. It deliberately does
+ * not reconcile or mutate candidate evidence during preparation. */
+export async function validateRuleCandidateActivationInTransaction(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  candidateId: string,
+): Promise<void> {
+  const candidate = await tx.autopilotRuleCandidate.findFirst({
+    where: { id: candidateId, companyId },
+  });
+  if (candidate === null) {
+    throw new RuleCandidateError('CANDIDATE_NOT_FOUND', 'Rule candidate not found.');
+  }
+  if (
+    candidate.state !== 'ready'
+    || candidate.evidenceCount < RULE_CANDIDATE_EVIDENCE_THRESHOLD
+    || candidate.conflictingEvidenceCount !== 0
+    || candidate.winningActionFingerprint === null
+  ) {
+    throw new RuleCandidateError('CANDIDATE_NOT_READY', 'Rule candidate is not ready to activate.');
+  }
+  await assertDurableEvidence(tx, candidate);
+  const checked = await readiness(tx, candidate);
+  if (checked.staleReasons.length > 0 || checked.category === null) {
+    throw new RuleCandidateError(
+      'CANDIDATE_STALE',
+      checked.staleReasons[0] ?? 'Rule candidate is stale.',
+    );
+  }
+}
+
 export async function dismissRuleCandidate(
   companyId: string,
   candidateId: string,
@@ -417,14 +470,25 @@ export async function dismissRuleCandidate(
   db: PrismaClient = prisma,
 ): Promise<RuleCandidateDto> {
   await runCompanyMutationTransaction(db, companyId, async (tx) => {
-    await lockCompanyAndCandidate(tx, companyId, candidateId);
-    const candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
-      where: { id: candidateId },
-    });
-    if (candidate.state === 'activated') {
-      throw new RuleCandidateError('CANDIDATE_NOT_READY', 'An activated candidate cannot be dismissed.');
-    }
-    if (candidate.state === 'dismissed') return;
+    await dismissRuleCandidateInTransaction(tx, companyId, candidateId, actor);
+  });
+  return getRuleCandidate(companyId, candidateId, db);
+}
+
+export async function dismissRuleCandidateInTransaction(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  candidateId: string,
+  actor: CandidateActor,
+): Promise<Prisma.AutopilotRuleCandidateGetPayload<Record<string, never>>> {
+  await lockCompanyAndCandidate(tx, companyId, candidateId);
+  const candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+    where: { id: candidateId },
+  });
+  if (candidate.state === 'activated') {
+    throw new RuleCandidateError('CANDIDATE_NOT_READY', 'An activated candidate cannot be dismissed.');
+  }
+  if (candidate.state !== 'dismissed') {
     await tx.autopilotRuleCandidate.update({
       where: { id: candidate.id },
       data: {
@@ -451,8 +515,131 @@ export async function dismissRuleCandidate(
         },
       },
     });
+  }
+  return tx.autopilotRuleCandidate.findUniqueOrThrow({ where: { id: candidate.id } });
+}
+
+export interface ActivateRuleCandidateOptions {
+  ruleId?: string;
+  priority?: number;
+  initialRevision?: number;
+  skipReconciliation?: boolean;
+}
+
+export async function reconcileRuleCandidateActivationInTransaction(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  candidateId: string,
+): Promise<{ saturated: boolean }> {
+  await lockCompanyAndCandidate(tx, companyId, candidateId);
+  const candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+    where: { id: candidateId },
   });
-  return getRuleCandidate(companyId, candidateId, db);
+  const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
+  return { saturated: reconciliation.saturated };
+}
+
+export async function activateRuleCandidateInTransaction(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  candidateId: string,
+  actor: CandidateActor,
+  options: ActivateRuleCandidateOptions = {},
+): Promise<{
+  candidate: Prisma.AutopilotRuleCandidateGetPayload<Record<string, never>>;
+  rule: Prisma.RuleGetPayload<{ include: { ruleTags: true } }>;
+}> {
+  await lockCompanyAndCandidate(tx, companyId, candidateId);
+  let candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+    where: { id: candidateId },
+  });
+  if (options.skipReconciliation !== true) {
+    const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
+    if (reconciliation.saturated) {
+      throw new RuleCandidateError(
+        'CANDIDATE_STALE',
+        'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
+      );
+    }
+    candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
+      where: { id: candidateId },
+    });
+  }
+  if (
+    candidate.state !== 'ready'
+    || candidate.evidenceCount < RULE_CANDIDATE_EVIDENCE_THRESHOLD
+    || candidate.conflictingEvidenceCount !== 0
+    || candidate.winningActionFingerprint === null
+  ) {
+    throw new RuleCandidateError('CANDIDATE_NOT_READY', 'Rule candidate is not ready to activate.');
+  }
+  await assertDurableEvidence(tx, candidate);
+  const checked = await readiness(tx, candidate);
+  if (checked.staleReasons.length > 0 || checked.category === null) {
+    throw new RuleCandidateError('CANDIDATE_STALE', checked.staleReasons[0] ?? 'Rule candidate is stale.');
+  }
+  const priority = options.priority ?? await tx.rule.aggregate({
+    where: { companyId, enabled: true, retiredAt: null },
+    _min: { priority: true },
+  }).then(({ _min }) => _min.priority === null ? 0 : _min.priority - 1);
+  const rule = await tx.rule.create({
+    data: {
+      ...(options.ruleId ? { id: options.ruleId } : {}),
+      companyId,
+      priority,
+      matchField: 'payee',
+      matchText: candidate.matchText,
+      category: checked.category,
+      categoryQboId: candidate.categoryQboId,
+      taxCalculation: candidate.taxCalculation,
+      taxCode: checked.taxCode,
+      taxCodeQboId: candidate.taxCodeQboId,
+      autoPost: false,
+      revision: options.initialRevision ?? 0,
+      originIntent: 'auto_candidate',
+      sourceCandidateId: candidate.id,
+      createdById: actor.id,
+      updatedById: actor.id,
+      ruleTags: {
+        create: checked.tagIds.map((tagId) => ({ tagId })),
+      },
+    },
+    include: { ruleTags: true },
+  });
+  await appendRuleRevision(tx, rule, actor.id);
+  const activated = await tx.autopilotRuleCandidate.update({
+    where: { id: candidate.id },
+    data: {
+      state: 'activated',
+      activatedAt: new Date(),
+      activatedByUserId: actor.id,
+      activationEvidenceCount: candidate.evidenceCount,
+      activationActionFingerprint: candidate.winningActionFingerprint,
+      activatedRuleId: rule.id,
+    },
+  });
+  await tx.auditEntry.create({
+    data: {
+      companyId,
+      actorId: actor.id,
+      actorLabel: actor.label,
+      payee: candidate.matchText,
+      amount: 0,
+      action: 'rule-candidate-activated',
+      before: 'Rule candidate',
+      after: checked.category,
+      payload: {
+        candidateId: candidate.id,
+        ruleId: rule.id,
+        evidenceCount: candidate.evidenceCount,
+        actionFingerprint: candidate.winningActionFingerprint,
+        schemaVersion: candidate.schemaVersion,
+        configVersion: candidate.configVersion,
+        autoPost: false,
+      },
+    },
+  });
+  return { candidate: activated, rule };
 }
 
 export async function activateRuleCandidate(
@@ -462,88 +649,8 @@ export async function activateRuleCandidate(
   db: PrismaClient = prisma,
 ): Promise<RuleCandidateDto> {
   const error = await runCompanyMutationTransaction(db, companyId, async (tx) => {
-    await lockCompanyAndCandidate(tx, companyId, candidateId);
-    let candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
-      where: { id: candidateId },
-    });
-    const reconciliation = await reconcileRuleCandidateBeforeActivation(tx, candidate);
-    if (reconciliation.saturated) {
-      return new RuleCandidateError(
-        'CANDIDATE_STALE',
-        'Too many verified outcomes are waiting to be reconciled. Refresh and try again.',
-      );
-    }
-    candidate = await tx.autopilotRuleCandidate.findUniqueOrThrow({
-      where: { id: candidateId },
-    });
     try {
-      if (
-        candidate.state !== 'ready'
-        || candidate.evidenceCount < RULE_CANDIDATE_EVIDENCE_THRESHOLD
-        || candidate.conflictingEvidenceCount !== 0
-        || candidate.winningActionFingerprint === null
-      ) {
-        throw new RuleCandidateError('CANDIDATE_NOT_READY', 'Rule candidate is not ready to activate.');
-      }
-      await assertDurableEvidence(tx, candidate);
-      const checked = await readiness(tx, candidate);
-      if (checked.staleReasons.length > 0 || checked.category === null) {
-        throw new RuleCandidateError('CANDIDATE_STALE', checked.staleReasons[0] ?? 'Rule candidate is stale.');
-      }
-      const priority = await tx.rule.aggregate({
-        where: { companyId },
-        _min: { priority: true },
-      });
-      const rule = await tx.rule.create({
-        data: {
-          companyId,
-          priority: priority._min.priority === null ? 0 : priority._min.priority - 1,
-          matchField: 'payee',
-          matchText: candidate.matchText,
-          category: checked.category,
-          categoryQboId: candidate.categoryQboId,
-          taxCalculation: candidate.taxCalculation,
-          taxCode: checked.taxCode,
-          taxCodeQboId: candidate.taxCodeQboId,
-          autoPost: false,
-          createdById: actor.id,
-          ruleTags: {
-            create: checked.tagIds.map((tagId) => ({ tagId })),
-          },
-        },
-      });
-      await tx.autopilotRuleCandidate.update({
-        where: { id: candidate.id },
-        data: {
-          state: 'activated',
-          activatedAt: new Date(),
-          activatedByUserId: actor.id,
-          activationEvidenceCount: candidate.evidenceCount,
-          activationActionFingerprint: candidate.winningActionFingerprint,
-          activatedRuleId: rule.id,
-        },
-      });
-      await tx.auditEntry.create({
-        data: {
-          companyId,
-          actorId: actor.id,
-          actorLabel: actor.label,
-          payee: candidate.matchText,
-          amount: 0,
-          action: 'rule-candidate-activated',
-          before: 'Rule candidate',
-          after: checked.category,
-          payload: {
-            candidateId: candidate.id,
-            ruleId: rule.id,
-            evidenceCount: candidate.evidenceCount,
-            actionFingerprint: candidate.winningActionFingerprint,
-            schemaVersion: candidate.schemaVersion,
-            configVersion: candidate.configVersion,
-            autoPost: false,
-          },
-        },
-      });
+      await activateRuleCandidateInTransaction(tx, companyId, candidateId, actor);
     } catch (caught) {
       if (caught instanceof RuleCandidateError) return caught;
       throw caught;

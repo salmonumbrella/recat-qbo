@@ -4,6 +4,7 @@ import {
   MCP_SCHEMA_BOUNDS,
   McpSchemaBoundsError,
   assertBoundedJsonSchema,
+  assertBoundedMcpOutput,
   parseBoundedMcpInput,
   toBoundedJsonSchema,
 } from './schemaBounds.js';
@@ -127,6 +128,15 @@ describe('bounded MCP schemas', () => {
         ...limits,
       }),
     ).toThrowError(expect.objectContaining<McpSchemaBoundsError>({ code }));
+  });
+
+  it('rejects a schema-valid service result whose serialized payload exceeds the output bound', () => {
+    expect(() => assertBoundedMcpOutput({ evidence: 'x'.repeat(128) }, {
+      ...MCP_SCHEMA_BOUNDS,
+      maxOutputBytes: 64,
+    })).toThrowError(expect.objectContaining<McpSchemaBoundsError>({
+      code: 'OUTPUT_BYTES',
+    }));
   });
 
   it.each([

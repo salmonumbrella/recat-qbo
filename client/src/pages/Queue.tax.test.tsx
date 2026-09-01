@@ -1,8 +1,9 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   CategorizationMutationResult,
+  RuleMutationResult,
   StagedCategorization,
   TaxReadinessDto,
   TransactionDto,
@@ -22,6 +23,12 @@ const mocks = vi.hoisted(() => ({
   bulkPost: vi.fn(),
   sync: vi.fn(),
   rulesCreate: vi.fn(),
+  lifecycleRules: vi.fn(),
+  classificationSearch: vi.fn(),
+  classificationHealth: vi.fn(),
+  currentCase: vi.fn(),
+  prepareFromCase: vi.fn(),
+  commitRuleOperation: vi.fn(),
   navigate: vi.fn(),
   toast: vi.fn(),
   setPendingCount: vi.fn(),
@@ -105,7 +112,16 @@ vi.mock('../lib/api', () => {
     ApiError,
     createCategorizationRequestId: mocks.requestId,
     companies: { sync: mocks.sync },
-    rules: { create: mocks.rulesCreate },
+    classificationMemory: {
+      search: mocks.classificationSearch,
+      health: mocks.classificationHealth,
+      currentCase: mocks.currentCase,
+    },
+    ruleOperations: {
+      prepareFromCase: mocks.prepareFromCase,
+      commit: mocks.commitRuleOperation,
+    },
+    rules: { create: mocks.rulesCreate, lifecycle: mocks.lifecycleRules },
     transactions: {
       list: mocks.list,
       categorize: mocks.categorize,
@@ -351,9 +367,137 @@ beforeEach(() => {
     .mockReset()
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000101')
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000202');
+  mocks.classificationHealth.mockResolvedValue({
+    configured: false,
+    vectorAvailable: false,
+    backlog: 0,
+    progress: 0,
+  });
+  mocks.classificationSearch.mockResolvedValue({
+    query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company',
+    mode: 'hybrid', requestedMode: 'auto', degraded: false, degradedReason: null,
+    status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
+  });
+  mocks.currentCase.mockResolvedValue(null);
+  mocks.lifecycleRules.mockResolvedValue({ items: [], nextCursor: null });
 });
 
 describe('tax-aware manual queue', () => {
+  it('shows transaction-aware similar decisions for the active row', async () => {
+    mocks.classificationSearch.mockResolvedValue({
+      query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company',
+      mode: 'hybrid', requestedMode: 'auto', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [{
+        id: 'hit-1', sourceId: 'case-1', kind: 'classification_case',
+        companyId: 'COMPANY_GENERIC', companyName: 'Generic company', companyRelation: 'current',
+        executable: true, advisory: false, matchedIn: ['case'], score: 1,
+        vendorIdentityId: null, vendorName: 'Generic supplier', action: {
+          categoryQboId: 'EXPENSE_ACCOUNT', taxCalculation: 'TaxInclusive',
+          taxCodeQboId: 'TAX_CODE_STANDARD', tagIds: [],
+        },
+        actionSummary: {
+          categoryName: 'Generic expense', taxCalculation: 'TaxInclusive',
+          taxCodeName: 'Standard purchase tax', tagNames: [],
+        },
+        originIntent: 'apply_once', evidenceCount: 3, conflictingEvidenceCount: 0,
+        conflicts: [], provenance: {
+          source: 'qbo_verified', sourceId: 'attempt-1', actorId: 'user-1',
+          recordedAt: '2026-08-30T00:00:00.000Z',
+        },
+        rationale: 'A verified receipt supports this treatment.', examples: [], counterexamples: [],
+        jurisdiction: 'CA-BC', currency: 'CAD', verifiedAt: '2026-08-30T00:00:00.000Z',
+        ruleRevision: null,
+      }],
+    });
+
+    await renderQueue();
+
+    expect(await screen.findByText('Similar Decisions')).toBeInTheDocument();
+    await waitFor(() => expect(mocks.classificationSearch).toHaveBeenCalledWith(
+      'COMPANY_GENERIC',
+      expect.objectContaining({
+        query: 'Generic supplier',
+        mode: 'auto',
+        transactionId: 'TRANSACTION_GENERIC',
+      }),
+    ));
+    expect(screen.getByText(/verified receipt supports this treatment/i)).toBeInTheDocument();
+  });
+
+  it('keeps apply-once distinct and prepares recurring intent only after the explicit action', async () => {
+    const currentCase = {
+      id: 'case-current', companyId: 'COMPANY_GENERIC', transactionId: 'TRANSACTION_GENERIC',
+      vendorIdentityId: null, qboMutationAttemptId: 'attempt-current',
+      action: { categoryQboId: 'EXPENSE_ACCOUNT', taxCalculation: 'TaxInclusive', taxCodeQboId: 'TAX_CODE_STANDARD', tagIds: [] },
+      actionFingerprint: 'fingerprint', originIntent: 'apply_once', rationale: 'Verified receipt.',
+      requiredEvidence: [], examples: [], counterexamples: [], citations: [],
+      reviewer: { userId: 'user-1', configVersion: 'v1', decision: 'approved' },
+      jurisdiction: 'CA-BC', currency: 'CAD',
+      context: { transactionDirection: 'out', qboType: 'Purchase', sourceAccountName: 'Generic bank', businessPurpose: null },
+      provenance: { source: 'qbo_verified', sourceId: 'attempt-current', actorId: 'user-1', recordedAt: '2026-08-30T00:00:00.000Z' },
+      verifiedAt: '2026-08-30T00:00:00.000Z', invalidatedAt: null, invalidationReason: null,
+    };
+    mocks.currentCase.mockResolvedValue(currentCase);
+    mocks.prepareFromCase.mockResolvedValue({
+      ok: true, operationId: 'operation-1', companyId: 'COMPANY_GENERIC', mutation: 'create',
+      originIntent: 'make_recurring', status: 'PREPARED', ruleId: 'rule-1', revision: null,
+      rule: null, candidate: null, error: null,
+      preview: {
+        operationId: 'operation-1', companyId: 'COMPANY_GENERIC', ruleId: 'rule-1', candidateId: null,
+        mutation: 'create', originIntent: 'make_recurring', currentRevision: 0, proposedRevision: 1,
+        condition: { matchField: 'payee', matchText: 'Generic supplier' },
+        action: currentCase.action, categoryName: 'Generic expense', taxCodeName: 'Standard purchase tax',
+        priority: 0, autoPost: false, affectedPendingCount: 2, affectedPostedCount: 1,
+        sampleTransactions: [], conflicts: [], warnings: [],
+        expiresAt: '2026-08-31T01:00:00.000Z', preparationDigest: 'digest',
+      },
+    });
+    let resolveCommit!: (value: RuleMutationResult) => void;
+    mocks.commitRuleOperation.mockReturnValue(new Promise<RuleMutationResult>((resolve) => { resolveCommit = resolve; }));
+    const committed = {
+      ok: true, operationId: 'operation-1', companyId: 'COMPANY_GENERIC', mutation: 'create',
+      originIntent: 'make_recurring', status: 'COMMITTED', ruleId: 'rule-1', revision: 1,
+      rule: null, candidate: null, preview: null, error: null,
+    } as const;
+    const user = userEvent.setup();
+    await renderQueue();
+
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await user.click(await screen.findByRole('button', { name: /^post$/i }));
+
+    expect(await screen.findByRole('button', { name: 'Apply once' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Make recurring suggestion' })).toBeInTheDocument();
+    expect(mocks.prepareFromCase).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Make recurring suggestion' }));
+    await waitFor(() => expect(mocks.prepareFromCase).toHaveBeenCalledWith(
+      'COMPANY_GENERIC',
+      'case-current',
+      {
+        matchText: 'Generic supplier',
+        priority: 0,
+        idempotencyKey: '00000000-0000-4000-8000-000000000202',
+      },
+    ));
+    expect(await screen.findByText(/auto-post remains off/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 pending.*1 posted/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Confirm recurring suggestion' }));
+    await waitFor(() => expect(mocks.commitRuleOperation).toHaveBeenCalledWith(
+      'COMPANY_GENERIC',
+      'operation-1',
+      '00000000-0000-4000-8000-000000000202',
+    ));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    await user.click(screen.getByTestId('confirm-dialog-backdrop'));
+    expect(screen.getByRole('dialog', { name: 'Make recurring suggestion?' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Make recurring suggestion' })).not.toBeInTheDocument();
+
+    await act(async () => resolveCommit(committed));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
   it('shows a pointer cursor over clickable transaction rows', async () => {
     const style = installGlobalStyles();
     document.body.classList.add('rr');
@@ -1407,7 +1551,7 @@ describe('tax-aware manual queue', () => {
     expect(mocks.legacyPost).not.toHaveBeenCalled();
   });
 
-  it('uses categorization undo for a reloaded posted Deposit when sales readiness is unavailable', async () => {
+  it('uses categorization undo for a recently posted Deposit when sales readiness is unavailable', async () => {
     mocks.taxReadiness = { ...READY, salesStatus: 'needs_setup', salesReason: 'Sales tax needs setup.', salesTaxCodes: [] };
     const user = userEvent.setup();
     // Keep the fixture inside the server's 30-day undo window regardless of
@@ -1423,6 +1567,41 @@ describe('tax-aware manual queue', () => {
       '00000000-0000-4000-8000-000000000101',
     ));
     expect(mocks.legacyUndo).not.toHaveBeenCalled();
+  });
+
+  it('shows Undo through exactly 30 days and hides it 1 ms later', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-08-31T12:00:00.000Z'));
+    try {
+      await renderQueue([
+        deposit({
+          id: 'TRANSACTION_AT_UNDO_BOUNDARY',
+          payee: 'Customer receipt at undo boundary',
+          status: 'POSTED',
+          postedAt: '2026-08-01T12:00:00.000Z',
+        }),
+        deposit({
+          id: 'TRANSACTION_PAST_UNDO_BOUNDARY',
+          payee: 'Customer receipt past undo boundary',
+          status: 'POSTED',
+          postedAt: '2026-08-01T11:59:59.999Z',
+        }),
+      ]);
+
+      const atBoundaryRow = screen
+        .getByText('Customer receipt at undo boundary')
+        .closest<HTMLElement>('.interactive-surface');
+      const pastBoundaryRow = screen
+        .getByText('Customer receipt past undo boundary')
+        .closest<HTMLElement>('.interactive-surface');
+
+      expect(atBoundaryRow).not.toBeNull();
+      expect(pastBoundaryRow).not.toBeNull();
+      expect(within(atBoundaryRow!).getByRole('button', { name: /^undo$/i })).toBeInTheDocument();
+      expect(within(pastBoundaryRow!).queryByRole('button', { name: /^undo$/i })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects the entire mixed bulk selection when a sales-ready Deposit is selected', async () => {

@@ -1,12 +1,22 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import type {
+  ClassificationCase,
+  ClassificationSearchHit,
+  ClassificationSearchMode,
+  ClassificationSearchResult,
+  ClassificationSearchScope,
   CompanyDto,
   ProviderActionabilityDisposition,
   ProviderActionabilityDto,
   QboAccountDto,
   Role,
+  RuleDetailDto,
   RuleDto,
+  RuleLifecycleFilter,
+  RuleLifecyclePageDto,
+  RuleRevision,
+  RuleRevisionReadDto,
   SuggestionDto,
   TagDto,
   TaxCodeDto,
@@ -20,7 +30,11 @@ import { env } from '../env.js';
 import { HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { suggestForMany as defaultSuggestForMany } from './suggestions.js';
-import { getTaxReadiness as defaultGetTaxReadiness } from './tax/reference.js';
+import {
+  getTaxReadiness as defaultGetTaxReadiness,
+  getTaxReadinessInTransaction as defaultGetTaxReadinessInTransaction,
+  type TaxReadinessQueryDb,
+} from './tax/reference.js';
 import { transferCandidates as defaultTransferCandidates } from './transferCandidates.js';
 import {
   PROVIDER_ACTIONABILITY_DISPOSITIONS,
@@ -29,6 +43,18 @@ import {
   effectiveProviderDisposition,
   providerActionabilityDto,
 } from './providerActionability.js';
+import {
+  parseClassificationCase,
+  parseRuleRevision,
+} from './classification/contracts.js';
+import {
+  searchClassificationMemoryWithRuntimeSnapshot,
+  type ClassificationSearchContextFilter,
+  type ClassificationSearchInput,
+  type ClassificationSearchSnapshot,
+} from './classification/search.js';
+import { actionTagIdsReason, parseActionTagIds } from './classification/actionTagIds.js';
+import { classificationReferenceReasons } from './classification/referenceReadiness.js';
 
 export const DEFAULT_READ_LIMIT = 20;
 export const MAX_READ_LIMIT = 100;
@@ -36,6 +62,9 @@ const MAX_CURSOR_LENGTH = 2_048;
 const MAX_SEARCH_LENGTH = 200;
 const MAX_ACCOUNT_LENGTH = 120;
 const MAX_ID_LENGTH = 128;
+const MAX_CLASSIFICATION_QUERY_LENGTH = 256;
+const MAX_CANDIDATE_EVIDENCE = 20;
+const MAX_RULE_CONFLICTS = 20;
 const ROLE_RANK: Record<Role, number> = { viewer: 0, categorizer: 1, admin: 2 };
 const VIEWER_HIDDEN_STATUSES = new Set<TxnStatus>(['PENDING', 'POSTING', 'ERROR']);
 const TXN_STATUSES: readonly TxnStatus[] = [
@@ -48,12 +77,15 @@ const TXN_STATUSES: readonly TxnStatus[] = [
   'REVERTED',
 ];
 const QUEUE_STATUSES = ['PENDING', 'ERROR'] as const;
+const RULE_LIFECYCLE_FILTERS = new Set<RuleLifecycleFilter>([
+  'enabled', 'disabled', 'retired', 'all',
+]);
 
 type DbMethod = (args: Record<string, unknown>) => Promise<unknown>;
 
 export interface CompanyReadDb {
   user: { findUnique: DbMethod; findMany?: DbMethod };
-  membership: { findUnique: DbMethod };
+  membership: { findUnique: DbMethod; findMany?: DbMethod };
   company: { findUnique: DbMethod; findMany: DbMethod };
   transaction: { findUnique: DbMethod; findMany: DbMethod; count: DbMethod };
   /** Optional only for legacy unit-test adapters. Production applies the
@@ -62,12 +94,25 @@ export interface CompanyReadDb {
   qboAccount: { findMany: DbMethod };
   qboTaxCode: { findMany: DbMethod };
   tag: { findMany: DbMethod };
-  rule: { findMany: DbMethod };
+  rule: { findMany: DbMethod; findFirst?: DbMethod };
+  ruleRevision?: { findFirst: DbMethod; findMany?: DbMethod };
+  autopilotRuleCandidate?: { findMany: DbMethod; findFirst: DbMethod };
+  autopilotRuleCandidateEvidence?: { findMany: DbMethod };
+  classificationCase?: { findFirst: DbMethod };
+  $queryRaw<T = unknown>(query: Prisma.Sql): Promise<T>;
+  $transaction<T>(
+    callback: (tx: CompanyReadDb) => Promise<T>,
+    options?: { isolationLevel: 'RepeatableRead' },
+  ): Promise<T>;
 }
 
 export interface PageInput {
   limit?: number;
   cursor?: string;
+}
+
+export interface RuleLifecycleListInput extends PageInput {
+  state?: RuleLifecycleFilter;
 }
 
 export interface Page<T> {
@@ -127,6 +172,81 @@ export interface TransferCandidateDto {
   b: TransactionDto;
 }
 
+export interface ClassificationSearchPage extends Page<ClassificationSearchHit> {
+  query: string;
+  companyId: string;
+  scope: ClassificationSearchScope;
+  mode: ClassificationSearchResult['mode'];
+  requestedMode: ClassificationSearchMode;
+  degraded: boolean;
+  degradedReason: ClassificationSearchResult['degradedReason'];
+  status: ClassificationSearchResult['status'];
+  noMatch: boolean;
+  total: number;
+}
+
+export type CompanyRuleRevisionReadDto = RuleRevisionReadDto;
+export type CompanyRuleReadDto = RuleDetailDto;
+
+export interface RuleCandidateReadDto {
+  id: string;
+  companyId: string;
+  state: 'gathering' | 'ready' | 'conflict' | 'stale' | 'dismissed' | 'activated';
+  matchField: 'payee';
+  matchText: string;
+  categoryName: string | null;
+  taxCodeName: string | null;
+  action: {
+    categoryQboId: string;
+    taxCalculation: 'TaxInclusive' | 'TaxExcluded' | 'NotApplicable';
+    taxCodeQboId: string | null;
+    tagIds: string[];
+  } | null;
+  invalidReasons: string[];
+  executable: false;
+  advisory: true;
+  evidenceCount: number;
+  conflictingEvidenceCount: number;
+  schemaVersion: string;
+  configVersion: string;
+  activatedRuleId: string | null;
+  updatedAt: string;
+  evidence?: RuleCandidateEvidenceReadDto[];
+}
+
+export interface RuleCandidateEvidenceReadDto {
+  id: string;
+  transactionId: string;
+  source: 'user' | 'autopilot' | 'mcp';
+  polarity: 'positive' | 'negative';
+  active: boolean;
+  observedAt: string;
+  invalidatedAt: string | null;
+  invalidationReason: string | null;
+}
+
+export interface RuleTestReadDto {
+  samples: Array<{
+    transactionId: string;
+    payee: string;
+    date: string;
+    amount: number;
+    status: 'PENDING' | 'POSTED' | 'DRY_RUN';
+    wouldWin: boolean;
+    currentWinner: string | null;
+  }>;
+  nextCursor: string | null;
+  pendingCount: number;
+  postedCount: number;
+  conflicts: Array<{
+    ruleId: string;
+    matchText: string;
+    category: string;
+    priority: number;
+  }>;
+  conflictsTruncated: boolean;
+}
+
 interface CursorPayload {
   v: 1;
   resource: string;
@@ -145,6 +265,9 @@ export interface CompanyReadDeps {
     txns: { payee: string; memo?: string | null; amount: number }[],
   ): Promise<(SuggestionDto | null)[]>;
   transferCandidates(companyId: string): Promise<Map<string, string>>;
+  classificationSearch(
+    input: ClassificationSearchInput,
+  ): Promise<ClassificationSearchSnapshot | ClassificationSearchResult>;
 }
 
 const defaultDeps: CompanyReadDeps = {
@@ -152,6 +275,7 @@ const defaultDeps: CompanyReadDeps = {
   suggestForMany: defaultSuggestForMany,
   transferCandidates: (companyId) =>
     defaultTransferCandidates(companyId, prisma),
+  classificationSearch: searchClassificationMemoryWithRuntimeSnapshot,
 };
 
 const safeCompanySelect = {
@@ -251,11 +375,18 @@ function decodeCursor(
   let payload: CursorPayload;
   try {
     actual = Buffer.from(signature, 'base64url');
+    const decodedBody = Buffer.from(body, 'base64url');
+    if (
+      actual.toString('base64url') !== signature
+      || decodedBody.toString('base64url') !== body
+    ) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
     const expectedMac = cursorMac(secret, body);
     if (actual.length !== expectedMac.length || !timingSafeEqual(actual, expectedMac)) {
       badRequest('Invalid cursor', 'INVALID_CURSOR');
     }
-    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as CursorPayload;
+    payload = JSON.parse(decodedBody.toString('utf8')) as CursorPayload;
   } catch (error) {
     if (error instanceof HttpError) throw error;
     badRequest('Invalid cursor', 'INVALID_CURSOR');
@@ -750,6 +881,126 @@ export function eligibleTaxCodes(readiness: TaxReadinessDto): TaxCodeDto[] {
   return readiness.taxCodes.filter(isUsableTaxCodeDto);
 }
 
+function ruleReferenceReasons(
+  rule: {
+    categoryQboId: string | null;
+    taxCalculation: unknown;
+    taxCodeQboId: string | null;
+    tagIds: readonly string[];
+  },
+  activeAccounts: ReadonlySet<string>,
+  existingTags: ReadonlySet<string>,
+  readiness: TaxReadinessDto | null,
+): string[] {
+  const eligibleCodes = new Set(
+    readiness === null ? [] : eligibleTaxCodes(readiness).map((code) => code.qboId),
+  );
+  return classificationReferenceReasons(rule, {
+    categoryActive: rule.categoryQboId !== null && activeAccounts.has(rule.categoryQboId),
+    taxReady: readiness?.status === 'ready',
+    taxCodeEligible: rule.taxCodeQboId !== null && eligibleCodes.has(rule.taxCodeQboId),
+    tagsExist: rule.tagIds.every((tagId) => existingTags.has(tagId)),
+  });
+}
+
+function ruleDetailDto(
+  rule: Row,
+  revisionRow: Row,
+  activeAccounts: ReadonlySet<string>,
+  existingTags: ReadonlySet<string>,
+  readiness: TaxReadinessDto | null,
+): CompanyRuleReadDto {
+  const rawCalculation = revisionRow.taxCalculation;
+  const rawCategoryQboId = typeof revisionRow.categoryQboId === 'string'
+    ? revisionRow.categoryQboId
+    : null;
+  const rawTaxCodeQboId = typeof revisionRow.taxCodeQboId === 'string'
+    ? revisionRow.taxCodeQboId
+    : null;
+  const parsedTagIds = parseActionTagIds(revisionRow.tagIds);
+  const tagIds = parsedTagIds ?? [];
+  const structurallyValidAction = parsedTagIds !== null && rawCategoryQboId !== null
+    && (rawCalculation === 'TaxInclusive'
+      || rawCalculation === 'TaxExcluded'
+      || rawCalculation === 'NotApplicable')
+    && ((rawCalculation === 'NotApplicable') === (rawTaxCodeQboId === null));
+  const parsedRevision = parseRuleRevision({
+    id: String(revisionRow.id),
+    ruleId: String(revisionRow.ruleId),
+    companyId: String(revisionRow.companyId),
+    revision: Number(revisionRow.revision),
+    state: revisionRow.state,
+    condition: { matchField: 'payee', matchText: revisionRow.matchText },
+    action: structurallyValidAction ? {
+      categoryQboId: rawCategoryQboId,
+      taxCalculation: rawCalculation,
+      taxCodeQboId: rawTaxCodeQboId,
+      tagIds,
+    } : {
+      // Legacy rows predate executable QBO references. This placeholder is
+      // used only to validate immutable non-action fields and is removed from
+      // the returned historical representation below.
+      categoryQboId: 'legacy-invalid-action',
+      taxCalculation: 'NotApplicable',
+      taxCodeQboId: null,
+      tagIds: [],
+    },
+    categoryName: revisionRow.category,
+    taxCodeName: revisionRow.taxCode ?? null,
+    priority: Number(revisionRow.priority),
+    autoPost: revisionRow.autoPost === true,
+    originIntent: revisionRow.originIntent ?? null,
+    sourceCaseId: revisionRow.sourceCaseId ?? null,
+    sourceCandidateId: revisionRow.sourceCandidateId ?? null,
+    changedBy: revisionRow.changedBy ?? null,
+    createdAt: iso(revisionRow.createdAt),
+    retiredAt: nullableIso(revisionRow.retiredAt),
+  });
+  const invalidReasons = ruleReferenceReasons({
+    categoryQboId: rawCategoryQboId,
+    taxCalculation: rawCalculation,
+    taxCodeQboId: rawTaxCodeQboId,
+    tagIds,
+  }, activeAccounts, existingTags, readiness);
+  if (parsedTagIds === null) invalidReasons.unshift('Action tag IDs are invalid.');
+  invalidReasons.splice(4);
+  const valid = structurallyValidAction && invalidReasons.length === 0;
+  const revision: CompanyRuleRevisionReadDto = {
+    ...parsedRevision,
+    action: valid ? parsedRevision.action : null,
+    valid,
+    invalidReasons,
+  };
+  const active = rule.enabled === true
+    && rule.retiredAt == null
+    && revision.state === 'enabled'
+    && revision.retiredAt === null;
+  const reviewRequiredAt = nullableIso(rule.reviewRequiredAt);
+  return {
+    active,
+    executable: active && reviewRequiredAt === null && revision.valid,
+    reviewRequiredAt,
+    reviewReason: typeof rule.reviewReason === 'string' ? rule.reviewReason : null,
+    revision,
+  };
+}
+
+async function ruleLifecycleFingerprint(
+  db: CompanyReadDb,
+  companyId: string,
+): Promise<string> {
+  const rows = await db.$queryRaw<Array<{ revision: bigint }>>(Prisma.sql`
+    SELECT "revision"
+      FROM "RuleLifecycleRevision"
+     WHERE "companyId" = ${companyId}
+  `);
+  const revision = rows[0]?.revision;
+  if (typeof revision !== 'bigint') {
+    throw new HttpError(503, 'Rule lifecycle is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  return `rule-lifecycle-fence-v1:${revision}`;
+}
+
 export function boundedTaxReadiness(
   readiness: TaxReadinessDto,
   limit = MAX_READ_LIMIT,
@@ -849,6 +1100,8 @@ export function createCompanyReadService(
       depsIn.transferCandidates ??
       ((companyId) =>
         defaultTransferCandidates(companyId, db as never)),
+    classificationSearch:
+      depsIn.classificationSearch ?? defaultDeps.classificationSearch,
   };
 
   async function currentUser(userId: string): Promise<Row> {
@@ -883,6 +1136,691 @@ export function createCompanyReadService(
       throw new HttpError(403, 'You do not have permission to do that', 'FORBIDDEN');
     }
     return { company, role: membership.role };
+  }
+
+  async function actualMembershipCompanyIds(userId: string): Promise<string[]> {
+    if (db.membership.findMany === undefined) {
+      throw new HttpError(503, 'Company memberships are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const rows = await db.membership.findMany({
+      where: { userId },
+      select: { companyId: true },
+      orderBy: { companyId: 'asc' },
+      take: 101,
+    }) as Row[];
+    if (rows.length > 100) {
+      throw new HttpError(400, 'Too many accessible companies', 'VALIDATION');
+    }
+    return [...new Set(rows.map((row) => String(row.companyId)))].sort();
+  }
+
+  async function searchClassificationKnowledgeForUser(
+    userId: string,
+    companyId: string,
+    input: {
+      query: string;
+      scope?: ClassificationSearchScope;
+      mode: ClassificationSearchMode;
+      limit?: number;
+      cursor?: string;
+      transactionId?: string;
+    },
+  ): Promise<ClassificationSearchPage> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    const query = optionalString(input.query, 'query', MAX_CLASSIFICATION_QUERY_LENGTH);
+    if (query === undefined) badRequest('query must not be empty');
+    const scope = input.scope ?? 'current_company';
+    if (scope !== 'current_company' && scope !== 'accessible_companies') {
+      badRequest('Invalid classification search scope');
+    }
+    if (!['auto', 'exact', 'lexical', 'hybrid', 'semantic'].includes(input.mode)) {
+      badRequest('Invalid classification search mode');
+    }
+    const requestedLimit = readLimit(input.limit);
+    const membershipIds = scope === 'accessible_companies'
+      ? await actualMembershipCompanyIds(userId)
+      : [companyId];
+    if (!membershipIds.includes(companyId)) {
+      throw new HttpError(403, 'Current company is not an actual membership', 'FORBIDDEN');
+    }
+    let context: ClassificationSearchContextFilter | undefined;
+    let transactionRevision: number | undefined;
+    if (input.transactionId !== undefined) {
+      boundedId(input.transactionId, 'transactionId');
+      const transaction = await db.transaction.findUnique({
+        where: { id: input.transactionId },
+        select: {
+          id: true, companyId: true, revision: true, qboType: true, date: true,
+          amount: true, bankAccount: true, rawData: true,
+        },
+      }) as Row | null;
+      if (transaction === null || transaction.companyId !== companyId) {
+        throw new HttpError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+      }
+      const amount = Number(transaction.amount);
+      const rawData = transaction.rawData !== null && typeof transaction.rawData === 'object'
+        && !Array.isArray(transaction.rawData) ? transaction.rawData as Row : {};
+      const currencyRef = rawData.CurrencyRef !== null && typeof rawData.CurrencyRef === 'object'
+        && !Array.isArray(rawData.CurrencyRef) ? rawData.CurrencyRef as Row : {};
+      const qboType = transaction.qboType === 'Purchase' || transaction.qboType === 'Deposit'
+        || transaction.qboType === 'JournalEntry' ? transaction.qboType : undefined;
+      context = {
+        ...(Number.isFinite(amount) && amount !== 0
+          ? { transactionDirection: amount < 0 ? 'out' as const : 'in' as const }
+          : {}),
+        ...(qboType === undefined ? {} : { qboType }),
+        ...(typeof transaction.bankAccount === 'string' && transaction.bankAccount.trim() !== ''
+          ? { sourceAccountName: transaction.bankAccount } : {}),
+        ...(typeof currencyRef.value === 'string' ? { currency: currencyRef.value } : {}),
+        transactionPeriod: iso(transaction.date).slice(0, 7),
+      };
+      transactionRevision = Number(transaction.revision);
+    }
+    const filter = canonicalFilter({
+      query, scope, mode: input.mode, limit: requestedLimit,
+      accessibleCompanyIds: [...membershipIds].sort(),
+      transactionId: input.transactionId ?? null,
+      transactionRevision: transactionRevision ?? null,
+      context: context ?? null,
+    });
+    const expected = { resource: 'classification-search', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const offset = position === null ? 0 : Number(position.offset);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const searched = await deps.classificationSearch({
+      query,
+      companyId,
+      scope,
+      mode: input.mode,
+      limit: MAX_READ_LIMIT,
+      accessibleCompanyIds: membershipIds,
+      context,
+    });
+    const canonical = 'result' in searched ? searched.result : searched;
+    const fingerprint = 'result' in searched
+      ? searched.fingerprint
+      : createHmac('sha256', cursorSecret).update(JSON.stringify(canonical)).digest('hex');
+    if (position !== null && position.fingerprint !== fingerprint) {
+      badRequest('Search population changed; restart pagination', 'INVALID_CURSOR');
+    }
+    const items = canonical.hits.slice(offset, offset + requestedLimit);
+    const nextOffset = offset + items.length;
+    return {
+      query: canonical.query,
+      companyId: canonical.companyId,
+      scope: canonical.scope,
+      mode: canonical.mode,
+      requestedMode: canonical.requestedMode,
+      degraded: canonical.degraded,
+      degradedReason: canonical.degradedReason,
+      status: canonical.status,
+      noMatch: canonical.noMatch,
+      total: Math.min(canonical.total, canonical.hits.length),
+      items,
+      nextCursor: nextOffset < canonical.hits.length
+        ? encodeCursor(cursorSecret, {
+            v: 1, ...expected, position: { offset: nextOffset, fingerprint },
+          })
+        : null,
+    };
+  }
+
+  async function getRuleForCompany(
+    companyId: string,
+    ruleId: string,
+  ): Promise<CompanyRuleReadDto> {
+    if (db.rule.findFirst === undefined || db.ruleRevision === undefined) {
+      throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const rule = await db.rule.findFirst({
+      where: { id: ruleId, companyId },
+      select: {
+        id: true, companyId: true, revision: true, enabled: true, retiredAt: true,
+        reviewRequiredAt: true, reviewReason: true,
+      },
+    }) as Row | null;
+    if (rule === null) throw new HttpError(404, 'Rule not found', 'RULE_NOT_FOUND');
+    const revisionRow = await db.ruleRevision.findFirst({
+      where: { companyId, ruleId, revision: Number(rule.revision) },
+    }) as Row | null;
+    if (revisionRow === null) {
+      throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const rawCategoryQboId = typeof revisionRow.categoryQboId === 'string'
+      ? revisionRow.categoryQboId
+      : null;
+    const parsedTagIds = parseActionTagIds(revisionRow.tagIds);
+    const tagIds = parsedTagIds ?? [];
+    const [accounts, tags, readiness] = await Promise.all([
+      rawCategoryQboId === null
+        ? Promise.resolve([])
+        : db.qboAccount.findMany({
+            where: { companyId, qboId: { in: [rawCategoryQboId] } },
+            select: { qboId: true, active: true },
+          }) as Promise<Row[]>,
+      tagIds.length === 0
+        ? Promise.resolve([])
+        : db.tag.findMany({
+            where: { companyId, id: { in: tagIds } },
+            select: { id: true },
+          }) as Promise<Row[]>,
+      revisionRow.taxCalculation === 'TaxInclusive' || revisionRow.taxCalculation === 'TaxExcluded'
+        ? deps.getTaxReadiness(companyId)
+        : Promise.resolve(null),
+    ]);
+    const activeAccounts = new Set(
+      accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
+    );
+    const existingTags = new Set(tags.map((tag) => String(tag.id)));
+    return ruleDetailDto(rule, revisionRow, activeAccounts, existingTags, readiness);
+  }
+
+  async function getRuleForUser(
+    userId: string,
+    companyId: string,
+    ruleId: string,
+  ): Promise<CompanyRuleReadDto> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(ruleId, 'ruleId');
+    return getRuleForCompany(companyId, ruleId);
+  }
+
+  async function listRuleRevisionsForUser(
+    userId: string,
+    companyId: string,
+    ruleId: string,
+    input: PageInput = {},
+  ): Promise<Page<CompanyRuleRevisionReadDto>> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(ruleId, 'ruleId');
+    if (db.rule.findFirst === undefined || db.ruleRevision?.findMany === undefined) {
+      throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const exists = await db.rule.findFirst({ where: { id: ruleId, companyId }, select: { id: true } }) as Row | null;
+    if (exists === null) throw new HttpError(404, 'Rule not found', 'RULE_NOT_FOUND');
+    const limit = readLimit(input.limit);
+    const filter = canonicalFilter({ ruleId });
+    const expected = { resource: 'rule-revisions', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const before = position === null ? undefined : Number(position.revision);
+    if (before !== undefined && (!Number.isInteger(before) || before < 1)) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const rows = await db.ruleRevision.findMany({
+      where: { companyId, ruleId, ...(before === undefined ? {} : { revision: { lt: before } }) },
+      orderBy: [{ revision: 'desc' }, { id: 'desc' }], take: limit + 1,
+    }) as Row[];
+    const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
+      v: 1, ...expected, position: { revision: Number(row.revision) },
+    }));
+    return {
+      items: page.rows.map((row) => {
+        const tags = parseActionTagIds(row.tagIds);
+        const calculation = row.taxCalculation;
+        const category = typeof row.categoryQboId === 'string' ? row.categoryQboId : null;
+        const taxCode = typeof row.taxCodeQboId === 'string' ? row.taxCodeQboId : null;
+        const valid = tags !== null && category !== null
+          && (calculation === 'TaxInclusive' || calculation === 'TaxExcluded' || calculation === 'NotApplicable')
+          && ((calculation === 'NotApplicable') === (taxCode === null));
+        const parsed = parseRuleRevision({
+          id: String(row.id), ruleId: String(row.ruleId), companyId: String(row.companyId),
+          revision: Number(row.revision), state: row.state,
+          condition: { matchField: 'payee', matchText: row.matchText },
+          action: valid ? { categoryQboId: category!, taxCalculation: calculation, taxCodeQboId: taxCode, tagIds: tags! }
+            : { categoryQboId: 'legacy-invalid-action', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+          categoryName: row.category, taxCodeName: row.taxCode ?? null,
+          priority: Number(row.priority), autoPost: row.autoPost === true,
+          originIntent: row.originIntent ?? null, sourceCaseId: row.sourceCaseId ?? null,
+          sourceCandidateId: row.sourceCandidateId ?? null, changedBy: row.changedBy ?? null,
+          createdAt: iso(row.createdAt), retiredAt: nullableIso(row.retiredAt),
+        });
+        return { ...parsed, action: valid ? parsed.action : null, valid, invalidReasons: valid ? [] : ['Stored legacy action is non-executable.'] };
+      }),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  async function hydrateRuleDetails(
+    tx: CompanyReadDb,
+    companyId: string,
+    ruleRows: Row[],
+  ): Promise<CompanyRuleReadDto[]> {
+    if (ruleRows.length === 0) return [];
+    if (tx.ruleRevision?.findMany === undefined) {
+      throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const revisionRows = await tx.ruleRevision.findMany({
+      where: {
+        companyId,
+        OR: ruleRows.map((rule) => ({
+          ruleId: String(rule.id),
+          revision: Number(rule.revision),
+        })),
+      },
+    }) as Row[];
+    const revisionsByRule = new Map(revisionRows.map((revision) => [
+      `${String(revision.ruleId)}:${Number(revision.revision)}`,
+      revision,
+    ]));
+    const orderedRevisions = ruleRows.map((rule) => {
+      const revision = revisionsByRule.get(`${String(rule.id)}:${Number(rule.revision)}`);
+      if (revision === undefined) {
+        throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+      }
+      return revision;
+    });
+    const categoryQboIds = [...new Set(orderedRevisions.flatMap((revision) => (
+      typeof revision.categoryQboId === 'string' ? [revision.categoryQboId] : []
+    )))];
+    const tagIds = [...new Set(orderedRevisions.flatMap((revision) => (
+      parseActionTagIds(revision.tagIds) ?? []
+    )))];
+    const requiresTaxReadiness = orderedRevisions.some((revision) => (
+      revision.taxCalculation === 'TaxInclusive' || revision.taxCalculation === 'TaxExcluded'
+    ));
+    const [accounts, tags, readiness] = await Promise.all([
+      categoryQboIds.length === 0
+        ? Promise.resolve([])
+        : tx.qboAccount.findMany({
+            where: { companyId, qboId: { in: categoryQboIds } },
+            select: { qboId: true, active: true },
+          }) as Promise<Row[]>,
+      tagIds.length === 0
+        ? Promise.resolve([])
+        : tx.tag.findMany({
+            where: { companyId, id: { in: tagIds } },
+            select: { id: true },
+          }) as Promise<Row[]>,
+      requiresTaxReadiness
+        ? (depsIn.getTaxReadiness === undefined
+            ? defaultGetTaxReadinessInTransaction(
+                companyId,
+                tx as unknown as TaxReadinessQueryDb,
+              )
+            : depsIn.getTaxReadiness(companyId))
+        : Promise.resolve(null),
+    ]);
+    const activeAccounts = new Set(
+      accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
+    );
+    const existingTags = new Set(tags.map((tag) => String(tag.id)));
+    return ruleRows.map((rule, index) => ruleDetailDto(
+      rule,
+      orderedRevisions[index]!,
+      activeAccounts,
+      existingTags,
+      readiness,
+    ));
+  }
+
+  async function listRuleLifecycleForUser(
+    userId: string,
+    companyId: string,
+    input: RuleLifecycleListInput = {},
+  ): Promise<RuleLifecyclePageDto> {
+    await authorizeCompany(userId, companyId, 'categorizer');
+    const limit = readLimit(input.limit);
+    const requestedState = input.state ?? 'all';
+    if (!RULE_LIFECYCLE_FILTERS.has(requestedState)) {
+      badRequest('Invalid rule lifecycle state', 'BAD_REQUEST');
+    }
+    const state: RuleLifecycleFilter = requestedState;
+    const filter = canonicalFilter({ state, limit });
+    const expected = { resource: 'rule-lifecycle', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const cursorPriority = position?.priority;
+    const cursorCreatedAt = position?.createdAt;
+    const cursorId = position?.id;
+    const cursorFingerprint = position?.fingerprint;
+    if (position && (
+      typeof cursorPriority !== 'number'
+      || !Number.isInteger(cursorPriority)
+      || typeof cursorCreatedAt !== 'string'
+      || Number.isNaN(new Date(cursorCreatedAt).getTime())
+      || typeof cursorId !== 'string'
+      || typeof cursorFingerprint !== 'string'
+    )) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const lifecycleWhere = state === 'enabled'
+      ? { enabled: true, retiredAt: null }
+      : state === 'disabled'
+        ? { enabled: false, retiredAt: null }
+        : state === 'retired'
+          ? { retiredAt: { not: null } }
+          : {};
+    return db.$transaction(async (tx) => {
+      const fingerprint = await ruleLifecycleFingerprint(tx, companyId);
+      if (position && cursorFingerprint !== fingerprint) {
+        badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
+      }
+      const cursorWhere = position
+        ? {
+            OR: [
+              { priority: { gt: cursorPriority } },
+              { priority: cursorPriority, createdAt: { lt: new Date(cursorCreatedAt as string) } },
+              { priority: cursorPriority, createdAt: new Date(cursorCreatedAt as string), id: { gt: cursorId } },
+            ],
+          }
+        : {};
+      const rows = await tx.rule.findMany({
+        where: { companyId, ...lifecycleWhere, ...cursorWhere },
+        orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+        take: limit + 1,
+        select: {
+          id: true, companyId: true, revision: true, enabled: true, retiredAt: true,
+          priority: true, createdAt: true, reviewRequiredAt: true, reviewReason: true,
+        },
+      }) as Row[];
+      const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
+        v: 1,
+        ...expected,
+        position: {
+          priority: Number(row.priority),
+          createdAt: iso(row.createdAt),
+          id: String(row.id),
+          fingerprint,
+        },
+      }));
+      return {
+        items: await hydrateRuleDetails(tx, companyId, page.rows),
+        nextCursor: page.nextCursor,
+      };
+    }, { isolationLevel: 'RepeatableRead' });
+  }
+
+  function candidateState(value: unknown): RuleCandidateReadDto['state'] {
+    if (
+      value === 'gathering'
+      || value === 'ready'
+      || value === 'conflict'
+      || value === 'stale'
+      || value === 'dismissed'
+      || value === 'activated'
+    ) return value;
+    throw new HttpError(503, 'Rule candidate has an invalid state', 'COMPANY_UNAVAILABLE');
+  }
+
+  async function candidateDtos(companyId: string, rows: Row[]): Promise<RuleCandidateReadDto[]> {
+    const accountIds = [...new Set(rows.flatMap((row) => (
+      typeof row.categoryQboId === 'string' ? [row.categoryQboId] : []
+    )))];
+    const taxIds = [...new Set(rows.flatMap((row) => (
+      typeof row.taxCodeQboId === 'string' ? [row.taxCodeQboId] : []
+    )))];
+    const [accounts, taxes] = await Promise.all([
+      accountIds.length === 0 ? Promise.resolve([]) : db.qboAccount.findMany({
+        where: { companyId, qboId: { in: accountIds }, active: true },
+        select: { qboId: true, name: true },
+      }) as Promise<Row[]>,
+      taxIds.length === 0 ? Promise.resolve([]) : db.qboTaxCode.findMany({
+        where: { companyId, qboId: { in: taxIds }, active: true },
+        select: { qboId: true, name: true },
+      }) as Promise<Row[]>,
+    ]);
+    const accountNames = new Map(accounts.map((row) => [String(row.qboId), String(row.name)]));
+    const taxNames = new Map(taxes.map((row) => [String(row.qboId), String(row.name)]));
+    return rows.map((row) => {
+      const calculation = row.taxCalculation;
+      const categoryQboId = typeof row.categoryQboId === 'string' ? row.categoryQboId : null;
+      const taxCodeQboId = typeof row.taxCodeQboId === 'string' ? row.taxCodeQboId : null;
+      const tagIds = parseActionTagIds(row.tagIds);
+      const invalidReasons = actionTagIdsReason(row.tagIds) === null
+        ? [] : [actionTagIdsReason(row.tagIds)!];
+      const validAction = categoryQboId !== null
+        && tagIds !== null
+        && (calculation === 'TaxInclusive' || calculation === 'TaxExcluded' || calculation === 'NotApplicable')
+        && ((calculation === 'NotApplicable') === (taxCodeQboId === null));
+      return {
+        id: String(row.id),
+        companyId: String(row.companyId),
+        state: candidateState(row.state),
+        matchField: 'payee',
+        matchText: String(row.matchText),
+        categoryName: categoryQboId === null ? null : accountNames.get(categoryQboId) ?? null,
+        taxCodeName: taxCodeQboId === null ? null : taxNames.get(taxCodeQboId) ?? null,
+        action: validAction ? {
+          categoryQboId,
+          taxCalculation: calculation,
+          taxCodeQboId,
+          tagIds,
+        } : null,
+        invalidReasons,
+        executable: false,
+        advisory: true,
+        evidenceCount: Math.max(0, Number(row.evidenceCount) || 0),
+        conflictingEvidenceCount: Math.max(0, Number(row.conflictingEvidenceCount) || 0),
+        schemaVersion: String(row.schemaVersion),
+        configVersion: String(row.configVersion),
+        activatedRuleId: typeof row.activatedRuleId === 'string' ? row.activatedRuleId : null,
+        updatedAt: iso(row.updatedAt),
+      };
+    });
+  }
+
+  async function listRuleCandidatesForUser(
+    userId: string,
+    companyId: string,
+    input: PageInput = {},
+  ): Promise<Page<RuleCandidateReadDto>> {
+    await authorizeCompany(userId, companyId, 'categorizer');
+    if (db.autopilotRuleCandidate === undefined) {
+      throw new HttpError(503, 'Rule candidates are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const requestedLimit = readLimit(input.limit);
+    const expected = { resource: 'rule-candidates', userId, companyId, filter: canonicalFilter({}) };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const updatedAt = typeof position?.updatedAt === 'string' ? new Date(position.updatedAt) : null;
+    const id = typeof position?.id === 'string' ? position.id : null;
+    if (position && (!updatedAt || Number.isNaN(updatedAt.getTime()) || !id)) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const rows = await db.autopilotRuleCandidate.findMany({
+      where: {
+        companyId,
+        state: { in: ['gathering', 'ready', 'conflict', 'dismissed', 'activated', 'stale'] },
+        ...(updatedAt && id ? {
+          OR: [{ updatedAt: { lt: updatedAt } }, { updatedAt, id: { lt: id } }],
+        } : {}),
+      },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: requestedLimit + 1,
+    }) as Row[];
+    const page = pageRows(rows, requestedLimit, (row) => encodeCursor(cursorSecret, {
+      v: 1,
+      ...expected,
+      position: { updatedAt: iso(row.updatedAt), id: String(row.id) },
+    }));
+    return { items: await candidateDtos(companyId, page.rows), nextCursor: page.nextCursor };
+  }
+
+  async function getRuleCandidateForUser(
+    userId: string,
+    companyId: string,
+    candidateId: string,
+  ): Promise<RuleCandidateReadDto> {
+    await authorizeCompany(userId, companyId, 'categorizer');
+    boundedId(candidateId, 'candidateId');
+    if (db.autopilotRuleCandidate === undefined || db.autopilotRuleCandidateEvidence === undefined) {
+      throw new HttpError(503, 'Rule candidates are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const row = await db.autopilotRuleCandidate.findFirst({ where: { id: candidateId, companyId } }) as Row | null;
+    if (row === null) throw new HttpError(404, 'Rule candidate not found', 'CANDIDATE_NOT_FOUND');
+    const [candidate] = await candidateDtos(companyId, [row]);
+    if (candidate === undefined) throw new HttpError(503, 'Rule candidate is unavailable', 'COMPANY_UNAVAILABLE');
+    const evidenceRows = await db.autopilotRuleCandidateEvidence.findMany({
+      where: { companyId, candidateId },
+      orderBy: [{ observedAt: 'desc' }, { id: 'desc' }],
+      take: MAX_CANDIDATE_EVIDENCE,
+      select: {
+        id: true, transactionId: true, source: true, polarity: true, active: true,
+        observedAt: true, invalidatedAt: true, invalidationReason: true,
+      },
+    }) as Row[];
+    return {
+      ...candidate,
+      evidence: evidenceRows.map((evidence) => ({
+        id: String(evidence.id),
+        transactionId: String(evidence.transactionId),
+        source: evidence.source === 'autopilot' || evidence.source === 'mcp' ? evidence.source : 'user',
+        polarity: evidence.polarity === 'negative' ? 'negative' : 'positive',
+        active: evidence.active === true,
+        observedAt: iso(evidence.observedAt),
+        invalidatedAt: nullableIso(evidence.invalidatedAt),
+        invalidationReason: typeof evidence.invalidationReason === 'string' ? evidence.invalidationReason : null,
+      })),
+    };
+  }
+
+  async function getClassificationCaseForUser(
+    userId: string,
+    companyId: string,
+    caseId: string,
+  ): Promise<ClassificationCase> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(caseId, 'caseId');
+    if (db.classificationCase === undefined) {
+      throw new HttpError(503, 'Classification cases are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const row = await db.classificationCase.findFirst({
+      where: { id: caseId, companyId },
+      include: { invalidation: true },
+    }) as Row | null;
+    if (row === null) throw new HttpError(404, 'Classification case not found', 'CASE_NOT_FOUND');
+    const invalidation = row.invalidation !== null && typeof row.invalidation === 'object'
+      ? row.invalidation as Row
+      : null;
+    return parseClassificationCase({
+      id: row.id,
+      companyId: row.companyId,
+      transactionId: row.transactionId,
+      vendorIdentityId: row.vendorIdentityId ?? null,
+      qboMutationAttemptId: row.qboMutationAttemptId,
+      action: row.action,
+      actionFingerprint: row.actionFingerprint,
+      originIntent: row.originIntent,
+      rationale: row.rationale,
+      requiredEvidence: Array.isArray(row.requiredEvidence) ? row.requiredEvidence.slice(0, 20) : [],
+      examples: Array.isArray(row.examples) ? row.examples.slice(0, 20) : [],
+      counterexamples: Array.isArray(row.counterexamples) ? row.counterexamples.slice(0, 20) : [],
+      citations: Array.isArray(row.citations) ? row.citations.slice(0, 10) : [],
+      reviewer: row.reviewer,
+      jurisdiction: row.jurisdiction,
+      currency: row.currency,
+      context: row.context,
+      provenance: row.provenance,
+      verifiedAt: iso(row.verifiedAt),
+      invalidatedAt: invalidation === null ? null : iso(invalidation.invalidatedAt),
+      invalidationReason: invalidation === null ? null : invalidation.reason,
+    });
+  }
+
+  async function getCurrentClassificationCaseForUser(
+    userId: string,
+    companyId: string,
+    transactionId: string,
+  ): Promise<ClassificationCase> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(transactionId, 'transactionId');
+    if (db.classificationCase === undefined) {
+      throw new HttpError(503, 'Classification cases are unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const row = await db.classificationCase.findFirst({
+      where: {
+        companyId, transactionId, invalidation: null,
+        qboMutationAttempt: { status: 'VERIFIED' },
+      },
+      orderBy: [{ verifiedAt: 'desc' }, { id: 'desc' }],
+      select: { id: true },
+    }) as Row | null;
+    if (row === null) throw new HttpError(404, 'Classification case not found', 'CASE_NOT_FOUND');
+    return getClassificationCaseForUser(userId, companyId, String(row.id));
+  }
+
+  async function testRuleForUser(
+    userId: string,
+    companyId: string,
+    input: { matchText: string; priorityTop?: boolean; limit?: number; cursor?: string },
+  ): Promise<RuleTestReadDto> {
+    await authorizeCompany(userId, companyId, 'categorizer');
+    const matchText = optionalString(input.matchText, 'matchText', 200);
+    if (matchText === undefined) badRequest('matchText must not be empty');
+    const requestedLimit = readLimit(input.limit);
+    const priorityTop = input.priorityTop ?? true;
+    const filter = canonicalFilter({ matchText, priorityTop });
+    const expected = { resource: 'rule-test', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const cursorDate = typeof position?.date === 'string' ? new Date(position.date) : null;
+    const cursorId = typeof position?.id === 'string' ? position.id : null;
+    if (position && (!cursorDate || Number.isNaN(cursorDate.getTime()) || !cursorId)) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const [transactions, rules] = await Promise.all([
+      db.transaction.findMany({
+        where: {
+          companyId,
+          status: { in: ['PENDING', 'POSTED', 'DRY_RUN'] },
+          payee: { contains: matchText, mode: 'insensitive' },
+          ...(cursorDate && cursorId ? {
+            OR: [{ date: { lt: cursorDate } }, { date: cursorDate, id: { lt: cursorId } }],
+          } : {}),
+        },
+        select: { id: true, payee: true, date: true, amount: true, status: true },
+        orderBy: [{ date: 'desc' }, { id: 'desc' }],
+        take: requestedLimit + 1,
+      }) as Promise<Row[]>,
+      db.rule.findMany({
+        where: { companyId, enabled: true, retiredAt: null },
+        select: { id: true, matchText: true, category: true, priority: true, createdAt: true },
+        orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+        take: 201,
+      }) as Promise<Row[]>,
+    ]);
+    if (rules.length > 200) {
+      throw new HttpError(503, 'Rule test population is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const page = pageRows(transactions, requestedLimit, (row) => encodeCursor(cursorSecret, {
+      v: 1,
+      ...expected,
+      position: { date: iso(row.date), id: String(row.id) },
+    }));
+    const matchingRule = (payee: string) => rules.find((rule) => {
+      const needle = String(rule.matchText).trim().toLocaleLowerCase('en-US');
+      return needle !== '' && payee.toLocaleLowerCase('en-US').includes(needle);
+    });
+    const samples = page.rows.map((row) => {
+      const winner = matchingRule(String(row.payee));
+      return {
+        transactionId: String(row.id),
+        payee: String(row.payee),
+        date: iso(row.date),
+        amount: Number(row.amount),
+        status: (row.status === 'POSTED' || row.status === 'DRY_RUN' ? row.status : 'PENDING') as
+          'PENDING' | 'POSTED' | 'DRY_RUN',
+        wouldWin: priorityTop || winner === undefined,
+        currentWinner: winner === undefined ? null : String(winner.matchText),
+      };
+    });
+    const samplePayees = samples.map((sample) => sample.payee.toLocaleLowerCase('en-US'));
+    const allConflicts = rules.filter((rule) => {
+      const needle = String(rule.matchText).trim().toLocaleLowerCase('en-US');
+      return needle !== '' && samplePayees.some((payee) => payee.includes(needle));
+    });
+    return {
+      samples,
+      nextCursor: page.nextCursor,
+      pendingCount: samples.filter((sample) => sample.status === 'PENDING').length,
+      postedCount: samples.filter((sample) => sample.status !== 'PENDING').length,
+      conflicts: allConflicts.slice(0, MAX_RULE_CONFLICTS).map((rule) => ({
+        ruleId: String(rule.id),
+        matchText: String(rule.matchText),
+        category: String(rule.category),
+        priority: Number(rule.priority),
+      })),
+      conflictsTruncated: allConflicts.length > MAX_RULE_CONFLICTS,
+    };
   }
 
   async function listCompaniesForUser(userId: string, input: PageInput = {}): Promise<Page<CompanyReadDto>> {
@@ -1286,7 +2224,7 @@ export function createCompanyReadService(
       resource: 'rules',
       minimum: 'categorizer',
       model: db.rule,
-      where: {},
+      where: { enabled: true, retiredAt: null },
       orderField: 'priority',
       include: {
         ruleTags: { select: { tagId: true } },
@@ -1321,27 +2259,11 @@ export function createCompanyReadService(
       accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
     );
     const existingTags = new Set(tags.map((tag) => String(tag.id)));
-    const eligibleCodes = new Set(
-      readiness === null ? [] : eligibleTaxCodes(readiness).map((code) => code.qboId),
-    );
     return {
       ...base,
       items: base.items.map((rule) => {
-        const reasons: string[] = [];
-        if (rule.categoryQboId === null || !activeAccounts.has(rule.categoryQboId)) {
-          reasons.push('Category account is missing or inactive.');
-        }
-        const taxed = rule.taxCalculation === 'TaxInclusive' || rule.taxCalculation === 'TaxExcluded';
-        if (taxed && readiness?.status !== 'ready') {
-          reasons.push('Tax reference is not ready.');
-        }
-        if (taxed && (rule.taxCodeQboId === null || !eligibleCodes.has(rule.taxCodeQboId))) {
-          reasons.push('Tax code is missing or ineligible.');
-        }
-        if (rule.tagIds.some((tagId) => !existingTags.has(tagId))) {
-          reasons.push('One or more tags no longer exist.');
-        }
-        return { ...rule, valid: reasons.length === 0, invalidReasons: reasons.slice(0, 4) };
+        const reasons = ruleReferenceReasons(rule, activeAccounts, existingTags, readiness);
+        return { ...rule, valid: reasons.length === 0, invalidReasons: reasons };
       }),
     };
   }
@@ -1410,6 +2332,15 @@ export function createCompanyReadService(
     listTaxCodes: listTaxCodesForUser,
     listTags: listTagsForUser,
     listRules: listRulesForUser,
+    listRuleLifecycle: listRuleLifecycleForUser,
+    getRule: getRuleForUser,
+    listRuleRevisions: listRuleRevisionsForUser,
+    testRule: testRuleForUser,
+    listRuleCandidates: listRuleCandidatesForUser,
+    getRuleCandidate: getRuleCandidateForUser,
+    getClassificationCase: getClassificationCaseForUser,
+    getCurrentClassificationCase: getCurrentClassificationCaseForUser,
+    searchClassificationKnowledge: searchClassificationKnowledgeForUser,
     listTransferCandidates: listTransferCandidatesForUser,
   };
 }
@@ -1427,4 +2358,13 @@ export const listCategories = defaultService.listCategories;
 export const listTaxCodes = defaultService.listTaxCodes;
 export const listTags = defaultService.listTags;
 export const listRules = defaultService.listRules;
+export const listRuleLifecycle = defaultService.listRuleLifecycle;
+export const getRule = defaultService.getRule;
+export const listRuleRevisions = defaultService.listRuleRevisions;
+export const testRule = defaultService.testRule;
+export const listRuleCandidates = defaultService.listRuleCandidates;
+export const getRuleCandidate = defaultService.getRuleCandidate;
+export const getClassificationCase = defaultService.getClassificationCase;
+export const getCurrentClassificationCase = defaultService.getCurrentClassificationCase;
+export const searchClassificationKnowledge = defaultService.searchClassificationKnowledge;
 export const listTransferCandidates = defaultService.listTransferCandidates;

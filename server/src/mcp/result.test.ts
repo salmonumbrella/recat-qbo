@@ -6,7 +6,9 @@ import { CategorizationError } from '../services/categorization.js';
 import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
+import { McpRuleChangeError } from '../services/mcp/rules.js';
 import { McpUndoError } from '../services/mcp/undo.js';
+import { RuleCandidateError } from '../services/ruleCandidates.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
 import { TransferOperationError } from '../services/transferOperations.js';
@@ -255,6 +257,26 @@ describe('MCP tool results', () => {
         message: expect.any(String),
         requestId: 'request-mutation',
       },
+    });
+    expect(JSON.stringify(result)).not.toContain(error.message);
+  });
+
+  it.each([
+    [new McpRuleChangeError('NOT_FOUND'), 'NOT_FOUND'],
+    [new McpRuleChangeError('INVALID_INPUT'), 'INVALID_INPUT'],
+    [new McpRuleChangeError('CONFLICT'), 'INVALID_INPUT'],
+    [new McpRuleChangeError('STALE_REVISION'), 'INVALID_INPUT'],
+    [new McpRuleChangeError('OPERATION_EXPIRED'), 'INVALID_INPUT'],
+    [new McpRuleChangeError('OPERATION_CORRUPT'), 'INVALID_INPUT'],
+    [new McpRuleChangeError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
+    [new RuleCandidateError('CANDIDATE_NOT_FOUND', 'PRIVATE_CANDIDATE'), 'NOT_FOUND'],
+    [new RuleCandidateError('CANDIDATE_NOT_READY', 'PRIVATE_CANDIDATE'), 'INVALID_INPUT'],
+    [new RuleCandidateError('CANDIDATE_STALE', 'PRIVATE_CANDIDATE'), 'INVALID_INPUT'],
+  ])('maps rule lifecycle rejection to authored safe code %s', (error, code) => {
+    const result = safeToolFailure(error, 'request-rule-rejection');
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code, requestId: 'request-rule-rejection' },
     });
     expect(JSON.stringify(result)).not.toContain(error.message);
   });

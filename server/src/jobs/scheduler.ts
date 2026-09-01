@@ -18,16 +18,20 @@ import { runAttachmentCleanup } from '../services/attachments/cleanup.js';
 import { recoverStuckAttachmentOperations } from '../services/attachments/operations.js';
 import { runReceiptTick as processReceiptTick } from '../services/receipts/worker.js';
 import { resolvePublicUrl } from '../services/publicUrl.js';
+import { runClassificationEmbeddingTick } from '../services/classification/embedding/reconciler.js';
 
 const TICK_MS = 60_000;
 const NIGHTLY_HOUR = 2;
 const STUCK_POSTING_MS = 5 * 60 * 1000;
+const CLASSIFICATION_EMBEDDING_TICK_MS = 10 * 60 * 1000;
 
 let ticker: NodeJS.Timeout | null = null;
 const inFlight = new Set<string>();
 let lastNightlyDate = '';
 let lastDigestDate = '';
 let receiptTickInFlight = false;
+let classificationEmbeddingTickInFlight = false;
+let lastClassificationEmbeddingTickAt = Number.NEGATIVE_INFINITY;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
@@ -167,6 +171,24 @@ export async function runReceiptTick(): Promise<void> {
   }
 }
 
+export async function runClassificationSearchEmbeddingTick(
+  now: Date = new Date(),
+): Promise<void> {
+  if (
+    classificationEmbeddingTickInFlight
+    || now.getTime() - lastClassificationEmbeddingTickAt < CLASSIFICATION_EMBEDDING_TICK_MS
+  ) {
+    return;
+  }
+  classificationEmbeddingTickInFlight = true;
+  lastClassificationEmbeddingTickAt = now.getTime();
+  try {
+    await runClassificationEmbeddingTick();
+  } finally {
+    classificationEmbeddingTickInFlight = false;
+  }
+}
+
 async function tick(): Promise<void> {
   const now = new Date();
   try {
@@ -197,6 +219,11 @@ async function tick(): Promise<void> {
   } catch {
     console.error('[jobs] receipt scheduler tick failed');
   }
+  try {
+    await runClassificationSearchEmbeddingTick(now);
+  } catch {
+    console.error('[jobs] classification embedding tick failed');
+  }
 }
 
 export function startJobs(): void {
@@ -209,6 +236,8 @@ export function startJobs(): void {
   runAttachmentCleanup().catch(() => console.error('[jobs] attachment cleanup failed'));
   runAgentTick().catch(() => console.error('[jobs] boot agent scheduler tick failed'));
   runReceiptTick().catch(() => console.error('[jobs] boot receipt scheduler tick failed'));
+  runClassificationSearchEmbeddingTick()
+    .catch(() => console.error('[jobs] boot classification embedding tick failed'));
   ticker = setInterval(() => void tick(), TICK_MS);
   // Node should still exit cleanly if the server is stopped.
   ticker.unref();

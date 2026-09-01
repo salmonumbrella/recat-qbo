@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run && vitest run --config vitest.pg.config.ts",
+    "test": "npm run test:unit && npm run test:pg",
+    "test:unit": "vitest run",
+    "test:pg": "vitest run --config vitest.pg.config.ts",
     "seed": "tsx src/seed.ts"
   },
   "dependencies": {
