@@ -1187,11 +1187,11 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = rule."companyId"
         AND tax."qboId" = revision."taxCodeQboId"
       LEFT JOIN LATERAL (
-        SELECT string_agg(tag."name", ' ' ORDER BY tag."id" ASC) AS "names",
-               jsonb_agg(tag."id" ORDER BY tag."id") AS "ids",
-               jsonb_agg(tag."name" ORDER BY tag."id") AS "namesArray"
+        SELECT string_agg(tag."name", ' ' ORDER BY relation."ordinal" ASC) AS "names",
+               jsonb_agg(tag."name" ORDER BY relation."ordinal" ASC) AS "namesArray"
         FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
-          THEN revision."tagIds" ELSE '[]'::jsonb END) relation("tagId")
+          THEN revision."tagIds" ELSE '[]'::jsonb END)
+          WITH ORDINALITY AS relation("tagId", "ordinal")
         JOIN "Tag" tag ON tag."id" = relation."tagId"
           AND tag."companyId" = rule."companyId"
       ) tags ON true
@@ -1534,6 +1534,12 @@ function jsonStrings(value: Prisma.JsonValue): string[] {
     : [];
 }
 
+function actionTagNames(value: Prisma.JsonValue): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string').slice(0, 50)
+    : [];
+}
+
 function taxCalculation(value: string | null): ClassificationAction['taxCalculation'] | null {
   return value === 'TaxInclusive' || value === 'TaxExcluded' || value === 'NotApplicable'
     ? value
@@ -1775,13 +1781,14 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
     const revisedAt = row.revisedAt.toISOString();
     const invalidTags = parseActionTagIds(row.tagIds) === null;
     const rawAction = actionFromColumns(row);
-    const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName, jsonStrings(row.tagNames));
-    const referencesValid = rawAction !== null && classificationReferenceReasons(rawAction, {
+    const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName, actionTagNames(row.tagNames));
+    const referenceReasons = rawAction === null ? [] : classificationReferenceReasons(rawAction, {
       categoryActive: row.categoryActive,
       taxReady: row.taxReady,
       taxCodeEligible: row.taxCodeEligible,
       tagsExist: row.tagsExist,
-    }).length === 0;
+    });
+    const referencesValid = rawAction !== null && referenceReasons.length === 0;
     const action = referencesValid && summary !== null ? rawAction : null;
     const taxed = rawAction !== null && rawAction.taxCalculation !== 'NotApplicable';
     const conflicted = row.reviewRequiredAt !== null;
@@ -1803,6 +1810,7 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
       evidenceCount: 0, conflictingEvidenceCount: conflict.length, conflicts: conflict,
       provenance: { source: 'rule', sourceId: row.id, actorId: row.updatedById, recordedAt: revisedAt },
       rationale: invalidTags ? 'Historical rule action is unavailable because its tag IDs are invalid.'
+        : !row.tagsExist ? 'Historical rule action is unavailable because one or more current tags are missing.'
         : historicalRuleRationale(row, rawAction), jurisdiction: taxed ? 'unknown' : null,
       ruleRevision: row.revision,
     });

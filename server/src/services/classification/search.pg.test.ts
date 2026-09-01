@@ -818,13 +818,19 @@ describePostgres('classification search on PostgreSQL', () => {
     const zuluTag = await db.tag.create({
       data: { id: zuluTagId!, companyId: data.current.id, name: 'Zulu tag', color: '#222222' },
     });
+    const middleTags = Array.from({ length: 48 }, (_unused, index) => ({
+      id: randomUUID(), companyId: data.current.id,
+      name: `Middle tag ${String(index).padStart(2, '0')}`, color: '#333333',
+    }));
+    await db.tag.createMany({ data: middleTags });
     await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: zuluTag.id } });
     await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: alphaTag.id } });
     await db.ruleRevision.create({ data: {
       ruleId: data.rule.id, companyId: data.current.id, revision: 3, state: 'enabled',
       matchText: data.rule.matchText, category: data.account.name, categoryQboId: data.account.qboId,
       taxCalculation: 'TaxExcluded', taxCode: data.taxCode.name, taxCodeQboId: data.taxCode.qboId,
-      tagIds: [data.tag.id, zuluTag.id, alphaTag.id], priority: 0, autoPost: false,
+      tagIds: [zuluTag.id, ...middleTags.map((tag) => tag.id), alphaTag.id],
+      priority: 0, autoPost: false,
       originIntent: 'make_recurring',
     } });
     await db.rule.update({ where: { id: data.rule.id }, data: { revision: 3 } });
@@ -878,8 +884,12 @@ describePostgres('classification search on PostgreSQL', () => {
       [data.current.id],
       [`rule:${data.rule.id}`],
     ))[0];
-    expect(rule?.document?.text.indexOf('Alpha tag'))
-      .toBeLessThan(rule?.document?.text.indexOf('Zulu tag') ?? -1);
+    expect(rule?.hit.action?.tagIds).toHaveLength(50);
+    expect(rule?.hit.action?.tagIds[0]).toBe(zuluTag.id);
+    expect(rule?.hit.actionSummary?.tagNames).toHaveLength(50);
+    expect(rule?.hit.actionSummary?.tagNames[0]).toBe('Zulu tag');
+    expect(rule?.document?.text.indexOf('Zulu tag'))
+      .toBeLessThan(rule?.document?.text.indexOf('Alpha tag') ?? -1);
     const candidate = (await repository.rehydrate(
       [data.current.id],
       [`rule_candidate:${data.candidate.id}`],
