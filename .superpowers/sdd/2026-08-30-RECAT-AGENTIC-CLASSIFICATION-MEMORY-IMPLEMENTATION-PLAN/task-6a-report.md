@@ -416,6 +416,92 @@ npx vitest run --config vitest.pg.config.ts \
 
 Exit 0: 61/61 focused unit tests and 24/24 focused PostgreSQL tests.
 
+## Independent review fix round 2
+
+### Additive rule lifecycle collection
+
+Production break named: the browser's only rule collection used the legacy
+active-rule query, so disabling or retiring a rule made it undiscoverable after
+reload even though its canonical revision and immutable history still existed.
+
+RED:
+
+```bash
+cd server
+DATABASE_URL="$TASK6A_DATABASE_URL" TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npx vitest run --config vitest.pg.config.ts \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 1: the new real PostgreSQL read expected the enabled page but received
+`undefined` because no lifecycle collection existed.
+
+GREEN after the minimal collection: 1/1. The same disconnected company read
+returned canonical `RuleDetailDto` items for `enabled`, `disabled`, `retired`,
+and `all`; disabled and retired items remained readable, inactive, and
+non-executable. A foreign-company rule was absent from every page.
+
+### Signed deterministic pagination and drift fence
+
+Production break named: the first minimal collection returned `nextCursor=null`
+after the first of three matching rules and had no replay/drift fence.
+
+RED with the PostgreSQL command above: 1 failed, 1 passed. The first bounded
+page returned the correct newest equal-priority rule, but did not return the
+required signed cursor.
+
+GREEN: 2/2. Ordering is `(priority ASC, createdAt DESC, id ASC)`. The cursor
+binds the exact user, company, state filter, limit, mixed-direction position,
+and an HMAC fingerprint of every matching rule's ID, current revision,
+lifecycle, order, and review fields. The service recomputes that fingerprint
+after canonical detail/readiness enrichment, rejecting a mutation racing the
+read. Tests reject signature tampering, state or limit reuse, another user,
+another company, and drift in a rule outside the current page.
+
+Production break named: a runtime caller could bypass the TypeScript filter and
+an unknown state widened silently to `all`.
+
+RED with the focused pagination test: the promise resolved with a page instead
+of rejecting. GREEN: the shared service now rejects unknown state with authored
+`BAD_REQUEST`; the HTTP schema rejects it with `VALIDATION` before service use.
+
+### Compatible browser route
+
+Production break named: `/rules/lifecycle` fell through to `/:id`, returning a
+single detail object, while an invalid state also widened to that detail route.
+
+RED:
+
+```bash
+npm run test:server:unit -- routes/rules.test.ts
+```
+
+Exit 1: 2 failed, 7 passed. The lifecycle request returned the mocked detail
+object rather than a page, and `state=unknown` returned 200 instead of 400.
+
+GREEN: 10/10. `GET /rules/lifecycle` is categorizer-only, permits disconnected
+company reads, validates `state`, `limit`, and `cursor`, and returns the bounded
+page. A role-gate mutation to viewer produced the expected 200-vs-403 RED before
+the categorizer gate was restored. The same test reads legacy `GET /rules` and
+proves its response remains the original active `RuleDto[]` array.
+
+Focused fix-round aggregate:
+
+```bash
+npm run test:server:unit -- routes/rules.test.ts services/companyReads.test.ts
+
+cd server
+DATABASE_URL="$TASK6A_DATABASE_URL" TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npx vitest run --config vitest.pg.config.ts \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 0: 51/51 focused unit tests and 2/2 focused PostgreSQL tests.
+
+No schema or migration changed. The already-deployed append-only
+rule/revision state is sufficient to derive the signed population fingerprint;
+no second policy store or new mutable epoch row was introduced.
+
 ## Migration reasoning and proof
 
 The migration is additive and rolling-compatible:
@@ -464,6 +550,7 @@ temporary database and files were removed afterward.
 - `server/src/services/ruleChanges.pg.test.ts`
 - `server/src/services/companyReads.ts`
 - `server/src/services/companyReads.test.ts`
+- `server/src/services/companyReads.rules.pg.test.ts`
 - `server/src/routes/classification.ts`
 - `server/src/routes/classification.test.ts`
 - `server/src/routes/ruleOperations.ts`
@@ -514,8 +601,8 @@ npm test
 Exit 0:
 
 - package-script contract: 1/1 passed;
-- server unit: 133 files, 2,237/2,237 passed;
-- server PostgreSQL: 35 files, 331 passed, 20 intentionally skipped;
+- server unit: 133 files, 2,240/2,240 passed;
+- server PostgreSQL: 36 files, 333 passed, 20 intentionally skipped;
 - client: 21 files, 207/207 passed, including `Queue.tax.test.tsx` 66/66.
 
 The PostgreSQL package has a pre-existing environment forwarding quirk. This

@@ -877,6 +877,7 @@ export interface RuleDto {
 }
 
 export type RuleLifecycleState = 'enabled' | 'disabled' | 'retired';
+export type RuleLifecycleFilter = RuleLifecycleState | 'all';
 
 /** A canonical revision stays readable when legacy references are no longer
  * executable; in that case action is null and invalidReasons explain why. */
@@ -892,6 +893,11 @@ export interface RuleDetailDto {
   reviewRequiredAt: string | null;
   reviewReason: string | null;
   revision: RuleRevisionReadDto;
+}
+
+export interface RuleLifecyclePageDto {
+  items: RuleDetailDto[];
+  nextCursor: string | null;
 }
 
 export interface RuleRevisionPageDto {

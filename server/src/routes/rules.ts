@@ -13,7 +13,7 @@ import {
   testRule,
   toRuleDto,
 } from '../services/rules.js';
-import { getRule, listRuleRevisions } from '../services/companyReads.js';
+import { getRule, listRuleLifecycle, listRuleRevisions } from '../services/companyReads.js';
 
 export { toRuleDto } from '../services/rules.js';
 
@@ -23,6 +23,12 @@ const testBody = z.object({
   matchText: z.string().trim().min(1).max(200),
   priorityTop: z.boolean().optional().default(true),
 });
+
+const lifecycleQuery = z.object({
+  state: z.enum(['enabled', 'disabled', 'retired', 'all']).default('all'),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  cursor: z.string().min(1).max(2_048).optional(),
+}).strict();
 
 function scopedCompany(req: { company?: Company }): Company {
   if (!req.company) throw new HttpError(404, 'Company not found', 'COMPANY_NOT_FOUND');
@@ -68,6 +74,12 @@ rulesRouter.post('/test', requireRole('categorizer'), withReadableCompany, async
 
 rulesRouter.put('/order', requireRole('categorizer'), withReadableCompany, asyncHandler(async (req, res) => {
   operationRequired();
+}));
+
+rulesRouter.get('/lifecycle', requireRole('categorizer'), withReadableCompany, asyncHandler(async (req, res) => {
+  if (!req.user) throw new HttpError(401, 'Not signed in', 'UNAUTHENTICATED');
+  const query = validate(lifecycleQuery)(req.query);
+  res.json(await listRuleLifecycle(req.user.id, scopedCompany(req).id, query));
 }));
 
 rulesRouter.get('/:id/revisions', requireRole('viewer'), withReadableCompany, asyncHandler(async (req, res) => {

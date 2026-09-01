@@ -11,6 +11,8 @@ import type {
   Role,
   RuleDetailDto,
   RuleDto,
+  RuleLifecycleFilter,
+  RuleLifecyclePageDto,
   RuleRevision,
   RuleRevisionReadDto,
   SuggestionDto,
@@ -61,6 +63,9 @@ const TXN_STATUSES: readonly TxnStatus[] = [
   'SUPERSEDED',
   'REVERTED',
 ];
+const RULE_LIFECYCLE_FILTERS = new Set<RuleLifecycleFilter>([
+  'enabled', 'disabled', 'retired', 'all',
+]);
 
 type DbMethod = (args: Record<string, unknown>) => Promise<unknown>;
 
@@ -82,6 +87,10 @@ export interface CompanyReadDb {
 export interface PageInput {
   limit?: number;
   cursor?: string;
+}
+
+export interface RuleLifecycleListInput extends PageInput {
+  state?: RuleLifecycleFilter;
 }
 
 export interface Page<T> {
@@ -1034,13 +1043,10 @@ export function createCompanyReadService(
     };
   }
 
-  async function getRuleForUser(
-    userId: string,
+  async function getRuleForCompany(
     companyId: string,
     ruleId: string,
   ): Promise<CompanyRuleReadDto> {
-    await authorizeCompany(userId, companyId, 'viewer');
-    boundedId(ruleId, 'ruleId');
     if (db.rule.findFirst === undefined || db.ruleRevision === undefined) {
       throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
     }
@@ -1154,6 +1160,16 @@ export function createCompanyReadService(
     };
   }
 
+  async function getRuleForUser(
+    userId: string,
+    companyId: string,
+    ruleId: string,
+  ): Promise<CompanyRuleReadDto> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(ruleId, 'ruleId');
+    return getRuleForCompany(companyId, ruleId);
+  }
+
   async function listRuleRevisionsForUser(
     userId: string,
     companyId: string,
@@ -1205,6 +1221,106 @@ export function createCompanyReadService(
         });
         return { ...parsed, action: valid ? parsed.action : null, valid, invalidReasons: valid ? [] : ['Stored legacy action is non-executable.'] };
       }),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  async function listRuleLifecycleForUser(
+    userId: string,
+    companyId: string,
+    input: RuleLifecycleListInput = {},
+  ): Promise<RuleLifecyclePageDto> {
+    await authorizeCompany(userId, companyId, 'categorizer');
+    const limit = readLimit(input.limit);
+    const requestedState = input.state ?? 'all';
+    if (!RULE_LIFECYCLE_FILTERS.has(requestedState)) {
+      badRequest('Invalid rule lifecycle state', 'BAD_REQUEST');
+    }
+    const state: RuleLifecycleFilter = requestedState;
+    const filter = canonicalFilter({ state, limit });
+    const expected = { resource: 'rule-lifecycle', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const cursorPriority = position?.priority;
+    const cursorCreatedAt = position?.createdAt;
+    const cursorId = position?.id;
+    const cursorFingerprint = position?.fingerprint;
+    if (position && (
+      typeof cursorPriority !== 'number'
+      || !Number.isInteger(cursorPriority)
+      || typeof cursorCreatedAt !== 'string'
+      || Number.isNaN(new Date(cursorCreatedAt).getTime())
+      || typeof cursorId !== 'string'
+      || typeof cursorFingerprint !== 'string'
+    )) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+    const lifecycleWhere = state === 'enabled'
+      ? { enabled: true, retiredAt: null }
+      : state === 'disabled'
+        ? { enabled: false, retiredAt: null }
+        : state === 'retired'
+          ? { retiredAt: { not: null } }
+          : {};
+    const currentFingerprint = async () => {
+      const population = await db.rule.findMany({
+        where: { companyId, ...lifecycleWhere },
+        orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+        select: {
+          id: true, revision: true, enabled: true, retiredAt: true,
+          priority: true, createdAt: true, reviewRequiredAt: true, reviewReason: true,
+        },
+      }) as Row[];
+      const canonicalPopulation = population.map((row) => ({
+        id: String(row.id),
+        revision: Number(row.revision),
+        enabled: row.enabled === true,
+        retiredAt: nullableIso(row.retiredAt),
+        priority: Number(row.priority),
+        createdAt: iso(row.createdAt),
+        reviewRequiredAt: nullableIso(row.reviewRequiredAt),
+        reviewReason: typeof row.reviewReason === 'string' ? row.reviewReason : null,
+      }));
+      return createHmac('sha256', cursorSecret)
+        .update(canonicalFilter(canonicalPopulation), 'utf8')
+        .digest('hex');
+    };
+    const fingerprint = await currentFingerprint();
+    if (position && cursorFingerprint !== fingerprint) {
+      badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
+    }
+    const cursorWhere = position
+      ? {
+          OR: [
+            { priority: { gt: cursorPriority } },
+            { priority: cursorPriority, createdAt: { lt: new Date(cursorCreatedAt as string) } },
+            { priority: cursorPriority, createdAt: new Date(cursorCreatedAt as string), id: { gt: cursorId } },
+          ],
+        }
+      : {};
+    const rows = await db.rule.findMany({
+      where: { companyId, ...lifecycleWhere, ...cursorWhere },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+      take: limit + 1,
+      select: { id: true, priority: true, createdAt: true },
+    }) as Row[];
+    const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
+      v: 1,
+      ...expected,
+      position: {
+        priority: Number(row.priority),
+        createdAt: iso(row.createdAt),
+        id: String(row.id),
+        fingerprint,
+      },
+    }));
+    const items = await Promise.all(
+      page.rows.map((row) => getRuleForCompany(companyId, String(row.id))),
+    );
+    if (await currentFingerprint() !== fingerprint) {
+      badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
+    }
+    return {
+      items,
       nextCursor: page.nextCursor,
     };
   }
@@ -1947,6 +2063,7 @@ export function createCompanyReadService(
     listTaxCodes: listTaxCodesForUser,
     listTags: listTagsForUser,
     listRules: listRulesForUser,
+    listRuleLifecycle: listRuleLifecycleForUser,
     getRule: getRuleForUser,
     listRuleRevisions: listRuleRevisionsForUser,
     testRule: testRuleForUser,
@@ -1972,6 +2089,7 @@ export const listCategories = defaultService.listCategories;
 export const listTaxCodes = defaultService.listTaxCodes;
 export const listTags = defaultService.listTags;
 export const listRules = defaultService.listRules;
+export const listRuleLifecycle = defaultService.listRuleLifecycle;
 export const getRule = defaultService.getRule;
 export const listRuleRevisions = defaultService.listRuleRevisions;
 export const testRule = defaultService.testRule;
