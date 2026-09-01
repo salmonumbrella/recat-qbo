@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-08-30
+last_edited: 2026-09-01
 ---
 
 # Autopilot shadow-provider boundary
@@ -44,6 +44,40 @@ IDs, priority, affected pending/posted counts, bounded samples, conflicts,
 warnings, and the preparation digest. Safe error serialization returns only
 an allowlisted code and fixed message—never provider messages, raw QBO data,
 credentials, or private prompts.
+
+### Deterministic local verification
+
+The classification-memory end-to-end suite uses a local deterministic HTTP
+embedding fixture and a disposable PostgreSQL/pgvector database. Fixed
+accounting topics map to stable unit vectors, including separate vector slots
+for a simulated model/generation cutover. The fixture records only the test
+request method, path, input type, input text, and resolved synthetic topic; it
+has no provider credential and makes no outbound request.
+
+With all Prisma migrations applied to a disposable database containing the
+`vector` extension, run:
+
+```bash
+cd server
+TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
+  src/services/classification/search.e2e.test.ts
+```
+
+The suite verifies exact alias, semantic-only paraphrase, and hybrid RRF
+retrieval; edit/re-embed and atomic generation cutover without stale-vector
+leakage; cross-company redaction and authorization; and labelled lexical
+degradation when the embedding endpoint is unavailable. Its isolated Chevron
+scenario keeps recurring policy suggestion-only (`autoPost: false`), snapshots
+the synthetic transactions and QBO-mutation-attempt count before the rule
+operation, and requires both to remain deeply equal to those snapshots after
+prepare, commit, endpoint calls, client replacement, and search readback.
+
+Fault injection after each durable prepare/commit write and midway through a
+reorder verifies transactional rollback, restart recovery, idempotent replay,
+expiry retry, stale-revision and candidate-conflict rejection, append-only
+history, and absence of partial priority or policy state. This is local test
+evidence only; it neither enables semantic configuration nor deploys or
+restarts a running Recat service.
 
 ## Provider request
 

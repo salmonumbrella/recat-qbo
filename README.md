@@ -180,6 +180,23 @@ npm run dev                 # server :3001 + client :5173
 npm test                    # full server + client test suite
 ```
 
+Classification-memory retrieval has a deterministic PostgreSQL end-to-end
+test. It starts a local HTTP embedding fixture, so it needs no embedding API
+key or provider account. Point it only at a disposable PostgreSQL database
+with the `vector` extension and all Prisma migrations applied:
+
+```bash
+cd server
+TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
+  src/services/classification/search.e2e.test.ts
+```
+
+The fixture is test-only. It exercises exact, lexical, semantic, and hybrid
+search; embedding replacement and generation cutover; tenant boundaries;
+explicit endpoint-down degradation; suggestion-only recurring rules; restart
+readback; and transaction rollback at rule-operation durability boundaries.
+It does not contact or mutate QuickBooks.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules.
 
 ## Configuration
