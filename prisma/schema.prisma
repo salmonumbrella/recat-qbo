@@ -1104,6 +1104,40 @@ model McpOperation {
   @@index([companyId, transactionId])
 }
 
+/// Immutable MCP preparation envelope for rule lifecycle mutations. This is
+/// deliberately separate from McpOperation because rule writes are local
+/// classification-policy changes, not transaction-scoped QBO operations.
+/// Attribution and target identifiers remain scalar provenance after deletion.
+model McpRuleOperation {
+  id                   String    @id @default(uuid())
+  tokenId              String
+  tokenPrefix          String    @db.VarChar(12)
+  userId               String
+  companyId            String
+  resourceType         String    @db.VarChar(32)
+  resourceId           String
+  mutation             String    @db.VarChar(32)
+  idempotencyKey       String    @db.VarChar(128)
+  inputHash            String    @db.Char(64)
+  payload              Json
+  payloadHash          String    @db.Char(64)
+  sourceRevision       Int
+  proposedRevision     Int
+  proposedSnapshotHash String    @db.Char(64)
+  expiresAt            DateTime
+  retryOfId            String?   @unique
+  committedAt          DateTime?
+  commitResult         Json?
+  commitResultHash     String?   @db.Char(64)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@unique([tokenId, companyId, idempotencyKey])
+  @@index([tokenId, createdAt])
+  @@index([userId, createdAt])
+  @@index([companyId, resourceType, resourceId])
+}
+
 model AppConfig {
   key       String   @id
   value     String // encrypted where sensitive

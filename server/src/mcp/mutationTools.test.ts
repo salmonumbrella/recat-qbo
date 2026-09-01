@@ -22,6 +22,8 @@ const operationId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const undoOperationId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const counterpartTransactionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const transferOperationId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const ruleOperationId = '11111111-1111-4111-8111-111111111111';
+const ruleId = '22222222-2222-4222-8222-222222222222';
 
 const preparedCategorization = {
   operationId,
@@ -115,6 +117,74 @@ const transferOperation = {
   },
 };
 
+const rulePreview = {
+  operationId: ruleOperationId,
+  companyId,
+  ruleId,
+  candidateId: null,
+  mutation: 'create' as const,
+  originIntent: 'make_recurring' as const,
+  currentRevision: 0,
+  proposedRevision: 1,
+  condition: { matchField: 'payee' as const, matchText: 'Harbour Supply' },
+  action: {
+    categoryQboId: 'expense-account',
+    taxCalculation: 'NotApplicable' as const,
+    taxCodeQboId: null,
+    tagIds: [],
+  },
+  categoryName: 'Operating expense',
+  taxCodeName: null,
+  priority: 0,
+  autoPost: false,
+  affectedPendingCount: 1,
+  affectedPostedCount: 0,
+  sampleTransactions: [],
+  conflicts: [],
+  warnings: [],
+  expiresAt: '2026-08-31T20:15:00.000Z',
+  preparationDigest: 'c'.repeat(64),
+};
+
+const preparedRuleChange = {
+  ok: true,
+  operationId: ruleOperationId,
+  companyId,
+  mutation: 'create' as const,
+  originIntent: 'make_recurring' as const,
+  status: 'PREPARED' as const,
+  ruleId,
+  revision: 1,
+  rule: null,
+  candidate: null,
+  preview: rulePreview,
+  error: null,
+};
+
+const committedRuleChange = {
+  ...preparedRuleChange,
+  status: 'COMMITTED' as const,
+  rule: {
+    id: '33333333-3333-4333-8333-333333333333',
+    ruleId,
+    companyId,
+    revision: 1,
+    state: 'enabled' as const,
+    condition: rulePreview.condition,
+    action: rulePreview.action,
+    categoryName: rulePreview.categoryName,
+    taxCodeName: null,
+    priority: 0,
+    autoPost: false,
+    originIntent: 'make_recurring' as const,
+    sourceCaseId: null,
+    sourceCandidateId: null,
+    changedBy: principal.userId,
+    createdAt: '2026-08-31T20:01:00.000Z',
+    retiredAt: null,
+  },
+};
+
 function mutations(
   overrides: Partial<McpMutationOperations> = {},
 ): McpMutationOperations {
@@ -131,6 +201,8 @@ function mutations(
     }),
     prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
     commitTransfer: vi.fn().mockResolvedValue(transferOperation),
+    prepareRuleChange: vi.fn().mockResolvedValue(preparedRuleChange),
+    commitRuleChange: vi.fn().mockResolvedValue(committedRuleChange),
     ...overrides,
   };
 }
@@ -254,6 +326,25 @@ describe('Recat MCP mutation tools', () => {
       openWorldHint: true,
     });
     expect(mutationTools.some((tool) => tool.name === 'post_transfer')).toBe(false);
+
+    const prepareRule = mutationTools.find((tool) =>
+      tool.name === 'prepare_rule_change')!;
+    expect(prepareRule.inputSchema.additionalProperties).toBe(false);
+    expect(prepareRule.inputSchema.properties.mutation.enum).toEqual([
+      'create', 'update', 'enable', 'disable', 'reorder', 'retire',
+      'activate_candidate', 'dismiss_candidate',
+    ]);
+    expect(prepareRule.inputSchema.properties.proposal.additionalProperties).toBe(false);
+    expect(prepareRule.inputSchema.properties.proposal.properties.tagIds.maxItems).toBe(50);
+    expect(prepareRule.inputSchema.properties.proposal.properties.orderIds.maxItems).toBe(500);
+    expect(prepareRule.outputSchema.properties.preview.anyOf).toHaveLength(2);
+    const commitRule = mutationTools.find((tool) => tool.name === 'commit_rule_change')!;
+    expect(commitRule.inputSchema.required).toEqual(['operationId', 'idempotencyKey']);
+    expect(commitRule.annotations).toMatchObject({
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
   });
 
   it('routes all eight operations with the fresh principal and sanitized DTOs', async () => {
@@ -304,6 +395,25 @@ describe('Recat MCP mutation tools', () => {
         operationId: transferOperationId,
         idempotencyKey: 'transfer-one',
       }],
+      ['prepare_rule_change', {
+        companyId,
+        mutation: 'create',
+        expectedRevision: 0,
+        idempotencyKey: 'rule-one',
+        proposal: {
+          matchText: 'Harbour Supply',
+          categoryQboId: 'expense-account',
+          taxCalculation: 'NotApplicable',
+          taxCodeQboId: null,
+          tagIds: [],
+          priority: 0,
+          autoPost: false,
+        },
+      }],
+      ['commit_rule_change', {
+        operationId: ruleOperationId,
+        idempotencyKey: 'rule-one',
+      }],
     ] as const;
 
     for (const [name, arguments_] of calls) {
@@ -328,6 +438,8 @@ describe('Recat MCP mutation tools', () => {
     expect(operations.commitUndo).toHaveBeenCalledWith(principal, calls[5][1]);
     expect(operations.prepareTransfer).toHaveBeenCalledWith(principal, calls[6][1]);
     expect(operations.commitTransfer).toHaveBeenCalledWith(principal, calls[7][1]);
+    expect(operations.prepareRuleChange).toHaveBeenCalledWith(principal, calls[8][1]);
+    expect(operations.commitRuleChange).toHaveBeenCalledWith(principal, calls[9][1]);
   });
 
   it('rejects extra keys and contradictory tax inputs before service dispatch', async () => {

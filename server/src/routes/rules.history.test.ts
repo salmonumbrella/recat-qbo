@@ -19,7 +19,7 @@ function rule(id: string, priority: number, tagIds: string[] = []): StoredRule {
     matchText: `Synthetic Vendor ${id}`,
     category: 'Synthetic expense',
     categoryQboId: 'account-synthetic',
-    taxCalculation: null,
+    taxCalculation: 'NotApplicable',
     taxCode: null,
     taxCodeQboId: null,
     autoPost: false,
@@ -46,12 +46,21 @@ const state = vi.hoisted(() => ({
 }));
 
 const fakePrisma = vi.hoisted(() => ({
-  qboAccount: { findFirst: vi.fn(async () => null) },
+  qboAccount: {
+    findFirst: vi.fn(async ({ where }: { where: { qboId?: string; name?: string } }) => ({
+      qboId: where.qboId ?? 'account-synthetic',
+      name: where.name ?? 'Synthetic expense',
+    })),
+  },
   tag: {
     count: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
       new Set(where.id.in).size),
   },
   rule: {
+    findFirst: vi.fn(async ({ where }: { where: { id?: string; priority?: number } }) =>
+      state.rules.find((row) =>
+        (where.id === undefined || row.id === where.id)
+        && (where.priority === undefined || row.priority === where.priority)) ?? null),
     aggregate: vi.fn(async () => ({
       _min: {
         priority: state.rules.length === 0
@@ -101,6 +110,13 @@ const fakePrisma = vi.hoisted(() => ({
       current.ruleTags.push(row);
       return row;
     }),
+    createMany: vi.fn(async ({ data }: { data: Array<{ ruleId: string; tagId: string }> }) => {
+      for (const row of data) {
+        const current = state.rules.find((ruleRow) => ruleRow.id === row.ruleId);
+        if (current !== undefined) current.ruleTags.push(row);
+      }
+      return { count: data.length };
+    }),
   },
   ruleRevision: {
     create: vi.fn(async ({ data }: { data: Record<string, any> }) => {
@@ -108,6 +124,7 @@ const fakePrisma = vi.hoisted(() => ({
       return data;
     }),
   },
+  auditEntry: { create: vi.fn(async ({ data }: { data: Record<string, any> }) => data) },
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: fakePrisma }));
@@ -163,7 +180,10 @@ describe('REST rule revision history', () => {
         matchText: 'Synthetic Vendor',
         category: 'Synthetic expense',
         categoryQboId: 'account-synthetic',
-        tagIds: ['tag-b', 'tag-a'],
+        tagIds: [
+          'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        ],
         autoPost: true,
       });
 
@@ -176,17 +196,23 @@ describe('REST rule revision history', () => {
         state: 'enabled',
         changedBy: 'user-synthetic',
         autoPost: true,
-        tagIds: ['tag-a', 'tag-b'],
+        tagIds: [
+          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        ],
       }),
     ]);
   });
 
   it('increments revision and snapshots the edited rule after replacing tags', async () => {
-    state.rules = [rule('rule-edit', 2, ['tag-old'])];
+    state.rules = [rule('rule-edit', 2, ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'])];
 
     const response = await request(app())
       .patch('/api/companies/company-synthetic/rules/rule-edit')
-      .send({ matchText: 'Edited Vendor', tagIds: ['tag-new'] });
+      .send({
+        matchText: 'Edited Vendor',
+        tagIds: ['dddddddd-dddd-4ddd-8ddd-dddddddddddd'],
+      });
 
     expect(response.status).toBe(200);
     expect(state.rules[0]).toMatchObject({
@@ -199,14 +225,17 @@ describe('REST rule revision history', () => {
         ruleId: 'rule-edit',
         revision: 1,
         matchText: 'Edited Vendor',
-        tagIds: ['tag-new'],
+        tagIds: ['dddddddd-dddd-4ddd-8ddd-dddddddddddd'],
         changedBy: 'user-synthetic',
       }),
     ]);
   });
 
   it('versions every rule whose priority changes during ordering', async () => {
-    state.rules = [rule('rule-a', 0, ['tag-a']), rule('rule-b', 1, ['tag-b'])];
+    state.rules = [
+      rule('rule-a', 0, ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']),
+      rule('rule-b', 1, ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']),
+    ];
 
     const response = await request(app())
       .put('/api/companies/company-synthetic/rules/order')
@@ -218,8 +247,14 @@ describe('REST rule revision history', () => {
       expect.objectContaining({ id: 'rule-b', priority: 0, revision: 1, updatedById: 'user-synthetic' }),
     ]));
     expect(state.revisions).toEqual(expect.arrayContaining([
-      expect.objectContaining({ ruleId: 'rule-a', priority: 1, revision: 1, tagIds: ['tag-a'] }),
-      expect.objectContaining({ ruleId: 'rule-b', priority: 0, revision: 1, tagIds: ['tag-b'] }),
+      expect.objectContaining({
+        ruleId: 'rule-a', priority: 1, revision: 1,
+        tagIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+      }),
+      expect.objectContaining({
+        ruleId: 'rule-b', priority: 0, revision: 1,
+        tagIds: ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'],
+      }),
     ]));
   });
 });

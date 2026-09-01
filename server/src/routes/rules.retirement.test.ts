@@ -8,7 +8,15 @@ const state = vi.hoisted(() => ({
 }));
 
 const fakePrisma = vi.hoisted(() => ({
+  qboAccount: {
+    findFirst: vi.fn(async () => ({ qboId: 'account-synthetic', name: 'Synthetic expense' })),
+  },
+  tag: { count: vi.fn(async () => 1) },
   rule: {
+    findFirst: vi.fn(async ({ where }: { where: { id: string; companyId: string } }) =>
+      state.rule?.id === where.id && state.rule?.companyId === where.companyId
+        ? state.rule
+        : null),
     findUnique: vi.fn(async ({ where }: { where: { id: string } }) =>
       state.rule?.id === where.id ? state.rule : null),
     update: vi.fn(async ({ data }: { data: Record<string, any> }) => {
@@ -31,6 +39,7 @@ const fakePrisma = vi.hoisted(() => ({
       return data;
     }),
   },
+  auditEntry: { create: vi.fn(async ({ data }: { data: Record<string, any> }) => data) },
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: fakePrisma }));
@@ -93,7 +102,10 @@ describe('DELETE /api/companies/:companyId/rules/:id', () => {
       updatedById: null,
       reviewRequiredAt: null,
       reviewReason: null,
-      ruleTags: [{ ruleId: 'rule-synthetic', tagId: 'tag-synthetic' }],
+      ruleTags: [{
+        ruleId: 'rule-synthetic',
+        tagId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      }],
       candidateOrigin: null,
     };
   });
@@ -121,7 +133,7 @@ describe('DELETE /api/companies/:companyId/rules/:id', () => {
         companyId: 'company-synthetic',
         revision: 1,
         state: 'retired',
-        tagIds: ['tag-synthetic'],
+        tagIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
         autoPost: true,
         changedBy: 'user-synthetic',
         retiredAt: state.rule?.retiredAt,

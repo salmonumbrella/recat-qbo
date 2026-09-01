@@ -192,7 +192,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly fifteen core reads and twenty conservatively annotated action tools', async () => {
+  it('registers exactly fifteen core reads and twenty-two conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -210,6 +210,8 @@ describe('Recat MCP read tools', () => {
       'commit_undo',
       'prepare_transfer',
       'commit_transfer',
+      'prepare_rule_change',
+      'commit_rule_change',
       'create_attachment_upload',
       'attach_transaction_files',
       'list_transaction_attachments',
@@ -223,7 +225,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(35);
+    expect(tools).toHaveLength(37);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -307,6 +309,24 @@ describe('Recat MCP read tools', () => {
           destructiveHint: true,
           idempotentHint: true,
           openWorldHint: true,
+        },
+      },
+      {
+        name: 'prepare_rule_change',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: 'commit_rule_change',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
         },
       },
       {
