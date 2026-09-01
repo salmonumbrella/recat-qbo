@@ -35,6 +35,7 @@ import {
   type ClassificationSearchSnapshot,
 } from './classification/search.js';
 import type { RuleRevision } from '@recat/shared';
+import { parseActionTagIds } from './classification/actionTagIds.js';
 import { classificationReferenceReasons } from './classification/referenceReadiness.js';
 
 export const DEFAULT_READ_LIMIT = 20;
@@ -1033,8 +1034,9 @@ export function createCompanyReadService(
     const rawTaxCodeQboId = typeof revisionRow.taxCodeQboId === 'string'
       ? revisionRow.taxCodeQboId
       : null;
-    const tagIds = stringArray(revisionRow.tagIds).slice(0, MAX_READ_LIMIT);
-    const structurallyValidAction = rawCategoryQboId !== null
+    const parsedTagIds = parseActionTagIds(revisionRow.tagIds);
+    const tagIds = parsedTagIds ?? [];
+    const structurallyValidAction = parsedTagIds !== null && rawCategoryQboId !== null
       && (rawCalculation === 'TaxInclusive'
         || rawCalculation === 'TaxExcluded'
         || rawCalculation === 'NotApplicable')
@@ -1098,6 +1100,8 @@ export function createCompanyReadService(
       taxCodeQboId: rawTaxCodeQboId,
       tagIds,
     }, activeAccounts, existingTags, readiness);
+    if (parsedTagIds === null) invalidReasons.unshift('Action tag IDs are invalid.');
+    invalidReasons.splice(4);
     const valid = structurallyValidAction && invalidReasons.length === 0;
     const revision: CompanyRuleRevisionReadDto = {
       ...parsedRevision,
@@ -1154,7 +1158,9 @@ export function createCompanyReadService(
       const calculation = row.taxCalculation;
       const categoryQboId = typeof row.categoryQboId === 'string' ? row.categoryQboId : null;
       const taxCodeQboId = typeof row.taxCodeQboId === 'string' ? row.taxCodeQboId : null;
+      const tagIds = parseActionTagIds(row.tagIds);
       const validAction = categoryQboId !== null
+        && tagIds !== null
         && (calculation === 'TaxInclusive' || calculation === 'TaxExcluded' || calculation === 'NotApplicable')
         && ((calculation === 'NotApplicable') === (taxCodeQboId === null));
       return {
@@ -1169,7 +1175,7 @@ export function createCompanyReadService(
           categoryQboId,
           taxCalculation: calculation,
           taxCodeQboId,
-          tagIds: stringArray(row.tagIds).slice(0, 50),
+          tagIds,
         } : null,
         executable: false,
         advisory: true,

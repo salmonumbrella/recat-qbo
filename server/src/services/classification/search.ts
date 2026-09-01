@@ -39,6 +39,7 @@ import {
 } from './rrf.js';
 import { normalizeVendorLookupKey } from './vendorIdentity.js';
 import { classificationReferenceReasons } from './referenceReadiness.js';
+import { parseActionTagIds } from './actionTagIds.js';
 
 const MAX_ACCESSIBLE_COMPANIES = 100;
 const SEARCH_FETCH_MULTIPLIER = 5;
@@ -1533,14 +1534,6 @@ function jsonStrings(value: Prisma.JsonValue): string[] {
     : [];
 }
 
-function actionTagIds(value: Prisma.JsonValue): string[] | null {
-  if (!Array.isArray(value) || value.length > 50) return null;
-  const tags = value.filter((item): item is string => typeof item === 'string');
-  if (tags.length !== value.length || new Set(tags).size !== tags.length
-    || tags.some((tag) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(tag))) return null;
-  return tags;
-}
-
 function taxCalculation(value: string | null): ClassificationAction['taxCalculation'] | null {
   return value === 'TaxInclusive' || value === 'TaxExcluded' || value === 'NotApplicable'
     ? value
@@ -1554,7 +1547,7 @@ export function actionFromColumns(input: {
   tagIds: Prisma.JsonValue;
 }): ClassificationAction | null {
   const calculation = taxCalculation(input.taxCalculation);
-  const tagIds = actionTagIds(input.tagIds);
+  const tagIds = parseActionTagIds(input.tagIds);
   if (input.categoryQboId === null || calculation === null || tagIds === null) return null;
   if ((calculation === 'NotApplicable') !== (input.taxCodeQboId === null)) return null;
   return {

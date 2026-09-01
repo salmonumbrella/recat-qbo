@@ -290,7 +290,8 @@ const classificationActionSchema = z.object({
   categoryQboId: z.string().min(1).max(120),
   taxCalculation: z.enum(['TaxInclusive', 'TaxExcluded', 'NotApplicable']),
   taxCodeQboId: z.string().min(1).max(120).nullable(),
-  tagIds: z.array(z.string().min(1).max(128)).max(50),
+  tagIds: z.array(z.string().uuid()).max(50)
+    .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.'),
   memo: z.string().max(500).nullable().optional(),
 }).strict().superRefine((value, context) => {
   if ((value.taxCalculation === 'NotApplicable') !== (value.taxCodeQboId === null)) {

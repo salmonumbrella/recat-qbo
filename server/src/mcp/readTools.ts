@@ -280,7 +280,8 @@ const action = z.strictObject({
   categoryQboId: z.string().min(1).max(120),
   taxCalculation,
   taxCodeQboId: z.string().min(1).max(120).nullable(),
-  tagIds: z.array(id).max(50),
+  tagIds: z.array(z.string().uuid()).max(50)
+    .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.'),
   memo: nullableText.optional(),
 });
 const actionSummary = z.strictObject({
