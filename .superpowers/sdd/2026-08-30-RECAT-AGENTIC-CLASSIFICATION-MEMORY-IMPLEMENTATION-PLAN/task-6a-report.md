@@ -6,15 +6,16 @@ last_edited: 2026-08-31
 
 ## Status
 
-Complete locally through independent review fix round 4, on top of integrated
-commit `8f4718a`. Browser rule operations now use
+Complete locally through independent review fix round 5, on top of integrated
+commit `b5d9409`. Browser rule operations now use
 the same immutable, company-scoped, two-phase lifecycle as MCP with a real
 session principal. Classification and canonical rule reads are available to
 the browser without adding a policy store, fake MCP token, or one-call write.
 
 No external provider, production database, QBO, deployment, push, or PR was
 used. Verification used an isolated disposable PostgreSQL 16 + pgvector
-container on localhost port 55439.
+container on localhost. Fix-round-5 verification used PostgreSQL 16 on port
+55434; credential-bearing connection strings are not retained.
 
 Commands below use `TASK6A_DATABASE_URL` and `TASK6A_SHADOW_DATABASE_URL` for
 the disposable local test and shadow database URLs. Credential-bearing URLs
@@ -1026,6 +1027,231 @@ drift.
   direct-delete/update trigger paths, then restore them before commit.
 - No REST, MCP, client, auth, shared-contract, policy, provider, QBO, deployment,
   push, or production behavior changed in this round.
+
+## Independent review fix round 5 — non-reused generations and statement triggers
+
+### Production breaks and strict RED evidence
+
+#### 1. Fence deletion/recreation could reproduce a stale cursor generation
+
+Production break named: the per-company counter restarted from zero whenever a
+`RuleLifecycleRevision` row was absent. Deleting that row, or deleting and
+recreating a Company with the same ID, could therefore reproduce the exact
+generation embedded in an old signed cursor.
+
+The service-level standalone-delete test prepares a cursor at generation six,
+deletes only the fence row, confirms reads fail closed while the row is absent,
+then performs six real Rule priority updates. Against the fix-round-4 schema:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_ROUND4_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/companyReads.rules.pg.test.ts -t 'deleted lifecycle fence'
+```
+
+Exit 1:
+
+```text
+AssertionError: expected 6 to be greater than 6
+```
+
+The same-company-ID recreation test deletes a Company (cascading the fence),
+recreates its user, membership, account, Company, and equivalent Rules under
+the identical IDs, then presents the old cursor. Against the old schema:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_ROUND4_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/companyReads.rules.pg.test.ts -t 'same company ID'
+```
+
+Exit 1:
+
+```text
+AssertionError: expected 6 to be greater than 6
+```
+
+A focused trigger test also proved that direct fence INSERT/UPDATE could still
+write an arbitrary/reused value before the stamp trigger existed:
+
+```text
+AssertionError: expected 0 to be greater than 0
+```
+
+GREEN after the sequence/stamp migration:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/companyReads.rules.pg.test.ts \
+  src/services/ruleLifecycleRevision.pg.test.ts
+```
+
+Exit 0: 2 files, 20/20 passed. Both delete/recreate paths receive a strictly
+larger global generation and reject the stale cursor with `INVALID_CURSOR`.
+Missing fences remain fail-closed on reads until a genuine lifecycle mutation
+self-heals them. Direct INSERT/UPDATE values are also replaced by fresh
+sequence generations.
+
+#### 2. Row UPDATE triggers could lock multiple company fences inconsistently
+
+Production break named: the Rule and RuleRevision UPDATE triggers ran once per
+row. Two bulk statements touching the same companies in reversed row order
+could acquire company fence row locks in opposite orders. They also advanced a
+company fence once per changed row instead of once per changed statement.
+
+The exact same-company multirow assertions were RED on the old schema:
+
+```text
+Rule:         expected 38n to be 37n
+RuleRevision: expected 13n to be 12n
+```
+
+Both show a two-row statement advancing the company twice rather than once.
+The adversarial tests install a test-only AFTER ROW barrier backed by a
+nontransactional sequence, start two transactions, and update disjoint Rule or
+RuleRevision rows belonging to the same two companies in reversed order. This
+drives the real production UPDATE trigger path rather than calling the bump
+helper directly. Against the row-trigger schema both tests were RED:
+
+```text
+Rule lifecycle test barrier timed out (SQLSTATE P0001)
+RuleRevision lifecycle test barrier timed out (SQLSTATE P0001)
+```
+
+After replacing the two UPDATE triggers with AFTER UPDATE statement triggers
+and OLD/NEW transition tables, the focused trigger suite is GREEN:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/ruleLifecycleRevision.pg.test.ts
+```
+
+Exit 0: 1 file, 12/12 passed. Both transactions reach the row barrier before
+any lifecycle fence is locked, then each statement unions OLD and NEW company
+owners, sorts the distinct company IDs once, and advances both companies
+without a deadlock or timeout. Each two-row/same-company statement advances
+the fence once. Rule comparison is restricted to the cursor projection
+(`id`, company, revision, enabled, retiredAt, priority, createdAt,
+reviewRequiredAt, reviewReason); RuleRevision comparison is full-row and
+bidirectional. No-op updates do not bump either fence.
+
+### Migration and rolling/restore reasoning
+
+Migration `20260831070000_harden_rule_lifecycle_generation` is additive and
+rolling-compatible:
+
+- creates a standalone `BIGINT NO CYCLE CACHE 1` PostgreSQL sequence above the
+  largest legacy per-company counter;
+- adds a BEFORE INSERT/UPDATE stamp trigger, drops the old Prisma default, and
+  rebases every existing fence through `nextval`, invalidating all pre-cutover
+  cursors exactly once;
+- keeps deletion and Company cascade behavior unchanged. A missing fence is
+  inserted with a placeholder that the stamp trigger replaces; the sequence is
+  global and is neither deleted with a Company nor rolled back, so self-heal
+  and same-ID recreation cannot reuse the old token;
+- updates the existing sorted bump helper so existing rows advance through a
+  harmless `revision = revision` write and concurrent missing-row creation is
+  resolved by `ON CONFLICT DO UPDATE`, with the stamp trigger assigning the
+  winner a new generation;
+- replaces only the Rule and RuleRevision UPDATE row triggers. Existing INSERT
+  and DELETE statement triggers and old-writer fallback history behavior are
+  retained.
+
+A fresh reset applied all 37 migrations and passed the full trigger suite. A
+rolling database first applied 36 migrations and held legacy fence values 50
+and 100. Deploying the new migration rebased them to 101 and 102. An old-shape
+raw Rule insert after cutover advanced the first company to 104 and created the
+expected fallback RuleRevision at revision zero, proving an old binary remains
+compatible with the new database.
+
+Standard `pg_dump -Fc` / `pg_restore --exit-on-error` testing preserved both
+the fence row and standalone sequence state at 214. A post-restore old-shape
+Rule insert advanced the fence to 216 and created fallback history. Thus the
+sequence state survives normal backup/restore, while sequence gaps caused by
+rollback or contention remain intentionally harmless and prevent reuse.
+
+### Files changed in fix round 5
+
+- `prisma/schema.prisma` — removes only the obsolete zero default from the
+  lifecycle generation; no formatter churn.
+- `prisma/migrations/20260831070000_harden_rule_lifecycle_generation/migration.sql`
+  — global generation sequence, mandatory stamp trigger, cutover rebase,
+  race-safe bump helper, and transition-table UPDATE triggers.
+- `server/src/services/companyReads.rules.pg.test.ts` — real service tests for
+  standalone fence deletion/self-heal and same-ID Company recreation.
+- `server/src/services/ruleLifecycleRevision.pg.test.ts` — sequence stamping,
+  multirow no-op/material semantics, and deterministic real-trigger concurrency
+  coverage for Rule and RuleRevision.
+- this report.
+
+No REST, MCP, client, npm-script, application service, policy, provider, QBO,
+deployment, push, or production code changed in this round.
+
+### Full fix-round-5 verification
+
+```bash
+DATABASE_URL="$TASK6A_DATABASE_URL" \
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" npm test
+```
+
+Exit 0:
+
+- package-script contract: 1/1 passed;
+- server unit: 133 files, 2,241/2,241 passed;
+- server PostgreSQL: 37 files, 351 passed, 20 intentionally skipped;
+- client: 21 files, 207/207 passed, including `Queue.tax.test.tsx` 66/66.
+
+The first full rerun encountered one `ECONNRESET` in the unrelated
+`transactions.categorization` live-recheck unit test. Its exact isolated rerun
+passed 1/1 without code changes, and the fresh complete root rerun above passed
+all 2,241 unit tests; this was recorded as transient test infrastructure, not
+masked or changed.
+
+```bash
+npm run typecheck
+npm run build
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma validate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma generate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma migrate status
+```
+
+All exited 0: shared/server/client typechecks and builds passed; Vite built 84
+modules; Prisma validated and generated client 6.19.3; all 37 migrations are
+applied. Fresh migration reset, rolling migration, MCP authored-schema startup,
+package-script contract, and diff checks passed. Prisma datamodel diff still
+contains only the same three inherited long-name index renames and no lifecycle
+schema drift.
+
+The 10,001-rule lifecycle read remains constant-query and bounded in returned
+materialization after this hardening. The final full PG run reported 10 queries
+for each measured page, returned only `limit + 1` Rule rows, and contained no
+population aggregate in the fence or page plan.
+
+### Fix-round-5 self-review
+
+- Generations are globally unique for the lifetime of the sequence, not merely
+  monotonic within a company row. PostgreSQL sequences are deliberately
+  nontransactional, so aborted transactions consume rather than reuse values.
+- Every initialization and bump is stamped. There is no writable/default zero
+  path after cutover, including explicit INSERT/UPDATE statements.
+- Direct fence deletion remains allowed as approved; reads fail closed while
+  absent, and the next legitimate mutation self-heals with a strictly new
+  generation. Company cascade still removes its fence without special guards.
+- UPDATE transition-table triggers compare OLD and NEW projections in both
+  directions, capturing company/ID moves and material value changes while
+  ignoring order-only transition-table presentation and exact no-ops.
+- The helper sorts distinct company IDs before locking. Statement triggers
+  call it once, avoiding row-order lock inversion across concurrent bulk
+  updates.
+- The migration locks Company, Rule, RuleRevision, and the fence only during
+  the cutover; ordinary lifecycle writes retain the existing company-scoped
+  transaction policy and do not introduce a global runtime lock.
+- SECURITY DEFINER functions retain a fixed `pg_catalog, public` search path.
+- Sequence exhaustion is fail-closed. At BIGINT scale it is not an operational
+  concern for this workload; sequence monitoring can be added without changing
+  the cursor contract.
 
 ## Security and self-review
 

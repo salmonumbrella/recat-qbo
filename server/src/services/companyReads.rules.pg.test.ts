@@ -364,6 +364,111 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
   });
 
+  it('rejects a stale cursor after its Company is deleted and recreated with the same ID and rules', async () => {
+    const suffix = randomUUID();
+    const companyId = `recreated-company-${suffix}`;
+    const companyData = {
+      id: companyId,
+      realmId: `recreated-realm-${suffix}`,
+      legalName: 'Recreated Legal',
+      nickname: 'Recreated',
+    };
+    await db.company.create({ data: companyData });
+    companyIds.add(companyId);
+    const user = await db.user.create({ data: { email: `recreated-${suffix}@example.test` } });
+    userIds.add(user.id);
+    const createdAt = new Date('2026-08-30T03:00:00.000Z');
+    const seedIdenticalPopulation = async () => {
+      await db.membership.create({ data: {
+        userId: user.id, companyId, role: 'categorizer',
+      } });
+      await db.qboAccount.create({ data: {
+        companyId, qboId: 'account-meals', name: 'Meals',
+        fullName: 'Expenses · Meals', classification: 'Expense',
+      } });
+      await seedRule(companyId, user.id, 'account-meals', {
+        id: `recreated-rule-a-${suffix}`, matchText: 'First', priority: 0,
+        state: 'disabled', createdAt,
+      });
+      await seedRule(companyId, user.id, 'account-meals', {
+        id: `recreated-rule-b-${suffix}`, matchText: 'Second', priority: 1,
+        state: 'disabled', createdAt,
+      });
+    };
+    await seedIdenticalPopulation();
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-company-recreation-secret',
+    );
+    const first = await listLifecycle(service, user.id, companyId, {
+      state: 'disabled', limit: 1,
+    });
+    const beforeDelete = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId }, select: { revision: true },
+    });
+
+    await db.company.delete({ where: { id: companyId } });
+    await db.company.create({ data: companyData });
+    await seedIdenticalPopulation();
+    const afterRecreate = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId }, select: { revision: true },
+    });
+
+    expect(afterRecreate.revision).toBeGreaterThan(beforeDelete.revision);
+    await expect(listLifecycle(service, user.id, companyId, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
+  it('fails closed on a deleted fence and never revives its stale cursor after self-heal', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `self-heal-${suffix}`, legalName: 'Self Heal Legal', nickname: 'Self Heal',
+    } });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `self-heal-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: company.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: company.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'First', priority: 0, state: 'disabled',
+    });
+    const laterRule = await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'Second', priority: 1, state: 'disabled',
+    });
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-self-heal-secret',
+    );
+    const first = await listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1,
+    });
+    const beforeDelete = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId: company.id }, select: { revision: true },
+    });
+    await db.ruleLifecycleRevision.delete({ where: { companyId: company.id } });
+
+    await expect(listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'COMPANY_UNAVAILABLE' });
+
+    for (const priority of [2, 1, 2, 1, 2, 1]) {
+      await db.rule.update({ where: { id: laterRule.id }, data: { priority } });
+    }
+    const afterSelfHeal = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId: company.id }, select: { revision: true },
+    });
+    expect(afterSelfHeal.revision).toBeGreaterThan(beforeDelete.revision);
+    await expect(listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
   it('keeps lifecycle reads bounded and set-based across thousands of rules', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({ data: {

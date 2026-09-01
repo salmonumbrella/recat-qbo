@@ -254,7 +254,7 @@ model ClassificationCorpusRevision {
 model RuleLifecycleRevision {
   companyId String  @id
   company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  revision  BigInt  @default(0)
+  revision  BigInt
 }
 
 model Transaction {

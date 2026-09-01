@@ -31,6 +31,13 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     return rows[0]?.revision ?? -1n;
   }
 
+  async function generationLast(): Promise<bigint> {
+    const rows = await db.$queryRaw<Array<{ last_value: bigint }>>`
+      SELECT last_value FROM "RuleLifecycleGeneration_seq"
+    `;
+    return rows[0]?.last_value ?? -1n;
+  }
+
   async function createRule(companyId: string, suffix: string) {
     return db.rule.create({ data: {
       id: `fence-rule-${suffix}`,
@@ -41,7 +48,7 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     } });
   }
 
-  it('initializes a zero-state fence for every newly created company', async () => {
+  it('initializes a fresh generation fence for every newly created company', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({ data: {
       realmId: `lifecycle-fence-${suffix}`,
@@ -56,7 +63,31 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
        WHERE "companyId" = ${company.id}
     `;
 
-    expect(rows).toEqual([{ revision: 0n }]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.revision).toBeGreaterThan(0n);
+  });
+
+  it('re-stamps direct fence updates and inserts instead of accepting a reused token', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `lifecycle-direct-stamp-${suffix}`,
+      legalName: 'Lifecycle Direct Stamp Legal',
+      nickname: 'Lifecycle Direct Stamp',
+    } });
+    companyIds.add(company.id);
+    const initialized = await fence(company.id);
+
+    await db.ruleLifecycleRevision.update({
+      where: { companyId: company.id }, data: { revision: initialized },
+    });
+    const afterUpdate = await fence(company.id);
+    expect(afterUpdate).toBeGreaterThan(initialized);
+
+    await db.ruleLifecycleRevision.delete({ where: { companyId: company.id } });
+    await db.ruleLifecycleRevision.create({
+      data: { companyId: company.id, revision: initialized },
+    });
+    expect(await fence(company.id)).toBeGreaterThan(afterUpdate);
   });
 
   it('bumps the company fence when a rolling old writer inserts a Rule directly', async () => {
@@ -185,7 +216,7 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     expect(await fence(company.id)).toBe(-1n);
   });
 
-  it('does not lose concurrent direct-writer bumps or deadlock reversed company order', async () => {
+  it('does not deadlock reversed multi-company Rule UPDATE statements', async () => {
     const suffix = randomUUID();
     const companies = await Promise.all(['a', 'b'].map((label) => db.company.create({ data: {
       realmId: `lifecycle-concurrency-${label}-${suffix}`,
@@ -194,22 +225,161 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     } })));
     companies.forEach((company) => companyIds.add(company.id));
     const [companyA, companyB] = companies;
+    const ruleA1 = await createRule(companyA!.id, `${suffix}-a1`);
+    const ruleA2 = await createRule(companyA!.id, `${suffix}-a2`);
+    const ruleB1 = await createRule(companyB!.id, `${suffix}-b1`);
+    const ruleB2 = await createRule(companyB!.id, `${suffix}-b2`);
     const beforeA = await fence(companyA!.id);
     const beforeB = await fence(companyB!.id);
+    const sequenceBefore = await generationLast();
     const writerA = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
     const writerB = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
 
     try {
+      await db.$executeRawUnsafe('CREATE SEQUENCE "RuleLifecycleRuleTestBarrier_seq" CACHE 1');
+      await db.$executeRawUnsafe(`
+        CREATE FUNCTION rule_lifecycle_rule_test_barrier()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+          arrivals BIGINT;
+          deadline TIMESTAMPTZ := clock_timestamp() + interval '2 seconds';
+        BEGIN
+          IF current_setting('recat.lifecycle_test_barrier', true) = 'rule'
+             AND COALESCE(current_setting('recat.lifecycle_test_barrier_seen', true), '') <> 'rule' THEN
+            PERFORM set_config('recat.lifecycle_test_barrier_seen', 'rule', true);
+            PERFORM nextval('"RuleLifecycleRuleTestBarrier_seq"'::regclass);
+            LOOP
+              SELECT last_value INTO arrivals FROM "RuleLifecycleRuleTestBarrier_seq";
+              EXIT WHEN arrivals >= 2;
+              IF clock_timestamp() >= deadline THEN
+                RAISE EXCEPTION 'Rule lifecycle test barrier timed out';
+              END IF;
+              PERFORM pg_sleep(0.01);
+            END LOOP;
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+      `);
+      await db.$executeRawUnsafe(`
+        CREATE TRIGGER zz_rule_lifecycle_test_barrier
+        AFTER UPDATE ON "Rule"
+        FOR EACH ROW EXECUTE FUNCTION rule_lifecycle_rule_test_barrier()
+      `);
       await Promise.all([
-        writerA.$executeRaw`SELECT rule_lifecycle_bump_company_ids(ARRAY[${companyA!.id}, ${companyB!.id}]::text[])`,
-        writerB.$executeRaw`SELECT rule_lifecycle_bump_company_ids(ARRAY[${companyB!.id}, ${companyA!.id}]::text[])`,
+        writerA.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '3s'");
+          await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+          await tx.$executeRawUnsafe("SET LOCAL recat.lifecycle_test_barrier = 'rule'");
+          await tx.rule.updateMany({
+            where: { id: { in: [ruleA1.id, ruleB1.id] } },
+            data: { priority: { increment: 1 } },
+          });
+        }),
+        writerB.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '3s'");
+          await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+          await tx.$executeRawUnsafe("SET LOCAL recat.lifecycle_test_barrier = 'rule'");
+          await tx.rule.updateMany({
+            where: { id: { in: [ruleB2.id, ruleA2.id] } },
+            data: { priority: { increment: 1 } },
+          });
+        }),
       ]);
     } finally {
       await Promise.all([writerA.$disconnect(), writerB.$disconnect()]);
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS zz_rule_lifecycle_test_barrier ON "Rule"');
+      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS rule_lifecycle_rule_test_barrier()');
+      await db.$executeRawUnsafe('DROP SEQUENCE IF EXISTS "RuleLifecycleRuleTestBarrier_seq"');
     }
 
-    expect(await fence(companyA!.id)).toBe(beforeA + 2n);
-    expect(await fence(companyB!.id)).toBe(beforeB + 2n);
+    expect(await fence(companyA!.id)).toBeGreaterThan(beforeA);
+    expect(await fence(companyB!.id)).toBeGreaterThan(beforeB);
+    expect(await generationLast()).toBe(sequenceBefore + 4n);
+  });
+
+  it('does not deadlock reversed multi-company RuleRevision UPDATE statements', async () => {
+    const suffix = randomUUID();
+    const companies = await Promise.all(['a', 'b'].map((label) => db.company.create({ data: {
+      realmId: `lifecycle-revision-concurrency-${label}-${suffix}`,
+      legalName: `Lifecycle Revision Concurrency ${label.toUpperCase()} Legal`,
+      nickname: `Lifecycle Revision Concurrency ${label.toUpperCase()}`,
+    } })));
+    companies.forEach((company) => companyIds.add(company.id));
+    const [companyA, companyB] = companies;
+    const ruleA1 = await createRule(companyA!.id, `${suffix}-revision-a1`);
+    const ruleA2 = await createRule(companyA!.id, `${suffix}-revision-a2`);
+    const ruleB1 = await createRule(companyB!.id, `${suffix}-revision-b1`);
+    const ruleB2 = await createRule(companyB!.id, `${suffix}-revision-b2`);
+    const beforeA = await fence(companyA!.id);
+    const beforeB = await fence(companyB!.id);
+    const sequenceBefore = await generationLast();
+    const writerA = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+    const writerB = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+
+    try {
+      await db.$executeRawUnsafe('ALTER TABLE "RuleRevision" DISABLE TRIGGER "RuleRevision_append_only"');
+      await db.$executeRawUnsafe('CREATE SEQUENCE "RuleLifecycleRuleRevisionTestBarrier_seq" CACHE 1');
+      await db.$executeRawUnsafe(`
+        CREATE FUNCTION rule_lifecycle_rule_revision_test_barrier()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+          arrivals BIGINT;
+          deadline TIMESTAMPTZ := clock_timestamp() + interval '2 seconds';
+        BEGIN
+          IF current_setting('recat.lifecycle_test_barrier', true) = 'revision'
+             AND COALESCE(current_setting('recat.lifecycle_test_barrier_seen', true), '') <> 'revision' THEN
+            PERFORM set_config('recat.lifecycle_test_barrier_seen', 'revision', true);
+            PERFORM nextval('"RuleLifecycleRuleRevisionTestBarrier_seq"'::regclass);
+            LOOP
+              SELECT last_value INTO arrivals FROM "RuleLifecycleRuleRevisionTestBarrier_seq";
+              EXIT WHEN arrivals >= 2;
+              IF clock_timestamp() >= deadline THEN
+                RAISE EXCEPTION 'RuleRevision lifecycle test barrier timed out';
+              END IF;
+              PERFORM pg_sleep(0.01);
+            END LOOP;
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+      `);
+      await db.$executeRawUnsafe(`
+        CREATE TRIGGER zz_rule_revision_lifecycle_test_barrier
+        AFTER UPDATE ON "RuleRevision"
+        FOR EACH ROW EXECUTE FUNCTION rule_lifecycle_rule_revision_test_barrier()
+      `);
+      await Promise.all([
+        writerA.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '3s'");
+          await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+          await tx.$executeRawUnsafe("SET LOCAL recat.lifecycle_test_barrier = 'revision'");
+          await tx.ruleRevision.updateMany({
+            where: { ruleId: { in: [ruleA1.id, ruleB1.id] }, revision: 0 },
+            data: { changedBy: 'legacy-bulk-writer-a' },
+          });
+        }),
+        writerB.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '3s'");
+          await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+          await tx.$executeRawUnsafe("SET LOCAL recat.lifecycle_test_barrier = 'revision'");
+          await tx.ruleRevision.updateMany({
+            where: { ruleId: { in: [ruleB2.id, ruleA2.id] }, revision: 0 },
+            data: { changedBy: 'legacy-bulk-writer-b' },
+          });
+        }),
+      ]);
+    } finally {
+      await Promise.all([writerA.$disconnect(), writerB.$disconnect()]);
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS zz_rule_revision_lifecycle_test_barrier ON "RuleRevision"');
+      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS rule_lifecycle_rule_revision_test_barrier()');
+      await db.$executeRawUnsafe('DROP SEQUENCE IF EXISTS "RuleLifecycleRuleRevisionTestBarrier_seq"');
+      await db.$executeRawUnsafe('ALTER TABLE "RuleRevision" ENABLE TRIGGER "RuleRevision_append_only"');
+    }
+
+    expect(await fence(companyA!.id)).toBeGreaterThan(beforeA);
+    expect(await fence(companyB!.id)).toBeGreaterThan(beforeB);
+    expect(await generationLast()).toBe(sequenceBefore + 4n);
   });
 
   it('fences both owners when a direct legacy repair changes a Rule company or ID', async () => {
@@ -247,7 +417,51 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     expect(await fence(target.id)).toBeGreaterThan(targetAfterMove);
   });
 
-  it('self-heals a missing zero-state row on the next old-writer mutation', async () => {
+  it('bumps each affected company once for a material multi-Rule UPDATE statement', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `lifecycle-bulk-${suffix}`,
+      legalName: 'Lifecycle Bulk Legal',
+      nickname: 'Lifecycle Bulk',
+    } });
+    companyIds.add(company.id);
+    const first = await createRule(company.id, `${suffix}-first`);
+    const second = await createRule(company.id, `${suffix}-second`);
+    const before = await fence(company.id);
+
+    await db.rule.updateMany({
+      where: { id: { in: [first.id, second.id] } },
+      data: { priority: { increment: 1 } },
+    });
+
+    expect(await fence(company.id)).toBe(before + 1n);
+  });
+
+  it('bumps each affected company once for a material multi-RuleRevision UPDATE statement', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `lifecycle-revision-bulk-${suffix}`,
+      legalName: 'Lifecycle Revision Bulk Legal',
+      nickname: 'Lifecycle Revision Bulk',
+    } });
+    companyIds.add(company.id);
+    const first = await createRule(company.id, `${suffix}-first`);
+    const second = await createRule(company.id, `${suffix}-second`);
+    const before = await fence(company.id);
+
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe('ALTER TABLE "RuleRevision" DISABLE TRIGGER "RuleRevision_append_only"');
+      await tx.ruleRevision.updateMany({
+        where: { ruleId: { in: [first.id, second.id] }, revision: 0 },
+        data: { changedBy: 'legacy-bulk-repair' },
+      });
+      await tx.$executeRawUnsafe('ALTER TABLE "RuleRevision" ENABLE TRIGGER "RuleRevision_append_only"');
+    });
+
+    expect(await fence(company.id)).toBe(before + 1n);
+  });
+
+  it('self-heals a deleted fence with a generation newer than every prior token', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({ data: {
       realmId: `lifecycle-self-heal-${suffix}`,
@@ -255,10 +469,12 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
       nickname: 'Lifecycle Self Heal',
     } });
     companyIds.add(company.id);
+    const rule = await createRule(company.id, suffix);
+    const beforeDelete = await fence(company.id);
     await db.ruleLifecycleRevision.delete({ where: { companyId: company.id } });
 
-    await createRule(company.id, suffix);
+    await db.rule.update({ where: { id: rule.id }, data: { priority: 11 } });
 
-    expect(await fence(company.id)).toBeGreaterThan(0n);
+    expect(await fence(company.id)).toBeGreaterThan(beforeDelete);
   });
 });
