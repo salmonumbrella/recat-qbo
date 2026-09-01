@@ -420,6 +420,68 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
   });
 
+  it('rejects a stale cursor after its fence is moved to another company and back without a revision write', async () => {
+    const suffix = randomUUID();
+    const [companyA, companyB] = await Promise.all(['a', 'b'].map((label) => db.company.create({
+      data: {
+        realmId: `fence-owner-${label}-${suffix}`,
+        legalName: `Fence Owner ${label.toUpperCase()} Legal`,
+        nickname: `Fence Owner ${label.toUpperCase()}`,
+      },
+    })));
+    companyIds.add(companyA.id);
+    companyIds.add(companyB.id);
+    const user = await db.user.create({ data: { email: `fence-owner-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: companyA.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: companyA.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    await seedRule(companyA.id, user.id, 'account-meals', {
+      matchText: 'First', priority: 0, state: 'disabled',
+    });
+    await seedRule(companyA.id, user.id, 'account-meals', {
+      matchText: 'Second', priority: 1, state: 'disabled',
+    });
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-fence-owner-secret',
+    );
+    const first = await listLifecycle(service, user.id, companyA.id, {
+      state: 'disabled', limit: 1,
+    });
+    const original = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId: companyA.id }, select: { revision: true },
+    });
+    await db.ruleLifecycleRevision.delete({ where: { companyId: companyB.id } });
+
+    await db.$executeRaw`
+      UPDATE "RuleLifecycleRevision"
+         SET "companyId" = ${companyB.id}
+       WHERE "companyId" = ${companyA.id}
+    `;
+    const moved = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId: companyB.id }, select: { revision: true },
+    });
+    await db.$executeRaw`
+      UPDATE "RuleLifecycleRevision"
+         SET "companyId" = ${companyA.id}
+       WHERE "companyId" = ${companyB.id}
+    `;
+    const returned = await db.ruleLifecycleRevision.findUniqueOrThrow({
+      where: { companyId: companyA.id }, select: { revision: true },
+    });
+
+    expect(moved.revision).toBeGreaterThan(original.revision);
+    expect(returned.revision).toBeGreaterThan(moved.revision);
+    await expect(listLifecycle(service, user.id, companyA.id, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
   it('fails closed on a deleted fence and never revives its stale cursor after self-heal', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({ data: {

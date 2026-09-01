@@ -6,8 +6,8 @@ last_edited: 2026-08-31
 
 ## Status
 
-Complete locally through independent review fix round 5, on top of integrated
-commit `b5d9409`. Browser rule operations now use
+Complete locally through independent review fix round 6, on top of integrated
+commit `6244b40`. Browser rule operations now use
 the same immutable, company-scoped, two-phase lifecycle as MCP with a real
 session principal. Classification and canonical rule reads are available to
 the browser without adding a policy store, fake MCP token, or one-call write.
@@ -1252,6 +1252,210 @@ population aggregate in the fence or page plan.
 - Sequence exhaustion is fail-closed. At BIGINT scale it is not an operational
   concern for this workload; sequence monitoring can be added without changing
   the cursor contract.
+
+## Independent review fix round 6 — ownership ABA, observed lock order, and helper ACLs
+
+### Production breaks and strict RED evidence
+
+#### 1. A companyId-only fence move preserved the old owner's generation
+
+Production break named: the generation trigger was declared `UPDATE OF
+revision`. Directly changing only `RuleLifecycleRevision.companyId` moved the
+old owner's signed-cursor generation to another Company and back unchanged.
+
+The service-level test prepares a real company-A lifecycle cursor, deletes the
+otherwise-conflicting company-B fence, moves A's fence to B and back by changing
+only `companyId`, then presents the old cursor. Before the fix:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/companyReads.rules.pg.test.ts -t 'fence is moved'
+```
+
+Exit 1:
+
+```text
+AssertionError: expected 182 to be greater than 182
+```
+
+The independent direct-fence test failed for the same exact reason:
+
+```text
+AssertionError: expected 184 to be greater than 184
+```
+
+Migration `20260831080000_harden_rule_lifecycle_ownership` recreates the stamp
+trigger as `BEFORE INSERT OR UPDATE`, which covers every writable column and
+future ownership projection. GREEN:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/ruleLifecycleRevision.pg.test.ts \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 0: 2 files, 23/23 passed. Both ownership moves receive strictly increasing
+global generations, and the original company-A cursor is rejected with
+`INVALID_CURSOR` after the fence returns.
+
+#### 2. Prior concurrency coverage did not observe actual fence acquisition
+
+Production evidence gap named: the prior barrier proved overlapping Rule and
+RuleRevision statements completed, but neither controlled/observed their
+source-row order nor recorded the actual `RuleLifecycleRevision` UPDATE order
+for each transaction.
+
+The replacement tests install test-only row audit triggers on the real source
+table and the real fence table. Each transaction sets its own local writer ID.
+Fixtures and IDs make writer A's observed source order A→B and writer B's
+observed source order B→A. The existing bounded barrier keeps both real bulk
+statements in flight concurrently; lock and statement timeouts remain three and
+five seconds. Audit rows then prove both production statement-trigger paths
+update fences in sorted company-ID order for each transaction. The global
+sequence must advance exactly four times: two statements times two companies.
+
+Because the canonical helper was already sorted, meaningful RED was established
+with a disposable-database mutation that iterated its received company array in
+reverse. No repository production file was changed for the mutation. Both
+tests failed on their recorded fence rows:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/ruleLifecycleRevision.pg.test.ts \
+  -t 'lifecycle fences in sorted order'
+```
+
+Exit 1: 2 failed. Each diff showed expected sorted A→B but received B→A for the
+actual fence surface. A fresh migration reset restored the canonical helper;
+both tests then passed. The tests also assert the deliberately opposed source
+orders, so a planner/fixture change cannot make the evidence silently vacuous.
+
+#### 3. SECURITY DEFINER lifecycle helpers were PUBLIC-executable
+
+Production break named: PostgreSQL grants function EXECUTE to PUBLIC by
+default. The central lifecycle bump was SECURITY DEFINER, so an unintended role
+could call it directly rather than reaching it only through governed table
+triggers. Initial privilege RED returned `true` for all four fix-round-5
+definer helpers where the test expected `false`.
+
+The first revoke exposed a second, useful RED: old-style Rule INSERT uses an
+invoker-security trigger wrapper around the central helper. A restricted
+application role with ordinary schema/table/sequence DML but no direct function
+grant failed its real Rule INSERT:
+
+```text
+ERROR: permission denied for function rule_lifecycle_bump_company_ids
+SQLSTATE 42501
+```
+
+The final migration makes all five insert/delete lifecycle wrappers
+SECURITY DEFINER with the same fixed `pg_catalog, public` search path, then
+revokes PUBLIC EXECUTE from those wrappers and the four existing definers. The
+restricted-role test now proves a real Rule UPDATE and old-shape Rule INSERT
+both succeed through triggers, all nine lifecycle definers report no EXECUTE,
+and a direct bump call fails with the authored PostgreSQL permission denial.
+
+### Fresh, rolling, and restore evidence
+
+Fresh PostgreSQL reset applied all 38 migrations. Focused trigger/service tests
+passed 23/23, including ownership ABA, actual lock-order audits, restricted-role
+old-writer insertion, direct-call denial, and the existing 10,001-rule bounded
+read.
+
+For rolling evidence, a database at migration 37 held an A fence at generation
+108. CompanyId-only A→B→A moves remained 108 before deploy, reproducing the
+legacy ABA. Deploying migration 38 changed the next two ownership moves to 109
+and 110. Catalog inspection found all nine lifecycle SECURITY DEFINER helpers
+owner-only. This migration changes no table/model shape and old binaries keep
+using the same Rule, RuleRevision, Company, and fence triggers.
+
+Standard `pg_dump -Fc` / `pg_restore --exit-on-error` preserved the source
+fence at generation 7 and sequence state 8. After restore, an ownership move
+received 9; moving back and performing an old-shape Rule insert advanced the
+fence to 12 and created fallback history. All nine function ACLs survived the
+restore.
+
+The migration takes a SHARE ROW EXCLUSIVE lock only on the one-row-per-company
+fence table while the stamp trigger is replaced and helper attributes/ACLs are
+changed. Any concurrent Company/Rule/RuleRevision path that reaches a fence
+write waits through this short transaction, closing the drop/recreate rolling
+gap without a new global runtime serialization point.
+
+### Files changed in fix round 6
+
+- `prisma/migrations/20260831080000_harden_rule_lifecycle_ownership/migration.sql`
+  — all-update generation stamping, fixed-path trigger-wrapper ownership, and
+  owner-only execution ACLs.
+- `server/src/services/companyReads.rules.pg.test.ts` — real stale-cursor
+  ownership ABA coverage.
+- `server/src/services/ruleLifecycleRevision.pg.test.ts` — direct ownership
+  stamping, restricted-role trigger/direct-call ACL behavior, controlled
+  opposing source order, actual per-transaction fence audit, bounded overlap,
+  and exact generation counts.
+- this report.
+
+No Prisma model, REST, MCP, client, npm script, application service, policy,
+provider, QBO, deployment, push, or production data changed in this round.
+
+### Full fix-round-6 verification
+
+```bash
+DATABASE_URL="$TASK6A_DATABASE_URL" \
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" npm test
+```
+
+Exit 0:
+
+- package-script contract: 1/1 passed;
+- server unit: 133 files, 2,241/2,241 passed;
+- server PostgreSQL: 37 files, 354 passed, 20 intentionally skipped;
+- client: 21 files, 207/207 passed, including `Queue.tax.test.tsx` 66/66.
+
+Additional gates:
+
+```bash
+npm run typecheck
+npm run build
+npm --workspace server run test:unit -- \
+  src/mcp/readTools.startup.test.ts \
+  src/mcp/mutationTools.test.ts \
+  src/mcp/readTools.test.ts
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma validate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma generate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma migrate status
+```
+
+All exited 0. Shared/server/client typechecks and builds passed; Vite built 84
+modules; MCP authored-schema/startup coverage passed 3 files / 27 tests; Prisma
+validated, generated client 6.19.3, and reported all 38 migrations applied.
+Fresh reset, rolling deploy, dump/restore, package-script, diff, and leak checks
+passed. Datamodel diff still contains only the same three inherited long-name
+index renames and no lifecycle drift.
+
+### Fix-round-6 self-review
+
+- Every fence INSERT and UPDATE now consumes `nextval`, including a pure
+  companyId move, a same-value revision update, a cascade, and a central-helper
+  bump. Deletes remain allowed and do not reset the standalone sequence.
+- Actual source and fence rows—not helper inputs or mocks—are audited. The test
+  records opposed source orders, requires sorted fence orders per transaction,
+  forces concurrent overlap, retains timeouts, and checks the exact sequence
+  delta.
+- The test-only audit table, functions, triggers, barrier sequence, and
+  restricted role are removed in `finally` paths. PostgreSQL PG suites remain
+  file-serial, so temporary global DDL cannot overlap another test file.
+- All nine lifecycle SECURITY DEFINER functions have a fixed search path and no
+  PUBLIC EXECUTE. Trigger invocation remains available without function grants;
+  nested central-helper calls run as the migration owner. Application roles do
+  not need, and cannot use, a direct definer entry point.
+- The migration intentionally does not grant a guessed application role. The
+  repository has no stable deployment role name, and normal application code
+  never calls these helpers directly; granting one would recreate the bypass.
+- The sequence, trigger events, transition-table ordering, cursor contract, and
+  company-scoped fence lookup remain unchanged outside the reviewed hardening.
 
 ## Security and self-review
 
