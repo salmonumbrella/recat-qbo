@@ -48,14 +48,17 @@ credentials, or private prompts.
 ### Deterministic local verification
 
 The classification-memory end-to-end suite uses a local deterministic HTTP
-embedding fixture and a disposable PostgreSQL/pgvector database. Fixed
-accounting topics map to stable unit vectors, including separate vector slots
-for a simulated model/generation cutover. The fixture records only the test
-request method, path, input type, input text, and resolved synthetic topic; it
-has no provider credential and makes no outbound request.
+embedding fixture and a disposable PostgreSQL/pgvector server. Fixed
+accounting-purpose signals map to stable unit vectors, including separate
+vector slots for a simulated model/generation cutover. Vendor/source words do
+not choose an accounting topic: vendor-only Chevron documents map to the
+neutral vector, while stored fuel and personal case documents map to distinct
+literal topics. The fixture records only the test request method, path, input
+type, input text, and resolved synthetic topic; it has no provider credential
+and makes no outbound request.
 
-With all Prisma migrations applied to a disposable database containing the
-`vector` extension, run:
+Use an anchor database on a disposable server where the local role may
+create/drop databases and install the already-available `vector` extension:
 
 ```bash
 cd server
@@ -63,21 +66,31 @@ TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
   src/services/classification/search.e2e.test.ts
 ```
 
-The suite verifies exact alias, semantic-only paraphrase, and hybrid RRF
-retrieval; edit/re-embed and atomic generation cutover without stale-vector
-leakage; cross-company redaction and authorization; and labelled lexical
-degradation when the embedding endpoint is unavailable. Its isolated Chevron
-scenario keeps recurring policy suggestion-only (`autoPost: false`), snapshots
-the synthetic transactions and QBO-mutation-attempt count before the rule
-operation, and requires both to remain deeply equal to those snapshots after
-prepare, commit, endpoint calls, client replacement, and search readback.
+Each invocation creates a unique database, applies all migrations, installs
+pgvector, truncates every disposable data table between cases, and force-drops
+the database in final teardown without changing the configured anchor. The
+suite verifies exact alias, distinct fuel/personal semantic queries, hybrid
+RRF retrieval, edit/re-embed and atomic generation cutover without stale-vector
+leakage, membership-derived cross-company redaction/authorization, and
+labelled lexical degradation when the embedding endpoint is unavailable. Its
+isolated Chevron scenario keeps recurring policy suggestion-only (`autoPost:
+false`), snapshots the synthetic transactions and QBO-mutation-attempt count
+before the rule operation, and requires both to remain deeply equal to those
+snapshots after prepare, commit, endpoint calls, client replacement, and search
+readback.
 
-Fault injection after each durable prepare/commit write and midway through a
-reorder verifies transactional rollback, restart recovery, idempotent replay,
-expiry retry, stale-revision and candidate-conflict rejection, append-only
-history, and absence of partial priority or policy state. This is local test
-evidence only; it neither enables semantic configuration nor deploys or
-restarts a running Recat service.
+Fail-closed instrumentation wraps every QBO factory method, mutating real/mock
+QBO client method, global fetch, and Node HTTP/HTTPS request path. Deliberate
+denial probes prove those guards count and throw; the real Chevron flow must
+then leave every counter at zero while only the exact loopback fixture origin
+is allowed. Fault injection after each durable prepare/create write, both
+occurrences of every changed reorder rule/revision/audit write, and each
+applicable candidate activation/dismissal rule/candidate/revision/audit/receipt
+write verifies exact rollback snapshots, reprepare, restart recovery,
+idempotent replay, expiry retry, stale-revision and conflict rejection,
+append-only history, unchanged candidate evidence, and absence of partial
+priority or policy state. This is local test evidence only; it neither enables
+semantic configuration nor deploys or restarts a running Recat service.
 
 ## Provider request
 

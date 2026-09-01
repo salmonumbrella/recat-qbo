@@ -20,8 +20,10 @@ export interface DeterministicEmbeddingFixture {
 
 function topicFor(text: string): AccountingTopic {
   const normalized = text.normalize('NFC').toLocaleLowerCase('en-US');
-  if (/verified outcomes disagree|rule candidate/u.test(normalized)) return 'fuel';
-  if (/chevron/u.test(normalized)) return 'fuel';
+  if (/expenses?\s*[·:]?\s*personal reimbursement|personal reimbursement/u.test(normalized)) {
+    return 'personal';
+  }
+  if (/expenses?\s*[·:]?\s*(fleet )?fuel|fuel expense/u.test(normalized)) return 'fuel';
   if (/gift.card|owner reimbursement|personal convenience/u.test(normalized)) return 'personal';
   if (/fleet propellant|motor fuel|refuel|road.trip/u.test(normalized)) return 'fuel';
   if (/inventory|wholesale stock|resale goods/u.test(normalized)) return 'inventory';

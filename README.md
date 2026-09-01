@@ -182,8 +182,9 @@ npm test                    # full server + client test suite
 
 Classification-memory retrieval has a deterministic PostgreSQL end-to-end
 test. It starts a local HTTP embedding fixture, so it needs no embedding API
-key or provider account. Point it only at a disposable PostgreSQL database
-with the `vector` extension and all Prisma migrations applied:
+key or provider account. Point it only at an anchor database on a disposable
+PostgreSQL server where the local test role may create/drop databases and
+install the already-available `vector` extension:
 
 ```bash
 cd server
@@ -191,11 +192,16 @@ TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
   src/services/classification/search.e2e.test.ts
 ```
 
-The fixture is test-only. It exercises exact, lexical, semantic, and hybrid
-search; embedding replacement and generation cutover; tenant boundaries;
-explicit endpoint-down degradation; suggestion-only recurring rules; restart
-readback; and transaction rollback at rule-operation durability boundaries.
-It does not contact or mutate QuickBooks.
+The suite creates a uniquely named database, applies all Prisma migrations,
+installs pgvector, truncates all disposable data between cases, and drops the
+database in final teardown without changing the configured anchor. The fixture
+is test-only. It exercises exact, lexical, semantic, and hybrid search;
+embedding replacement and generation cutover; membership-derived tenant
+boundaries; explicit endpoint-down degradation; suggestion-only recurring
+rules; restart readback; and transaction rollback at every exercised
+rule-operation durability boundary. Fail-closed guards mechanically deny and
+count QBO factory/client calls and outbound network traffic other than the
+exact loopback embedding origin. It does not contact or mutate QuickBooks.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules.
 

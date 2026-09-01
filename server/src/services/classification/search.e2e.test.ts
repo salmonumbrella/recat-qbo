@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
 import { PrismaClient } from '@prisma/client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createCompanyReadService } from '../companyReads.js';
 import {
   commitRuleChange,
@@ -16,10 +17,22 @@ import { createVoyageEmbeddingClient } from './embedding/client.js';
 import { classificationEmbeddingGeneration } from './embedding/recipe.js';
 import { reconcileClassificationEmbeddings } from './embedding/reconciler.js';
 import { PgClassificationVectorStore } from './embedding/vectorStore.js';
+import { qboFactory } from '../../lib/qbo/factory.js';
+import { RealQboClient } from '../../lib/qbo/real.js';
 import {
   startDeterministicEmbeddingFixture,
+  type AccountingTopic,
   type DeterministicEmbeddingFixture,
 } from '../../test/deterministicEmbeddingFixture.js';
+import {
+  installTask8SafetyGuards,
+  type Task8SafetyGuards,
+} from '../../test/task8SafetyGuards.js';
+import {
+  createDisposablePgvectorDatabase,
+  resetDisposablePgvectorDatabase,
+  type DisposablePgvectorDatabase,
+} from '../../test/disposablePgvectorDatabase.js';
 
 describe('classification memory deterministic end-to-end fixture', () => {
   const fixtures: DeterministicEmbeddingFixture[] = [];
@@ -64,16 +77,29 @@ describe('classification memory deterministic end-to-end fixture', () => {
   });
 });
 
-const TASK8_DATABASE_URL = process.env.TEST_PGVECTOR_DATABASE_URL;
-const describeTask8 = TASK8_DATABASE_URL ? describe.sequential : describe.skip;
+const TASK8_DATABASE_ANCHOR_URL = process.env.TEST_PGVECTOR_DATABASE_URL;
+const describeTask8 = TASK8_DATABASE_ANCHOR_URL ? describe.sequential : describe.skip;
+let task8DatabaseUrl: string | null = null;
 const NOW = new Date('2026-09-01T12:00:00.000Z');
 
 function digest(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function recordedTopic(
+  fixture: DeterministicEmbeddingFixture,
+  input: string,
+): AccountingTopic | undefined {
+  for (const request of fixture.requests) {
+    const index = request.inputs.indexOf(input);
+    if (index >= 0) return request.topics[index];
+  }
+  return undefined;
+}
+
 function newClient(): PrismaClient {
-  return new PrismaClient({ datasources: { db: { url: TASK8_DATABASE_URL! } } });
+  if (task8DatabaseUrl === null) throw new Error('Task 8 disposable database is unavailable.');
+  return new PrismaClient({ datasources: { db: { url: task8DatabaseUrl } } });
 }
 
 async function createVerifiedCase(
@@ -308,6 +334,82 @@ async function seedForeignChevron(db: PrismaClient, userId: string) {
   return { company, account, vendor, transaction, classificationCase };
 }
 
+async function seedReadyCandidate(
+  db: PrismaClient,
+  seeded: Awaited<ReturnType<typeof seedChevronCompany>>,
+) {
+  const suffix = randomUUID();
+  const candidate = await db.autopilotRuleCandidate.create({
+    data: {
+      companyId: seeded.company.id,
+      conditionFingerprint: digest(`ready-candidate-${suffix}`),
+      schemaVersion: 'classification-rule-v2',
+      configVersion: 'verified-writeback-v1',
+      matchText: `Chevron Ready ${suffix.slice(0, 8)}`,
+      state: 'ready',
+      winningActionFingerprint: seeded.fuelCase.actionFingerprint,
+      categoryQboId: seeded.fuelAccount.qboId,
+      taxCalculation: 'NotApplicable',
+      tagIds: [],
+      evidenceCount: 3,
+      conflictingEvidenceCount: 0,
+    },
+  });
+  const transactions = [];
+  for (const index of [0, 1, 2]) {
+    const transaction = await db.transaction.create({ data: {
+      companyId: seeded.company.id,
+      qboId: `ready-candidate-${index}-${suffix}`,
+      qboType: 'Purchase', qboSyncToken: '1', date: NOW,
+      payee: candidate.matchText, memo: 'Fleet propellant expenditure',
+      amount: '-45.00', bankAccount: 'Synthetic operating card',
+      status: 'POSTED', revision: 1,
+    } });
+    const requestId = `ready-evidence-${index}-${suffix}`;
+    await db.qboMutationAttempt.create({ data: {
+      transactionId: transaction.id, requestId, operation: 'recategorize', status: 'VERIFIED',
+      expectedRevision: 1, expectedSyncToken: '1', requestHash: digest(requestId),
+      requestPayload: {}, beforeSnapshot: {}, verification: { outcome: 'VERIFIED' },
+    } });
+    await db.autopilotRuleCandidateEvidence.create({ data: {
+      companyId: seeded.company.id, candidateId: candidate.id, transactionId: transaction.id,
+      inputRevision: 1, requestId, source: 'verified_outcome', polarity: 'positive',
+      actionFingerprint: seeded.fuelCase.actionFingerprint,
+      pattern: { payee: candidate.matchText, topic: 'fleet propellant' }, observedAt: NOW,
+    } });
+    await db.autopilotRuleCandidateFold.create({ data: {
+      requestId, companyId: seeded.company.id, transactionId: transaction.id,
+      operation: 'recategorize', processedAt: NOW,
+    } });
+    transactions.push(transaction);
+  }
+  return { candidate, transactions };
+}
+
+function createRuleInput(
+  seeded: Awaited<ReturnType<typeof seedChevronCompany>>,
+  idempotencyKey: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    companyId: seeded.company.id,
+    mutation: 'create' as const,
+    expectedRevision: 0,
+    idempotencyKey,
+    proposal: {
+      matchText: `Chevron ${idempotencyKey.slice(-8)}`,
+      categoryQboId: seeded.fuelAccount.qboId,
+      taxCalculation: 'NotApplicable' as const,
+      taxCodeQboId: null,
+      tagIds: [] as string[],
+      priority: 0,
+      autoPost: false as const,
+      sourceCaseId: seeded.fuelCase.id,
+      ...overrides,
+    },
+  };
+}
+
 async function publishEmbeddings(
   db: PrismaClient,
   companyId: string,
@@ -407,10 +509,70 @@ function faultInjectedClient(db: PrismaClient, boundary: FaultBoundary): PrismaC
   }) as PrismaClient;
 }
 
+async function durablePolicySnapshot(db: PrismaClient, companyId: string, operationId: string) {
+  const [rules, revisions, audits, candidates, evidence, receipt] = await Promise.all([
+    db.rule.findMany({
+      where: { companyId },
+      select: {
+        id: true, priority: true, revision: true, enabled: true, retiredAt: true,
+        sourceCandidateId: true, autoPost: true,
+      },
+      orderBy: { id: 'asc' },
+    }),
+    db.ruleRevision.findMany({
+      where: { companyId },
+      select: {
+        id: true, ruleId: true, revision: true, state: true, priority: true,
+        sourceCandidateId: true, autoPost: true,
+      },
+      orderBy: [{ ruleId: 'asc' }, { revision: 'asc' }],
+    }),
+    db.auditEntry.findMany({
+      where: { companyId },
+      select: { id: true, action: true, payload: true, at: true },
+      orderBy: { id: 'asc' },
+    }),
+    db.autopilotRuleCandidate.findMany({
+      where: { companyId },
+      select: {
+        id: true, state: true, evidenceCount: true, conflictingEvidenceCount: true,
+        dismissedAt: true, dismissedByUserId: true, activatedAt: true,
+        activatedByUserId: true, activationEvidenceCount: true,
+        activationActionFingerprint: true, activatedRuleId: true, updatedAt: true,
+      },
+      orderBy: { id: 'asc' },
+    }),
+    db.autopilotRuleCandidateEvidence.findMany({
+      where: { companyId },
+      select: {
+        id: true, candidateId: true, transactionId: true, active: true, polarity: true,
+        actionFingerprint: true, invalidatedAt: true, invalidationReason: true,
+      },
+      orderBy: { id: 'asc' },
+    }),
+    db.mcpRuleOperation.findUniqueOrThrow({
+      where: { id: operationId },
+      select: { id: true, committedAt: true, commitResult: true, commitResultHash: true, updatedAt: true },
+    }),
+  ]);
+  return { rules, revisions, audits, candidates, evidence, receipt };
+}
+
 describeTask8('classification memory deterministic PostgreSQL end-to-end', () => {
   const clients: PrismaClient[] = [];
   const fixtures: DeterministicEmbeddingFixture[] = [];
-  const companyIds = new Set<string>();
+  const safetyGuards: Task8SafetyGuards[] = [];
+  let disposable: DisposablePgvectorDatabase;
+
+  beforeAll(async () => {
+    disposable = await createDisposablePgvectorDatabase(TASK8_DATABASE_ANCHOR_URL!);
+    task8DatabaseUrl = disposable.databaseUrl;
+  });
+
+  afterAll(async () => {
+    task8DatabaseUrl = null;
+    await disposable?.destroy();
+  });
 
   const client = () => {
     const db = newClient();
@@ -421,28 +583,78 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
   afterEach(async () => {
     const cleanup = newClient();
     try {
-      if (companyIds.size > 0) {
-        await cleanup.company.deleteMany({ where: { id: { in: [...companyIds] } } });
-      }
+      await resetDisposablePgvectorDatabase(cleanup);
     } finally {
-      companyIds.clear();
       await Promise.allSettled(clients.splice(0).map((db) => db.$disconnect()));
       await Promise.allSettled(fixtures.splice(0).map((fixture) => fixture.close()));
+      safetyGuards.splice(0).forEach((guard) => guard.restore());
       await cleanup.$disconnect();
     }
+  });
+
+  it('uses a unique fully migrated pgvector database instead of the configured anchor', async () => {
+    const db = client();
+    const anchorName = decodeURIComponent(new URL(TASK8_DATABASE_ANCHOR_URL!).pathname.slice(1));
+    const [database, migrations, vector] = await Promise.all([
+      db.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`,
+      db.$queryRaw<Array<{ count: bigint }>>`SELECT count(*) AS count FROM "_prisma_migrations" WHERE finished_at IS NOT NULL`,
+      db.$queryRaw<Array<{ count: bigint }>>`SELECT count(*) AS count FROM pg_extension WHERE extname = 'vector'`,
+    ]);
+    expect(database[0]?.name).toBe(disposable.databaseName);
+    expect(database[0]?.name).not.toBe(anchorName);
+    expect(disposable.databaseName).toMatch(/^recat_task8_[0-9]+_[0-9a-f]{12}$/u);
+    expect(migrations[0]?.count).toBe(38n);
+    expect(vector[0]?.count).toBe(1n);
+  });
+
+  it('cleans users, sessions, and immutable envelopes from an untracked partial seed', async () => {
+    const db = client();
+    const seeded = await seedChevronCompany(db, 'Task 8 Untracked Partial Seed');
+    const idempotencyKey = `untracked-seed-${randomUUID()}`;
+    await prepareRuleChange(
+      seeded.principal,
+      createRuleInput(seeded, idempotencyKey),
+      { db, now: () => NOW },
+    );
+    expect(await db.user.count()).toBe(1);
+    expect(await db.session.count()).toBe(1);
+    expect(await db.company.count()).toBe(1);
+    expect(await db.mcpRuleOperation.count()).toBe(1);
+
+    await resetDisposablePgvectorDatabase(db);
+
+    expect(await db.user.count()).toBe(0);
+    expect(await db.session.count()).toBe(0);
+    expect(await db.company.count()).toBe(0);
+    expect(await db.mcpRuleOperation.count()).toBe(0);
   });
 
   it('proves exact, semantic-only, hybrid RRF, re-embed, cutover, tenancy, and endpoint-down degradation', async () => {
     const db = client();
     const current = await seedChevronCompany(db);
     const foreign = await seedForeignChevron(db, current.user.id);
-    companyIds.add(current.company.id);
-    companyIds.add(foreign.company.id);
+    const nonMember = await seedForeignChevron(db, current.user.id);
+    await db.membership.delete({
+      where: {
+        userId_companyId: { userId: current.user.id, companyId: nonMember.company.id },
+      },
+    });
     const releaseA = await startDeterministicEmbeddingFixture('a');
     fixtures.push(releaseA);
     const saltA = 'task8-model-release-a';
     const firstPublication = await publishEmbeddings(db, current.company.id, releaseA, saltA);
     await publishEmbeddings(db, foreign.company.id, releaseA, saltA);
+    await publishEmbeddings(db, nonMember.company.id, releaseA, saltA);
+
+    const documentTopic = (documentId: string) => {
+      const document = firstPublication.corpus.documents.find(({ id }) => id === documentId);
+      if (document === undefined) throw new Error(`Missing Task 8 document ${documentId}`);
+      return document.chunks.map(({ text }) => recordedTopic(releaseA, text));
+    };
+    expect(documentTopic(`classification_case:${current.fuelCase.id}`)).toEqual(['fuel']);
+    expect(documentTopic(`classification_case:${current.personalCase.id}`)).toEqual(['personal']);
+    expect(documentTopic(`vendor_identity:${current.vendor.id}`)).toEqual(['unknown']);
+    expect(documentTopic(`vendor_alias:${current.alias.id}`)).toEqual(['unknown']);
 
     const exact = await searchClassificationMemory({
       query: current.alias.value, companyId: current.company.id, scope: 'current_company',
@@ -465,6 +677,22 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
     expect(semantic.hits).toContainEqual(expect.objectContaining({
       id: `classification_case:${current.fuelCase.id}`, matchedIn: expect.arrayContaining(['semantic']),
     }));
+    expect(semantic.hits.map(({ id }) => id)).not.toContain(
+      `classification_case:${current.personalCase.id}`,
+    );
+
+    const personal = await searchClassificationMemory({
+      query: 'owner gift-card reimbursement for personal convenience',
+      companyId: current.company.id, scope: 'current_company', mode: 'semantic',
+      accessibleCompanyIds: [current.company.id],
+    }, semanticDependencies(db, releaseA, saltA));
+    expect(personal.hits).toContainEqual(expect.objectContaining({
+      id: `classification_case:${current.personalCase.id}`,
+      matchedIn: expect.arrayContaining(['semantic']),
+    }));
+    expect(personal.hits.map(({ id }) => id)).not.toContain(
+      `classification_case:${current.fuelCase.id}`,
+    );
 
     const hybrid = await searchClassificationMemory({
       query: current.alias.value, companyId: current.company.id, scope: 'current_company',
@@ -489,6 +717,38 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
       accessibleCompanyIds: [current.company.id],
     }, { repository: firstPublication.repository, semantic: null }))
       .rejects.toBeInstanceOf(ClassificationSearchError);
+
+    const readDb = client();
+    const reads = createCompanyReadService(readDb as never, 'task8-tenant-cursor-secret', {
+      classificationSearch: (input) => searchClassificationMemory(
+        input,
+        semanticDependencies(readDb, releaseA, saltA),
+      ),
+    });
+    const authorized = await reads.searchClassificationKnowledge(
+      current.user.id,
+      current.company.id,
+      { query: 'fleet propellant', scope: 'accessible_companies', mode: 'hybrid', limit: 100 },
+    );
+    const authorizedForeign = authorized.items.filter(({ companyId }) => companyId === foreign.company.id);
+    expect(authorizedForeign.length).toBeGreaterThan(0);
+    expect(authorizedForeign.every((hit) => hit.companyRelation === 'foreign'
+      && hit.advisory && !hit.executable && hit.action === null)).toBe(true);
+    expect(JSON.stringify(authorizedForeign)).not.toContain(foreign.account.qboId);
+    expect(authorized.items.map(({ companyId }) => companyId)).not.toContain(nonMember.company.id);
+
+    const denial = async (companyId: string) => {
+      try {
+        await reads.searchClassificationKnowledge(current.user.id, companyId, {
+          query: 'fleet propellant', mode: 'semantic', limit: 20,
+        });
+        return null;
+      } catch (error) {
+        const row = error as { status?: number; code?: string; message?: string };
+        return { status: row.status, code: row.code, message: row.message };
+      }
+    };
+    expect(await denial(nonMember.company.id)).toEqual(await denial(randomUUID()));
 
     const requestsBeforeEdit = releaseA.requests.length;
     await db.vendorIdentity.update({
@@ -547,9 +807,32 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
   it('runs the isolated Chevron suggestion flow with restart readback and zero accounting-provider writes', async () => {
     let db = client();
     const seeded = await seedChevronCompany(db, 'Task 8 Restart');
-    companyIds.add(seeded.company.id);
     const endpoint = await startDeterministicEmbeddingFixture('a');
     fixtures.push(endpoint);
+    const safety = installTask8SafetyGuards(new URL(endpoint.baseUrl).origin);
+    safetyGuards.push(safety);
+    await expect(qboFactory.forCompany('task8-deny-proof')).rejects.toThrow(
+      'task8-unexpected-qbo-factory-call',
+    );
+    await expect(qboFactory.exchangeCode('task8-deny-proof', 'task8-deny-proof', 'demo'))
+      .rejects.toThrow('task8-unexpected-qbo-factory-call');
+    await expect(RealQboClient.prototype.recategorize.call(
+      {} as RealQboClient,
+      {} as never,
+      [],
+    )).rejects.toThrow('task8-unexpected-qbo-mutation');
+    await expect(fetch('https://task8-external.invalid/deny-proof')).rejects.toThrow(
+      'task8-unexpected-network:fetch',
+    );
+    expect(() => httpRequest('http://task8-external.invalid/deny-proof'))
+      .toThrow('task8-unexpected-network:http');
+    const deniedCounts = safety.counts();
+    expect(deniedCounts.qboFactory).toBe(2);
+    expect(Object.keys(deniedCounts.qboMutations)).toHaveLength(14);
+    expect(Object.entries(deniedCounts.qboMutations).filter(([, count]) => count !== 0))
+      .toEqual([['RealQboClient.recategorize', 1]]);
+    expect(deniedCounts.network).toEqual({ fetch: 1, http: 1, https: 0 });
+    safety.reset();
     const salt = 'task8-restart-model';
     await publishEmbeddings(db, seeded.company.id, endpoint, salt);
     const beforeAttempts = await db.qboMutationAttempt.count({
@@ -653,36 +936,18 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
     expect(await db.transaction.findMany({
       where: { companyId: seeded.company.id }, select: transactionProjection, orderBy: { id: 'asc' },
     })).toEqual(beforeTransactions);
+    const finalCounts = safety.counts();
+    expect(finalCounts.qboFactory).toBe(0);
+    expect(Object.keys(finalCounts.qboMutations)).toHaveLength(14);
+    expect(Object.values(finalCounts.qboMutations).every((count) => count === 0)).toBe(true);
+    expect(finalCounts.network).toEqual({ fetch: 0, http: 0, https: 0 });
   }, 60_000);
 
   it('recovers rule prepare and commit at every durable boundary without partial policy or order state', async () => {
-    const createInput = (
-      seeded: Awaited<ReturnType<typeof seedChevronCompany>>,
-      idempotencyKey: string,
-      overrides: Record<string, unknown> = {},
-    ) => ({
-      companyId: seeded.company.id,
-      mutation: 'create' as const,
-      expectedRevision: 0,
-      idempotencyKey,
-      proposal: {
-        matchText: `Chevron ${idempotencyKey.slice(-8)}`,
-        categoryQboId: seeded.fuelAccount.qboId,
-        taxCalculation: 'NotApplicable' as const,
-        taxCodeQboId: null,
-        tagIds: [] as string[],
-        priority: 0,
-        autoPost: false as const,
-        sourceCaseId: seeded.fuelCase.id,
-        ...overrides,
-      },
-    });
-
     const prepareDb = client();
     const prepareSeed = await seedChevronCompany(prepareDb, 'Task 8 Prepare Recovery');
-    companyIds.add(prepareSeed.company.id);
     const prepareKey = `prepare-crash-${randomUUID()}`;
-    const prepareRequest = createInput(prepareSeed, prepareKey);
+    const prepareRequest = createRuleInput(prepareSeed, prepareKey);
     await expect(prepareRuleChange(
       prepareSeed.principal,
       prepareRequest,
@@ -715,9 +980,8 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
     for (const boundary of commitBoundaries) {
       const db = client();
       const seeded = await seedChevronCompany(db, `Task 8 ${boundary.model}`);
-      companyIds.add(seeded.company.id);
       const idempotencyKey = `commit-${boundary.model}-${randomUUID()}`;
-      const request = createInput(seeded, idempotencyKey);
+      const request = createRuleInput(seeded, idempotencyKey);
       const prepared = await prepareRuleChange(seeded.principal, request, { db, now: () => NOW });
 
       await expect(commitRuleChange(seeded.principal, {
@@ -755,9 +1019,8 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
 
     const expiryDb = client();
     const expirySeed = await seedChevronCompany(expiryDb, 'Task 8 Expiry');
-    companyIds.add(expirySeed.company.id);
     const expiryKey = `expiry-${randomUUID()}`;
-    const expiryInput = createInput(expirySeed, expiryKey);
+    const expiryInput = createRuleInput(expirySeed, expiryKey);
     const expired = await prepareRuleChange(expirySeed.principal, expiryInput, { db: expiryDb, now: () => NOW });
     const retryAt = new Date(NOW.getTime() + 16 * 60 * 1_000);
     await expect(commitRuleChange(expirySeed.principal, {
@@ -778,7 +1041,6 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
 
     const conflictDb = client();
     const conflictSeed = await seedChevronCompany(conflictDb, 'Task 8 Candidate Conflict');
-    companyIds.add(conflictSeed.company.id);
     await expect(prepareRuleChange(conflictSeed.principal, {
       companyId: conflictSeed.company.id,
       mutation: 'activate_candidate',
@@ -790,11 +1052,10 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
 
     const historyDb = client();
     const historySeed = await seedChevronCompany(historyDb, 'Task 8 History');
-    companyIds.add(historySeed.company.id);
     const createKey = `history-create-${randomUUID()}`;
     const historyPrepared = await prepareRuleChange(
       historySeed.principal,
-      createInput(historySeed, createKey),
+      createRuleInput(historySeed, createKey),
       { db: historyDb, now: () => NOW },
     );
     const historyCreated = await commitRuleChange(historySeed.principal, {
@@ -845,58 +1106,190 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
       .rejects.toThrow('RuleRevision is append-only');
     expect(await historyDb.ruleRevision.count({ where: { ruleId: historyCreated.ruleId! } })).toBe(4);
 
-    const orderDb = client();
-    const orderSeed = await seedChevronCompany(orderDb, 'Task 8 Order');
-    companyIds.add(orderSeed.company.id);
-    const firstKey = `order-first-${randomUUID()}`;
-    const firstPrepared = await prepareRuleChange(
-      orderSeed.principal,
-      createInput(orderSeed, firstKey, { matchText: 'Chevron First', priority: 0 }),
-      { db: orderDb, now: () => NOW },
-    );
-    const first = await commitRuleChange(orderSeed.principal, {
-      companyId: orderSeed.company.id, operationId: firstPrepared.operationId, idempotencyKey: firstKey,
-    }, { db: orderDb, now: () => new Date(NOW.getTime() + 1_000) });
-    const secondKey = `order-second-${randomUUID()}`;
-    const secondPrepared = await prepareRuleChange(
-      orderSeed.principal,
-      createInput(orderSeed, secondKey, { matchText: 'Chevron Second', priority: 1 }),
-      { db: orderDb, now: () => new Date(NOW.getTime() + 2_000) },
-    );
-    const second = await commitRuleChange(orderSeed.principal, {
-      companyId: orderSeed.company.id, operationId: secondPrepared.operationId, idempotencyKey: secondKey,
-    }, { db: orderDb, now: () => new Date(NOW.getTime() + 3_000) });
-    const orderBefore = await orderDb.rule.findMany({
-      where: { id: { in: [first.ruleId!, second.ruleId!] } },
-      select: { id: true, priority: true, revision: true }, orderBy: { id: 'asc' },
-    });
-    const reorderKey = `order-recovery-${randomUUID()}`;
-    const reorder = await prepareRuleChange(orderSeed.principal, {
-      companyId: orderSeed.company.id, mutation: 'reorder', expectedRevision: 1,
-      idempotencyKey: reorderKey, proposal: { orderIds: [second.ruleId!, first.ruleId!] },
-    }, { db: orderDb, now: () => new Date(NOW.getTime() + 4_000) });
-    await expect(commitRuleChange(orderSeed.principal, {
-      companyId: orderSeed.company.id, operationId: reorder.operationId, idempotencyKey: reorderKey,
-    }, {
-      db: faultInjectedClient(orderDb, { model: 'rule', method: 'update' }),
-      now: () => new Date(NOW.getTime() + 5_000),
-    })).rejects.toThrow('task8-simulated-crash:rule.update');
-    expect(await orderDb.rule.findMany({
-      where: { id: { in: [first.ruleId!, second.ruleId!] } },
-      select: { id: true, priority: true, revision: true }, orderBy: { id: 'asc' },
-    })).toEqual(orderBefore);
-    expect(await orderDb.mcpRuleOperation.findUniqueOrThrow({ where: { id: reorder.operationId } }))
-      .toMatchObject({ committedAt: null, commitResult: null });
-    await expect(commitRuleChange(orderSeed.principal, {
-      companyId: orderSeed.company.id, operationId: reorder.operationId, idempotencyKey: reorderKey,
-    }, { db: client(), now: () => new Date(NOW.getTime() + 6_000) }))
-      .resolves.toMatchObject({ status: 'COMMITTED' });
-    await expect(orderDb.rule.findMany({
-      where: { id: { in: [first.ruleId!, second.ruleId!] } },
-      select: { id: true, priority: true }, orderBy: { priority: 'asc' },
-    })).resolves.toEqual([
-      { id: second.ruleId!, priority: 0 },
-      { id: first.ruleId!, priority: 1 },
-    ]);
+  }, 120_000);
+
+  it('recovers every changed reorder write, revision, audit, and receipt boundary', async () => {
+    const boundaries: FaultBoundary[] = [
+      { model: 'rule', method: 'update', occurrence: 1 },
+      { model: 'rule', method: 'update', occurrence: 2 },
+      { model: 'ruleRevision', method: 'create', occurrence: 1 },
+      { model: 'ruleRevision', method: 'create', occurrence: 2 },
+      { model: 'auditEntry', method: 'create', occurrence: 1 },
+      { model: 'auditEntry', method: 'create', occurrence: 2 },
+      { model: 'mcpRuleOperation', method: 'update', occurrence: 1 },
+    ];
+    for (const boundary of boundaries) {
+      const db = client();
+      const label = `${boundary.model}-${boundary.occurrence}`;
+      const seeded = await seedChevronCompany(db, `Task 8 Reorder ${label}`);
+      const firstKey = `reorder-first-${label}-${randomUUID()}`;
+      const firstPrepared = await prepareRuleChange(
+        seeded.principal,
+        createRuleInput(seeded, firstKey, { matchText: 'Chevron First', priority: 0 }),
+        { db, now: () => NOW },
+      );
+      const first = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: firstPrepared.operationId, idempotencyKey: firstKey,
+      }, { db, now: () => new Date(NOW.getTime() + 1_000) });
+      const secondKey = `reorder-second-${label}-${randomUUID()}`;
+      const secondPrepared = await prepareRuleChange(
+        seeded.principal,
+        createRuleInput(seeded, secondKey, { matchText: 'Chevron Second', priority: 1 }),
+        { db, now: () => new Date(NOW.getTime() + 2_000) },
+      );
+      const second = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: secondPrepared.operationId, idempotencyKey: secondKey,
+      }, { db, now: () => new Date(NOW.getTime() + 3_000) });
+      const idempotencyKey = `reorder-matrix-${label}-${randomUUID()}`;
+      const request = {
+        companyId: seeded.company.id, mutation: 'reorder' as const, expectedRevision: 1,
+        idempotencyKey, proposal: { orderIds: [second.ruleId!, first.ruleId!] },
+      };
+      const prepared = await prepareRuleChange(
+        seeded.principal, request, { db, now: () => new Date(NOW.getTime() + 4_000) },
+      );
+      const before = await durablePolicySnapshot(db, seeded.company.id, prepared.operationId);
+
+      await expect(commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, {
+        db: faultInjectedClient(db, boundary),
+        now: () => new Date(NOW.getTime() + 5_000),
+      }), label).rejects.toThrow(`task8-simulated-crash:${boundary.model}.${boundary.method}`);
+      expect(await durablePolicySnapshot(db, seeded.company.id, prepared.operationId), label).toEqual(before);
+
+      const reprepared = await prepareRuleChange(
+        seeded.principal, request, { db: client(), now: () => new Date(NOW.getTime() + 6_000) },
+      );
+      expect(reprepared, label).toMatchObject({ status: 'PREPARED', operationId: prepared.operationId });
+      const committed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 7_000) });
+      const replayed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 8_000) });
+      expect([committed.status, replayed.status], label).toEqual(['COMMITTED', 'REPLAYED']);
+      expect(await db.rule.findMany({
+        where: { id: { in: [first.ruleId!, second.ruleId!] } },
+        select: { id: true, priority: true, revision: true }, orderBy: { priority: 'asc' },
+      }), label).toEqual([
+        { id: second.ruleId!, priority: 0, revision: 2 },
+        { id: first.ruleId!, priority: 1, revision: 2 },
+      ]);
+      expect(await db.ruleRevision.count({
+        where: { ruleId: { in: [first.ruleId!, second.ruleId!] } },
+      }), label).toBe(6);
+      expect(await db.auditEntry.count({
+        where: { companyId: seeded.company.id, action: 'rule-reordered' },
+      }), label).toBe(2);
+    }
+  }, 120_000);
+
+  it('recovers candidate activation and dismissal at every applicable durable boundary', async () => {
+    const activationBoundaries: FaultBoundary[] = [
+      { model: 'rule', method: 'create', occurrence: 1 },
+      { model: 'ruleRevision', method: 'create', occurrence: 1 },
+      { model: 'autopilotRuleCandidate', method: 'update', occurrence: 1 },
+      { model: 'auditEntry', method: 'create', occurrence: 1 },
+      { model: 'mcpRuleOperation', method: 'update', occurrence: 1 },
+    ];
+    for (const boundary of activationBoundaries) {
+      const db = client();
+      const label = `activate-${boundary.model}`;
+      const seeded = await seedChevronCompany(db, `Task 8 ${label}`);
+      const ready = await seedReadyCandidate(db, seeded);
+      const idempotencyKey = `${label}-${randomUUID()}`;
+      const request = {
+        companyId: seeded.company.id, mutation: 'activate_candidate' as const,
+        candidateId: ready.candidate.id, expectedRevision: 0, idempotencyKey,
+      };
+      const prepared = await prepareRuleChange(seeded.principal, request, { db, now: () => NOW });
+      const before = await durablePolicySnapshot(db, seeded.company.id, prepared.operationId);
+
+      await expect(commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, {
+        db: faultInjectedClient(db, boundary),
+        now: () => new Date(NOW.getTime() + 1_000),
+      }), label).rejects.toThrow(`task8-simulated-crash:${boundary.model}.${boundary.method}`);
+      expect(await durablePolicySnapshot(db, seeded.company.id, prepared.operationId), label).toEqual(before);
+
+      const reprepared = await prepareRuleChange(
+        seeded.principal, request, { db: client(), now: () => new Date(NOW.getTime() + 2_000) },
+      );
+      expect(reprepared, label).toMatchObject({ status: 'PREPARED', operationId: prepared.operationId });
+      const committed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 3_000) });
+      const replayed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 4_000) });
+      expect([committed.status, replayed.status], label).toEqual(['COMMITTED', 'REPLAYED']);
+      expect(await db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: ready.candidate.id },
+      }), label).toMatchObject({
+        state: 'activated', activatedRuleId: prepared.ruleId, activationEvidenceCount: 3,
+      });
+      expect(await db.rule.findUniqueOrThrow({ where: { id: prepared.ruleId! } }), label)
+        .toMatchObject({ sourceCandidateId: ready.candidate.id, autoPost: false, revision: 1 });
+      expect(await db.ruleRevision.findMany({
+        where: { ruleId: prepared.ruleId! }, select: { revision: true }, orderBy: { revision: 'asc' },
+      }), label).toEqual([{ revision: 0 }, { revision: 1 }]);
+      expect(await db.auditEntry.count({
+        where: { companyId: seeded.company.id, action: 'rule-candidate-activated' },
+      }), label).toBe(1);
+      expect(await db.autopilotRuleCandidateEvidence.count({
+        where: { candidateId: ready.candidate.id, active: true },
+      }), label).toBe(3);
+    }
+
+    const dismissalBoundaries: FaultBoundary[] = [
+      { model: 'autopilotRuleCandidate', method: 'update', occurrence: 1 },
+      { model: 'auditEntry', method: 'create', occurrence: 1 },
+      { model: 'mcpRuleOperation', method: 'update', occurrence: 1 },
+    ];
+    for (const boundary of dismissalBoundaries) {
+      const db = client();
+      const label = `dismiss-${boundary.model}`;
+      const seeded = await seedChevronCompany(db, `Task 8 ${label}`);
+      const idempotencyKey = `${label}-${randomUUID()}`;
+      const request = {
+        companyId: seeded.company.id, mutation: 'dismiss_candidate' as const,
+        candidateId: seeded.candidate.id, expectedRevision: 0, idempotencyKey,
+      };
+      const prepared = await prepareRuleChange(seeded.principal, request, { db, now: () => NOW });
+      const before = await durablePolicySnapshot(db, seeded.company.id, prepared.operationId);
+
+      await expect(commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, {
+        db: faultInjectedClient(db, boundary),
+        now: () => new Date(NOW.getTime() + 1_000),
+      }), label).rejects.toThrow(`task8-simulated-crash:${boundary.model}.${boundary.method}`);
+      expect(await durablePolicySnapshot(db, seeded.company.id, prepared.operationId), label).toEqual(before);
+
+      const reprepared = await prepareRuleChange(
+        seeded.principal, request, { db: client(), now: () => new Date(NOW.getTime() + 2_000) },
+      );
+      expect(reprepared, label).toMatchObject({ status: 'PREPARED', operationId: prepared.operationId });
+      const committed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 3_000) });
+      const replayed = await commitRuleChange(seeded.principal, {
+        companyId: seeded.company.id, operationId: prepared.operationId, idempotencyKey,
+      }, { db: client(), now: () => new Date(NOW.getTime() + 4_000) });
+      expect([committed.status, replayed.status], label).toEqual(['COMMITTED', 'REPLAYED']);
+      expect(await db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: seeded.candidate.id },
+      }), label).toMatchObject({ state: 'dismissed', activatedRuleId: null });
+      expect(await db.rule.count({ where: { companyId: seeded.company.id } }), label).toBe(0);
+      expect(await db.ruleRevision.count({ where: { companyId: seeded.company.id } }), label).toBe(0);
+      expect(await db.auditEntry.count({
+        where: { companyId: seeded.company.id, action: 'rule-candidate-dismissed' },
+      }), label).toBe(1);
+      expect(await db.autopilotRuleCandidateEvidence.count({
+        where: { candidateId: seeded.candidate.id, active: true },
+      }), label).toBe(2);
+    }
   }, 120_000);
 });
