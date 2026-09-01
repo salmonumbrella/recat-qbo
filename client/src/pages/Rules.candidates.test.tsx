@@ -317,7 +317,7 @@ describe('Rules candidate review', () => {
 
     await user.click(screen.getByRole('button', { name: 'View history for Disabled supplier' }));
     await waitFor(() => expect(mocks.revisions).toHaveBeenCalledWith(
-      'COMPANY_GENERIC', 'rule-disabled', undefined, 20,
+      'COMPANY_GENERIC', 'rule-disabled', undefined, 100,
     ));
     expect(screen.getByText(/revision 5.*disabled/i)).toBeInTheDocument();
     expect(screen.getByText(/revision 4.*enabled/i)).toBeInTheDocument();
@@ -618,6 +618,96 @@ describe('Rules candidate review', () => {
     expect(revision2).toHaveTextContent(/historical category is inactive/i);
   });
 
+  it('shows one bounded newest-history window and never drains hidden older revisions', async () => {
+    const current = ruleDetail();
+    const revisions = Array.from({ length: 100 }, (_, index) => ({
+      ...current.revision,
+      id: `history-${100 - index}`,
+      revision: 100 - index,
+    }));
+    mocks.lifecycleRules.mockResolvedValue({ items: [current], nextCursor: null });
+    mocks.revisions.mockResolvedValue({ items: revisions, nextCursor: 'older-history' });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'View history for Generic supplier' }));
+
+    expect(mocks.revisions).toHaveBeenCalledWith('COMPANY_GENERIC', 'rule-1', undefined, 100);
+    expect(screen.getAllByRole('article', { name: /^Revision / })).toHaveLength(100);
+    expect(screen.getByRole('status', { name: 'Revision history truncated' })).toHaveTextContent(
+      /showing 100 newest revisions.*older history exists/i,
+    );
+    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument();
+    expect(screen.getByRole('article', { name: 'Revision 1' })).toHaveTextContent(
+      /older comparison unavailable.*history is truncated/i,
+    );
+    expect(mocks.revisions).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call a partial legacy history page initial when an older cursor exists', async () => {
+    const current = ruleDetail();
+    const legacy = {
+      ...current.revision,
+      id: 'legacy-partial',
+      revision: 2,
+      action: null,
+      valid: false,
+      invalidReasons: ['Legacy action cannot execute.'],
+    };
+    mocks.lifecycleRules.mockResolvedValue({ items: [current], nextCursor: null });
+    mocks.revisions.mockResolvedValue({ items: [current.revision, legacy], nextCursor: 'older-history' });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'View history for Generic supplier' }));
+
+    expect(screen.getByRole('article', { name: 'Revision 2' })).toHaveTextContent(/legacy action unavailable/i);
+    expect(screen.getByRole('article', { name: 'Revision 2' })).toHaveTextContent(
+      /older comparison unavailable.*history is truncated/i,
+    );
+    expect(screen.queryByText('Initial recorded revision.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument();
+  });
+
+  it('detects canonical action identifiers, tax mode, tag order, validity, and provenance changes', async () => {
+    const current = ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        action: {
+          categoryQboId: 'CATEGORY_NEW', taxCalculation: 'TaxExcluded',
+          taxCodeQboId: 'TAX_NEW', tagIds: ['tag-a', 'tag-b'],
+        },
+        categoryName: 'Same category', taxCodeName: 'Same tax code',
+        originIntent: 'auto_candidate', sourceCaseId: 'case-new', sourceCandidateId: null,
+        changedBy: 'actor-new', valid: true, invalidReasons: [],
+      },
+    });
+    const previous = {
+      ...current.revision,
+      id: 'revision-2', revision: 2,
+      action: {
+        categoryQboId: 'CATEGORY_OLD', taxCalculation: 'TaxInclusive' as const,
+        taxCodeQboId: 'TAX_OLD', tagIds: ['tag-b', 'tag-a'],
+      },
+      originIntent: 'make_recurring' as const, sourceCaseId: 'case-old',
+      sourceCandidateId: 'candidate-old', changedBy: 'actor-old',
+      valid: false, invalidReasons: ['Old reference invalid.'],
+    };
+    mocks.lifecycleRules.mockResolvedValue({ items: [current], nextCursor: null });
+    mocks.revisions.mockResolvedValue({ items: [current.revision, previous], nextCursor: null });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'View history for Generic supplier' }));
+
+    const newest = screen.getByRole('article', { name: 'Revision 3' });
+    expect(newest).toHaveTextContent(/Same category.*CATEGORY_NEW.*TaxExcluded.*Same tax code.*TAX_NEW/i);
+    expect(newest).toHaveTextContent(
+      /changed.*category QBO ID.*CATEGORY_OLD.*CATEGORY_NEW.*tax calculation.*TaxInclusive.*TaxExcluded.*tax code QBO ID.*TAX_OLD.*TAX_NEW.*tag order.*validity invalid.*valid.*origin intent.*make recurring.*auto candidate.*source case.*case-old.*case-new.*source candidate.*candidate-old.*none.*actor.*actor-old.*actor-new/i,
+    );
+    expect(newest).not.toHaveTextContent(/no material classification fields changed/i);
+  });
+
   it('requires a standalone auto-post preview with truthful affected counts', async () => {
     mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
     mocks.prepare.mockResolvedValue(prepared('update', {
@@ -686,6 +776,102 @@ describe('Rules candidate review', () => {
       first.id,
     );
     expect(screen.queryByRole('button', { name: 'Load more candidates' })).not.toBeInTheDocument();
+  });
+
+  it('caps visible lifecycle pages at 200 rows and stops before another request', async () => {
+    const rules = Array.from({ length: 300 }, (_, index) => ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        id: `revision-cap-${index}`,
+        ruleId: `rule-cap-${index}`,
+        priority: index,
+        condition: { matchField: 'payee', matchText: `Capped supplier ${index}` },
+      },
+    }));
+    mocks.lifecycleRules.mockImplementation(async (
+      _companyId: string,
+      state: string,
+      cursor?: string,
+    ) => {
+      if (state === 'enabled') return { items: [], nextCursor: null };
+      if (!cursor) return { items: rules.slice(0, 100), nextCursor: 'rule-page-2' };
+      if (cursor === 'rule-page-2') return { items: rules.slice(100, 200), nextCursor: 'rule-page-3' };
+      return { items: rules.slice(200), nextCursor: null };
+    });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
+
+    expect(await screen.findByText('Capped supplier 199')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-rule-cap-"]')).toHaveLength(200);
+    expect(screen.getByRole('status', { name: 'Rule lifecycle truncated' })).toHaveTextContent(
+      /showing first 200 rules.*more rules exist/i,
+    );
+    expect(screen.queryByRole('button', { name: 'Load more rules' })).not.toBeInTheDocument();
+    expect(mocks.lifecycleRules.mock.calls.filter(([, state]) => state === 'all')).toHaveLength(2);
+  });
+
+  it('caps visible candidate pages at 100 rows and stops before another request', async () => {
+    const candidates = Array.from({ length: 120 }, (_, index) => candidate({
+      id: `candidate-cap-${index}`,
+      matchText: `Capped candidate ${index}`,
+    }));
+    mocks.listCandidates.mockImplementation(async (
+      _companyId: string,
+      cursor?: string,
+    ) => {
+      const pageNumber = cursor ? Number(cursor.replace('candidate-page-', '')) : 0;
+      return {
+        candidates: candidates.slice(pageNumber * 20, pageNumber * 20 + 20),
+        nextCursor: `candidate-page-${pageNumber + 1}`,
+      };
+    });
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    for (let page = 1; page < 5; page += 1) {
+      await user.click(await screen.findByRole('button', { name: 'Load more candidates' }));
+    }
+
+    expect(await screen.findByText('Capped candidate 99')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-candidate-candidate-cap-"]')).toHaveLength(100);
+    expect(screen.getByRole('status', { name: 'Rule candidates truncated' })).toHaveTextContent(
+      /showing newest 100 candidates.*older candidates exist/i,
+    );
+    expect(screen.queryByRole('button', { name: 'Load more candidates' })).not.toBeInTheDocument();
+    expect(mocks.listCandidates).toHaveBeenCalledTimes(5);
+  });
+
+  it('fences late lifecycle and candidate pages after a company switch', async () => {
+    let resolveRules!: (value: { items: RuleDetailDto[]; nextCursor: null }) => void;
+    let resolveCandidates!: (value: { candidates: RuleCandidateDto[]; nextCursor: null }) => void;
+    mocks.lifecycleRules.mockImplementation((companyId: string, state: string, cursor?: string) => {
+      if (state === 'enabled' || companyId === 'COMPANY_OTHER') return Promise.resolve({ items: [], nextCursor: null });
+      if (cursor) return new Promise((resolve) => { resolveRules = resolve; });
+      return Promise.resolve({ items: [ruleDetail()], nextCursor: 'old-rule-page' });
+    });
+    mocks.listCandidates.mockImplementation((companyId: string, cursor?: string) => {
+      if (companyId === 'COMPANY_OTHER') return Promise.resolve({ candidates: [], nextCursor: null });
+      if (cursor) return new Promise((resolve) => { resolveCandidates = resolve; });
+      return Promise.resolve({ candidates: [candidate()], nextCursor: 'old-candidate-page' });
+    });
+    const user = userEvent.setup();
+    const view = render(<Rules />);
+
+    await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
+    await user.click(screen.getByRole('button', { name: 'Load more candidates' }));
+    mocks.activeCompanyId = 'COMPANY_OTHER';
+    view.rerender(<Rules />);
+    await waitFor(() => expect(mocks.listCandidates).toHaveBeenCalledWith('COMPANY_OTHER'));
+
+    await act(async () => {
+      resolveRules({ items: [ruleDetail({ revision: { ...ruleDetail().revision, ruleId: 'late-rule', condition: { matchField: 'payee', matchText: 'Late old rule' } } })], nextCursor: null });
+      resolveCandidates({ candidates: [candidate({ id: 'late-candidate', matchText: 'Late old candidate' })], nextCursor: null });
+    });
+
+    expect(screen.queryByText('Late old rule')).not.toBeInTheDocument();
+    expect(screen.queryByText('Late old candidate')).not.toBeInTheDocument();
   });
 
   it('keeps the next page reachable after acting on the final visible candidate', async () => {

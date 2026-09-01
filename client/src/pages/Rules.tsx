@@ -24,7 +24,9 @@ import { fmtDate, fmtMoney } from '../lib/format';
 import { useApp } from '../state/AppContext';
 
 const PAGE_SIZE = 100;
-const HISTORY_PAGE_SIZE = 20;
+const HISTORY_WINDOW_SIZE = 100;
+const MAX_VISIBLE_RULES = 200;
+const MAX_VISIBLE_CANDIDATES = 100;
 const MAX_REORDER_PAGES = 20;
 const buttonStyle = {
   border: '1px solid var(--bd)', background: 'var(--card)', color: 'var(--ink)',
@@ -47,7 +49,7 @@ type PendingPreparation = {
 
 type HistoryState = {
   items: RuleRevisionReadDto[];
-  cursor: string | null;
+  olderExists: boolean;
   busy: boolean;
 };
 
@@ -59,20 +61,51 @@ function onOff(value: boolean): string {
   return value ? 'on' : 'off';
 }
 
-function revisionChanges(current: RuleRevisionReadDto, previous?: RuleRevisionReadDto): string {
-  if (!previous) return 'Initial recorded revision.';
+function revisionChanges(
+  current: RuleRevisionReadDto,
+  previous?: RuleRevisionReadDto,
+  olderComparisonUnavailable = false,
+): string {
+  if (!previous) {
+    return olderComparisonUnavailable
+      ? 'Older comparison unavailable — history is truncated.'
+      : 'Initial recorded revision.';
+  }
   const changes: string[] = [];
   if (previous.state !== current.state) changes.push(`state ${previous.state} → ${current.state}`);
+  if (previous.condition.matchField !== current.condition.matchField) {
+    changes.push(`match field ${previous.condition.matchField} → ${current.condition.matchField}`);
+  }
   if (previous.condition.matchText !== current.condition.matchText) {
     changes.push(`match ${previous.condition.matchText} → ${current.condition.matchText}`);
   }
   if (previous.categoryName !== current.categoryName) changes.push(`category ${previous.categoryName} → ${current.categoryName}`);
+  if ((previous.action?.categoryQboId ?? null) !== (current.action?.categoryQboId ?? null)) {
+    changes.push(`category QBO ID ${previous.action?.categoryQboId ?? 'none'} → ${current.action?.categoryQboId ?? 'none'}`);
+  }
+  if ((previous.action?.taxCalculation ?? null) !== (current.action?.taxCalculation ?? null)) {
+    changes.push(`tax calculation ${previous.action?.taxCalculation ?? 'none'} → ${current.action?.taxCalculation ?? 'none'}`);
+  }
   if (previous.taxCodeName !== current.taxCodeName) changes.push(`tax code ${previous.taxCodeName ?? 'none'} → ${current.taxCodeName ?? 'none'}`);
+  if ((previous.action?.taxCodeQboId ?? null) !== (current.action?.taxCodeQboId ?? null)) {
+    changes.push(`tax code QBO ID ${previous.action?.taxCodeQboId ?? 'none'} → ${current.action?.taxCodeQboId ?? 'none'}`);
+  }
+  const previousTags = previous.action?.tagIds ?? [];
+  const currentTags = current.action?.tagIds ?? [];
+  if (JSON.stringify(previousTags) !== JSON.stringify(currentTags)) {
+    changes.push(`tag order ${previousTags.join(', ') || 'none'} → ${currentTags.join(', ') || 'none'}`);
+  }
   if (previous.priority !== current.priority) changes.push(`priority ${previous.priority} → ${current.priority}`);
   if (previous.autoPost !== current.autoPost) changes.push(`auto-post ${onOff(previous.autoPost)} → ${onOff(current.autoPost)}`);
-  const previousTags = previous.action?.tagIds.join(',') ?? '';
-  const currentTags = current.action?.tagIds.join(',') ?? '';
-  if (previousTags !== currentTags) changes.push('tags changed');
+  if (previous.valid !== current.valid) changes.push(`validity ${previous.valid ? 'valid' : 'invalid'} → ${current.valid ? 'valid' : 'invalid'}`);
+  if (JSON.stringify(previous.invalidReasons) !== JSON.stringify(current.invalidReasons)) changes.push('invalid reasons changed');
+  if (previous.originIntent !== current.originIntent) {
+    changes.push(`origin intent ${previous.originIntent ? readable(previous.originIntent) : 'none'} → ${current.originIntent ? readable(current.originIntent) : 'none'}`);
+  }
+  if (previous.sourceCaseId !== current.sourceCaseId) changes.push(`source case ${previous.sourceCaseId ?? 'none'} → ${current.sourceCaseId ?? 'none'}`);
+  if (previous.sourceCandidateId !== current.sourceCandidateId) changes.push(`source candidate ${previous.sourceCandidateId ?? 'none'} → ${current.sourceCandidateId ?? 'none'}`);
+  if (previous.changedBy !== current.changedBy) changes.push(`actor ${previous.changedBy ?? 'none'} → ${current.changedBy ?? 'none'}`);
+  if (previous.retiredAt !== current.retiredAt) changes.push(`retired at ${previous.retiredAt ?? 'none'} → ${current.retiredAt ?? 'none'}`);
   return changes.length > 0 ? `Changed: ${changes.join(' · ')}` : 'No material classification fields changed.';
 }
 
@@ -145,10 +178,12 @@ export default function Rules() {
   const [ruleCursor, setRuleCursor] = useState<string | null>(null);
   const [rulesBusy, setRulesBusy] = useState(false);
   const [rulesError, setRulesError] = useState<string | null>(null);
+  const [rulesTruncated, setRulesTruncated] = useState(false);
   const [candidateList, setCandidateList] = useState<RuleCandidateDto[]>([]);
   const [candidateCursor, setCandidateCursor] = useState<string | null>(null);
   const [candidateBusy, setCandidateBusy] = useState(false);
   const [candidatesError, setCandidatesError] = useState<string | null>(null);
+  const [candidatesTruncated, setCandidatesTruncated] = useState(false);
   const [reorderRules, setReorderRules] = useState<RuleDetailDto[]>([]);
   const [reorderReady, setReorderReady] = useState(false);
   const [reorderBusy, setReorderBusy] = useState(false);
@@ -168,9 +203,14 @@ export default function Rules() {
   const candidatePageRequestRef = useRef(0);
   const reorderRequestRef = useRef(0);
   const operationRequestRef = useRef(0);
+  const historyRequestRef = useRef<Record<string, number>>({});
   const preparingRef = useRef(false);
   const pendingPreparationRef = useRef<PendingPreparation | null>(null);
+  const ruleListRef = useRef<RuleDetailDto[]>([]);
+  const candidateListRef = useRef<RuleCandidateDto[]>([]);
   companyRef.current = activeCompanyId;
+  ruleListRef.current = ruleList;
+  candidateListRef.current = candidateList;
 
   const categoryOptions = useMemo(() => {
     const holdingIds = new Set((activeCompany?.holdingAccountIds ?? []).map(String));
@@ -189,11 +229,17 @@ export default function Rules() {
     const requestId = ++rulePageRequestRef.current;
     setRulesBusy(true);
     setRulesError(null);
+    setRulesTruncated(false);
     try {
       const page = await rulesApi.lifecycle(companyId, state, undefined, PAGE_SIZE);
       if (requestId !== rulePageRequestRef.current || companyRef.current !== companyId) return;
-      setRuleList(page.items);
-      setRuleCursor(page.nextCursor);
+      const items = page.items.slice(0, MAX_VISIBLE_RULES);
+      const truncated = page.items.length > MAX_VISIBLE_RULES
+        || (items.length >= MAX_VISIBLE_RULES && page.nextCursor !== null);
+      ruleListRef.current = items;
+      setRuleList(items);
+      setRulesTruncated(truncated);
+      setRuleCursor(truncated ? null : page.nextCursor);
     } catch (error) {
       if (requestId === rulePageRequestRef.current && companyRef.current === companyId) {
         setRulesError(error instanceof Error ? error.message : 'Rules are unavailable.');
@@ -204,20 +250,31 @@ export default function Rules() {
   }, []);
 
   const loadCandidates = useCallback(async (companyId: string, cursor?: string, append = false) => {
+    if (append && candidateListRef.current.length >= MAX_VISIBLE_CANDIDATES) return;
     const requestId = ++candidatePageRequestRef.current;
     setCandidateBusy(true);
-    if (!append) setCandidatesError(null);
+    if (!append) {
+      setCandidatesError(null);
+      setCandidatesTruncated(false);
+    }
     try {
       const page = cursor === undefined
         ? await ruleCandidatesApi.list(companyId)
         : await ruleCandidatesApi.list(companyId, cursor);
       if (requestId !== candidatePageRequestRef.current || companyRef.current !== companyId) return;
-      setCandidateList((current) => {
-        if (!append) return page.candidates;
-        const existing = new Set(current.map((candidate) => candidate.id));
-        return [...current, ...page.candidates.filter((candidate) => !existing.has(candidate.id))];
-      });
-      setCandidateCursor(page.nextCursor);
+      const current = append ? candidateListRef.current : [];
+      const existing = new Set(current.map((candidate) => candidate.id));
+      const combined = [
+        ...current,
+        ...page.candidates.filter((candidate) => !existing.has(candidate.id)),
+      ];
+      const retained = combined.slice(0, MAX_VISIBLE_CANDIDATES);
+      const truncated = combined.length > MAX_VISIBLE_CANDIDATES
+        || (retained.length >= MAX_VISIBLE_CANDIDATES && page.nextCursor !== null);
+      candidateListRef.current = retained;
+      setCandidateList(retained);
+      setCandidatesTruncated(truncated);
+      setCandidateCursor(truncated ? null : page.nextCursor);
     } catch (error) {
       if (requestId === candidatePageRequestRef.current && companyRef.current === companyId) {
         setCandidatesError(error instanceof Error ? error.message : 'Rule candidates are unavailable.');
@@ -272,12 +329,17 @@ export default function Rules() {
     rulePageRequestRef.current += 1;
     candidatePageRequestRef.current += 1;
     reorderRequestRef.current += 1;
+    historyRequestRef.current = {};
     setRuleList([]);
+    ruleListRef.current = [];
     setRuleCursor(null);
     setRulesError(null);
+    setRulesTruncated(false);
     setCandidateList([]);
+    candidateListRef.current = [];
     setCandidateCursor(null);
     setCandidatesError(null);
+    setCandidatesTruncated(false);
     setReorderRules([]);
     setReorderReady(false);
     setReorderError(null);
@@ -328,18 +390,23 @@ export default function Rules() {
   }, [activeCompanyId, filter, loadCandidates, loadFirstPage, loadReorderRules, toast]);
 
   const loadMoreRules = useCallback(async () => {
-    if (!activeCompanyId || !ruleCursor || rulesBusy) return;
+    if (!activeCompanyId || !ruleCursor || rulesBusy || ruleListRef.current.length >= MAX_VISIBLE_RULES) return;
     const companyId = activeCompanyId;
     const requestId = ++rulePageRequestRef.current;
     setRulesBusy(true);
     try {
       const page = await rulesApi.lifecycle(companyId, filter, ruleCursor, PAGE_SIZE);
       if (requestId !== rulePageRequestRef.current || companyRef.current !== companyId) return;
-      setRuleList((current) => {
-        const ids = new Set(current.map((rule) => rule.revision.ruleId));
-        return [...current, ...page.items.filter((rule) => !ids.has(rule.revision.ruleId))];
-      });
-      setRuleCursor(page.nextCursor);
+      const current = ruleListRef.current;
+      const ids = new Set(current.map((rule) => rule.revision.ruleId));
+      const combined = [...current, ...page.items.filter((rule) => !ids.has(rule.revision.ruleId))];
+      const retained = combined.slice(0, MAX_VISIBLE_RULES);
+      const truncated = combined.length > MAX_VISIBLE_RULES
+        || (retained.length >= MAX_VISIBLE_RULES && page.nextCursor !== null);
+      ruleListRef.current = retained;
+      setRuleList(retained);
+      setRulesTruncated(truncated);
+      setRuleCursor(truncated ? null : page.nextCursor);
     } catch (error) {
       if (requestId === rulePageRequestRef.current && companyRef.current === companyId) {
         toast(error instanceof Error ? error.message : 'Rules are unavailable.');
@@ -406,10 +473,10 @@ export default function Rules() {
   }, [beginOperation, commitBusy, prepared]);
 
   const displayedRules = sourceRule && !ruleList.some((rule) => rule.revision.ruleId === sourceRule.revision.ruleId)
-    ? [sourceRule, ...ruleList]
+    ? [sourceRule, ...ruleList].slice(0, MAX_VISIBLE_RULES)
     : ruleList;
   const displayedCandidates = sourceCandidate && !candidateList.some((candidate) => candidate.id === sourceCandidate.id)
-    ? [sourceCandidate, ...candidateList]
+    ? [sourceCandidate, ...candidateList].slice(0, MAX_VISIBLE_CANDIDATES)
     : candidateList;
   const reorderRule = useCallback((rule: RuleDetailDto, direction: -1 | 1) => {
     if (!reorderReady || preparingRef.current || pendingPreparationRef.current || prepared || commitBusy) return;
@@ -459,20 +526,26 @@ export default function Rules() {
     }
   }, [activeCompanyId, commitBusy, filter, loadCandidates, loadFirstPage, loadReorderRules, prepared, toast]);
 
-  const viewHistory = useCallback(async (ruleId: string, cursor?: string) => {
+  const viewHistory = useCallback(async (ruleId: string) => {
     if (!activeCompanyId || history[ruleId]?.busy) return;
     const companyId = activeCompanyId;
-    setHistory((current) => ({ ...current, [ruleId]: { items: current[ruleId]?.items ?? [], cursor: current[ruleId]?.cursor ?? null, busy: true } }));
+    const requestId = (historyRequestRef.current[ruleId] ?? 0) + 1;
+    historyRequestRef.current[ruleId] = requestId;
+    setHistory((current) => ({ ...current, [ruleId]: { items: current[ruleId]?.items ?? [], olderExists: current[ruleId]?.olderExists ?? false, busy: true } }));
     try {
-      const page = await rulesApi.revisions(companyId, ruleId, cursor, HISTORY_PAGE_SIZE);
-      if (companyRef.current !== companyId) return;
+      const page = await rulesApi.revisions(companyId, ruleId, undefined, HISTORY_WINDOW_SIZE);
+      if (requestId !== historyRequestRef.current[ruleId] || companyRef.current !== companyId) return;
       setHistory((current) => ({
         ...current,
-        [ruleId]: { items: cursor ? [...(current[ruleId]?.items ?? []), ...page.items] : page.items, cursor: page.nextCursor, busy: false },
+        [ruleId]: {
+          items: page.items.slice(0, HISTORY_WINDOW_SIZE),
+          olderExists: page.nextCursor !== null || page.items.length > HISTORY_WINDOW_SIZE,
+          busy: false,
+        },
       }));
     } catch (error) {
-      if (companyRef.current === companyId) {
-        setHistory((current) => ({ ...current, [ruleId]: { ...(current[ruleId] ?? { items: [], cursor: null }), busy: false } }));
+      if (requestId === historyRequestRef.current[ruleId] && companyRef.current === companyId) {
+        setHistory((current) => ({ ...current, [ruleId]: { ...(current[ruleId] ?? { items: [], olderExists: false }), busy: false } }));
         toast(error instanceof Error ? error.message : 'Revision history is unavailable.');
       }
     }
@@ -611,12 +684,12 @@ export default function Rules() {
                   ))}
                 </div>}
                 {currentHistory && <div style={{ marginTop: 11, borderTop: '1px solid var(--bd2)', paddingTop: 9 }}>
-                  {currentHistory.items.slice(0, 100).map((item, index, items) => (
+                  {currentHistory.items.map((item, index, items) => (
                     <article key={item.id} aria-label={`Revision ${item.revision}`} style={{ fontSize: 13, marginTop: 9, paddingTop: 7, borderTop: index === 0 ? 'none' : '1px solid var(--bd2)' }}>
                       <strong>{`Revision ${item.revision} · ${item.state} · ${fmtDate(item.createdAt)}`}</strong>
                       {item.action ? (
                         <div style={{ marginTop: 4 }}>
-                          {item.categoryName} · {readable(item.action.taxCalculation)} · {item.taxCodeName ?? 'No tax code'} · Tags {item.action.tagIds.length > 0 ? item.action.tagIds.map((id) => tagById.get(id) ?? 'Unavailable tag').join(', ') : 'none'} · priority {item.priority} · auto-post {onOff(item.autoPost)}
+                          {item.categoryName} ({item.action.categoryQboId}) · {readable(item.action.taxCalculation)} · {item.taxCodeName ?? 'No tax code'} ({item.action.taxCodeQboId ?? 'no QBO tax code'}) · Tags {item.action.tagIds.length > 0 ? item.action.tagIds.map((id) => `${tagById.get(id) ?? 'Unavailable tag'} (${id})`).join(', ') : 'none'} · priority {item.priority} · auto-post {onOff(item.autoPost)}
                         </div>
                       ) : <div style={{ marginTop: 4 }}>Legacy action unavailable — advisory provenance only.</div>}
                       <div style={{ marginTop: 4, color: 'var(--mut)' }}>
@@ -626,15 +699,24 @@ export default function Rules() {
                         {item.changedBy ? ` · actor ${item.changedBy}` : ''}
                       </div>
                       <div style={{ marginTop: 4 }}>{item.valid ? 'Valid revision.' : `Invalid revision: ${item.invalidReasons.join(' · ') || 'No reason supplied.'}`}</div>
-                      <div style={{ marginTop: 4 }}>{revisionChanges(item, items[index + 1])}</div>
+                      <div style={{ marginTop: 4 }}>{revisionChanges(
+                        item,
+                        items[index + 1],
+                        currentHistory.olderExists && index === items.length - 1,
+                      )}</div>
                     </article>
                   ))}
-                  {currentHistory.cursor && <button style={{ ...buttonStyle, marginTop: 8 }} disabled={currentHistory.busy} onClick={() => void viewHistory(revision.ruleId, currentHistory.cursor!)}>{currentHistory.busy ? 'Loading…' : 'Load more history'}</button>}
+                  {currentHistory.olderExists && <div role="status" aria-label="Revision history truncated" style={{ color: 'var(--mut)', fontSize: 13, marginTop: 9 }}>
+                    Showing {currentHistory.items.length} newest revision{currentHistory.items.length === 1 ? '' : 's'}; older history exists.
+                  </div>}
                 </div>}
               </article>
             );
           })}
         </div>
+        {rulesTruncated && <div role="status" aria-label="Rule lifecycle truncated" style={{ color: 'var(--mut)', fontSize: 13, marginTop: 10 }}>
+          Showing first {ruleList.length} rules in this lifecycle; more rules exist.
+        </div>}
         {ruleCursor && <button style={{ ...buttonStyle, marginTop: 12 }} disabled={rulesBusy} onClick={() => void loadMoreRules()}>{rulesBusy ? 'Loading…' : 'Load more rules'}</button>}
       </section>
 
@@ -662,6 +744,9 @@ export default function Rules() {
           </article>;
           })}
         </div>
+        {candidatesTruncated && <div role="status" aria-label="Rule candidates truncated" style={{ color: 'var(--mut)', fontSize: 13, marginTop: 10 }}>
+          Showing newest {candidateList.length} candidates; older candidates exist.
+        </div>}
         {candidateCursor && <button style={{ ...buttonStyle, marginTop: 12 }} disabled={candidateBusy} onClick={() => activeCompanyId && void loadCandidates(activeCompanyId, candidateCursor, true)}>{candidateBusy ? 'Loading…' : 'Load more candidates'}</button>}
       </section>
 

@@ -215,6 +215,60 @@ No PostgreSQL suite was rerun because no disposable test database URL was
 provided. The approved Task 6A PostgreSQL evidence remains authoritative; this
 fix round changed only client files and this report.
 
+## Independent review fix round 2
+
+### Bounded, truthful revision history
+
+RED: the focused history regressions exposed four failures. The UI still
+requested 20 revisions and offered to append hidden pages, treated the oldest
+row on a partial page as the initial revision, and missed material changes to
+canonical QBO identifiers, tax calculation, tag order, validity, and
+provenance.
+
+GREEN: history now makes one request for the newest 100 revisions and never
+drains or retains an invisible older page. A signed `nextCursor` produces a
+visible `Showing 100 newest revisions; older history exists` status, no Load
+more control, and an explicit unavailable/truncated comparison on the oldest
+visible row. `Initial recorded revision` appears only when the canonical page
+proves there is no older cursor. Summaries compare category name and QBO ID,
+tax calculation, tax-code name and QBO ID, ordered tag IDs, priority,
+auto-post, lifecycle state/retirement, validity and reasons, origin intent,
+source case/candidate, and actor. Legacy null actions remain visibly advisory.
+
+### Bounded lifecycle and candidate collections
+
+RED: lifecycle and candidate pagination grew retained state and the DOM without
+an explicit ceiling. Dedicated over-cap tests failed because a third lifecycle
+page and sixth candidate page remained reachable with no truncation message.
+
+GREEN: visible lifecycle results retain at most 200 deduplicated rules and
+candidate review retains at most 100 deduplicated candidates. Reaching either
+cap removes Load more, shows a truthful accessible truncation status, and
+guards against any later request. Company-switch request fencing prevents old
+pages from entering either collection. The separate non-rendered enabled-rule
+drain for exact reordering remains unchanged, signed-cursor fenced, and
+fail-closed at its existing 2,000-rule ceiling.
+
+### Fix-round-2 verification
+
+```text
+Focused history regressions: 5/5
+Focused collection cap/fencing regressions: 3/3
+Rules candidate/lifecycle/history file: 28/28
+Focused Task 7: 5 files, 106/106
+Full client: 23 files, 239/239
+Task 6A HTTP contracts: 4 files, 23/23
+Server unit: 133 files, 2,241/2,241
+Package-script contract: 1/1
+Root shared/server/client typecheck: passed
+Root shared/server/client production build: passed (Vite 84 modules)
+git diff --check: passed
+```
+
+This round changes only `Rules.tsx`, its candidate/lifecycle/history test, and
+this report. No PostgreSQL suite was rerun because the client-only change has no
+database path and no disposable test database URL was provided.
+
 ## Concerns
 
 - PostgreSQL behavior was not rerun against a disposable database in this
