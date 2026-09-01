@@ -898,6 +898,80 @@ describePostgres('classification search on PostgreSQL', () => {
       .toBeLessThan(candidate?.document?.text.indexOf('Zulu pattern') ?? -1);
   });
 
+  it('bounds raw rule revision tag expansion before validating oversized and malformed actions', async () => {
+    const data = await fixtures();
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(
+        'ALTER TABLE "RuleRevision" DROP CONSTRAINT "RuleRevision_tag_shape_check"',
+      );
+      let observedRuleSql = '';
+      const intercepted = new Proxy(tx, {
+        get(target, property, receiver) {
+          if (property === '$queryRaw') {
+            return async (query: { strings?: readonly string[] }) => {
+              const sql = query.strings?.join(' ') ?? '';
+              if (sql.includes('FROM "Rule" rule')) observedRuleSql = sql;
+              return target.$queryRaw(query as never);
+            };
+          }
+          const value = Reflect.get(target, property, receiver) as unknown;
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const repository = new PrismaClassificationSearchRepository(intercepted as never);
+      const invalidTagRationale = 'Historical rule action is unavailable because its tag IDs are invalid.';
+      const cases: Array<{ label: string; tagIds: unknown }> = [
+        { label: 'non-array', tagIds: 'not-an-array' },
+        { label: 'duplicate', tagIds: [data.tag.id, data.tag.id] },
+        { label: '51 items', tagIds: Array.from({ length: 51 }, () => randomUUID()) },
+        { label: 'five thousand items', tagIds: Array.from({ length: 5_000 }, () => randomUUID()) },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const revision = index + 3;
+        await tx.ruleRevision.create({ data: {
+          ruleId: data.rule.id, companyId: data.current.id, revision, state: 'enabled',
+          matchText: data.rule.matchText, category: data.account.name,
+          categoryQboId: data.account.qboId, taxCalculation: 'TaxExcluded',
+          taxCode: data.taxCode.name, taxCodeQboId: data.taxCode.qboId,
+          tagIds: testCase.tagIds as never, priority: 0, autoPost: false,
+          originIntent: 'make_recurring',
+        } });
+        await tx.rule.update({ where: { id: data.rule.id }, data: { revision } });
+        const record = (await repository.rehydrate(
+          [data.current.id],
+          [`rule:${data.rule.id}`],
+        ))[0];
+        expect(record?.hit, testCase.label).toMatchObject({
+          action: null,
+          executable: false,
+          advisory: true,
+          rationale: invalidTagRationale,
+        });
+        expect(record?.hit.actionSummary?.tagNames ?? [], testCase.label).toHaveLength(0);
+      }
+
+      const guardedExpansions = observedRuleSql.match(
+        /jsonb_array_elements(?:_text)?\(CASE WHEN jsonb_typeof\(revision\."tagIds"\) = 'array'\s+AND jsonb_array_length\(revision\."tagIds"\) <= 50/gu,
+      ) ?? [];
+      expect(guardedExpansions).toHaveLength(2);
+      expect(observedRuleSql).toMatch(
+        /AND CASE WHEN jsonb_typeof\(revision\."tagIds"\) = 'array'\s+THEN jsonb_array_length\(revision\."tagIds"\) <= 50 ELSE false END AS "tagsExist"/u,
+      );
+
+      await tx.$executeRawUnsafe('SET LOCAL session_replication_role = replica');
+      await tx.ruleRevision.deleteMany({
+        where: { companyId: data.current.id, ruleId: data.rule.id, revision: { gte: 3 } },
+      });
+      await tx.$executeRawUnsafe('SET LOCAL session_replication_role = origin');
+      await tx.rule.update({ where: { id: data.rule.id }, data: { revision: 2 } });
+      await tx.$executeRawUnsafe(
+        'ALTER TABLE "RuleRevision" ADD CONSTRAINT "RuleRevision_tag_shape_check" '
+        + 'CHECK (jsonb_typeof("tagIds") = \'array\' AND jsonb_array_length("tagIds") <= 50)',
+      );
+    });
+  });
+
   it('paginates the complete embedding corpus beyond the former ten-thousand-row cap', async () => {
     const owner = await company('Large Corpus');
     await db.vendorIdentity.createMany({

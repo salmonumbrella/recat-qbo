@@ -1170,11 +1170,13 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              NOT EXISTS (
                SELECT 1
                FROM jsonb_array_elements(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
+                 AND jsonb_array_length(revision."tagIds") <= 50
                  THEN revision."tagIds" ELSE '[]'::jsonb END) value
                WHERE jsonb_typeof(value) <> 'string'
                  OR NOT EXISTS (SELECT 1 FROM "Tag" current_tag
                    WHERE current_tag."id" = value #>> '{}' AND current_tag."companyId" = rule."companyId")
-             ) AND jsonb_typeof(revision."tagIds") = 'array' AS "tagsExist",
+             ) AND CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
+               THEN jsonb_array_length(revision."tagIds") <= 50 ELSE false END AS "tagsExist",
              revision."tagIds" AS "tagIds",
              COALESCE(tags."namesArray", '[]'::jsonb) AS "tagNames",
              ${text} AS "searchText", ${score} AS "lexicalScore"
@@ -1190,6 +1192,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
         SELECT string_agg(tag."name", ' ' ORDER BY relation."ordinal" ASC) AS "names",
                jsonb_agg(tag."name" ORDER BY relation."ordinal" ASC) AS "namesArray"
         FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
+          AND jsonb_array_length(revision."tagIds") <= 50
           THEN revision."tagIds" ELSE '[]'::jsonb END)
           WITH ORDINALITY AS relation("tagId", "ordinal")
         JOIN "Tag" tag ON tag."id" = relation."tagId"
