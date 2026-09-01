@@ -6,8 +6,8 @@ last_edited: 2026-08-31
 
 ## Status
 
-Complete locally through independent review fix round 3, on top of integrated
-commit `7bacea3`. Browser rule operations now use
+Complete locally through independent review fix round 4, on top of integrated
+commit `8f4718a`. Browser rule operations now use
 the same immutable, company-scoped, two-phase lifecycle as MCP with a real
 session principal. Classification and canonical rule reads are available to
 the browser without adding a policy store, fake MCP token, or one-call write.
@@ -788,6 +788,244 @@ schema diff contains only eight lines
 for the new discriminator/nullability/session indexes; there is no formatter
 churn. The rule/candidate route deletions are intentional removal of direct
 write implementations and now-unused schemas/imports, not formatting churn.
+
+## Independent review fix round 4 — constant-state lifecycle fence
+
+### Production break and chosen boundary
+
+The fix-round-3 database fingerprint was query-bounded but not work-bounded:
+PostgreSQL still constructed a `jsonb_agg` over every matching Rule before
+hashing it. A page read therefore retained population-sized database memory and
+CPU even though the application received only one digest and `limit + 1` rows.
+
+Fix round 4 replaces that aggregate with one `RuleLifecycleRevision` row per
+Company. Its BIGINT revision is incremented transactionally by database
+triggers for every lifecycle-visible Rule mutation and every RuleRevision
+mutation, including rolling old binaries and direct SQL. The signed cursor now
+contains `rule-lifecycle-fence-v1:<revision>`. It remains bound to resource,
+user, company, state filter, limit, and page position. A fix-round-3 SHA cursor
+is intentionally rejected after cutover; clients restart pagination. All state
+filters conservatively share the company fence, so an unrelated lifecycle
+change may invalidate a page but can never make a stale page executable.
+
+The migration takes `SHARE ROW EXCLUSIVE` locks on Company, Rule, and
+RuleRevision inside one explicit transaction before table creation, trigger
+installation, and backfill. That closes the install/backfill missed-write gap.
+Backfill is one row per Company and does not scan Rule or RuleRevision. A
+Company INSERT trigger creates revision zero. The bump helper uses a sorted,
+distinct company-ID array and one UPSERT per affected company; it checks that
+the Company still exists so Company cascades cannot resurrect a fence. Missing
+zero-state rows self-heal on the next old/direct mutation.
+
+Rule INSERT/DELETE and RuleRevision INSERT/DELETE triggers use transition
+tables and bump each affected company once per statement. Rule UPDATE uses an
+exact no-op guard over ID, company, current revision, enabled, retiredAt,
+priority, createdAt, reviewRequiredAt, and reviewReason. RuleRevision UPDATE
+uses `OLD.* IS DISTINCT FROM NEW.*`, since every immutable historical field is
+part of lifecycle/history pagination. Old and new ownership are sorted before
+row locking, so reversed cross-company writers do not deadlock. Canonical
+writers retain Task 6's existing company mutation serialization; the trigger
+adds no global/advisory mutation lock. Counter gaps are harmless freshness
+tokens.
+
+### RED evidence
+
+Fresh schema / zero-state fence:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/ruleLifecycleRevision.pg.test.ts
+```
+
+Before the migration, the first real PostgreSQL test failed as expected:
+
+```text
+1 failed
+Raw query failed. Code: 42P01.
+relation "RuleLifecycleRevision" does not exist
+```
+
+After adding only the table/backfill/Company trigger, the rolling-old-writer
+test failed because a direct legacy Rule insert left the fence unchanged:
+
+```text
+1 failed | 1 passed
+expected 0 to be greater than 0
+```
+
+After INSERT coverage, exact lifecycle UPDATE coverage failed first on
+priority drift:
+
+```text
+1 failed | 2 passed
+expected 2n to be 3n
+```
+
+After Rule UPDATE coverage, immutable-history UPDATE/delete coverage failed on
+a direct RuleRevision change:
+
+```text
+1 failed | 4 passed
+expected [ { revision: 3n } ] to deeply equal [ { revision: 4n } ]
+```
+
+The service-boundary RED used an appended non-current RuleRevision that did
+not modify Rule. The old population aggregate accepted the stale cursor:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/companyReads.rules.pg.test.ts \
+  -t 'immutable RuleRevision history'
+```
+
+```text
+1 failed | 5 skipped
+promise resolved ... instead of rejecting
+```
+
+The first full PostgreSQL run also exposed a test-fixture-only issue: under
+parallel suite load, the 10,000-row seed exceeded Prisma's default five-second
+interactive transaction timeout. No lifecycle read timed out. The fixture
+transaction alone now has a 30-second timeout; production transaction settings
+were not changed.
+
+### GREEN evidence and scale proof
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm --workspace server run test:pg -- \
+  src/services/ruleLifecycleRevision.pg.test.ts \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 0: 2 files, 14/14 tests passed. The trigger suite covers fresh zero state,
+backfill-compatible raw old-writer Rule insertion, deferred revision-zero
+capture, all exact Rule fields, unrelated/no-op Rule writes, RuleRevision
+insert/update/no-op/delete, direct Rule delete with the existing immutability
+guards disabled transactionally only for the test, Company cascade cleanup,
+missing-row self-healing, old+new company ownership, Rule ID drift, concurrent
+increments, and reversed company ordering.
+
+The real 10,001-rule test compares one-rule and large populations through the
+actual service. Both used exactly 10 database queries; limit 100 returned 100
+items and stayed below the 250 KB response bound. A representative focused run
+reported:
+
+```text
+[rule-lifecycle-scale] {
+  rules: 10001,
+  smallElapsedMs: 24.08,
+  largeElapsedMs: 7.92,
+  queryCounts: [ 10, 10, 10 ],
+  fenceNodeTypes: [ 'Seq Scan' ],
+  pageRoot: 'Limit',
+  pageRows: 101
+}
+```
+
+The fence table contained one row in that test, so PostgreSQL rationally chose
+a one-row sequential scan rather than its primary-key index. Real `EXPLAIN
+(ANALYZE, BUFFERS, FORMAT JSON)` assertions prove the fence plan touches only
+RuleLifecycleRevision, returns one row, and contains no Aggregate. The page
+plan is rooted at Limit, returns 101 rows, and contains no Aggregate. This
+proves the removed full-population fingerprint is not hidden in either query.
+The existing state/order page query may still inspect matching Rule rows; that
+explicitly accepted fix-round limitation was not widened with a denormalized
+index or second lifecycle store.
+
+### Fresh and rolling migration evidence
+
+Fresh PostgreSQL 16 reset/deploy applied all 36 migrations, generated Prisma
+Client 6.19.3, and passed the zero-state/trigger suite.
+
+For the rolling test, a second disposable database received only the first 35
+migrations, then an existing Company and an old-shape raw Rule. The new
+migration was added to that migration set and deployed with `prisma migrate
+deploy`. The existing company was backfilled at revision zero. A second
+old-shape Rule insert after cutover produced:
+
+```text
+before old-writer insert: rolling-company | 0
+after transaction commit: rolling-company | 2
+fallback history: rolling-after-rule | revision 0
+```
+
+One increment came from Rule INSERT and one from the deferred compatibility
+RuleRevision INSERT. This proves a new database reader observes writes from an
+old binary after cutover. Old binaries ignore the additive table and triggers,
+so their read/write schema remains compatible. Company cascade removes the
+single fence row; no separate cleanup job or retained population artifact is
+required.
+
+### Files changed in fix round 4
+
+- `prisma/schema.prisma` — one Company relation and the three-field
+  RuleLifecycleRevision model only; no formatter churn.
+- `prisma/migrations/20260831060000_add_rule_lifecycle_revision/migration.sql`
+  — additive table, bounded backfill, bump helper, and transactional triggers.
+- `server/src/services/companyReads.ts` — removes the `jsonb_agg`/SHA scan and
+  reads the one-row version fence inside the existing repeatable-read snapshot.
+- `server/src/services/companyReads.rules.pg.test.ts` — non-current-history
+  drift plus 10,001-rule query-count/EXPLAIN/latency/result-bound proof.
+- `server/src/services/ruleLifecycleRevision.pg.test.ts` — focused real
+  PostgreSQL migration, trigger, ownership, concurrency, no-op, and cleanup
+  behavior.
+- this report.
+
+### Full fix-round-4 verification
+
+```bash
+DATABASE_URL="$TASK6A_DATABASE_URL" \
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" npm test
+```
+
+Exit 0 after the fixture-timeout correction:
+
+- package-script contract: 1/1 passed;
+- server unit: 133 files, 2,241/2,241 passed;
+- server PostgreSQL: 37 files, 345 passed, 20 intentionally skipped;
+- client: 21 files, 207/207 passed, including `Queue.tax.test.tsx` 66/66.
+
+Additional gates:
+
+```bash
+npm run test:server:unit -- mcp/mutationTools.test.ts \
+  mcp/readTools.startup.test.ts mcp/readTools.test.ts
+npm run typecheck
+DATABASE_URL="$TASK6A_DATABASE_URL" npm run build
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma validate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma generate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma migrate status
+```
+
+All exited 0. MCP authored-schema/startup coverage passed 3 files / 27 tests;
+shared/server/client typechecks passed; the server and production client build
+passed; Prisma validate/generate/status reported a valid schema, generated
+client, 36 migrations, and an up-to-date database. The datamodel diff still
+reports only the same three inherited long-name index renames on
+AutopilotRuleCandidate and QboTransferOperation, with no RuleLifecycleRevision
+drift.
+
+### Fix-round-4 self-review
+
+- No Rule or RuleRevision population is materialized or aggregated to validate
+  a lifecycle cursor. The application reads one BIGINT and at most `limit + 1`
+  Rule rows before bounded batch hydration.
+- All trigger invalidation is transactionally visible with the changed rule or
+  history. Rollback also rolls back the increment; concurrent UPSERT increments
+  cannot be lost.
+- No-op guards prevent unrelated Rule edits from invalidating pagination. The
+  conservative shared company fence intentionally invalidates every state
+  filter on a relevant lifecycle/history change.
+- Both OLD and NEW company owners are bumped in stable order. Company deletion
+  cannot recreate a fence because the bump helper requires a live Company.
+- Immutable provenance triggers remain enabled and unchanged in production;
+  tests disable them only inside transactions to exercise otherwise unreachable
+  direct-delete/update trigger paths, then restore them before commit.
+- No REST, MCP, client, auth, shared-contract, policy, provider, QBO, deployment,
+  push, or production behavior changed in this round.
 
 ## Security and self-review
 

@@ -875,56 +875,20 @@ function ruleDetailDto(
   };
 }
 
-function lifecyclePredicate(state: RuleLifecycleFilter): Prisma.Sql {
-  if (state === 'enabled') {
-    return Prisma.sql`r."enabled" = true AND r."retiredAt" IS NULL`;
-  }
-  if (state === 'disabled') {
-    return Prisma.sql`r."enabled" = false AND r."retiredAt" IS NULL`;
-  }
-  if (state === 'retired') return Prisma.sql`r."retiredAt" IS NOT NULL`;
-  return Prisma.sql`true`;
-}
-
 async function ruleLifecycleFingerprint(
   db: CompanyReadDb,
   companyId: string,
-  state: RuleLifecycleFilter,
 ): Promise<string> {
-  const rows = await db.$queryRaw<Array<{ fingerprint: string }>>(Prisma.sql`
-    SELECT encode(
-      sha256(convert_to(
-        COALESCE(
-          jsonb_agg(
-            jsonb_build_array(
-              r."id",
-              r."revision",
-              r."enabled",
-              CASE WHEN r."retiredAt" IS NULL THEN NULL
-                ELSE to_char(r."retiredAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END,
-              r."priority",
-              to_char(r."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-              CASE WHEN r."reviewRequiredAt" IS NULL THEN NULL
-                ELSE to_char(r."reviewRequiredAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END,
-              r."reviewReason"
-            )
-            ORDER BY r."priority" ASC, r."createdAt" DESC, r."id" ASC
-          ),
-          '[]'::jsonb
-        )::text,
-        'UTF8'
-      )),
-      'hex'
-    ) AS "fingerprint"
-      FROM "Rule" r
-     WHERE r."companyId" = ${companyId}
-       AND ${lifecyclePredicate(state)}
+  const rows = await db.$queryRaw<Array<{ revision: bigint }>>(Prisma.sql`
+    SELECT "revision"
+      FROM "RuleLifecycleRevision"
+     WHERE "companyId" = ${companyId}
   `);
-  const fingerprint = rows[0]?.fingerprint;
-  if (typeof fingerprint !== 'string') {
+  const revision = rows[0]?.revision;
+  if (typeof revision !== 'bigint') {
     throw new HttpError(503, 'Rule lifecycle is unavailable', 'COMPANY_UNAVAILABLE');
   }
-  return fingerprint;
+  return `rule-lifecycle-fence-v1:${revision}`;
 }
 
 export function boundedTaxReadiness(
@@ -1418,7 +1382,7 @@ export function createCompanyReadService(
           ? { retiredAt: { not: null } }
           : {};
     return db.$transaction(async (tx) => {
-      const fingerprint = await ruleLifecycleFingerprint(tx, companyId, state);
+      const fingerprint = await ruleLifecycleFingerprint(tx, companyId);
       if (position && cursorFingerprint !== fingerprint) {
         badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
       }

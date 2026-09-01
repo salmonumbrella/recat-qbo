@@ -234,6 +234,7 @@ model Company {
   classificationCaseInvalidations ClassificationCaseInvalidation[]
   ruleRevisions               RuleRevision[]
   classificationCorpusRevisions ClassificationCorpusRevision[]
+  ruleLifecycleRevision       RuleLifecycleRevision?
 }
 
 /// Append-only company-local freshness fence for the classification retrieval
@@ -246,6 +247,14 @@ model ClassificationCorpusRevision {
   createdAt DateTime @default(now())
 
   @@index([companyId, revision(sort: Desc)])
+}
+
+/// Constant-state company-local fence for lifecycle pagination. Database
+/// triggers update it transactionally for canonical, legacy, and direct writes.
+model RuleLifecycleRevision {
+  companyId String  @id
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  revision  BigInt  @default(0)
 }
 
 model Transaction {

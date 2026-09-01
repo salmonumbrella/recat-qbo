@@ -323,6 +323,47 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
   });
 
+  it('invalidates pagination when immutable RuleRevision history changes without changing Rule', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `history-drift-${suffix}`, legalName: 'History Drift Legal', nickname: 'History Drift',
+    } });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `history-drift-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: company.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: company.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'First', priority: 0, state: 'disabled',
+    });
+    const laterRule = await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'Later', priority: 1, state: 'disabled',
+    });
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-history-drift-cursor-secret',
+    );
+    const first = await listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1,
+    });
+
+    await db.ruleRevision.create({ data: {
+      companyId: company.id, ruleId: laterRule.id, revision: 99, state: 'disabled',
+      matchText: 'Historical only', category: 'Meals', categoryQboId: 'account-meals',
+      taxCalculation: 'NotApplicable', priority: 1, autoPost: false,
+      originIntent: 'make_recurring', changedBy: user.id,
+    } });
+
+    await expect(listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
   it('keeps lifecycle reads bounded and set-based across thousands of rules', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({ data: {
@@ -339,15 +380,15 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       fullName: 'Expenses · Meals', classification: 'Expense',
     } });
     const createdAt = new Date('2026-08-30T03:00:00.000Z');
-    const rules = Array.from({ length: 2_000 }, (_, index) => ({
-      id: `bounded-${suffix}-${String(index).padStart(4, '0')}`,
+    const rules = Array.from({ length: 10_001 }, (_, index) => ({
+      id: `bounded-${suffix}-${String(index).padStart(5, '0')}`,
       companyId: company.id,
       matchText: `Vendor ${index}`,
       category: 'Meals',
       categoryQboId: 'account-meals',
       taxCalculation: 'NotApplicable',
       enabled: false,
-      revision: 1,
+      revision: 0,
       priority: index,
       originIntent: 'make_recurring',
       createdAt,
@@ -356,7 +397,7 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       id: `revision-${rule.id}`,
       companyId: company.id,
       ruleId: rule.id,
-      revision: 1,
+      revision: 0,
       state: 'disabled',
       matchText: rule.matchText,
       category: 'Meals',
@@ -368,8 +409,10 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       changedBy: user.id,
       createdAt,
     }));
-    await db.rule.createMany({ data: rules.slice(0, 1) });
-    await db.ruleRevision.createMany({ data: revisions.slice(0, 1) });
+    await db.$transaction(async (tx) => {
+      await tx.rule.createMany({ data: rules.slice(0, 1) });
+      await tx.ruleRevision.createMany({ data: revisions.slice(0, 1) });
+    });
 
     const measuredDb = new PrismaClient({
       datasources: { db: { url: TEST_DATABASE_URL! } },
@@ -383,22 +426,28 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       'rule-lifecycle-bounded-cursor-secret',
     );
     try {
+      const smallStartedAt = performance.now();
       countQueries = true;
       const smallPopulation = await listLifecycle(service, user.id, company.id, {
         state: 'disabled', limit: 1,
       });
       countQueries = false;
+      const smallElapsedMs = performance.now() - smallStartedAt;
       const smallPopulationQueryCount = queryCount;
       queryCount = 0;
 
-      await db.rule.createMany({ data: rules.slice(1) });
-      await db.ruleRevision.createMany({ data: revisions.slice(1) });
+      await db.$transaction(async (tx) => {
+        await tx.rule.createMany({ data: rules.slice(1) });
+        await tx.ruleRevision.createMany({ data: revisions.slice(1) });
+      }, { timeout: 30_000 });
 
+      const largeStartedAt = performance.now();
       countQueries = true;
       const one = await listLifecycle(service, user.id, company.id, {
         state: 'disabled', limit: 1,
       });
       countQueries = false;
+      const largeElapsedMs = performance.now() - largeStartedAt;
       const oneQueryCount = queryCount;
       queryCount = 0;
 
@@ -416,6 +465,55 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       expect(oneQueryCount).toBe(smallPopulationQueryCount);
       expect(hundredQueryCount).toBe(oneQueryCount);
       expect(hundredQueryCount).toBe(10);
+      expect(smallElapsedMs).toBeLessThan(5_000);
+      expect(largeElapsedMs).toBeLessThan(5_000);
+
+      type PlanNode = {
+        'Node Type': string;
+        'Actual Rows'?: number;
+        'Relation Name'?: string;
+        Plans?: PlanNode[];
+      };
+      const planNodes = (root: PlanNode): PlanNode[] => [
+        root,
+        ...(root.Plans ?? []).flatMap(planNodes),
+      ];
+      const fenceExplain = await db.$queryRaw<Array<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>>`
+        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT "revision" FROM "RuleLifecycleRevision" WHERE "companyId" = ${company.id}
+      `;
+      const fencePlan = fenceExplain[0]?.['QUERY PLAN'][0]?.Plan;
+      expect(fencePlan).toBeDefined();
+      const fenceNodes = planNodes(fencePlan!);
+      expect(fenceNodes.map((node) => node['Node Type'])).not.toContain('Aggregate');
+      expect(fenceNodes.flatMap((node) => node['Relation Name'] ?? [])).toEqual([
+        'RuleLifecycleRevision',
+      ]);
+      expect(fencePlan?.['Actual Rows']).toBe(1);
+
+      const pageExplain = await db.$queryRaw<Array<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>>`
+        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT "id", "priority", "createdAt"
+          FROM "Rule"
+         WHERE "companyId" = ${company.id}
+           AND "enabled" = false
+           AND "retiredAt" IS NULL
+         ORDER BY "priority" ASC, "createdAt" DESC, "id" ASC
+         LIMIT 101
+      `;
+      const pagePlan = pageExplain[0]?.['QUERY PLAN'][0]?.Plan;
+      expect(pagePlan?.['Node Type']).toBe('Limit');
+      expect(pagePlan?.['Actual Rows']).toBe(101);
+      expect(planNodes(pagePlan!).map((node) => node['Node Type'])).not.toContain('Aggregate');
+      console.info('[rule-lifecycle-scale]', {
+        rules: rules.length,
+        smallElapsedMs: Number(smallElapsedMs.toFixed(2)),
+        largeElapsedMs: Number(largeElapsedMs.toFixed(2)),
+        queryCounts: [smallPopulationQueryCount, oneQueryCount, hundredQueryCount],
+        fenceNodeTypes: fenceNodes.map((node) => node['Node Type']),
+        pageRoot: pagePlan?.['Node Type'],
+        pageRows: pagePlan?.['Actual Rows'],
+      });
 
       const cursor = one.nextCursor ?? '';
       await db.rule.update({
@@ -429,5 +527,5 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       countQueries = false;
       await measuredDb.$disconnect();
     }
-  });
+  }, 30_000);
 });
