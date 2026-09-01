@@ -67,7 +67,7 @@ export interface ClassificationSearchRecordContext {
   sourceAccountName?: string | null;
   currency?: string;
   transactionDate?: string;
-  jurisdiction?: string;
+  jurisdiction?: string | null;
   taxCalculation?: ClassificationAction['taxCalculation'];
 }
 
@@ -77,7 +77,7 @@ export interface ClassificationSearchContextFilter {
   sourceAccountName?: string;
   currency?: string;
   transactionPeriod?: string;
-  jurisdiction?: string;
+  jurisdiction?: string | null;
   taxCalculation?: ClassificationAction['taxCalculation'];
 }
 
@@ -208,7 +208,7 @@ function checkedContext(
     if (!['in', 'out', 'unknown'].includes(raw.transactionDirection)) {
       throw new ClassificationSearchError('INVALID_INPUT');
     }
-    result.transactionDirection = raw.transactionDirection;
+    if (raw.transactionDirection !== 'unknown') result.transactionDirection = raw.transactionDirection;
   }
   if (raw.qboType !== undefined) {
     if (!['Purchase', 'Deposit', 'JournalEntry'].includes(raw.qboType)) {
@@ -229,8 +229,9 @@ function checkedContext(
     }
     result.transactionPeriod = raw.transactionPeriod;
   }
-  if (raw.jurisdiction !== undefined) {
-    result.jurisdiction = checkedText(raw.jurisdiction, 128);
+  if (raw.jurisdiction !== undefined && raw.jurisdiction !== null) {
+    const jurisdiction = checkedText(raw.jurisdiction, 128);
+    if (jurisdiction.toLocaleLowerCase('en-US') !== 'unknown') result.jurisdiction = jurisdiction;
   }
   if (raw.taxCalculation !== undefined) {
     if (!['TaxInclusive', 'TaxExcluded', 'NotApplicable'].includes(raw.taxCalculation)) {
@@ -1124,14 +1125,14 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
   ) {
     if (ids !== null && ids.length === 0) return Promise.resolve([] as RuleSearchRow[]);
     const idFilter = ids === null ? Prisma.empty : Prisma.sql`AND rule."id" IN (${Prisma.join(ids)})`;
-    const text = Prisma.sql`concat_ws(' ', rule."matchText", rule."category", account."fullName",
-      rule."taxCode", tax."name", tags."names", rule."reviewReason")`;
+    const text = Prisma.sql`concat_ws(' ', revision."matchText", revision."category", account."fullName",
+      revision."taxCode", tax."name", tags."names", rule."reviewReason")`;
     const exactKey = query === null ? null : normalizeVendorLookupKey(query);
     const queryFilter = query === null ? Prisma.empty : exactOnly ? Prisma.sql`
-      AND normalize(lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
+      AND normalize(lower(regexp_replace(trim(revision."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
     ` : Prisma.sql`
       AND (
-        normalize(lower(regexp_replace(trim(rule."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
+        normalize(lower(regexp_replace(trim(revision."matchText"), '\\s+', ' ', 'g')), NFC) = ${exactKey}
         OR to_tsvector('simple', ${text}) @@ plainto_tsquery('simple', ${query})
       )
     `;
@@ -1140,16 +1141,17 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     `;
     return this.db.$queryRaw<RuleSearchRow[]>(Prisma.sql`
       SELECT rule."id", rule."companyId", company."nickname" AS "companyName",
-             rule."matchText", rule."categoryQboId", rule."taxCalculation", rule."taxCodeQboId",
-             rule."originIntent", rule."revision", rule."updatedById", rule."updatedAt" AS "revisedAt",
+             revision."matchText", revision."categoryQboId", revision."taxCalculation", revision."taxCodeQboId",
+             revision."originIntent", revision."revision", revision."changedBy" AS "updatedById",
+             revision."createdAt" AS "revisedAt",
              rule."reviewRequiredAt", rule."reviewReason",
-             COALESCE(account."name", rule."category") AS "categoryName",
-             COALESCE(tax."name", rule."taxCode") AS "taxCodeName",
+             COALESCE(account."name", revision."category") AS "categoryName",
+             COALESCE(tax."name", revision."taxCode") AS "taxCodeName",
              account."active" IS TRUE AS "categoryActive",
              company."taxSupportStatus" = 'ready' AS "taxReady",
              CASE
-               WHEN rule."taxCalculation" = 'NotApplicable' THEN rule."taxCodeQboId" IS NULL
-               WHEN rule."taxCalculation" IN ('TaxInclusive', 'TaxExcluded')
+               WHEN revision."taxCalculation" = 'NotApplicable' THEN revision."taxCodeQboId" IS NULL
+               WHEN revision."taxCalculation" IN ('TaxInclusive', 'TaxExcluded')
                  THEN tax."active" IS TRUE
                   AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
                   AND (
@@ -1163,33 +1165,38 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                ELSE false
              END AS "taxCodeEligible",
              NOT EXISTS (
-               SELECT 1 FROM "RuleTag" current_relation
-               JOIN "Tag" current_tag ON current_tag."id" = current_relation."tagId"
-               WHERE current_relation."ruleId" = rule."id"
-                 AND current_tag."companyId" <> rule."companyId"
-             ) AS "tagsExist",
+               SELECT 1
+               FROM jsonb_array_elements(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
+                 THEN revision."tagIds" ELSE '[]'::jsonb END) value
+               WHERE jsonb_typeof(value) <> 'string'
+                 OR NOT EXISTS (SELECT 1 FROM "Tag" current_tag
+                   WHERE current_tag."id" = value #>> '{}' AND current_tag."companyId" = rule."companyId")
+             ) AND jsonb_typeof(revision."tagIds") = 'array' AS "tagsExist",
              COALESCE(tags."ids", '[]'::jsonb) AS "tagIds",
              COALESCE(tags."namesArray", '[]'::jsonb) AS "tagNames",
              ${text} AS "searchText", ${score} AS "lexicalScore"
       FROM "Rule" rule
+      JOIN "RuleRevision" revision ON revision."companyId" = rule."companyId"
+        AND revision."ruleId" = rule."id" AND revision."revision" = rule."revision"
       JOIN "Company" company ON company."id" = rule."companyId"
       LEFT JOIN "QboAccount" account ON account."companyId" = rule."companyId"
-        AND account."qboId" = rule."categoryQboId"
+        AND account."qboId" = revision."categoryQboId"
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = rule."companyId"
-        AND tax."qboId" = rule."taxCodeQboId"
+        AND tax."qboId" = revision."taxCodeQboId"
       LEFT JOIN LATERAL (
         SELECT string_agg(tag."name", ' ' ORDER BY tag."id" ASC) AS "names",
                jsonb_agg(tag."id" ORDER BY tag."id") AS "ids",
                jsonb_agg(tag."name" ORDER BY tag."id") AS "namesArray"
-        FROM "RuleTag" relation
+        FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'
+          THEN revision."tagIds" ELSE '[]'::jsonb END) relation("tagId")
         JOIN "Tag" tag ON tag."id" = relation."tagId"
           AND tag."companyId" = rule."companyId"
-        WHERE relation."ruleId" = rule."id"
       ) tags ON true
       WHERE rule."companyId" IN (${Prisma.join(companyIds)})
         AND rule."enabled" = true AND rule."retiredAt" IS NULL
+        AND revision."state" = 'enabled' AND revision."retiredAt" IS NULL
         ${idFilter} ${queryFilter}
-      ORDER BY "lexicalScore" DESC, rule."updatedAt" DESC, rule."id" ASC
+      ORDER BY "lexicalScore" DESC, revision."createdAt" DESC, rule."id" ASC
       LIMIT ${limit}
     `);
   }
@@ -1568,6 +1575,16 @@ function actionSummary(
   return { categoryName, taxCalculation: action.taxCalculation, taxCodeName, tagNames };
 }
 
+function historicalRuleRationale(row: RuleSearchRow, rawAction: ClassificationAction | null): string | null {
+  if (row.reviewReason !== null) return row.reviewReason;
+  if (rawAction !== null) return null;
+  const category = row.categoryName === null ? 'category unavailable' : `category “${row.categoryName}”`;
+  const tax = row.taxCalculation === null
+    ? 'tax treatment unavailable'
+    : `stored tax treatment “${row.taxCalculation}”`;
+  return `Historical rule classification: ${category}; ${tax}.`;
+}
+
 function documentFor(
   hit: ClassificationSearchHit,
   revisedAt: string,
@@ -1775,7 +1792,8 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
       originIntent: row.originIntent as ClassificationSearchHit['originIntent'],
       evidenceCount: 0, conflictingEvidenceCount: conflict.length, conflicts: conflict,
       provenance: { source: 'rule', sourceId: row.id, actorId: row.updatedById, recordedAt: revisedAt },
-      rationale: row.reviewReason, jurisdiction: taxed ? 'unknown' : null, ruleRevision: row.revision,
+      rationale: historicalRuleRationale(row, rawAction), jurisdiction: taxed ? 'unknown' : null,
+      ruleRevision: row.revision,
     });
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],

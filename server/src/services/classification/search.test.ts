@@ -298,6 +298,20 @@ describe('classification memory search', () => {
       'classification_case:unknown-direction',
       'rule:unknown',
     ]);
+
+    for (const context of [
+      { transactionDirection: 'unknown' as const, jurisdiction: 'unknown' },
+      { transactionDirection: 'unknown' as const, jurisdiction: null },
+    ]) {
+      const unfiltered = await searchClassificationMemory({
+        query: 'same vendor', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
+        limit: 10, accessibleCompanyIds: ['company-a'], context,
+      }, { repository: repository([mismatching, matching, explicitUnknown, unknownRule]), semantic: null });
+      expect(unfiltered.hits.map((candidate) => candidate.id)).toEqual([
+        'classification_case:mismatch', 'classification_case:matching',
+        'classification_case:unknown-direction', 'rule:unknown',
+      ]);
+    }
   });
 
   it('never lets a requested company escape the caller accessibility fence', async () => {

@@ -120,6 +120,14 @@ describePostgres('classification search on PostgreSQL', () => {
       },
     });
     await db.ruleTag.create({ data: { ruleId: rule.id, tagId: tag.id } });
+    await db.ruleRevision.create({
+      data: {
+        ruleId: rule.id, companyId: current.id, revision: 2, state: 'enabled',
+        matchText: rule.matchText, category: account.name, categoryQboId: account.qboId,
+        taxCalculation: 'TaxExcluded', taxCode: taxCode.name, taxCodeQboId: taxCode.qboId,
+        tagIds: [tag.id], priority: 0, autoPost: false, originIntent: 'make_recurring',
+      },
+    });
     await db.rule.create({
       data: {
         companyId: current.id,
@@ -288,6 +296,18 @@ describePostgres('classification search on PostgreSQL', () => {
     }, { repository, semantic: null });
     expect(mismatchingContext.hits.map((candidate) => candidate.id))
       .not.toContain(`classification_case:${data.classificationCase.id}`);
+
+    for (const context of [
+      { transactionDirection: 'unknown' as const, jurisdiction: 'unknown' },
+      { transactionDirection: 'unknown' as const, jurisdiction: null },
+    ]) {
+      const requestUnknown = await searchClassificationMemory({
+        query: 'Ontario thirteen percent inventory', companyId: data.current.id,
+        scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [data.current.id], context,
+      }, { repository, semantic: null });
+      expect(requestUnknown.hits.map((candidate) => candidate.id))
+        .toContain(`classification_case:${data.classificationCase.id}`);
+    }
 
     const unknownData = await fixtures('unknown');
     for (const transactionDirection of ['in', 'out'] as const) {
@@ -693,8 +713,9 @@ describePostgres('classification search on PostgreSQL', () => {
       where: { id: data.current.id }, data: { taxSupportStatus: 'ready' },
     });
     await db.tag.delete({ where: { id: data.tag.id } });
-    const caseAfterTagDeletion = (await cards()).find((card) => card.id === ids[1]);
-    expect(caseAfterTagDeletion).toMatchObject({ action: null, executable: false, advisory: true });
+    for (const card of await cards()) {
+      expect(card).toMatchObject({ action: null, executable: false, advisory: true });
+    }
 
     const foreignAccount = await db.qboAccount.create({
       data: {
@@ -709,6 +730,11 @@ describePostgres('classification search on PostgreSQL', () => {
         taxCalculation: 'NotApplicable', revision: 1,
       },
     });
+    await db.ruleRevision.create({ data: {
+      ruleId: foreignRule.id, companyId: data.foreign.id, revision: 1, state: 'enabled',
+      matchText: foreignRule.matchText, category: foreignAccount.name, categoryQboId: null,
+      taxCalculation: 'NotApplicable', priority: 0, autoPost: false,
+    } });
     const foreign = await searchClassificationMemory({
       query: 'Foreign readiness needle', companyId: data.current.id, scope: 'accessible_companies',
       mode: 'exact', accessibleCompanyIds: [data.current.id, data.foreign.id],
@@ -716,7 +742,11 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(foreign.hits).toContainEqual(expect.objectContaining({
       id: `rule:${foreignRule.id}`, companyRelation: 'foreign', action: null,
       executable: false, advisory: true,
+      rationale: expect.stringContaining('Historical rule classification'),
     }));
+
+    await db.rule.update({ where: { id: data.rule.id }, data: { revision: 99 } });
+    await expect(repository.rehydrate([data.current.id], [`rule:${data.rule.id}`])).resolves.toEqual([]);
   });
 
   it('keeps deleted-account historical evidence readable but never executable', async () => {
@@ -790,6 +820,14 @@ describePostgres('classification search on PostgreSQL', () => {
     });
     await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: zuluTag.id } });
     await db.ruleTag.create({ data: { ruleId: data.rule.id, tagId: alphaTag.id } });
+    await db.ruleRevision.create({ data: {
+      ruleId: data.rule.id, companyId: data.current.id, revision: 3, state: 'enabled',
+      matchText: data.rule.matchText, category: data.account.name, categoryQboId: data.account.qboId,
+      taxCalculation: 'TaxExcluded', taxCode: data.taxCode.name, taxCodeQboId: data.taxCode.qboId,
+      tagIds: [data.tag.id, zuluTag.id, alphaTag.id], priority: 0, autoPost: false,
+      originIntent: 'make_recurring',
+    } });
+    await db.rule.update({ where: { id: data.rule.id }, data: { revision: 3 } });
     const observedAt = new Date('2026-08-31T00:00:00.000Z');
     const [alphaEvidenceId, zuluEvidenceId] = [randomUUID(), randomUUID()].sort();
     await db.autopilotRuleCandidateEvidence.create({
@@ -931,6 +969,7 @@ describePostgres('classification search on PostgreSQL', () => {
       'classification_corpus_candidate_evidence',
       'classification_corpus_candidate_evidence_update',
       'classification_corpus_tag',
+      'classification_corpus_tag_update',
       'classification_corpus_account',
       'classification_corpus_account_update',
       'classification_corpus_tax_code',
@@ -960,17 +999,26 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(scopedColumns.get('classification_corpus_vendor_merge_update')).toEqual(
       expect.arrayContaining(['companyId', 'sourceVendorIdentityId', 'targetVendorIdentityId']),
     );
-    expect(scopedColumns.get('classification_corpus_tag')).toEqual(
+    expect(scopedColumns.get('classification_corpus_company_nickname')).toEqual(
+      expect.arrayContaining(['nickname', 'taxSupportStatus']),
+    );
+    expect(scopedColumns.get('classification_corpus_tag_update')).toEqual(
       expect.arrayContaining(['companyId', 'name']),
     );
     expect(scopedColumns.get('classification_corpus_account_update')).toEqual(
-      expect.arrayContaining(['companyId', 'qboId', 'name', 'fullName']),
+      expect.arrayContaining(['companyId', 'qboId', 'name', 'fullName', 'active']),
     );
     expect(scopedColumns.get('classification_corpus_tax_code_update')).toEqual(
-      expect.arrayContaining(['companyId', 'qboId', 'name']),
+      expect.arrayContaining([
+        'companyId', 'qboId', 'name', 'active', 'taxable',
+        'purchaseTaxRateList', 'combinedPurchaseRate',
+      ]),
     );
     expect(scopedColumns.get('classification_corpus_transaction')).toEqual(
-      expect.arrayContaining(['companyId', 'payee', 'memo']),
+      expect.arrayContaining([
+        'companyId', 'qboType', 'date', 'payee', 'memo', 'amount', 'bankAccount',
+        'category', 'categoryQboId', 'taxCalculation', 'taxCode', 'taxCodeQboId',
+      ]),
     );
     for (const trigger of triggers.filter((row) => row.definition.includes(' UPDATE '))) {
       expect(trigger.definition, trigger.name).toContain('WHEN (');
@@ -1027,6 +1075,9 @@ describePostgres('classification search on PostgreSQL', () => {
     const before = await revisionStats();
 
     await db.company.update({ where: { id: data.current.id }, data: { nickname: data.current.nickname } });
+    await db.company.update({
+      where: { id: data.current.id }, data: { taxSupportStatus: 'ready' },
+    });
     await db.vendorIdentity.update({
       where: { id: identity.id }, data: { displayName: identity.displayName },
     });
@@ -1036,10 +1087,23 @@ describePostgres('classification search on PostgreSQL', () => {
     });
     await db.$executeRaw`UPDATE "AutopilotRuleCandidateEvidence" SET "pattern" = "pattern" WHERE "id" = ${evidence.id}`;
     await db.tag.update({ where: { id: tag.id }, data: { name: tag.name } });
-    await db.qboAccount.update({ where: { id: account.id }, data: { name: account.name } });
-    await db.qboTaxCode.update({ where: { id: taxCode.id }, data: { name: taxCode.name } });
+    await db.qboAccount.update({
+      where: { id: account.id }, data: { name: account.name, active: account.active },
+    });
+    await db.qboTaxCode.update({ where: { id: taxCode.id }, data: {
+      name: taxCode.name, active: taxCode.active, taxable: taxCode.taxable,
+      purchaseTaxRateList: taxCode.purchaseTaxRateList as never,
+      combinedPurchaseRate: taxCode.combinedPurchaseRate,
+    } });
     await db.transaction.update({
-      where: { id: data.transaction.id }, data: { payee: data.transaction.payee },
+      where: { id: data.transaction.id }, data: {
+        qboType: data.transaction.qboType, date: data.transaction.date,
+        payee: data.transaction.payee, memo: data.transaction.memo, amount: data.transaction.amount,
+        bankAccount: data.transaction.bankAccount, category: data.transaction.category,
+        categoryQboId: data.transaction.categoryQboId,
+        taxCalculation: data.transaction.taxCalculation, taxCode: data.transaction.taxCode,
+        taxCodeQboId: data.transaction.taxCodeQboId,
+      },
     });
     await db.ruleTag.update({
       where: { ruleId_tagId: { ruleId: data.rule.id, tagId: tag.id } },
@@ -1084,7 +1148,7 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(await revision(data.foreign.id)).toBeGreaterThan(beforeForeign);
   });
 
-  it('does not dirty the corpus for high-churn columns that cannot affect documents', async () => {
+  it('ignores unrelated high-churn fields but fences reference-readiness changes', async () => {
     const data = await fixtures();
     const latest = async () => (
       await db.classificationCorpusRevision.findFirstOrThrow({
@@ -1109,9 +1173,10 @@ describePostgres('classification search on PostgreSQL', () => {
       where: { companyId: data.current.id },
     });
     await db.qboAccount.update({ where: { id: account.id }, data: { active: false } });
-    expect(await latest()).toBe(afterPayee);
+    const afterActive = await latest();
+    expect(afterActive).toBeGreaterThan(afterPayee);
     await db.qboAccount.update({ where: { id: account.id }, data: { name: 'Renamed corpus account' } });
-    expect(await latest()).toBeGreaterThan(afterPayee);
+    expect(await latest()).toBeGreaterThan(afterActive);
   });
 
   it('bounds oversized candidate evidence without dropping the lexical hit', async () => {

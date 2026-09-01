@@ -74,8 +74,11 @@ END;
 $$;
 
 CREATE TRIGGER classification_corpus_company_nickname
-AFTER UPDATE OF "nickname" ON "Company"
-FOR EACH ROW WHEN (OLD."nickname" IS DISTINCT FROM NEW."nickname")
+AFTER UPDATE OF "nickname", "taxSupportStatus" ON "Company"
+FOR EACH ROW WHEN (
+  OLD."nickname" IS DISTINCT FROM NEW."nickname"
+  OR OLD."taxSupportStatus" IS DISTINCT FROM NEW."taxSupportStatus"
+)
 EXECUTE FUNCTION classification_corpus_append_company_nickname();
 
 -- Direct documents plus every joined source whose value or eligibility can
@@ -171,6 +174,9 @@ FOR EACH ROW WHEN (
   ROW(NEW."id", NEW."companyId", NEW."candidateId", NEW."transactionId", NEW."pattern", NEW."active", NEW."observedAt")
 ) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tag
+AFTER INSERT OR DELETE ON "Tag"
+FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
+CREATE TRIGGER classification_corpus_tag_update
 AFTER UPDATE OF "companyId", "name" ON "Tag"
 FOR EACH ROW WHEN (
   OLD."companyId" IS DISTINCT FROM NEW."companyId"
@@ -180,29 +186,43 @@ CREATE TRIGGER classification_corpus_account
 AFTER INSERT OR DELETE ON "QboAccount"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_account_update
-AFTER UPDATE OF "companyId", "qboId", "name", "fullName" ON "QboAccount"
+AFTER UPDATE OF "companyId", "qboId", "name", "fullName", "active" ON "QboAccount"
 FOR EACH ROW WHEN (
   OLD."companyId" IS DISTINCT FROM NEW."companyId"
   OR OLD."qboId" IS DISTINCT FROM NEW."qboId"
   OR OLD."name" IS DISTINCT FROM NEW."name"
   OR OLD."fullName" IS DISTINCT FROM NEW."fullName"
+  OR OLD."active" IS DISTINCT FROM NEW."active"
 ) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tax_code
 AFTER INSERT OR DELETE ON "QboTaxCode"
 FOR EACH ROW EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_tax_code_update
-AFTER UPDATE OF "companyId", "qboId", "name" ON "QboTaxCode"
+AFTER UPDATE OF "companyId", "qboId", "name", "active", "taxable", "purchaseTaxRateList", "combinedPurchaseRate" ON "QboTaxCode"
 FOR EACH ROW WHEN (
   OLD."companyId" IS DISTINCT FROM NEW."companyId"
   OR OLD."qboId" IS DISTINCT FROM NEW."qboId"
   OR OLD."name" IS DISTINCT FROM NEW."name"
+  OR OLD."active" IS DISTINCT FROM NEW."active"
+  OR OLD."taxable" IS DISTINCT FROM NEW."taxable"
+  OR OLD."purchaseTaxRateList" IS DISTINCT FROM NEW."purchaseTaxRateList"
+  OR OLD."combinedPurchaseRate" IS DISTINCT FROM NEW."combinedPurchaseRate"
 ) EXECUTE FUNCTION classification_corpus_append_company_id();
 CREATE TRIGGER classification_corpus_transaction
-AFTER UPDATE OF "companyId", "payee", "memo" ON "Transaction"
+AFTER UPDATE OF "companyId", "qboType", "date", "payee", "memo", "amount", "bankAccount", "category", "categoryQboId", "taxCalculation", "taxCode", "taxCodeQboId" ON "Transaction"
 FOR EACH ROW WHEN (
   OLD."companyId" IS DISTINCT FROM NEW."companyId"
+  OR OLD."qboType" IS DISTINCT FROM NEW."qboType"
+  OR OLD."date" IS DISTINCT FROM NEW."date"
   OR OLD."payee" IS DISTINCT FROM NEW."payee"
   OR OLD."memo" IS DISTINCT FROM NEW."memo"
+  OR OLD."amount" IS DISTINCT FROM NEW."amount"
+  OR OLD."bankAccount" IS DISTINCT FROM NEW."bankAccount"
+  OR OLD."category" IS DISTINCT FROM NEW."category"
+  OR OLD."categoryQboId" IS DISTINCT FROM NEW."categoryQboId"
+  OR OLD."taxCalculation" IS DISTINCT FROM NEW."taxCalculation"
+  OR OLD."taxCode" IS DISTINCT FROM NEW."taxCode"
+  OR OLD."taxCodeQboId" IS DISTINCT FROM NEW."taxCodeQboId"
 ) EXECUTE FUNCTION classification_corpus_append_company_id();
 
 -- RuleTag has no companyId column. Resolve the owning rule; a cascade after

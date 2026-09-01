@@ -419,11 +419,12 @@ export const classificationSearchHitSchema = z.object({
     value.companyRelation === 'foreign'
     && ['classification_case', 'rule', 'rule_candidate'].includes(value.kind)
     && value.actionSummary === null
+    && value.rationale === null
   ) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['actionSummary'],
-      message: 'Foreign classification knowledge must retain a redacted action summary.',
+      message: 'Foreign classification knowledge must retain a redacted action summary or historical rationale.',
     });
   }
   if (

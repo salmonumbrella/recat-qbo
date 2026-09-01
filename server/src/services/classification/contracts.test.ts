@@ -149,6 +149,18 @@ describe('classification public contracts', () => {
     });
     expect(advisory.success).toBe(true);
 
+    expect(classificationSearchHitSchema.safeParse({
+      ...hit,
+      companyId: 'company-b',
+      companyRelation: 'foreign',
+      executable: false,
+      advisory: true,
+      action: null,
+      actionSummary: null,
+      rationale: 'Historical rule classification: category retained; tax treatment unavailable.',
+      conflicts: [],
+    }).success).toBe(true);
+
     expect(classificationSearchResultSchema.safeParse({
       query: 'synthetic',
       companyId: 'company-a',
