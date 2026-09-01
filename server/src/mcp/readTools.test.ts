@@ -474,6 +474,45 @@ describe('Recat MCP read tools', () => {
     expect(operations.listCompanies).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts the attachment-retention field returned by company reads', async () => {
+    const operations = reads();
+    vi.mocked(operations.listCompanies).mockResolvedValueOnce({
+      items: [{
+        id: 'company-a',
+        realmId: 'realm-a',
+        legalName: 'Delicious Milk Corporation',
+        nickname: 'Delicious Milk',
+        env: 'production',
+        syncMode: 'polling',
+        pollIntervalMin: 10,
+        holdingAccountIds: ['holding-a'],
+        dryRun: false,
+        tagsRequired: false,
+        retainAttachmentFiles: true,
+        connectedAt: '2026-01-01T00:00:00.000Z',
+        disconnectedAt: null,
+        lastSyncedAt: '2026-08-29T00:00:00.000Z',
+        role: 'admin',
+      }],
+      nextCursor: null,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'list_companies',
+      arguments: { limit: 1 },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.items[0]).toMatchObject({
+      id: 'company-a',
+      retainAttachmentFiles: true,
+    });
+  });
+
   it.each([
     [{ startDate: '2025-02-29' }, 'real date'],
     [{ endDate: '2026-02-30' }, 'real date'],

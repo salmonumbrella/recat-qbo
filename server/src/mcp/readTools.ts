@@ -331,6 +331,7 @@ const company = z.strictObject({
   holdingAccountIds: z.array(text).max(MAX_READ_LIMIT),
   dryRun: z.boolean(),
   tagsRequired: z.boolean(),
+  retainAttachmentFiles: z.boolean(),
   connectedAt: isoDate,
   disconnectedAt: nullableIsoDate,
   lastSyncedAt: nullableIsoDate,
