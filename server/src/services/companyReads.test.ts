@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -881,6 +882,45 @@ describe('company read services', () => {
     await expect(
       service.listTransactions('user-2', COMPANY_ID, { limit: 1, status: 'PENDING', cursor }),
     ).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
+  });
+
+  it('rejects textually noncanonical base64url cursor payloads and signatures', async () => {
+    const db = makeDb();
+    db.transaction.findMany.mockResolvedValue([
+      transaction({ id: 'txn-1', date: new Date('2026-01-02T00:00:00.000Z') }),
+      transaction({ id: 'txn-2', date: new Date('2026-01-01T00:00:00.000Z') }),
+    ]);
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET);
+    const first = await service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+    });
+    const [body, signature] = first.nextCursor!.split('.') as [string, string];
+
+    const decodedSignature = Buffer.from(signature, 'base64url');
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const alternateSignature = [...alphabet]
+      .map((last) => `${signature.slice(0, -1)}${last}`)
+      .find((candidate) => candidate !== signature
+        && Buffer.from(candidate, 'base64url').equals(decodedSignature));
+    expect(alternateSignature).toEqual(expect.any(String));
+
+    const paddedBody = `${body}=`;
+    expect(Buffer.from(paddedBody, 'base64url')).toEqual(Buffer.from(body, 'base64url'));
+    const resignedPaddedBody = createHmac('sha256', SECRET)
+      .update(paddedBody, 'utf8')
+      .digest('base64url');
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+      cursor: `${body}.${alternateSignature}`,
+    })).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
+    await expect(service.listTransactions(USER_ID, COMPANY_ID, {
+      limit: 1,
+      status: 'PENDING',
+      cursor: `${paddedBody}.${resignedPaddedBody}`,
+    })).rejects.toMatchObject({ status: 400, code: 'INVALID_CURSOR' });
   });
 
   it('strictly bounds transaction strings and calendar dates', async () => {

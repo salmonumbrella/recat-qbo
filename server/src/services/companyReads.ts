@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import type {
   ClassificationCase,
   ClassificationSearchHit,
@@ -28,7 +28,11 @@ import { env } from '../env.js';
 import { HttpError } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { suggestForMany as defaultSuggestForMany } from './suggestions.js';
-import { getTaxReadiness as defaultGetTaxReadiness } from './tax/reference.js';
+import {
+  getTaxReadiness as defaultGetTaxReadiness,
+  getTaxReadinessInTransaction as defaultGetTaxReadinessInTransaction,
+  type TaxReadinessQueryDb,
+} from './tax/reference.js';
 import { transferCandidates as defaultTransferCandidates } from './transferCandidates.js';
 import {
   parseClassificationCase,
@@ -82,6 +86,11 @@ export interface CompanyReadDb {
   autopilotRuleCandidate?: { findMany: DbMethod; findFirst: DbMethod };
   autopilotRuleCandidateEvidence?: { findMany: DbMethod };
   classificationCase?: { findFirst: DbMethod };
+  $queryRaw<T = unknown>(query: Prisma.Sql): Promise<T>;
+  $transaction<T>(
+    callback: (tx: CompanyReadDb) => Promise<T>,
+    options?: { isolationLevel: 'RepeatableRead' },
+  ): Promise<T>;
 }
 
 export interface PageInput {
@@ -347,11 +356,18 @@ function decodeCursor(
   let payload: CursorPayload;
   try {
     actual = Buffer.from(signature, 'base64url');
+    const decodedBody = Buffer.from(body, 'base64url');
+    if (
+      actual.toString('base64url') !== signature
+      || decodedBody.toString('base64url') !== body
+    ) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
     const expectedMac = cursorMac(secret, body);
     if (actual.length !== expectedMac.length || !timingSafeEqual(actual, expectedMac)) {
       badRequest('Invalid cursor', 'INVALID_CURSOR');
     }
-    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as CursorPayload;
+    payload = JSON.parse(decodedBody.toString('utf8')) as CursorPayload;
   } catch (error) {
     if (error instanceof HttpError) throw error;
     badRequest('Invalid cursor', 'INVALID_CURSOR');
@@ -777,6 +793,140 @@ function ruleReferenceReasons(
   });
 }
 
+function ruleDetailDto(
+  rule: Row,
+  revisionRow: Row,
+  activeAccounts: ReadonlySet<string>,
+  existingTags: ReadonlySet<string>,
+  readiness: TaxReadinessDto | null,
+): CompanyRuleReadDto {
+  const rawCalculation = revisionRow.taxCalculation;
+  const rawCategoryQboId = typeof revisionRow.categoryQboId === 'string'
+    ? revisionRow.categoryQboId
+    : null;
+  const rawTaxCodeQboId = typeof revisionRow.taxCodeQboId === 'string'
+    ? revisionRow.taxCodeQboId
+    : null;
+  const parsedTagIds = parseActionTagIds(revisionRow.tagIds);
+  const tagIds = parsedTagIds ?? [];
+  const structurallyValidAction = parsedTagIds !== null && rawCategoryQboId !== null
+    && (rawCalculation === 'TaxInclusive'
+      || rawCalculation === 'TaxExcluded'
+      || rawCalculation === 'NotApplicable')
+    && ((rawCalculation === 'NotApplicable') === (rawTaxCodeQboId === null));
+  const parsedRevision = parseRuleRevision({
+    id: String(revisionRow.id),
+    ruleId: String(revisionRow.ruleId),
+    companyId: String(revisionRow.companyId),
+    revision: Number(revisionRow.revision),
+    state: revisionRow.state,
+    condition: { matchField: 'payee', matchText: revisionRow.matchText },
+    action: structurallyValidAction ? {
+      categoryQboId: rawCategoryQboId,
+      taxCalculation: rawCalculation,
+      taxCodeQboId: rawTaxCodeQboId,
+      tagIds,
+    } : {
+      // Legacy rows predate executable QBO references. This placeholder is
+      // used only to validate immutable non-action fields and is removed from
+      // the returned historical representation below.
+      categoryQboId: 'legacy-invalid-action',
+      taxCalculation: 'NotApplicable',
+      taxCodeQboId: null,
+      tagIds: [],
+    },
+    categoryName: revisionRow.category,
+    taxCodeName: revisionRow.taxCode ?? null,
+    priority: Number(revisionRow.priority),
+    autoPost: revisionRow.autoPost === true,
+    originIntent: revisionRow.originIntent ?? null,
+    sourceCaseId: revisionRow.sourceCaseId ?? null,
+    sourceCandidateId: revisionRow.sourceCandidateId ?? null,
+    changedBy: revisionRow.changedBy ?? null,
+    createdAt: iso(revisionRow.createdAt),
+    retiredAt: nullableIso(revisionRow.retiredAt),
+  });
+  const invalidReasons = ruleReferenceReasons({
+    categoryQboId: rawCategoryQboId,
+    taxCalculation: rawCalculation,
+    taxCodeQboId: rawTaxCodeQboId,
+    tagIds,
+  }, activeAccounts, existingTags, readiness);
+  if (parsedTagIds === null) invalidReasons.unshift('Action tag IDs are invalid.');
+  invalidReasons.splice(4);
+  const valid = structurallyValidAction && invalidReasons.length === 0;
+  const revision: CompanyRuleRevisionReadDto = {
+    ...parsedRevision,
+    action: valid ? parsedRevision.action : null,
+    valid,
+    invalidReasons,
+  };
+  const active = rule.enabled === true
+    && rule.retiredAt == null
+    && revision.state === 'enabled'
+    && revision.retiredAt === null;
+  const reviewRequiredAt = nullableIso(rule.reviewRequiredAt);
+  return {
+    active,
+    executable: active && reviewRequiredAt === null && revision.valid,
+    reviewRequiredAt,
+    reviewReason: typeof rule.reviewReason === 'string' ? rule.reviewReason : null,
+    revision,
+  };
+}
+
+function lifecyclePredicate(state: RuleLifecycleFilter): Prisma.Sql {
+  if (state === 'enabled') {
+    return Prisma.sql`r."enabled" = true AND r."retiredAt" IS NULL`;
+  }
+  if (state === 'disabled') {
+    return Prisma.sql`r."enabled" = false AND r."retiredAt" IS NULL`;
+  }
+  if (state === 'retired') return Prisma.sql`r."retiredAt" IS NOT NULL`;
+  return Prisma.sql`true`;
+}
+
+async function ruleLifecycleFingerprint(
+  db: CompanyReadDb,
+  companyId: string,
+  state: RuleLifecycleFilter,
+): Promise<string> {
+  const rows = await db.$queryRaw<Array<{ fingerprint: string }>>(Prisma.sql`
+    SELECT encode(
+      sha256(convert_to(
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_array(
+              r."id",
+              r."revision",
+              r."enabled",
+              CASE WHEN r."retiredAt" IS NULL THEN NULL
+                ELSE to_char(r."retiredAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END,
+              r."priority",
+              to_char(r."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+              CASE WHEN r."reviewRequiredAt" IS NULL THEN NULL
+                ELSE to_char(r."reviewRequiredAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END,
+              r."reviewReason"
+            )
+            ORDER BY r."priority" ASC, r."createdAt" DESC, r."id" ASC
+          ),
+          '[]'::jsonb
+        )::text,
+        'UTF8'
+      )),
+      'hex'
+    ) AS "fingerprint"
+      FROM "Rule" r
+     WHERE r."companyId" = ${companyId}
+       AND ${lifecyclePredicate(state)}
+  `);
+  const fingerprint = rows[0]?.fingerprint;
+  if (typeof fingerprint !== 'string') {
+    throw new HttpError(503, 'Rule lifecycle is unavailable', 'COMPANY_UNAVAILABLE');
+  }
+  return fingerprint;
+}
+
 export function boundedTaxReadiness(
   readiness: TaxReadinessDto,
   limit = MAX_READ_LIMIT,
@@ -1064,52 +1214,11 @@ export function createCompanyReadService(
     if (revisionRow === null) {
       throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
     }
-    const rawCalculation = revisionRow.taxCalculation;
     const rawCategoryQboId = typeof revisionRow.categoryQboId === 'string'
       ? revisionRow.categoryQboId
       : null;
-    const rawTaxCodeQboId = typeof revisionRow.taxCodeQboId === 'string'
-      ? revisionRow.taxCodeQboId
-      : null;
     const parsedTagIds = parseActionTagIds(revisionRow.tagIds);
     const tagIds = parsedTagIds ?? [];
-    const structurallyValidAction = parsedTagIds !== null && rawCategoryQboId !== null
-      && (rawCalculation === 'TaxInclusive'
-        || rawCalculation === 'TaxExcluded'
-        || rawCalculation === 'NotApplicable')
-      && ((rawCalculation === 'NotApplicable') === (rawTaxCodeQboId === null));
-    const parsedRevision = parseRuleRevision({
-      id: String(revisionRow.id),
-      ruleId: String(revisionRow.ruleId),
-      companyId: String(revisionRow.companyId),
-      revision: Number(revisionRow.revision),
-      state: revisionRow.state,
-      condition: { matchField: 'payee', matchText: revisionRow.matchText },
-      action: structurallyValidAction ? {
-        categoryQboId: rawCategoryQboId,
-        taxCalculation: rawCalculation,
-        taxCodeQboId: rawTaxCodeQboId,
-        tagIds,
-      } : {
-        // Legacy rows predate executable QBO references. This placeholder is
-        // used only to validate the immutable non-action revision fields and
-        // is removed from the returned historical representation below.
-        categoryQboId: 'legacy-invalid-action',
-        taxCalculation: 'NotApplicable',
-        taxCodeQboId: null,
-        tagIds: [],
-      },
-      categoryName: revisionRow.category,
-      taxCodeName: revisionRow.taxCode ?? null,
-      priority: Number(revisionRow.priority),
-      autoPost: revisionRow.autoPost === true,
-      originIntent: revisionRow.originIntent ?? null,
-      sourceCaseId: revisionRow.sourceCaseId ?? null,
-      sourceCandidateId: revisionRow.sourceCandidateId ?? null,
-      changedBy: revisionRow.changedBy ?? null,
-      createdAt: iso(revisionRow.createdAt),
-      retiredAt: nullableIso(revisionRow.retiredAt),
-    });
     const [accounts, tags, readiness] = await Promise.all([
       rawCategoryQboId === null
         ? Promise.resolve([])
@@ -1123,7 +1232,7 @@ export function createCompanyReadService(
             where: { companyId, id: { in: tagIds } },
             select: { id: true },
           }) as Promise<Row[]>,
-      rawCalculation === 'TaxInclusive' || rawCalculation === 'TaxExcluded'
+      revisionRow.taxCalculation === 'TaxInclusive' || revisionRow.taxCalculation === 'TaxExcluded'
         ? deps.getTaxReadiness(companyId)
         : Promise.resolve(null),
     ]);
@@ -1131,33 +1240,7 @@ export function createCompanyReadService(
       accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
     );
     const existingTags = new Set(tags.map((tag) => String(tag.id)));
-    const invalidReasons = ruleReferenceReasons({
-      categoryQboId: rawCategoryQboId,
-      taxCalculation: rawCalculation,
-      taxCodeQboId: rawTaxCodeQboId,
-      tagIds,
-    }, activeAccounts, existingTags, readiness);
-    if (parsedTagIds === null) invalidReasons.unshift('Action tag IDs are invalid.');
-    invalidReasons.splice(4);
-    const valid = structurallyValidAction && invalidReasons.length === 0;
-    const revision: CompanyRuleRevisionReadDto = {
-      ...parsedRevision,
-      action: valid ? parsedRevision.action : null,
-      valid,
-      invalidReasons,
-    };
-    const active = rule.enabled === true
-      && rule.retiredAt == null
-      && revision.state === 'enabled'
-      && revision.retiredAt === null;
-    const reviewRequiredAt = nullableIso(rule.reviewRequiredAt);
-    return {
-      active,
-      executable: active && reviewRequiredAt === null && revision.valid,
-      reviewRequiredAt,
-      reviewReason: typeof rule.reviewReason === 'string' ? rule.reviewReason : null,
-      revision,
-    };
+    return ruleDetailDto(rule, revisionRow, activeAccounts, existingTags, readiness);
   }
 
   async function getRuleForUser(
@@ -1225,6 +1308,79 @@ export function createCompanyReadService(
     };
   }
 
+  async function hydrateRuleDetails(
+    tx: CompanyReadDb,
+    companyId: string,
+    ruleRows: Row[],
+  ): Promise<CompanyRuleReadDto[]> {
+    if (ruleRows.length === 0) return [];
+    if (tx.ruleRevision?.findMany === undefined) {
+      throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+    }
+    const revisionRows = await tx.ruleRevision.findMany({
+      where: {
+        companyId,
+        OR: ruleRows.map((rule) => ({
+          ruleId: String(rule.id),
+          revision: Number(rule.revision),
+        })),
+      },
+    }) as Row[];
+    const revisionsByRule = new Map(revisionRows.map((revision) => [
+      `${String(revision.ruleId)}:${Number(revision.revision)}`,
+      revision,
+    ]));
+    const orderedRevisions = ruleRows.map((rule) => {
+      const revision = revisionsByRule.get(`${String(rule.id)}:${Number(rule.revision)}`);
+      if (revision === undefined) {
+        throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+      }
+      return revision;
+    });
+    const categoryQboIds = [...new Set(orderedRevisions.flatMap((revision) => (
+      typeof revision.categoryQboId === 'string' ? [revision.categoryQboId] : []
+    )))];
+    const tagIds = [...new Set(orderedRevisions.flatMap((revision) => (
+      parseActionTagIds(revision.tagIds) ?? []
+    )))];
+    const requiresTaxReadiness = orderedRevisions.some((revision) => (
+      revision.taxCalculation === 'TaxInclusive' || revision.taxCalculation === 'TaxExcluded'
+    ));
+    const [accounts, tags, readiness] = await Promise.all([
+      categoryQboIds.length === 0
+        ? Promise.resolve([])
+        : tx.qboAccount.findMany({
+            where: { companyId, qboId: { in: categoryQboIds } },
+            select: { qboId: true, active: true },
+          }) as Promise<Row[]>,
+      tagIds.length === 0
+        ? Promise.resolve([])
+        : tx.tag.findMany({
+            where: { companyId, id: { in: tagIds } },
+            select: { id: true },
+          }) as Promise<Row[]>,
+      requiresTaxReadiness
+        ? (depsIn.getTaxReadiness === undefined
+            ? defaultGetTaxReadinessInTransaction(
+                companyId,
+                tx as unknown as TaxReadinessQueryDb,
+              )
+            : depsIn.getTaxReadiness(companyId))
+        : Promise.resolve(null),
+    ]);
+    const activeAccounts = new Set(
+      accounts.filter((account) => account.active === true).map((account) => String(account.qboId)),
+    );
+    const existingTags = new Set(tags.map((tag) => String(tag.id)));
+    return ruleRows.map((rule, index) => ruleDetailDto(
+      rule,
+      orderedRevisions[index]!,
+      activeAccounts,
+      existingTags,
+      readiness,
+    ));
+  }
+
   async function listRuleLifecycleForUser(
     userId: string,
     companyId: string,
@@ -1261,68 +1417,44 @@ export function createCompanyReadService(
         : state === 'retired'
           ? { retiredAt: { not: null } }
           : {};
-    const currentFingerprint = async () => {
-      const population = await db.rule.findMany({
-        where: { companyId, ...lifecycleWhere },
+    return db.$transaction(async (tx) => {
+      const fingerprint = await ruleLifecycleFingerprint(tx, companyId, state);
+      if (position && cursorFingerprint !== fingerprint) {
+        badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
+      }
+      const cursorWhere = position
+        ? {
+            OR: [
+              { priority: { gt: cursorPriority } },
+              { priority: cursorPriority, createdAt: { lt: new Date(cursorCreatedAt as string) } },
+              { priority: cursorPriority, createdAt: new Date(cursorCreatedAt as string), id: { gt: cursorId } },
+            ],
+          }
+        : {};
+      const rows = await tx.rule.findMany({
+        where: { companyId, ...lifecycleWhere, ...cursorWhere },
         orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+        take: limit + 1,
         select: {
-          id: true, revision: true, enabled: true, retiredAt: true,
+          id: true, companyId: true, revision: true, enabled: true, retiredAt: true,
           priority: true, createdAt: true, reviewRequiredAt: true, reviewReason: true,
         },
       }) as Row[];
-      const canonicalPopulation = population.map((row) => ({
-        id: String(row.id),
-        revision: Number(row.revision),
-        enabled: row.enabled === true,
-        retiredAt: nullableIso(row.retiredAt),
-        priority: Number(row.priority),
-        createdAt: iso(row.createdAt),
-        reviewRequiredAt: nullableIso(row.reviewRequiredAt),
-        reviewReason: typeof row.reviewReason === 'string' ? row.reviewReason : null,
+      const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
+        v: 1,
+        ...expected,
+        position: {
+          priority: Number(row.priority),
+          createdAt: iso(row.createdAt),
+          id: String(row.id),
+          fingerprint,
+        },
       }));
-      return createHmac('sha256', cursorSecret)
-        .update(canonicalFilter(canonicalPopulation), 'utf8')
-        .digest('hex');
-    };
-    const fingerprint = await currentFingerprint();
-    if (position && cursorFingerprint !== fingerprint) {
-      badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
-    }
-    const cursorWhere = position
-      ? {
-          OR: [
-            { priority: { gt: cursorPriority } },
-            { priority: cursorPriority, createdAt: { lt: new Date(cursorCreatedAt as string) } },
-            { priority: cursorPriority, createdAt: new Date(cursorCreatedAt as string), id: { gt: cursorId } },
-          ],
-        }
-      : {};
-    const rows = await db.rule.findMany({
-      where: { companyId, ...lifecycleWhere, ...cursorWhere },
-      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
-      take: limit + 1,
-      select: { id: true, priority: true, createdAt: true },
-    }) as Row[];
-    const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
-      v: 1,
-      ...expected,
-      position: {
-        priority: Number(row.priority),
-        createdAt: iso(row.createdAt),
-        id: String(row.id),
-        fingerprint,
-      },
-    }));
-    const items = await Promise.all(
-      page.rows.map((row) => getRuleForCompany(companyId, String(row.id))),
-    );
-    if (await currentFingerprint() !== fingerprint) {
-      badRequest('Rule lifecycle changed; restart pagination', 'INVALID_CURSOR');
-    }
-    return {
-      items,
-      nextCursor: page.nextCursor,
-    };
+      return {
+        items: await hydrateRuleDetails(tx, companyId, page.rows),
+        nextCursor: page.nextCursor,
+      };
+    }, { isolationLevel: 'RepeatableRead' });
   }
 
   function candidateState(value: unknown): RuleCandidateReadDto['state'] {

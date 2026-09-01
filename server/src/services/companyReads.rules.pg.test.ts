@@ -35,6 +35,7 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     userId: string,
     accountQboId: string,
     input: {
+      id?: string;
       matchText: string;
       priority: number;
       state: 'enabled' | 'disabled' | 'retired';
@@ -44,6 +45,7 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     const retiredAt = input.state === 'retired' ? new Date('2026-08-30T03:00:00.000Z') : null;
     const rule = await db.rule.create({
       data: {
+        ...(input.id === undefined ? {} : { id: input.id }),
         companyId,
         matchText: input.matchText,
         category: 'Meals',
@@ -233,5 +235,199 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
     await expect(listLifecycle(service, user.id, company.id, {
       state: 'disabled', limit: 1, cursor,
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
+  it('uses the rule ID as the deterministic final tie-break for equal creation times', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `tie-${suffix}`, legalName: 'Tie Legal', nickname: 'Tie',
+    } });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `tie-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: company.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: company.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    const createdAt = new Date('2026-08-30T03:00:00.000Z');
+    await seedRule(company.id, user.id, 'account-meals', {
+      id: `rule-b-${suffix}`, matchText: 'B vendor', priority: 0, state: 'disabled', createdAt,
+    });
+    await seedRule(company.id, user.id, 'account-meals', {
+      id: `rule-a-${suffix}`, matchText: 'A vendor', priority: 0, state: 'disabled', createdAt,
+    });
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-tie-cursor-secret',
+    );
+
+    const first = await listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1,
+    });
+    const second = await listLifecycle(service, user.id, company.id, {
+      state: 'disabled', limit: 1, cursor: first.nextCursor ?? undefined,
+    });
+
+    expect(first.items[0]?.revision.ruleId).toBe(`rule-a-${suffix}`);
+    expect(second.items[0]?.revision.ruleId).toBe(`rule-b-${suffix}`);
+  });
+
+  it('invalidates pagination for isolated lifecycle and review drift', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `drift-${suffix}`, legalName: 'Drift Legal', nickname: 'Drift',
+    } });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `drift-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: company.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: company.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    const firstRule = await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'First', priority: 0, state: 'enabled',
+    });
+    const laterRule = await seedRule(company.id, user.id, 'account-meals', {
+      matchText: 'Later', priority: 1, state: 'enabled',
+    });
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'rule-lifecycle-drift-cursor-secret',
+    );
+
+    const lifecyclePage = await listLifecycle(service, user.id, company.id, {
+      state: 'all', limit: 1,
+    });
+    expect(lifecyclePage.items[0]?.revision.ruleId).toBe(firstRule.id);
+    await db.rule.update({ where: { id: laterRule.id }, data: { enabled: false } });
+    await expect(listLifecycle(service, user.id, company.id, {
+      state: 'all', limit: 1, cursor: lifecyclePage.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+
+    await db.rule.update({ where: { id: laterRule.id }, data: { enabled: true } });
+    const reviewPage = await listLifecycle(service, user.id, company.id, {
+      state: 'all', limit: 1,
+    });
+    await db.rule.update({ where: { id: laterRule.id }, data: {
+      reviewRequiredAt: new Date('2026-08-31T04:00:00.000Z'),
+      reviewReason: 'Reference changed.',
+    } });
+    await expect(listLifecycle(service, user.id, company.id, {
+      state: 'all', limit: 1, cursor: reviewPage.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+  });
+
+  it('keeps lifecycle reads bounded and set-based across thousands of rules', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({ data: {
+      realmId: `bounded-${suffix}`, legalName: 'Bounded Legal', nickname: 'Bounded',
+    } });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `bounded-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: {
+      userId: user.id, companyId: company.id, role: 'categorizer',
+    } });
+    await db.qboAccount.create({ data: {
+      companyId: company.id, qboId: 'account-meals', name: 'Meals',
+      fullName: 'Expenses · Meals', classification: 'Expense',
+    } });
+    const createdAt = new Date('2026-08-30T03:00:00.000Z');
+    const rules = Array.from({ length: 2_000 }, (_, index) => ({
+      id: `bounded-${suffix}-${String(index).padStart(4, '0')}`,
+      companyId: company.id,
+      matchText: `Vendor ${index}`,
+      category: 'Meals',
+      categoryQboId: 'account-meals',
+      taxCalculation: 'NotApplicable',
+      enabled: false,
+      revision: 1,
+      priority: index,
+      originIntent: 'make_recurring',
+      createdAt,
+    }));
+    const revisions = rules.map((rule) => ({
+      id: `revision-${rule.id}`,
+      companyId: company.id,
+      ruleId: rule.id,
+      revision: 1,
+      state: 'disabled',
+      matchText: rule.matchText,
+      category: 'Meals',
+      categoryQboId: 'account-meals',
+      taxCalculation: 'NotApplicable',
+      priority: rule.priority,
+      autoPost: false,
+      originIntent: 'make_recurring',
+      changedBy: user.id,
+      createdAt,
+    }));
+    await db.rule.createMany({ data: rules.slice(0, 1) });
+    await db.ruleRevision.createMany({ data: revisions.slice(0, 1) });
+
+    const measuredDb = new PrismaClient({
+      datasources: { db: { url: TEST_DATABASE_URL! } },
+      log: [{ emit: 'event', level: 'query' }],
+    });
+    let countQueries = false;
+    let queryCount = 0;
+    measuredDb.$on('query', () => { if (countQueries) queryCount += 1; });
+    const service = createCompanyReadService(
+      measuredDb as unknown as CompanyReadDb,
+      'rule-lifecycle-bounded-cursor-secret',
+    );
+    try {
+      countQueries = true;
+      const smallPopulation = await listLifecycle(service, user.id, company.id, {
+        state: 'disabled', limit: 1,
+      });
+      countQueries = false;
+      const smallPopulationQueryCount = queryCount;
+      queryCount = 0;
+
+      await db.rule.createMany({ data: rules.slice(1) });
+      await db.ruleRevision.createMany({ data: revisions.slice(1) });
+
+      countQueries = true;
+      const one = await listLifecycle(service, user.id, company.id, {
+        state: 'disabled', limit: 1,
+      });
+      countQueries = false;
+      const oneQueryCount = queryCount;
+      queryCount = 0;
+
+      countQueries = true;
+      const hundred = await listLifecycle(service, user.id, company.id, {
+        state: 'disabled', limit: 100,
+      });
+      countQueries = false;
+      const hundredQueryCount = queryCount;
+
+      expect(smallPopulation.items).toHaveLength(1);
+      expect(one.items).toHaveLength(1);
+      expect(hundred.items).toHaveLength(100);
+      expect(JSON.stringify(hundred).length).toBeLessThan(250_000);
+      expect(oneQueryCount).toBe(smallPopulationQueryCount);
+      expect(hundredQueryCount).toBe(oneQueryCount);
+      expect(hundredQueryCount).toBe(10);
+
+      const cursor = one.nextCursor ?? '';
+      await db.rule.update({
+        where: { id: rules.at(-1)!.id },
+        data: { reviewRequiredAt: new Date('2026-08-31T05:00:00.000Z') },
+      });
+      await expect(listLifecycle(service, user.id, company.id, {
+        state: 'disabled', limit: 1, cursor,
+      })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+    } finally {
+      countQueries = false;
+      await measuredDb.$disconnect();
+    }
   });
 });

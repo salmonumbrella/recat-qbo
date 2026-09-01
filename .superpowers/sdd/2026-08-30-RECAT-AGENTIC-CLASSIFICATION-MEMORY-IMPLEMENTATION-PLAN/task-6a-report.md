@@ -6,8 +6,8 @@ last_edited: 2026-08-31
 
 ## Status
 
-Complete locally on top of Task 6 fix-round-2 commit
-`149749d9be571d2dcd276aa8ba533f5511b3fedf`. Browser rule operations now use
+Complete locally through independent review fix round 3, on top of integrated
+commit `7bacea3`. Browser rule operations now use
 the same immutable, company-scoped, two-phase lifecycle as MCP with a real
 session principal. Classification and canonical rule reads are available to
 the browser without adding a policy store, fake MCP token, or one-call write.
@@ -502,6 +502,123 @@ No schema or migration changed. The already-deployed append-only
 rule/revision state is sufficient to derive the signed population fingerprint;
 no second policy store or new mutable epoch row was introduced.
 
+## Independent review fix round 3
+
+### Bounded lifecycle fingerprint and set-based detail hydration
+
+Production break named: the lifecycle collection loaded the complete matching
+rule population into application memory twice, then called canonical rule
+detail separately for every returned item. A 100-item page performed roughly
+300–400 queries and population memory grew without a bound.
+
+RED:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm run test:pg -w server -- --run \
+  src/services/companyReads.rules.pg.test.ts \
+  -t "keeps lifecycle reads bounded"
+```
+
+Exit 1 against 2,000 real rules. A one-item page performed 9 queries and a
+100-item page performed 306; the invariant assertion failed with
+`expected 306 to be 9`.
+
+GREEN:
+
+```bash
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm run test:pg -w server -- --run \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 0: 5/5. The lifecycle read now runs in one `RepeatableRead` transaction.
+PostgreSQL returns one SHA-256 fingerprint for the exact state-filtered
+population, ordered over each rule's ID, current revision, lifecycle, priority,
+creation time, and review fields; no population rows cross into application
+memory. The service fetches only `limit + 1` live rows, then batch-loads exact
+current revision pairs, category accounts, tags, and transaction-local tax
+readiness before applying the unchanged canonical `RuleDetailDto` mapper.
+
+The real Prisma query-event regression proves exactly 10 queries for both a
+one-rule and 2,000-rule matching population, and for page limits 1 and 100.
+The returned page remains capped at 100 and under the explicit serialized
+result bound. Updating a rule outside the page still changes the fingerprint
+and rejects the old cursor. Equal priority and equal `createdAt` rows paginate
+by `id ASC`, and isolated lifecycle-only and review-only changes both reject
+the cursor.
+
+The apparent `companyReads.ts` churn was audited line-by-line. It is the
+minimal semantic extraction required to share the byte-equivalent canonical
+rule-detail mapper between single reads and batch hydration, plus the database
+fingerprint and transaction boundary. There is no formatter-only or unrelated
+change.
+
+### Canonical base64url cursor text
+
+Production break named: Node's permissive base64url decoder accepted multiple
+text strings for the same payload or MAC bytes, so a cursor did not have one
+canonical signed representation.
+
+RED:
+
+```bash
+npm run test:unit -w server -- --run \
+  src/services/companyReads.test.ts \
+  -t "textually noncanonical"
+```
+
+Exit 1. An alternate last signature character decoded to the same MAC bytes,
+passed `timingSafeEqual`, and the request resolved instead of rejecting. The
+test also creates an equivalently decoded padded body and signs that exact text
+with the test secret.
+
+GREEN with the same command: 1/1. The decoder now round-trips and compares the
+base64url text of both decoded components before HMAC verification. Alternate
+signature sextets and padded/re-signed payload text both return the authored
+`INVALID_CURSOR` response.
+
+### Fix-round-3 focused and full proof
+
+```bash
+npm run test:unit -w server -- --run src/services/companyReads.test.ts
+
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm run test:pg -w server -- --run \
+  src/services/companyReads.rules.pg.test.ts
+```
+
+Exit 0: 42/42 unit and 5/5 PostgreSQL tests.
+
+```bash
+DATABASE_URL="$TASK6A_DATABASE_URL" \
+TEST_DATABASE_URL="$TASK6A_DATABASE_URL" \
+npm test
+```
+
+Exit 0 on PostgreSQL 16: package-script contract 1/1; server unit 133 files,
+2,241/2,241; server PostgreSQL 36 files, 336 passed and 20 intentional skips;
+client 21 files, 207/207, including `Queue.tax.test.tsx` 66/66.
+
+```bash
+npm run typecheck
+npm run build
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma validate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma generate
+DATABASE_URL="$TASK6A_DATABASE_URL" npx prisma migrate status
+```
+
+All exited 0. Fresh PostgreSQL 16 migration also applied all 35 migrations.
+The MCP authored-schema startup and mutation-tool gate passed 7/7. The Prisma
+datamodel diff remains limited to the same three inherited long-name index
+renames documented below; this fix adds no schema or migration.
+
+An initial disposable PostgreSQL 17 Alpine run timed out only in the unrelated
+pre-existing 10,000-row classification corpus test. The exact isolated test
+passed 1/1 in 3.1 seconds on the repository's established PostgreSQL 16
+baseline, and the complete root gate then passed there. No unrelated timeout
+or classification-search test was changed.
+
 ## Migration reasoning and proof
 
 The migration is additive and rolling-compatible:
@@ -692,6 +809,12 @@ write implementations and now-unused schemas/imports, not formatting churn.
   remain action-independent.
 - Confirmed MCP schemas, routing, authored startup, legacy integrity hashes,
   and all 17 real PostgreSQL lifecycle tests remain unchanged and green.
+- Confirmed lifecycle pagination transfers only one fixed-size population
+  fingerprint plus `limit + 1` rows, hydrates current revisions and references
+  in set-based queries, and observes all of them in one repeatable-read snapshot.
+- Confirmed the cursor MAC remains the authority boundary: the database
+  fingerprint is not independently trusted, and both cursor components must
+  use their one canonical base64url spelling before the MAC is compared.
 - Confirmed no client or npm script file appears in the diff.
 
 ## Concerns
