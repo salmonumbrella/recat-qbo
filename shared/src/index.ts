@@ -1492,6 +1492,8 @@ export interface DashboardWidget {
 }
 
 export interface DashboardDataDto {
+  source: 'demo' | 'quickbooks' | 'local_fallback';
+  retrievedAt: string;
   months: string[];
   rev: number[];
   exp: number[];
