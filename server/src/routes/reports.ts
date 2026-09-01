@@ -9,6 +9,7 @@ import { asyncHandler, HttpError, validate } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { requireRole, requireUser } from '../middleware/auth.js';
 import { withCompany } from '../middleware/company.js';
+import { reportReadFailure } from '../services/reportReadFailure.js';
 import {
   balanceSheet,
   customReport,
@@ -96,7 +97,11 @@ reportsRouter.get(
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
     const q = validate(plQuery)(req.query);
-    res.json(await profitAndLoss(company.id, q));
+    try {
+      res.json(await profitAndLoss(company.id, q));
+    } catch (error) {
+      throw reportReadFailure(error, 'profit_and_loss');
+    }
   }),
 );
 
@@ -108,7 +113,11 @@ reportsRouter.get(
     // 'YYYY-MM' → zero-based month index (the statement service's encoding).
     const yyyyMm = /^(\d{4})-(\d{2})$/.exec(q.asOf);
     const asOf = yyyyMm ? String(Number(yyyyMm[2]) - 1) : q.asOf;
-    res.json(await balanceSheet(company.id, { asOf, compare: q.compare, basis: q.basis }));
+    try {
+      res.json(await balanceSheet(company.id, { asOf, compare: q.compare, basis: q.basis }));
+    } catch (error) {
+      throw reportReadFailure(error, 'balance_sheet');
+    }
   }),
 );
 
@@ -128,7 +137,11 @@ reportsRouter.get(
   asyncHandler(async (req, res) => {
     const company = scopedCompany(req);
     const q = validate(txnLogQuery)(req.query);
-    res.json(await transactionLog(company.id, { start: q.start, end: q.end }));
+    try {
+      res.json(await transactionLog(company.id, { start: q.start, end: q.end }));
+    } catch (error) {
+      throw reportReadFailure(error, 'transaction_log');
+    }
   }),
 );
 
