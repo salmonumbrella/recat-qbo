@@ -14,6 +14,11 @@ export interface DisposablePgvectorDatabase {
   destroy(): Promise<void>;
 }
 
+export interface DisposablePgvectorDatabaseTestHooks {
+  runMigrations?(args: { defaultRun(): Promise<void> }): Promise<void>;
+  dropDatabase?(args: { databaseName: string; defaultDrop(): Promise<void> }): Promise<void>;
+}
+
 function databaseUrl(anchor: string, databaseName: string): string {
   const url = new URL(anchor);
   url.pathname = `/${databaseName}`;
@@ -38,6 +43,7 @@ async function dropDatabase(admin: PrismaClient, databaseName: string): Promise<
 /** Creates, migrates, and later force-drops a unique database without mutating the anchor database. */
 export async function createDisposablePgvectorDatabase(
   anchorDatabaseUrl: string,
+  testHooks: DisposablePgvectorDatabaseTestHooks = {},
 ): Promise<DisposablePgvectorDatabase> {
   const databaseName = `recat_task8_${process.pid}_${randomBytes(6).toString('hex')}`;
   if (!SAFE_IDENTIFIER.test(databaseName)) throw new Error('Unsafe disposable database name.');
@@ -45,14 +51,28 @@ export async function createDisposablePgvectorDatabase(
   const targetUrl = databaseUrl(anchorDatabaseUrl, databaseName);
   let created = false;
   let destroyed = false;
+  const performMigrations = () => {
+    const defaultRun = async () => {
+      await execFileAsync('npx', ['prisma', 'migrate', 'deploy'], {
+        cwd: REPOSITORY_ROOT,
+        env: { ...process.env, DATABASE_URL: targetUrl },
+        maxBuffer: 2 * 1024 * 1024,
+      });
+    };
+    return testHooks.runMigrations === undefined
+      ? defaultRun()
+      : testHooks.runMigrations({ defaultRun });
+  };
+  const performDrop = () => testHooks.dropDatabase === undefined
+    ? dropDatabase(admin, databaseName)
+    : testHooks.dropDatabase({
+        databaseName,
+        defaultDrop: () => dropDatabase(admin, databaseName),
+      });
   try {
     await admin.$executeRawUnsafe(`CREATE DATABASE "${databaseName}"`);
     created = true;
-    await execFileAsync('npx', ['prisma', 'migrate', 'deploy'], {
-      cwd: REPOSITORY_ROOT,
-      env: { ...process.env, DATABASE_URL: targetUrl },
-      maxBuffer: 2 * 1024 * 1024,
-    });
+    await performMigrations();
     const target = new PrismaClient({ datasources: { db: { url: targetUrl } } });
     try {
       await target.$executeRawUnsafe('CREATE EXTENSION IF NOT EXISTS vector');
@@ -60,8 +80,25 @@ export async function createDisposablePgvectorDatabase(
       await target.$disconnect();
     }
   } catch (error) {
-    if (created) await dropDatabase(admin, databaseName).catch(() => undefined);
-    await admin.$disconnect();
+    const cleanupErrors: unknown[] = [];
+    if (created) {
+      try {
+        await performDrop();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    try {
+      await admin.$disconnect();
+    } catch (disconnectError) {
+      cleanupErrors.push(disconnectError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `Task 8 database initialization and cleanup failed for ${databaseName}.`,
+      );
+    }
     throw error;
   }
   return {
@@ -69,12 +106,9 @@ export async function createDisposablePgvectorDatabase(
     databaseUrl: targetUrl,
     async destroy() {
       if (destroyed) return;
+      await performDrop();
       destroyed = true;
-      try {
-        await dropDatabase(admin, databaseName);
-      } finally {
-        await admin.$disconnect();
-      }
+      await admin.$disconnect();
     },
   };
 }

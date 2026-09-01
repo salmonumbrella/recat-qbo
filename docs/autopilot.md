@@ -68,11 +68,15 @@ TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
 
 Each invocation creates a unique database, applies all migrations, installs
 pgvector, truncates every disposable data table between cases, and force-drops
-the database in final teardown without changing the configured anchor. The
-suite verifies exact alias, distinct fuel/personal semantic queries, hybrid
-RRF retrieval, edit/re-embed and atomic generation cutover without stale-vector
-leakage, membership-derived cross-company redaction/authorization, and
-labelled lexical degradation when the embedding endpoint is unavailable. Its
+the database in final teardown without changing the configured anchor. A drop
+failure is surfaced without marking teardown complete, so the same handle can
+retry; successful teardown verifies absence from the anchor. Initialization
+and cleanup failures are reported together with the exact disposable database
+name. The suite verifies exact alias, distinct fuel/personal semantic queries,
+hybrid RRF retrieval, edit/re-embed and atomic generation cutover without
+stale-vector leakage, membership-derived cross-company
+redaction/authorization, and labelled lexical degradation when the embedding
+endpoint is unavailable. Its
 isolated Chevron scenario keeps recurring policy suggestion-only (`autoPost:
 false`), snapshots the synthetic transactions and QBO-mutation-attempt count
 before the rule operation, and requires both to remain deeply equal to those
@@ -83,14 +87,20 @@ Fail-closed instrumentation wraps every QBO factory method, mutating real/mock
 QBO client method, global fetch, and Node HTTP/HTTPS request path. Deliberate
 denial probes prove those guards count and throw; the real Chevron flow must
 then leave every counter at zero while only the exact loopback fixture origin
-is allowed. Fault injection after each durable prepare/create write, both
-occurrences of every changed reorder rule/revision/audit write, and each
-applicable candidate activation/dismissal rule/candidate/revision/audit/receipt
-write verifies exact rollback snapshots, reprepare, restart recovery,
-idempotent replay, expiry retry, stale-revision and conflict rejection,
-append-only history, unchanged candidate evidence, and absence of partial
-priority or policy state. This is local test evidence only; it neither enables
-semantic configuration nor deploys or restarts a running Recat service.
+is allowed. The candidate policy-write matrix uses already folded evidence and
+injects after each applicable activation/dismissal
+rule/candidate/revision/audit/receipt write. A separate activation scenario
+leaves one real VERIFIED outcome unfurled, commits the durable reconciliation
+transaction, and crashes before the policy transaction. It proves the four
+fold/evidence receipts survive while rules, revisions, audits, and the old
+operation receipt do not change; a fresh client observes the stale prepared
+envelope conflict, reprepares a new envelope, commits, and replays it. Together
+with faults after each durable prepare/create write and both occurrences of
+every changed reorder rule/revision/audit write, these cases verify exact
+rollback snapshots, restart recovery, idempotent replay, expiry retry,
+stale-revision and conflict rejection, append-only history, and absence of
+partial priority or policy state. This is local test evidence only; it neither
+enables semantic configuration nor deploys or restarts a running Recat service.
 
 ## Provider request
 

@@ -194,8 +194,10 @@ TEST_PGVECTOR_DATABASE_URL=postgresql://... npx vitest run \
 
 The suite creates a uniquely named database, applies all Prisma migrations,
 installs pgvector, truncates all disposable data between cases, and drops the
-database in final teardown without changing the configured anchor. The fixture
-is test-only. It exercises exact, lexical, semantic, and hybrid search;
+database in final teardown without changing the configured anchor. A failed
+drop is reported and remains retryable; teardown records completion only after
+the anchor verifies that the database is absent. The fixture is test-only. It
+exercises exact, lexical, semantic, and hybrid search;
 embedding replacement and generation cutover; membership-derived tenant
 boundaries; explicit endpoint-down degradation; suggestion-only recurring
 rules; restart readback; and transaction rollback at every exercised

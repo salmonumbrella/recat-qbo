@@ -1,8 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, type Prisma } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createCompanyReadService } from '../companyReads.js';
+import type {
+  VerifiedCategorizationOutcome,
+  VerifiedCategorizationProposal,
+} from '../agent/evaluation.js';
+import { recordVerifiedRuleCandidateOutcome } from '../agent/ruleCandidatePersistence.js';
+import { candidateContextFor } from '../agent/ruleCandidates.js';
 import {
   commitRuleChange,
   prepareRuleChange,
@@ -337,7 +343,60 @@ async function seedForeignChevron(db: PrismaClient, userId: string) {
 async function seedReadyCandidate(
   db: PrismaClient,
   seeded: Awaited<ReturnType<typeof seedChevronCompany>>,
+  options: { pendingReconciliation?: boolean } = {},
 ) {
+  if (options.pendingReconciliation === true) {
+    const suffix = randomUUID();
+    const payee = `Chevron Repair ${suffix.slice(0, 8)}`;
+    const context = candidateContextFor(payee, 'verified-writeback-v1', 'mcp');
+    if (context === null) throw new Error('Task 8 reconciliation candidate context is invalid.');
+    const proposal: VerifiedCategorizationProposal = {
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        idx: 0, subtotalCents: -4500, taxCents: 0, totalCents: -4500,
+        categoryQboId: seeded.fuelAccount.qboId, taxCodeQboId: null,
+        memo: null, tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const transactions = [];
+    for (const index of [0, 1, 2, 3]) {
+      const transaction = await db.transaction.create({ data: {
+        companyId: seeded.company.id,
+        qboId: `repair-candidate-${index}-${suffix}`,
+        qboType: 'Purchase', qboSyncToken: '1', date: NOW,
+        payee, memo: 'Fleet propellant expenditure', amount: '-45.00',
+        bankAccount: 'Synthetic operating card', status: 'POSTED', revision: 1,
+      } });
+      const requestId = `repair-evidence-${index}-${suffix}`;
+      const requestPayload = {
+        ruleCandidateFold: { version: 1 },
+        categorizationEvidence: { version: 1, proposal },
+        ruleCandidateEvidence: { version: 1, ...context },
+      } satisfies Prisma.InputJsonObject;
+      await db.qboMutationAttempt.create({ data: {
+        transactionId: transaction.id, requestId, operation: 'recategorize', status: 'VERIFIED',
+        expectedRevision: 1, expectedSyncToken: '1', requestHash: digest(requestId),
+        requestPayload, beforeSnapshot: {}, verification: { outcome: 'VERIFIED' },
+      } });
+      if (index < 3) {
+        const outcome: VerifiedCategorizationOutcome = {
+          companyId: seeded.company.id, transactionId: transaction.id,
+          inputRevision: 1, requestId, operation: 'posted', proposal, candidateContext: context,
+        };
+        await recordVerifiedRuleCandidateOutcome(outcome, { db, now: () => NOW });
+      }
+      transactions.push(transaction);
+    }
+    const candidate = await db.autopilotRuleCandidate.findFirstOrThrow({
+      where: {
+        companyId: seeded.company.id,
+        conditionFingerprint: context.conditionFingerprint,
+        configVersion: context.configVersion,
+      },
+    });
+    return { candidate, transactions };
+  }
   const suffix = randomUUID();
   const candidate = await db.autopilotRuleCandidate.create({
     data: {
@@ -509,6 +568,27 @@ function faultInjectedClient(db: PrismaClient, boundary: FaultBoundary): PrismaC
   }) as PrismaClient;
 }
 
+function crashBeforeTransaction(db: PrismaClient, occurrence: number): PrismaClient {
+  let calls = 0;
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === '$transaction') {
+        return async (...arguments_: unknown[]) => {
+          calls += 1;
+          if (calls === occurrence) {
+            throw new Error(`task8-simulated-crash:$transaction.${occurrence}`);
+          }
+          return (target.$transaction as unknown as (...args: unknown[]) => Promise<unknown>)(
+            ...arguments_,
+          );
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as PrismaClient;
+}
+
 async function durablePolicySnapshot(db: PrismaClient, companyId: string, operationId: string) {
   const [rules, revisions, audits, candidates, evidence, receipt] = await Promise.all([
     db.rule.findMany({
@@ -558,6 +638,77 @@ async function durablePolicySnapshot(db: PrismaClient, companyId: string, operat
   return { rules, revisions, audits, candidates, evidence, receipt };
 }
 
+async function activationRecoverySnapshot(
+  db: PrismaClient,
+  companyId: string,
+  candidateId: string,
+  operationIds: string[],
+  requestIds: string[],
+) {
+  const [candidate, evidence, folds, attempts, rules, revisions, audits, operations] =
+    await Promise.all([
+      db.autopilotRuleCandidate.findUniqueOrThrow({
+        where: { id: candidateId },
+        select: {
+          id: true, state: true, evidenceCount: true, conflictingEvidenceCount: true,
+          winningActionFingerprint: true, activatedRuleId: true,
+          activationEvidenceCount: true, activationActionFingerprint: true,
+        },
+      }),
+      db.autopilotRuleCandidateEvidence.findMany({
+        where: { candidateId },
+        select: {
+          requestId: true, transactionId: true, polarity: true, actionFingerprint: true,
+          active: true, invalidatedAt: true, invalidationReason: true,
+        },
+        orderBy: { requestId: 'asc' },
+      }),
+      db.autopilotRuleCandidateFold.findMany({
+        where: { companyId, requestId: { in: requestIds } },
+        select: { requestId: true, transactionId: true, operation: true },
+        orderBy: { requestId: 'asc' },
+      }),
+      db.qboMutationAttempt.findMany({
+        where: { transaction: { companyId }, requestId: { in: requestIds } },
+        select: {
+          requestId: true, transactionId: true, status: true, operation: true,
+          ruleCandidateFoldedAt: true,
+        },
+        orderBy: { requestId: 'asc' },
+      }),
+      db.rule.findMany({
+        where: { companyId },
+        select: {
+          id: true, priority: true, revision: true, enabled: true, sourceCandidateId: true,
+          autoPost: true,
+        },
+        orderBy: { id: 'asc' },
+      }),
+      db.ruleRevision.findMany({
+        where: { companyId },
+        select: { ruleId: true, revision: true, state: true, sourceCandidateId: true, autoPost: true },
+        orderBy: [{ ruleId: 'asc' }, { revision: 'asc' }],
+      }),
+      db.auditEntry.findMany({
+        where: { companyId },
+        select: { action: true, payload: true },
+        orderBy: { id: 'asc' },
+      }),
+      db.mcpRuleOperation.findMany({
+        where: { id: { in: operationIds } },
+        select: {
+          id: true, idempotencyKey: true, resourceId: true,
+          committedAt: true, commitResult: true, commitResultHash: true,
+        },
+        orderBy: { id: 'asc' },
+      }),
+    ]);
+  return {
+    reconciliation: { candidate, evidence, folds, attempts },
+    policy: { rules, revisions, audits, operations },
+  };
+}
+
 describeTask8('classification memory deterministic PostgreSQL end-to-end', () => {
   const clients: PrismaClient[] = [];
   const fixtures: DeterministicEmbeddingFixture[] = [];
@@ -605,6 +756,93 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
     expect(disposable.databaseName).toMatch(/^recat_task8_[0-9]+_[0-9a-f]{12}$/u);
     expect(migrations[0]?.count).toBe(38n);
     expect(vector[0]?.count).toBe(1n);
+  });
+
+  it('reports a failed disposable database drop and retries until absence is verified', async () => {
+    let dropAttempts = 0;
+    const retryable = await createDisposablePgvectorDatabase(TASK8_DATABASE_ANCHOR_URL!, {
+      async dropDatabase({ defaultDrop }) {
+        dropAttempts += 1;
+        if (dropAttempts === 1) throw new Error('task8-simulated-drop-failure');
+        await defaultDrop();
+      },
+    });
+    const admin = new PrismaClient({
+      datasources: { db: { url: TASK8_DATABASE_ANCHOR_URL! } },
+    });
+    const exists = async () => (await admin.$queryRaw<Array<{ present: boolean }>>`
+      SELECT EXISTS(
+        SELECT 1 FROM pg_database WHERE datname = ${retryable.databaseName}
+      ) AS present
+    `)[0]?.present;
+    try {
+      await expect(retryable.destroy()).rejects.toThrow('task8-simulated-drop-failure');
+      await expect(exists()).resolves.toBe(true);
+      await retryable.destroy();
+      expect(dropAttempts).toBe(2);
+      await expect(exists()).resolves.toBe(false);
+    } finally {
+      await retryable.destroy();
+      await admin.$disconnect();
+    }
+  });
+
+  it('reports both initialization and cleanup failures with the exact database target', async () => {
+    let leakedDatabaseName: string | null = null;
+    let unexpectedlyCreated: DisposablePgvectorDatabase | null = null;
+    const admin = new PrismaClient({
+      datasources: { db: { url: TASK8_DATABASE_ANCHOR_URL! } },
+    });
+    const attempt = createDisposablePgvectorDatabase(TASK8_DATABASE_ANCHOR_URL!, {
+      async runMigrations() {
+        throw new Error('task8-simulated-migration-failure');
+      },
+      async dropDatabase({ databaseName }) {
+        leakedDatabaseName = databaseName;
+        throw new Error('task8-simulated-initialization-drop-failure');
+      },
+    }).then((database) => {
+      unexpectedlyCreated = database;
+      return database;
+    });
+    try {
+      await expect(attempt).rejects.toSatisfy((error: unknown) => (
+        error instanceof AggregateError
+        && error.message.includes(leakedDatabaseName ?? 'missing-database-name')
+        && error.errors.some((entry) => (
+          entry instanceof Error && entry.message === 'task8-simulated-migration-failure'
+        ))
+        && error.errors.some((entry) => (
+          entry instanceof Error && entry.message === 'task8-simulated-initialization-drop-failure'
+        ))
+      ));
+      expect(leakedDatabaseName).toMatch(/^recat_task8_[0-9]+_[0-9a-f]{12}$/u);
+    } finally {
+      let unexpectedDestroyError: unknown = null;
+      if (unexpectedlyCreated !== null) {
+        try {
+          await unexpectedlyCreated.destroy();
+        } catch (error) {
+          unexpectedDestroyError = error;
+        }
+      }
+      if (leakedDatabaseName !== null) {
+        if (!/^recat_task8_[0-9]+_[0-9a-f]{12}$/u.test(leakedDatabaseName)) {
+          throw new Error('Unsafe Task 8 leaked database name.');
+        }
+        await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${leakedDatabaseName}" WITH (FORCE)`);
+        const rows = await admin.$queryRaw<Array<{ present: boolean }>>`
+          SELECT EXISTS(
+            SELECT 1 FROM pg_database WHERE datname = ${leakedDatabaseName}
+          ) AS present
+        `;
+        expect(rows[0]?.present).toBe(false);
+      }
+      await admin.$disconnect();
+      if (unexpectedDestroyError !== null && leakedDatabaseName === null) {
+        throw unexpectedDestroyError;
+      }
+    }
   });
 
   it('cleans users, sessions, and immutable envelopes from an untracked partial seed', async () => {
@@ -1183,6 +1421,189 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
         where: { companyId: seeded.company.id, action: 'rule-reordered' },
       }), label).toBe(2);
     }
+  }, 120_000);
+
+  it('persists candidate reconciliation before policy and recovers a crash between transactions', async () => {
+    const db = client();
+    const seeded = await seedChevronCompany(db, 'Task 8 Reconciliation Boundary');
+    const ready = await seedReadyCandidate(db, seeded, {
+      pendingReconciliation: true,
+    });
+    const requestIds = (await db.qboMutationAttempt.findMany({
+      where: { transactionId: { in: ready.transactions.map(({ id }) => id) } },
+      select: { requestId: true },
+      orderBy: { requestId: 'asc' },
+    })).map(({ requestId }) => requestId);
+    expect(requestIds).toHaveLength(4);
+
+    const idempotencyKey = `activate-reconciliation-crash-${randomUUID()}`;
+    const request = {
+      companyId: seeded.company.id,
+      mutation: 'activate_candidate' as const,
+      candidateId: ready.candidate.id,
+      expectedRevision: 0,
+      idempotencyKey,
+    };
+    const prepared = await prepareRuleChange(seeded.principal, request, { db, now: () => NOW });
+    const before = await activationRecoverySnapshot(
+      db,
+      seeded.company.id,
+      ready.candidate.id,
+      [prepared.operationId],
+      requestIds,
+    );
+    expect(before.reconciliation.candidate).toMatchObject({
+      state: 'ready', evidenceCount: 3, conflictingEvidenceCount: 0,
+      activatedRuleId: null, activationEvidenceCount: null, activationActionFingerprint: null,
+    });
+    expect(before.reconciliation.evidence).toHaveLength(3);
+    expect(before.reconciliation.folds).toHaveLength(3);
+    expect(before.reconciliation.attempts).toHaveLength(4);
+    const initiallyFolded = before.reconciliation.attempts.filter(({ ruleCandidateFoldedAt }) => (
+      ruleCandidateFoldedAt !== null
+    ));
+    expect(initiallyFolded).toHaveLength(3);
+    expect(before.reconciliation.evidence.map(({ requestId }) => requestId))
+      .toEqual(initiallyFolded.map(({ requestId }) => requestId));
+    expect(before.reconciliation.folds.map(({ requestId }) => requestId))
+      .toEqual(initiallyFolded.map(({ requestId }) => requestId));
+    expect(before.reconciliation.evidence.every((row) => (
+      row.active
+      && row.polarity === 'positive'
+      && row.actionFingerprint === ready.candidate.winningActionFingerprint
+      && row.invalidatedAt === null
+      && row.invalidationReason === null
+    ))).toBe(true);
+    expect(before.policy).toMatchObject({
+      rules: [], revisions: [], audits: [],
+      operations: [{ id: prepared.operationId, committedAt: null, commitResult: null, commitResultHash: null }],
+    });
+
+    await expect(commitRuleChange(seeded.principal, {
+      companyId: seeded.company.id,
+      operationId: prepared.operationId,
+      idempotencyKey,
+    }, {
+      db: crashBeforeTransaction(db, 2),
+      now: () => new Date(NOW.getTime() + 1_000),
+    })).rejects.toThrow('task8-simulated-crash:$transaction.2');
+
+    const afterReconciliation = await activationRecoverySnapshot(
+      db,
+      seeded.company.id,
+      ready.candidate.id,
+      [prepared.operationId],
+      requestIds,
+    );
+    expect(afterReconciliation.reconciliation.candidate).toMatchObject({
+      state: 'ready', evidenceCount: 4, conflictingEvidenceCount: 0,
+      activatedRuleId: null, activationEvidenceCount: null, activationActionFingerprint: null,
+    });
+    expect(afterReconciliation.reconciliation.evidence).toHaveLength(4);
+    expect(afterReconciliation.reconciliation.folds).toHaveLength(4);
+    expect(afterReconciliation.reconciliation.attempts).toHaveLength(4);
+    expect(afterReconciliation.reconciliation.evidence.map(({ requestId }) => requestId))
+      .toEqual(requestIds);
+    expect(afterReconciliation.reconciliation.folds.map(({ requestId }) => requestId))
+      .toEqual(requestIds);
+    expect(afterReconciliation.reconciliation.attempts.every(({ ruleCandidateFoldedAt }) => (
+      ruleCandidateFoldedAt !== null
+    ))).toBe(true);
+    expect(afterReconciliation.reconciliation.attempts.every((row) => (
+      row.status === 'VERIFIED' && row.operation === 'recategorize'
+    ))).toBe(true);
+    expect(afterReconciliation.reconciliation.evidence.every((row) => (
+      row.active
+      && row.polarity === 'positive'
+      && row.actionFingerprint === ready.candidate.winningActionFingerprint
+      && row.invalidatedAt === null
+      && row.invalidationReason === null
+    ))).toBe(true);
+    expect(afterReconciliation.policy).toEqual(before.policy);
+
+    await expect(commitRuleChange(seeded.principal, {
+      companyId: seeded.company.id,
+      operationId: prepared.operationId,
+      idempotencyKey,
+    }, {
+      db: client(),
+      now: () => new Date(NOW.getTime() + 2_000),
+    })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await activationRecoverySnapshot(
+      db,
+      seeded.company.id,
+      ready.candidate.id,
+      [prepared.operationId],
+      requestIds,
+    )).toEqual(afterReconciliation);
+
+    const recoveredKey = `activate-reconciliation-reprepare-${randomUUID()}`;
+    const recovered = await prepareRuleChange(seeded.principal, {
+      ...request,
+      idempotencyKey: recoveredKey,
+    }, {
+      db: client(),
+      now: () => new Date(NOW.getTime() + 3_000),
+    });
+    expect(recovered).toMatchObject({
+      status: 'PREPARED',
+      preview: { candidateId: ready.candidate.id, affectedPostedCount: 4 },
+    });
+    expect(recovered.operationId).not.toBe(prepared.operationId);
+    const committed = await commitRuleChange(seeded.principal, {
+      companyId: seeded.company.id,
+      operationId: recovered.operationId,
+      idempotencyKey: recoveredKey,
+    }, {
+      db: client(),
+      now: () => new Date(NOW.getTime() + 4_000),
+    });
+    const replayed = await commitRuleChange(seeded.principal, {
+      companyId: seeded.company.id,
+      operationId: recovered.operationId,
+      idempotencyKey: recoveredKey,
+    }, {
+      db: client(),
+      now: () => new Date(NOW.getTime() + 5_000),
+    });
+    expect([committed.status, replayed.status]).toEqual(['COMMITTED', 'REPLAYED']);
+
+    const final = await activationRecoverySnapshot(
+      db,
+      seeded.company.id,
+      ready.candidate.id,
+      [prepared.operationId, recovered.operationId],
+      requestIds,
+    );
+    expect(final.reconciliation.candidate).toMatchObject({
+      state: 'activated', evidenceCount: 4, conflictingEvidenceCount: 0,
+      activatedRuleId: recovered.ruleId, activationEvidenceCount: 4,
+      activationActionFingerprint: ready.candidate.winningActionFingerprint,
+    });
+    expect(final.reconciliation.evidence).toHaveLength(4);
+    expect(final.reconciliation.folds).toHaveLength(4);
+    expect(final.reconciliation.attempts.every(({ ruleCandidateFoldedAt }) => (
+      ruleCandidateFoldedAt !== null
+    ))).toBe(true);
+    expect(final.policy.rules).toEqual([expect.objectContaining({
+      id: recovered.ruleId, priority: 0, revision: 1, enabled: true,
+      sourceCandidateId: ready.candidate.id, autoPost: false,
+    })]);
+    expect(final.policy.revisions).toEqual([
+      expect.objectContaining({ ruleId: recovered.ruleId, revision: 0, autoPost: false }),
+      expect.objectContaining({ ruleId: recovered.ruleId, revision: 1, autoPost: false }),
+    ]);
+    expect(final.policy.audits).toEqual([
+      expect.objectContaining({ action: 'rule-candidate-activated' }),
+    ]);
+    expect(final.policy.operations.find(({ id }) => id === prepared.operationId)).toMatchObject({
+      committedAt: null, commitResult: null, commitResultHash: null,
+    });
+    expect(final.policy.operations.find(({ id }) => id === recovered.operationId)).toMatchObject({
+      committedAt: new Date(NOW.getTime() + 4_000),
+      commitResult: expect.objectContaining({ status: 'COMMITTED' }),
+      commitResultHash: expect.any(String),
+    });
   }, 120_000);
 
   it('recovers candidate activation and dismissal at every applicable durable boundary', async () => {
