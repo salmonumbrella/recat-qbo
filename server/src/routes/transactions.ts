@@ -703,7 +703,8 @@ transactionActionsRouter.post(
     await assertCategorizationRouteAccess(requestUser(req), scope.companyId);
     await assertCompanyConnected(scope.companyId);
     try {
-      await assertProviderWritable(scope.companyId, scope.transactionId);
+      // Staging is Recat-local. The commit path performs a fresh QBO safety
+      // check immediately before any provider write.
       const staged = await stageCategorization({
         transactionId: scope.transactionId,
         companyId: scope.companyId,
@@ -842,7 +843,8 @@ transactionActionsRouter.post(
       throw new HttpError(400, `Cannot edit a transaction in status ${txn.status}`, 'BAD_STATUS');
     }
     const companyId = txn.companyId;
-    await assertProviderWritable(companyId, id);
+    // Draft categorization is Recat-local and remains available while a
+    // cached provider observation is missing or stale.
     const amount = Number(txn.amount);
     const data: Prisma.TransactionUpdateInput = {};
     let stagedCategory: string | null = null;
@@ -936,8 +938,9 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id); // 404 before the write-back service's plain Errors
     await assertCategorizerFor(user, txn.companyId);
-    await assertProviderWritable(txn.companyId, id);
 
+    // postTransaction fetches current QBO state and enforces write safety at
+    // the write boundary; a cached actionability observation is not a gate.
     let result;
     try {
       result = await postTransaction(id, actorFor(user));

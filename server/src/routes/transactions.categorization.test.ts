@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   membershipFindUnique: vi.fn(),
   mutationAttemptFindFirst: vi.fn(),
   mutationAttemptFindUnique: vi.fn(),
+  assertTransactionProviderActionability: vi.fn(),
   isLiveReconciliationOwnedRequest: vi.fn(),
   loadLiveReconciliationRequest: vi.fn(),
   postTransaction: vi.fn(),
@@ -85,6 +86,16 @@ vi.mock('../lib/prisma.js', () => ({
 vi.mock('../services/categorization.js', () => ({
   stageCategorization: mocks.stageCategorization,
 }));
+
+vi.mock('../services/providerActionability.js', async () => {
+  const actual = await vi.importActual<typeof import('../services/providerActionability.js')>(
+    '../services/providerActionability.js',
+  );
+  return {
+    ...actual,
+    assertTransactionProviderActionability: mocks.assertTransactionProviderActionability,
+  };
+});
 
 vi.mock('../services/agent/liveReconciliation.js', () => ({
   isLiveReconciliationOwnedRequest: mocks.isLiveReconciliationOwnedRequest,
@@ -221,6 +232,7 @@ beforeEach(() => {
   mocks.getTaxReadiness.mockResolvedValue({ salesStatus: 'ready' });
   mocks.mutationAttemptFindFirst.mockResolvedValue(null);
   mocks.mutationAttemptFindUnique.mockResolvedValue({ transactionId: TRANSACTION_ID });
+  mocks.assertTransactionProviderActionability.mockResolvedValue(undefined);
   mocks.stageCategorization.mockResolvedValue(stagedResult);
   mocks.commitStagedCategorization.mockResolvedValue(verifiedResult);
   mocks.reconcileMutationAttempt.mockResolvedValue(verifiedResult);
@@ -436,6 +448,25 @@ describe('tax-aware categorization action routes', () => {
     expect(JSON.stringify(response.body)).not.toMatch(/internal|provider|private|secret/i);
   });
 
+  it('lets legacy post perform its fresh write-safety check instead of trusting the cache', async () => {
+    mocks.assertTransactionProviderActionability.mockRejectedValue({
+      code: 'QBO_WRITE_SAFETY_UNAVAILABLE',
+    });
+    mocks.postTransaction.mockResolvedValue({
+      id: TRANSACTION_ID,
+      ok: true,
+      status: 'POSTED',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/post`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(202);
+    expect(mocks.postTransaction).toHaveBeenCalledTimes(1);
+    expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
+  });
+
   it('blocks direct legacy categorization for a tax-ready Purchase before local mutation', async () => {
     mocks.companyFindUnique.mockResolvedValue({
       id: COMPANY_ID,
@@ -587,6 +618,22 @@ describe('tax-aware categorization action routes', () => {
       });
     },
   );
+
+  it('stages locally even when the cached provider observation is unavailable', async () => {
+    mocks.assertTransactionProviderActionability.mockRejectedValue({
+      code: 'QBO_WRITE_SAFETY_UNAVAILABLE',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/stage`)
+      .set(sessionHeaders)
+      .send(stageBody);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(stagedResult);
+    expect(mocks.stageCategorization).toHaveBeenCalledTimes(1);
+    expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
+  });
 
   it('allowlists the complete nested stage response and drops internal fields', async () => {
     mocks.stageCategorization.mockResolvedValue({
@@ -1214,6 +1261,24 @@ describe('tax-aware categorization action routes', () => {
       data: { txnId: TRANSACTION_ID, tagId: TAG_ID },
     });
     expect(mocks.stageCategorization).not.toHaveBeenCalled();
+  });
+
+  it('saves a local category draft when the cached provider observation is unavailable', async () => {
+    mocks.assertTransactionProviderActionability.mockRejectedValue({
+      code: 'QBO_WRITE_SAFETY_UNAVAILABLE',
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorize`)
+      .set(sessionHeaders)
+      .send({
+        category: 'Prepared purchases',
+        categoryQboId: 'EXPENSE_ACCOUNT',
+      });
+
+    expect(response.status).toBe(200);
+    expect(mocks.transactionUpdate).toHaveBeenCalled();
+    expect(mocks.assertTransactionProviderActionability).not.toHaveBeenCalled();
   });
 
   it.each([

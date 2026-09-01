@@ -203,8 +203,8 @@ export default function ClassificationMemoryPanel({
       <div style={{ fontSize: 15, fontWeight: 650, marginBottom: 8 }}>{title}</div>
       <form onSubmit={onSubmit} style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <label style={{ flex: '1 1 220px' }}>
-          <span className="sr-only">Classification search</span>
           <input
+            aria-label="Classification search"
             className="input"
             value={query}
             onChange={(event) => {
@@ -217,7 +217,6 @@ export default function ClassificationMemoryPanel({
           />
         </label>
         <label>
-          <span className="sr-only">Search mode</span>
           <select
             aria-label="Search mode"
             className="select"

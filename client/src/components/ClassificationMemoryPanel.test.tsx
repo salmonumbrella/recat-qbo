@@ -121,6 +121,13 @@ beforeEach(() => {
 });
 
 describe('ClassificationMemoryPanel', () => {
+  it('keeps the search mode accessible without rendering a visible label', () => {
+    render(<ClassificationMemoryPanel companyId="company-1" initialQuery="Northwind Fuel" />);
+
+    expect(screen.getByRole('combobox', { name: 'Search mode' })).toBeInTheDocument();
+    expect(screen.queryByText('Search mode')).not.toBeInTheDocument();
+  });
+
   it('searches with transaction context and renders bounded provenance with source navigation', async () => {
     render(
       <ClassificationMemoryPanel

@@ -1660,7 +1660,7 @@ describe('tax-aware manual queue', () => {
   );
 });
 
-describe('provider actionability queue views', () => {
+describe('single interactive queue', () => {
   function providerRow(
     id: string,
     payee: string,
@@ -1678,37 +1678,10 @@ describe('provider actionability queue views', () => {
     });
   }
 
-  it('defaults an omitted provider observation to Needs safety check, not the actionable queue', async () => {
-    const user = userEvent.setup();
+  it('shows and counts every pending transaction without actionability tabs', async () => {
     await renderQueue([
       providerRow('TXN_WRITABLE', 'Writable supplier', 'WRITABLE'),
       providerRow('TXN_UNKNOWN', 'Unknown supplier', undefined),
-    ]);
-
-    expect(screen.getByTestId('queue-count-actionable')).toHaveTextContent('1');
-    expect(screen.getByTestId('queue-count-blocked')).toHaveTextContent('0');
-    expect(screen.getByTestId('queue-count-safety')).toHaveTextContent('1');
-    expect(screen.getByText('Writable supplier')).toBeInTheDocument();
-    expect(screen.queryByText('Unknown supplier')).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole('tab', { name: /Needs safety check 1/i }));
-    expect(screen.getByText('Unknown supplier')).toBeInTheDocument();
-    expect(screen.getByText('Needs safety check · Actionability unknown')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Expenses · Generic expense' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '+ tag' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Split' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /preview tax/i })).toBeDisabled();
-    expect(screen.getAllByRole('checkbox').every((checkbox) => (checkbox as HTMLInputElement).disabled)).toBe(true);
-    expect(mocks.categorize).not.toHaveBeenCalled();
-    expect(mocks.stage).not.toHaveBeenCalled();
-    expect(mocks.commit).not.toHaveBeenCalled();
-    expect(mocks.legacyPost).not.toHaveBeenCalled();
-  });
-
-  it('keeps writable rows in Queue and gives blocked and safety rows separate counts', async () => {
-    await renderQueue([
-      providerRow('TXN_WRITABLE', 'Writable supplier', 'WRITABLE'),
       providerRow('TXN_CLEARED', 'Cleared supplier', 'BLOCKED_CLEARED'),
       providerRow('TXN_RECONCILED', 'Reconciled supplier', 'BLOCKED_RECONCILED'),
       providerRow('TXN_CLOSED', 'Closed supplier', 'BLOCKED_PERIOD_CLOSED'),
@@ -1716,28 +1689,42 @@ describe('provider actionability queue views', () => {
       providerRow('TXN_POSTED', 'Posted writable supplier', 'WRITABLE', undefined, { status: 'POSTED' }),
     ]);
 
-    expect(screen.getByTestId('queue-count-actionable')).toHaveTextContent('1');
-    expect(screen.getByTestId('queue-count-blocked')).toHaveTextContent('3');
-    expect(screen.getByTestId('queue-count-safety')).toHaveTextContent('1');
-    expect(screen.getByText('Writable supplier')).toBeInTheDocument();
-    expect(screen.queryByText('Cleared supplier')).not.toBeInTheDocument();
-    expect(screen.getByText('Posted writable supplier')).toBeInTheDocument();
+    for (const payee of [
+      'Writable supplier',
+      'Unknown supplier',
+      'Cleared supplier',
+      'Reconciled supplier',
+      'Closed supplier',
+      'Unavailable supplier',
+      'Posted writable supplier',
+    ]) {
+      expect(screen.getByText(payee)).toBeInTheDocument();
+    }
+    expect(screen.queryByRole('tablist', { name: 'Transaction queue views' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Needs safety check|Blocked in QuickBooks/i)).not.toBeInTheDocument();
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(6);
+  });
 
+  it.each([
+    ['unknown', undefined],
+    ['cleared', 'BLOCKED_CLEARED'],
+    ['reconciled', 'BLOCKED_RECONCILED'],
+    ['closed period', 'BLOCKED_PERIOD_CLOSED'],
+    ['unavailable', 'UNAVAILABLE'],
+  ])('keeps a %s observation interactive for local review and tax staging', async (_label, disposition) => {
     const user = userEvent.setup();
-    await user.click(screen.getByRole('tab', { name: /Blocked in QuickBooks 3/i }));
-    expect(screen.getByText('Cleared supplier')).toBeInTheDocument();
-    expect(screen.getByText('Reconciled supplier')).toBeInTheDocument();
-    expect(screen.getByText('Closed supplier')).toBeInTheDocument();
-    expect(screen.getByText('Blocked in QuickBooks · Cleared')).toBeInTheDocument();
-    expect(screen.getByText('Blocked in QuickBooks · Reconciled')).toBeInTheDocument();
-    expect(screen.getByText('Blocked in QuickBooks · Closed period')).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: /^post$/i }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
-    expect(screen.getAllByRole('checkbox').every((checkbox) => (checkbox as HTMLInputElement).disabled)).toBe(true);
-    expect(screen.getAllByRole('button', { name: '+ tag' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
-    expect(screen.getAllByRole('button', { name: 'Split' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    await renderQueue(providerRow('TXN_REVIEW', 'Review supplier', disposition));
 
-    await user.click(screen.getByRole('tab', { name: /Needs safety check 1/i }));
-    expect(screen.getByText('Unavailable supplier')).toBeInTheDocument();
-    expect(screen.getByText('Needs safety check · Unavailable')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Expenses · Generic expense' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '+ tag' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Split' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /preview tax/i })).toBeEnabled();
+    expect(screen.getAllByRole('checkbox').every((checkbox) => !(checkbox as HTMLInputElement).disabled)).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
+      'TXN_REVIEW',
+      expect.objectContaining({ expectedRevision: 4 }),
+    ));
   });
 });

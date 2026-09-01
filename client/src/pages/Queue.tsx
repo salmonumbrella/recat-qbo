@@ -47,12 +47,6 @@ import TaxCodePicker, {
 import type { TaxDirection } from '../components/TaxCodePicker';
 import { AutopilotQueueStatus } from './settings/AutopilotCard';
 import AttachmentPanel from '../components/AttachmentPanel';
-import {
-  isQueueActionable,
-  queueActionabilityOf,
-  queueViewLabel,
-  type QueueActionabilityView,
-} from './queueActionability';
 
 // ---------------------------------------------------------------------------
 // Prototype-state mapping & small helpers
@@ -235,7 +229,6 @@ export default function Queue() {
   const [acct, setAcct] = useState('all');
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<1 | -1>(1);
-  const [queueView, setQueueView] = useState<QueueActionabilityView>('actionable');
   const [activeIdx, setActiveIdx] = useState(0);
   const [sel, setSel] = useState<Record<string, boolean>>({});
   const [picker, setPicker] = useState<string | null>(null); // txn id | 'bulk' | null
@@ -294,9 +287,8 @@ export default function Queue() {
     [taxState],
   );
 
-  /** Provider-blocked and unknown rows are read-only in every queue view. */
   const canMutate = useCallback(
-    (t: TransactionDto): boolean => isQueueActionable(t) && !hasActiveMutation(t),
+    (t: TransactionDto): boolean => !hasActiveMutation(t),
     [hasActiveMutation],
   );
 
@@ -369,12 +361,10 @@ export default function Queue() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompanyId]);
 
-  // ---- pending badge: only provider-writable rows are actionable ----
+  // ---- pending badge: recompute locally (pending = PENDING + ERROR rows) ----
   useEffect(() => {
     if (!loaded) return;
-    setPendingCount(rows.filter((r) =>
-      (r.status === 'PENDING' || r.status === 'ERROR') && isQueueActionable(r),
-    ).length);
+    setPendingCount(rows.filter((r) => r.status === 'PENDING' || r.status === 'ERROR').length);
   }, [rows, loaded, setPendingCount]);
 
   // ---- row helpers ----
@@ -475,31 +465,17 @@ export default function Queue() {
     [rows],
   );
 
-  // Provider state is deliberately independent from Recat's transaction
-  // status. A row can stay PENDING in Recat while QuickBooks has already
-  // cleared, reconciled, or closed it; those rows belong in a separate view.
   const pendingRows = useMemo(
     () => rows.filter((t) => t.status === 'PENDING' || t.status === 'ERROR'),
     [rows],
   );
-  const queueCounts = useMemo(() => {
-    const counts: Record<QueueActionabilityView, number> = {
-      actionable: 0,
-      blocked: 0,
-      safety: 0,
-    };
-    for (const row of pendingRows) counts[queueActionabilityOf(row).view] += 1;
-    return counts;
-  }, [pendingRows]);
 
-  // ---- visible(): actionability view + search + account filter + 3-way sort ----
+  // ---- visible(): search + account filter + 3-way sort ----
   const vis = useMemo(() => {
     const q = search.toLowerCase();
     const list = rows.filter((t) => {
       const state = STATE_OF[t.status];
       if (!state) return false; // SUPERSEDED rows never render
-      const actionability = queueActionabilityOf(t);
-      if (actionability.view !== queueView) return false;
       if (acct !== 'all' && t.bankAccount !== acct) return false;
       if (!q) return true;
       const hay = [
@@ -509,8 +485,6 @@ export default function Queue() {
         fmtDate(t.date),
         t.category ? fullCat(t.category) : '',
         t.suggestion?.category || '',
-        actionability.disposition,
-        actionability.reason,
         STATUS_WORDS[state],
         fmtMoney(t.amount),
         String(Math.abs(t.amount)),
@@ -537,16 +511,13 @@ export default function Queue() {
       const vb = val(b);
       return (va < vb ? -1 : va > vb ? 1 : 0) * sortDir;
     });
-  }, [rows, search, acct, queueView, sortKey, sortDir, fullCat]);
+  }, [rows, search, acct, sortKey, sortDir, fullCat]);
 
   const activeRow = vis.length ? vis[Math.min(activeIdx, vis.length - 1)] : undefined;
   const activeId = activeRow ? activeRow.id : null;
 
   // ---- header numbers ----
-  const pend = useMemo(
-    () => pendingRows.filter((t) => queueActionabilityOf(t).view === queueView),
-    [pendingRows, queueView],
-  );
+  const pend = pendingRows;
   const pendTotal = pend.reduce((a, t) => a + Math.abs(t.amount), 0);
   const subline = `${pend.length} transactions · $${pendTotal.toLocaleString('en-US', {
     minimumFractionDigits: 2,
@@ -559,7 +530,7 @@ export default function Queue() {
   const selPend = useMemo(
     () => selIds.filter((id) => {
       const row = rows.find((candidate) => candidate.id === id);
-      return row?.status === 'PENDING' && !!row && isQueueActionable(row) && !hasActiveMutation(row);
+      return row?.status === 'PENDING' && !!row && !hasActiveMutation(row);
     }),
     [selIds, rows, hasActiveMutation],
   );
@@ -991,7 +962,7 @@ export default function Queue() {
     (t: TransactionDto, retry: boolean) => {
       const current = taxState(t);
       const mutation = current.mutation;
-      if (!isQueueActionable(t) || !mutation || mutation.busy) return;
+      if (!mutation || mutation.busy) return;
       updateTaxState(t, (state) => ({
         ...state,
         mutation: state.mutation
@@ -1021,7 +992,7 @@ export default function Queue() {
     (t: TransactionDto) => {
       const current = taxState(t);
       const mutation = current.mutation;
-      if (!isQueueActionable(t) || !mutation || mutation.attemptStatus !== 'PREPARED' || mutation.busy) return;
+      if (!mutation || mutation.attemptStatus !== 'PREPARED' || mutation.busy) return;
       const resumed: TaxMutationState = {
         ...mutation,
         busy: true,
@@ -1665,8 +1636,6 @@ export default function Queue() {
     });
   };
 
-  // The bulk bar is a mutation surface, so only currently writable pending
-  // rows may keep it visible after a provider disposition refresh.
   const selCount = selPend.length;
 
   // -------------------------------------------------------------------------
@@ -1676,8 +1645,6 @@ export default function Queue() {
   interface RowView {
     t: TransactionDto;
     state: UiState;
-    actionability: ReturnType<typeof queueActionabilityOf>;
-    isActionable: boolean;
     hasSplit: boolean;
     suggested: boolean;
     sugName: string | null;
@@ -1695,7 +1662,6 @@ export default function Queue() {
 
   const rowView = (t: TransactionDto): RowView => {
     const state = stateOf(t);
-    const actionability = queueActionabilityOf(t);
     const hasSplit = !!(t.splits && t.splits.length);
     const sugName = t.suggestion?.category ?? null;
     const suggested = !t.category && !hasSplit && !!sugName;
@@ -1709,8 +1675,6 @@ export default function Queue() {
     return {
       t,
       state,
-      actionability,
-      isActionable: actionability.disposition === 'WRITABLE',
       hasSplit,
       suggested,
       sugName,
@@ -1817,24 +1781,6 @@ export default function Queue() {
           {tg.name}
         </span>
       ));
-
-  const actionabilityBadge = (v: RowView) => {
-    if (v.isActionable) return null;
-    return (
-      <span
-        data-testid={`queue-actionability-${v.t.id}`}
-        style={{
-          display: 'inline-block',
-          marginTop: 4,
-          color: 'var(--mut)',
-          fontSize: 12,
-          fontWeight: 600,
-        }}
-      >
-        {queueViewLabel(v.actionability.view)} · {v.actionability.reason}
-      </span>
-    );
-  };
 
   const taxControls = (t: TransactionDto) => {
     if (!taxReadyFor(t) || t.status !== 'PENDING' || (!t.category && !(t.splits && t.splits.length))) {
@@ -1955,7 +1901,7 @@ export default function Queue() {
       state.stagedVersion !== null &&
       state.stagedVersion === state.version &&
       !state.staging &&
-      v.isActionable;
+      canMutate(v.t);
     const buttonStyle: CSSProperties = {
       fontSize: 13.5,
       fontWeight: 600,
@@ -1997,7 +1943,6 @@ export default function Queue() {
           </span>
           <button
             className="btn-ghost"
-            disabled={!v.isActionable}
             onClick={() => resumePreparedTax(v.t)}
           >
             {mutation.kind === 'undo' ? 'Resume undo' : 'Resume post'}
@@ -2014,14 +1959,12 @@ export default function Queue() {
           <span style={{ display: 'inline-flex', gap: 7 }}>
             <button
               className="btn-ghost"
-              disabled={!v.isActionable}
               onClick={() => reconcileTax(v.t, false)}
             >
               Reconcile
             </button>
             <button
               className="btn-ghost"
-              disabled={!v.isActionable}
               onClick={() => reconcileTax(v.t, true)}
             >
               Retry verification
@@ -2055,7 +1998,6 @@ export default function Queue() {
                 event.stopPropagation();
                 undoTax(v.t);
               }}
-              disabled={!v.isActionable}
               className="hov-ink"
               style={{ border: 'none', background: 'none', color: 'var(--fnt)', cursor: 'pointer' }}
             >
@@ -2075,7 +2017,6 @@ export default function Queue() {
                 event.stopPropagation();
                 undoTax(v.t);
               }}
-              disabled={!v.isActionable}
               className="hov-ink"
               style={{ border: 'none', background: 'none', color: 'var(--fnt)', cursor: 'pointer' }}
             >
@@ -2106,28 +2047,6 @@ export default function Queue() {
   };
 
   const statusCell = (v: RowView, mobile: boolean) => {
-    if (!v.isActionable && (v.state === 'pending' || v.state === 'error')) {
-      return (
-        <button
-          type="button"
-          disabled
-          data-tip={`QuickBooks action blocked: ${v.actionability.reason}`}
-          style={{
-            fontSize: 13.5,
-            fontWeight: 600,
-            color: 'var(--bd)',
-            background: 'var(--card)',
-            border: '1px solid var(--bd2)',
-            borderRadius: 7,
-            padding: mobile ? '9px 12px' : '7px 12px',
-            cursor: 'not-allowed',
-            font: 'inherit',
-          }}
-        >
-          Post
-        </button>
-      );
-    }
     if (usesTaxLifecycleFor(v.t)) return taxStatusCell(v, mobile);
     return (
     <>
@@ -2191,7 +2110,6 @@ export default function Queue() {
                 e.stopPropagation();
                 undoPost(v.t.id);
               }}
-              disabled={!v.isActionable}
               onMouseDown={stopMouse}
               data-tip={mobile ? 'Undo' : 'Undo — move back to the queue'}
               data-tip-align="right"
@@ -2227,7 +2145,6 @@ export default function Queue() {
                 e.stopPropagation();
                 undoPost(v.t.id);
               }}
-              disabled={!v.isActionable}
               onMouseDown={stopMouse}
               data-tip={mobile ? 'Undo' : 'Undo — move back to the queue'}
               data-tip-align="right"
@@ -2350,51 +2267,6 @@ export default function Queue() {
         </div>
       </div>
 
-      <div
-        role="tablist"
-        aria-label="Transaction queue views"
-        style={{
-          display: 'flex',
-          gap: 8,
-          flexWrap: 'wrap',
-          marginBottom: 14,
-        }}
-      >
-        {(['actionable', 'blocked', 'safety'] as const).map((view) => {
-          const selected = queueView === view;
-          return (
-            <button
-              key={view}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              data-testid={`queue-view-${view}`}
-              onClick={() => {
-                setQueueView(view);
-                setActiveIdx(0);
-                setSel({});
-                setPicker(null);
-                setTagPicker(null);
-              }}
-              style={{
-                border: `1px solid ${selected ? 'var(--acc)' : 'var(--bd2)'}`,
-                borderRadius: 99,
-                background: selected ? 'var(--hl)' : 'var(--card)',
-                color: selected ? 'var(--ink)' : 'var(--mut)',
-                padding: '6px 11px',
-                font: 'inherit',
-                fontSize: 13,
-                fontWeight: selected ? 700 : 600,
-                cursor: 'pointer',
-              }}
-            >
-              {queueViewLabel(view)}{' '}
-              <span data-testid={`queue-count-${view}`}>{queueCounts[view]}</span>
-            </button>
-          );
-        })}
-      </div>
-
       {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
         <AutopilotQueueStatus
           key={activeCompanyId}
@@ -2501,7 +2373,7 @@ export default function Queue() {
                   <input
                     type="checkbox"
                     checked={!!sel[t.id]}
-                    disabled={!v.isActionable || hasActiveMutation(t)}
+                    disabled={hasActiveMutation(t)}
                     onChange={() => setSel((s) => ({ ...s, [t.id]: !s[t.id] }))}
                     onClick={stopMouse}
                     onMouseDown={stopMouse}
@@ -2520,7 +2392,6 @@ export default function Queue() {
                     >
                       {t.payee}
                     </span>
-                    {actionabilityBadge(v)}
                     {t.memo && (
                       <span
                         style={{
@@ -2549,7 +2420,7 @@ export default function Queue() {
                       <button
                         onClick={onTagBtn(t)}
                         onMouseDown={stopMouse}
-                        disabled={!v.isActionable || hasActiveMutation(t)}
+                        disabled={hasActiveMutation(t)}
                         data-tip="Tags live only in Recat — never written to QuickBooks"
                         className="hov-dash"
                         style={{
@@ -2643,7 +2514,7 @@ export default function Queue() {
                     <button
                       onClick={onOpenPicker(v)}
                       onMouseDown={stopMouse}
-                      disabled={!v.isActionable || hasActiveMutation(t)}
+                      disabled={hasActiveMutation(t)}
                       className="hov-brd"
                       style={{
                         flex: 1,
@@ -2690,7 +2561,7 @@ export default function Queue() {
                           doOpenSplit(t.id);
                         }}
                         onMouseDown={stopMouse}
-                        disabled={!v.isActionable || hasActiveMutation(t)}
+                        disabled={hasActiveMutation(t)}
                         data-tip="Split this transaction across multiple categories"
                         data-tip-align="right"
                         className="hov-dash"
@@ -2719,7 +2590,7 @@ export default function Queue() {
                   <AttachmentPanel
                     companyId={activeCompanyId}
                     transactionId={t.id}
-                    canMutate={(role === 'categorizer' || role === 'admin') && v.isActionable}
+                    canMutate={role === 'categorizer' || role === 'admin'}
                     onCountChange={(count) => setAttachmentCounts((current) => ({
                       ...current,
                       [t.id]: count,
@@ -2768,7 +2639,7 @@ export default function Queue() {
                   <input
                     type="checkbox"
                     checked={!!sel[t.id]}
-                    disabled={!v.isActionable || hasActiveMutation(t)}
+                    disabled={hasActiveMutation(t)}
                     onChange={() => setSel((s) => ({ ...s, [t.id]: !s[t.id] }))}
                     onClick={stopMouse}
                     onMouseDown={stopMouse}
@@ -2794,7 +2665,6 @@ export default function Queue() {
                     >
                       {t.payee}
                     </span>
-                    {actionabilityBadge(v)}
                     <span
                       style={{ display: 'block', fontSize: 12.5, color: 'var(--fnt)', marginTop: 2 }}
                     >
@@ -2826,7 +2696,7 @@ export default function Queue() {
                   <button
                     onClick={onTagBtn(t)}
                     onMouseDown={stopMouse}
-                    disabled={!v.isActionable || hasActiveMutation(t)}
+                    disabled={hasActiveMutation(t)}
                     style={{
                       fontSize: 11.5,
                       fontWeight: 600,
@@ -2898,7 +2768,7 @@ export default function Queue() {
                     <button
                       onClick={onOpenPicker(v)}
                       onMouseDown={stopMouse}
-                      disabled={!v.isActionable || hasActiveMutation(t)}
+                      disabled={hasActiveMutation(t)}
                       style={{
                         width: '100%',
                         boxSizing: 'border-box',
@@ -2927,7 +2797,7 @@ export default function Queue() {
                         doOpenSplit(t.id);
                       }}
                       onMouseDown={stopMouse}
-                      disabled={!v.isActionable || hasActiveMutation(t)}
+                      disabled={hasActiveMutation(t)}
                       data-tip="Split across multiple categories"
                       style={{
                         border: '1px solid var(--bd)',
@@ -2955,7 +2825,7 @@ export default function Queue() {
                   <AttachmentPanel
                     companyId={activeCompanyId}
                     transactionId={t.id}
-                    canMutate={(role === 'categorizer' || role === 'admin') && v.isActionable}
+                    canMutate={role === 'categorizer' || role === 'admin'}
                     onCountChange={(count) => setAttachmentCounts((current) => ({
                       ...current,
                       [t.id]: count,
