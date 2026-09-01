@@ -266,6 +266,7 @@ function recordsMatchingContext(
       && !value.transactionDate.startsWith(`${filter.transactionPeriod}-`)) return false;
     if (filter.jurisdiction !== undefined
       && value.jurisdiction !== undefined
+      && value.jurisdiction !== null
       && value.jurisdiction !== 'unknown'
       && value.jurisdiction !== filter.jurisdiction) return false;
     if (filter.taxCalculation !== undefined
@@ -922,7 +923,8 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       WITH RECURSIVE ${vendorResolution},
       source_vendor_support AS (
         SELECT resolution."companyId", resolution."targetId", source."id",
-               source."normalizedName", source."updatedAt",
+               source."normalizedName",
+               GREATEST(source."createdAt", COALESCE(max(alias."createdAt"), source."createdAt")) AS "updatedAt",
                concat_ws(' ', source."displayName",
                  string_agg(alias."value", ' '
                             ORDER BY alias."normalizedValue" ASC, alias."id" ASC)) AS "searchText"
@@ -934,7 +936,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
           ON alias."companyId" = source."companyId"
          AND alias."vendorIdentityId" = source."id"
         GROUP BY resolution."companyId", resolution."targetId", source."id",
-                 source."normalizedName", source."displayName", source."updatedAt"
+                 source."normalizedName", source."displayName", source."createdAt"
       ),
       vendor_identity_support AS (
         SELECT source_support."companyId", source_support."targetId",
@@ -948,7 +950,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       ),
       ${exactSourceCte}
       SELECT identity."id", identity."companyId", company."nickname" AS "companyName",
-             identity."displayName", identity."normalizedName", identity."updatedAt" AS "revisedAt",
+             identity."displayName", identity."normalizedName", identity."createdAt" AS "revisedAt",
              support."values" AS "aliases", support."lexicalScore",
              exact_match."exactSourceId", exact_match."exactSourceRevisedAt"
       FROM "VendorIdentity" identity
@@ -966,7 +968,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       WHERE identity."companyId" IN (${Prisma.join(companyIds)})
         AND support."matched"
         ${idFilter}
-      ORDER BY support."lexicalScore" DESC, identity."updatedAt" DESC, identity."id" ASC
+      ORDER BY support."lexicalScore" DESC, identity."createdAt" DESC, identity."id" ASC
       LIMIT ${limit}
     `);
   }
@@ -1222,7 +1224,8 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              candidate."matchText", candidate."state", candidate."categoryQboId",
              candidate."taxCalculation", candidate."taxCodeQboId", candidate."tagIds",
              candidate."evidenceCount", candidate."conflictingEvidenceCount",
-             candidate."updatedAt" AS "revisedAt", account."name" AS "categoryName",
+             GREATEST(candidate."createdAt", COALESCE(evidence."latestObservedAt", candidate."createdAt")) AS "revisedAt",
+             account."name" AS "categoryName",
              tax."name" AS "taxCodeName", COALESCE(evidence."patterns", '') AS "patterns",
              COALESCE(evidence."transactions", '') AS "transactions",
              ${text} AS "searchText", ${score} AS "lexicalScore"
@@ -1238,7 +1241,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                  AS "patterns",
                left(string_agg(bounded_evidence.transaction_text, ' '
                               ORDER BY bounded_evidence."observedAt" DESC, bounded_evidence."id" ASC), 8000)
-                 AS "transactions"
+                 AS "transactions", max(bounded_evidence."observedAt") AS "latestObservedAt"
         FROM (
           SELECT candidateEvidence."id", candidateEvidence."observedAt",
                  left(candidateEvidence."pattern"::text, 1000) AS pattern_text,
@@ -1257,7 +1260,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       WHERE candidate."companyId" IN (${Prisma.join(companyIds)})
         AND candidate."state" IN ('ready', 'conflict')
         ${idFilter} ${queryFilter}
-      ORDER BY "lexicalScore" DESC, candidate."updatedAt" DESC, candidate."id" ASC
+      ORDER BY "lexicalScore" DESC, "revisedAt" DESC, candidate."id" ASC
       LIMIT ${limit}
     `);
   }
@@ -1397,7 +1400,7 @@ function classificationCaseSqlFilter(
     AND to_char(transaction."date", 'YYYY-MM') = ${context.transactionPeriod}
   `);
   if (context.jurisdiction !== undefined) clauses.push(Prisma.sql`
-    AND (memory."jurisdiction" = 'unknown' OR memory."jurisdiction" = ${context.jurisdiction})
+    AND (memory."jurisdiction" IS NULL OR memory."jurisdiction" = 'unknown' OR memory."jurisdiction" = ${context.jurisdiction})
   `);
   if (context.taxCalculation !== undefined) clauses.push(Prisma.sql`
     AND (
@@ -1530,26 +1533,35 @@ function jsonStrings(value: Prisma.JsonValue): string[] {
     : [];
 }
 
+function actionTagIds(value: Prisma.JsonValue): string[] | null {
+  if (!Array.isArray(value) || value.length > 50) return null;
+  const tags = value.filter((item): item is string => typeof item === 'string');
+  if (tags.length !== value.length || new Set(tags).size !== tags.length
+    || tags.some((tag) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(tag))) return null;
+  return tags;
+}
+
 function taxCalculation(value: string | null): ClassificationAction['taxCalculation'] | null {
   return value === 'TaxInclusive' || value === 'TaxExcluded' || value === 'NotApplicable'
     ? value
     : null;
 }
 
-function actionFromColumns(input: {
+export function actionFromColumns(input: {
   categoryQboId: string | null;
   taxCalculation: string | null;
   taxCodeQboId: string | null;
   tagIds: Prisma.JsonValue;
 }): ClassificationAction | null {
   const calculation = taxCalculation(input.taxCalculation);
-  if (input.categoryQboId === null || calculation === null) return null;
+  const tagIds = actionTagIds(input.tagIds);
+  if (input.categoryQboId === null || calculation === null || tagIds === null) return null;
   if ((calculation === 'NotApplicable') !== (input.taxCodeQboId === null)) return null;
   return {
     categoryQboId: input.categoryQboId,
     taxCalculation: calculation,
     taxCodeQboId: input.taxCodeQboId,
-    tagIds: jsonStrings(input.tagIds),
+    tagIds,
   };
 }
 
@@ -1633,6 +1645,10 @@ function baseHit(input: {
   verifiedAt?: string | null;
   ruleRevision?: number | null;
 }): ClassificationSearchHit {
+  const historicalRationale = input.action === null && input.summary === null
+    && ['classification_case', 'rule', 'rule_candidate'].includes(input.kind)
+    ? 'Historical classification evidence is retained, but no usable action or display summary is available.'
+    : null;
   return parseClassificationSearchHit({
     id: `${input.kind}:${input.row.id}`,
     sourceId: input.row.id,
@@ -1653,7 +1669,7 @@ function baseHit(input: {
     conflictingEvidenceCount: input.conflictingEvidenceCount,
     conflicts: input.conflicts ?? [],
     provenance: input.provenance,
-    rationale: input.rationale ?? null,
+    rationale: input.rationale ?? historicalRationale,
     examples: input.examples ?? [],
     counterexamples: input.counterexamples ?? [],
     jurisdiction: input.jurisdiction ?? null,
@@ -1717,7 +1733,7 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
       taxCodeEligible: row.taxCodeEligible,
       tagsExist: row.tagsExist,
     }).length === 0;
-    const action = referencesValid ? rawAction : null;
+    const action = referencesValid && summary !== null ? rawAction : null;
     const provenance = row.provenance as unknown as ClassificationSearchHit['provenance'];
     const hit = baseHit({
       row, kind: 'classification_case', vendorIdentityId: row.vendorIdentityId, vendorName: row.vendorName,
@@ -1772,7 +1788,7 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
       taxCodeEligible: row.taxCodeEligible,
       tagsExist: row.tagsExist,
     }).length === 0;
-    const action = referencesValid ? rawAction : null;
+    const action = referencesValid && summary !== null ? rawAction : null;
     const taxed = rawAction !== null && rawAction.taxCalculation !== 'NotApplicable';
     const conflicted = row.reviewRequiredAt !== null;
     const conflict = conflicted ? [{
@@ -1805,8 +1821,9 @@ function ruleRecord(row: RuleSearchRow): () => ClassificationSearchRecord {
 function candidateRecord(row: CandidateSearchRow): () => ClassificationSearchRecord {
   return () => {
     const revisedAt = row.revisedAt.toISOString();
-    const action = actionFromColumns(row);
-    const summary = actionSummary(action, row.categoryName, row.taxCodeName);
+    const rawAction = actionFromColumns(row);
+    const summary = actionSummary(rawAction, row.categoryName, row.taxCodeName);
+    const action = summary === null ? null : rawAction;
     const conflict = row.state === 'conflict' ? [{
       id: `candidate-conflict:${row.id}`,
       companyId: row.companyId,

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ClassificationSearchHit } from '@recat/shared';
 import {
   ClassificationSearchError,
+  actionFromColumns,
   PrismaClassificationSearchRepository,
   classificationSemanticRuntime,
   searchClassificationMemory,
@@ -10,6 +11,20 @@ import {
   type ClassificationSearchRepository,
 } from './search.js';
 import { classificationEmbeddingGeneration } from './embedding/recipe.js';
+
+describe('canonical action tag parsing', () => {
+  const tags = (count: number) => Array.from({ length: count }, (_unused, index) =>
+    `00000000-0000-4000-8000-${index.toString().padStart(12, '0')}`);
+  const parse = (tagIds: string[]) => actionFromColumns({
+    categoryQboId: 'account-1', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds,
+  });
+
+  it('preserves fifty unique UUID tags and rejects duplicate or oversized actions', () => {
+    expect(parse(tags(50))?.tagIds).toHaveLength(50);
+    expect(parse([...tags(20), tags(1)[0]!])).toBeNull();
+    expect(parse(tags(51))).toBeNull();
+  });
+});
 
 function hit(overrides: Partial<ClassificationSearchHit> = {}): ClassificationSearchHit {
   return {
@@ -282,6 +297,11 @@ describe('classification memory search', () => {
         taxCalculation: 'TaxExcluded',
       },
     });
+    const nullJurisdiction = record({
+      hit: { id: 'classification_case:null-jurisdiction', sourceId: 'null-jurisdiction', kind: 'classification_case' },
+      lexicalScore: 0.44, exactReasons: [],
+      context: { transactionDirection: 'out', jurisdiction: null },
+    });
 
     const result = await searchClassificationMemory({
       query: 'same vendor', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
@@ -291,11 +311,12 @@ describe('classification memory search', () => {
         currency: 'CAD', transactionPeriod: '2026-08', jurisdiction: 'CA-AB',
         taxCalculation: 'TaxExcluded',
       },
-    }, { repository: repository([mismatching, matching, explicitUnknown, unknownRule]), semantic: null });
+    }, { repository: repository([mismatching, matching, explicitUnknown, nullJurisdiction, unknownRule]), semantic: null });
 
     expect(result.hits.map((candidate) => candidate.id)).toEqual([
       'classification_case:matching',
       'classification_case:unknown-direction',
+      'classification_case:null-jurisdiction',
       'rule:unknown',
     ]);
 
@@ -306,10 +327,11 @@ describe('classification memory search', () => {
       const unfiltered = await searchClassificationMemory({
         query: 'same vendor', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
         limit: 10, accessibleCompanyIds: ['company-a'], context,
-      }, { repository: repository([mismatching, matching, explicitUnknown, unknownRule]), semantic: null });
+      }, { repository: repository([mismatching, matching, explicitUnknown, nullJurisdiction, unknownRule]), semantic: null });
       expect(unfiltered.hits.map((candidate) => candidate.id)).toEqual([
         'classification_case:mismatch', 'classification_case:matching',
-        'classification_case:unknown-direction', 'rule:unknown',
+        'classification_case:unknown-direction', 'classification_case:null-jurisdiction',
+        'rule:unknown',
       ]);
     }
   });

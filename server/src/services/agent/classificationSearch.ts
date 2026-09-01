@@ -1,4 +1,5 @@
 import type { ClassificationSearchResult } from '@recat/shared';
+import { parseClassificationSearchResult } from '../classification/contracts.js';
 import {
   searchClassificationMemoryWithRuntime,
   type ClassificationSearchInput,
@@ -23,7 +24,7 @@ export function classificationSearchForCompany(
   companyId: string,
   search: CanonicalSearch = searchClassificationMemoryWithRuntime,
 ): AgentClassificationSearch {
-  return ({ query, mode, limit, transaction }: AgentClassificationSearchRequest) => search({
+  return async ({ query, mode, limit, transaction }: AgentClassificationSearchRequest) => parseClassificationSearchResult(await search({
     query,
     companyId,
     scope: 'current_company',
@@ -40,5 +41,5 @@ export function classificationSearchForCompany(
       transactionPeriod: transaction.transactionPeriod,
       ...(transaction.jurisdiction === null ? {} : { jurisdiction: transaction.jurisdiction }),
     },
-  });
+  }));
 }
