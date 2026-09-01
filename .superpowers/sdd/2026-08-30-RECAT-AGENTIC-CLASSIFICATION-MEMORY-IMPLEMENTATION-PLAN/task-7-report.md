@@ -269,6 +269,45 @@ This round changes only `Rules.tsx`, its candidate/lifecycle/history test, and
 this report. No PostgreSQL suite was rerun because the client-only change has no
 database path and no disposable test database URL was provided.
 
+## Independent review fix round 3
+
+RED: three exact-cap regressions reproduced the source-injection defect. An
+absent retired rule deep link displaced row 200 from an otherwise complete
+enabled lifecycle collection, and absent activated and dismissed candidate
+deep links each displaced candidate 100. Because both canonical responses had
+no next cursor, the UI also gave no indication that a live row had disappeared.
+The already-present source-record test remained deduplicated, confirming that
+the fault was the prepend-and-slice path for absent sources.
+
+GREEN: an absent source rule or candidate now renders in its own labelled
+`Linked source rule` or `Linked source candidate` region, explicitly described
+as outside the currently loaded canonical collection. The lifecycle and candidate
+arrays retain and render all 200 and 100 live rows respectively, source records
+do not count toward either cap, and canonical no-cursor responses do not show a
+false truncation state. A source already present in its collection is rendered
+once with no extra source region. The existing retirement and activation tests
+also prove that a successful commit still clears the linked region and reloads
+the authoritative collections.
+
+### Fix-round-3 verification
+
+```text
+Exact-cap/source-clear regressions: 6/6
+Rules candidate/lifecycle/history file: 32/32
+Focused Task 7: 5 files, 110/110
+Full client: 23 files, 243/243
+Task 6A HTTP contracts: 4 files, 23/23
+Server unit: 133 files, 2,241/2,241
+Package-script contract: 1/1
+Root shared/server/client typecheck: passed
+Root shared/server/client production build: passed (Vite 84 modules)
+git diff --check: passed
+```
+
+This client-only round changes `Rules.tsx`, its candidate/lifecycle/source
+test, and this report. No PostgreSQL suite was rerun because no database path
+changed and no disposable test database URL was provided.
+
 ## Concerns
 
 - PostgreSQL behavior was not rerun against a disposable database in this

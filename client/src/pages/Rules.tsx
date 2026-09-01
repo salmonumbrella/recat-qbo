@@ -472,12 +472,22 @@ export default function Rules() {
     void beginOperation({ mutation, candidateId: candidate.id, expectedRevision: 0, idempotencyKey: createCategorizationRequestId() }, candidate.id);
   }, [beginOperation, commitBusy, prepared]);
 
-  const displayedRules = sourceRule && !ruleList.some((rule) => rule.revision.ruleId === sourceRule.revision.ruleId)
-    ? [sourceRule, ...ruleList].slice(0, MAX_VISIBLE_RULES)
-    : ruleList;
-  const displayedCandidates = sourceCandidate && !candidateList.some((candidate) => candidate.id === sourceCandidate.id)
-    ? [sourceCandidate, ...candidateList].slice(0, MAX_VISIBLE_CANDIDATES)
-    : candidateList;
+  const linkedSourceRule = sourceRule
+    && !ruleList.some((rule) => rule.revision.ruleId === sourceRule.revision.ruleId)
+    ? sourceRule
+    : null;
+  const linkedSourceCandidate = sourceCandidate
+    && !candidateList.some((candidate) => candidate.id === sourceCandidate.id)
+    ? sourceCandidate
+    : null;
+  const ruleGroups = [
+    ...(linkedSourceRule ? [{ key: 'linked-source', linked: true, items: [linkedSourceRule] }] : []),
+    { key: 'lifecycle-collection', linked: false, items: ruleList },
+  ];
+  const candidateGroups = [
+    ...(linkedSourceCandidate ? [{ key: 'linked-source', linked: true, items: [linkedSourceCandidate] }] : []),
+    { key: 'candidate-collection', linked: false, items: candidateList },
+  ];
   const reorderRule = useCallback((rule: RuleDetailDto, direction: -1 | 1) => {
     if (!reorderReady || preparingRef.current || pendingPreparationRef.current || prepared || commitBusy) return;
     const ordered = reorderRules;
@@ -614,10 +624,21 @@ export default function Rules() {
         {reorderError && <div role="alert" aria-label="Rule ordering unavailable" style={{ color: 'var(--erT)', marginBottom: 10 }}>
           {reorderError}{' '}<button style={buttonStyle} disabled={reorderBusy} onClick={() => activeCompanyId && void loadReorderRules(activeCompanyId)}>Retry ordering</button>
         </div>}
-        {rulesBusy && displayedRules.length === 0 && <div role="status">Loading rules…</div>}
-        {!rulesBusy && !rulesError && displayedRules.length === 0 && <p style={{ color: 'var(--mut)' }}>No rules in this lifecycle state.</p>}
-        <div style={{ display: 'grid', gap: 12 }}>
-          {displayedRules.map((rule) => {
+        {rulesBusy && ruleList.length === 0 && <div role="status">Loading rules…</div>}
+        {!rulesBusy && !rulesError && ruleList.length === 0 && <p style={{ color: 'var(--mut)' }}>No rules in this lifecycle state.</p>}
+        {ruleGroups.map((group) => group.items.length > 0 && (
+          <div
+            key={group.key}
+            role={group.linked ? 'region' : undefined}
+            aria-labelledby={group.linked ? 'linked-source-rule-title' : undefined}
+            style={group.linked ? { marginBottom: 16 } : undefined}
+          >
+            {group.linked && <>
+              <h3 id="linked-source-rule-title" style={{ fontSize: 16, margin: '0 0 4px' }}>Linked source rule</h3>
+              <p style={{ color: 'var(--mut)', fontSize: 13, margin: '0 0 9px' }}>Shown from the deep link; it is not part of the currently loaded lifecycle collection.</p>
+            </>}
+            <div style={{ display: 'grid', gap: 12 }}>
+          {group.items.map((rule) => {
             const revision = rule.revision;
             const state = revision.state;
             const currentHistory = history[revision.ruleId];
@@ -713,7 +734,9 @@ export default function Rules() {
               </article>
             );
           })}
-        </div>
+            </div>
+          </div>
+        ))}
         {rulesTruncated && <div role="status" aria-label="Rule lifecycle truncated" style={{ color: 'var(--mut)', fontSize: 13, marginTop: 10 }}>
           Showing first {ruleList.length} rules in this lifecycle; more rules exist.
         </div>}
@@ -726,9 +749,20 @@ export default function Rules() {
         {candidatesError && <div role="alert" aria-label="Candidates unavailable" style={{ color: 'var(--erT)', marginBottom: 10 }}>
           {candidatesError}{' '}<button style={buttonStyle} disabled={candidateBusy} onClick={() => activeCompanyId && void loadCandidates(activeCompanyId)}>Retry candidates</button>
         </div>}
-        {candidateBusy && displayedCandidates.length === 0 && !candidatesError && <div role="status">Loading candidates…</div>}
-        <div style={{ display: 'grid', gap: 10 }}>
-          {displayedCandidates.map((candidate) => {
+        {candidateBusy && candidateList.length === 0 && !candidatesError && <div role="status">Loading candidates…</div>}
+        {candidateGroups.map((group) => group.items.length > 0 && (
+          <div
+            key={group.key}
+            role={group.linked ? 'region' : undefined}
+            aria-labelledby={group.linked ? 'linked-source-candidate-title' : undefined}
+            style={group.linked ? { marginBottom: 14 } : undefined}
+          >
+            {group.linked && <>
+              <h3 id="linked-source-candidate-title" style={{ fontSize: 16, margin: '0 0 4px' }}>Linked source candidate</h3>
+              <p style={{ color: 'var(--mut)', fontSize: 13, margin: '0 0 9px' }}>Shown from the deep link; it is not part of the currently loaded candidate collection.</p>
+            </>}
+            <div style={{ display: 'grid', gap: 10 }}>
+          {group.items.map((candidate) => {
             const actionable = candidate.state !== 'activated' && candidate.state !== 'dismissed';
             return <article key={candidate.id} id={`rule-candidate-${candidate.id}`} style={{ border: '1px solid var(--bd2)', borderRadius: 10, padding: 15 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}><strong>{candidate.matchText}</strong><span className={candidate.canActivate ? 'pill-ok' : 'pill-am'}>{readable(candidate.state)}</span></div>
@@ -743,7 +777,9 @@ export default function Rules() {
             </div>}
           </article>;
           })}
-        </div>
+            </div>
+          </div>
+        ))}
         {candidatesTruncated && <div role="status" aria-label="Rule candidates truncated" style={{ color: 'var(--mut)', fontSize: 13, marginTop: 10 }}>
           Showing newest {candidateList.length} candidates; older candidates exist.
         </div>}

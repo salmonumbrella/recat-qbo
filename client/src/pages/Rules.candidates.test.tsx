@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RuleCandidateDto, RuleDetailDto, RuleMutationResult } from '@recat/shared';
@@ -841,6 +841,128 @@ describe('Rules candidate review', () => {
     );
     expect(screen.queryByRole('button', { name: 'Load more candidates' })).not.toBeInTheDocument();
     expect(mocks.listCandidates).toHaveBeenCalledTimes(5);
+  });
+
+  it('keeps all 200 enabled rules when an absent retired deep link is shown separately', async () => {
+    const rules = Array.from({ length: 200 }, (_, index) => ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        id: `revision-source-cap-${index}`,
+        ruleId: `rule-source-cap-${index}`,
+        priority: index,
+        condition: { matchField: 'payee', matchText: `Live capped supplier ${index}` },
+      },
+    }));
+    const source = ruleDetail({
+      active: false,
+      executable: false,
+      revision: {
+        ...ruleDetail().revision,
+        id: 'revision-retired-source',
+        ruleId: 'rule-retired-source',
+        state: 'retired',
+        retiredAt: '2026-08-31T00:00:00.000Z',
+        condition: { matchField: 'payee', matchText: 'Linked retired supplier' },
+      },
+    });
+    mocks.detail.mockResolvedValue(source);
+    mocks.lifecycleRules.mockImplementation(async (
+      _companyId: string,
+      state: string,
+      cursor?: string,
+    ) => {
+      if (state !== 'enabled') return { items: [], nextCursor: null };
+      return cursor
+        ? { items: rules.slice(100), nextCursor: null }
+        : { items: rules.slice(0, 100), nextCursor: 'enabled-page-2' };
+    });
+    window.history.replaceState({}, '', '/rules?source=rule&sourceId=rule-retired-source');
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Rule lifecycle' }), 'enabled');
+    await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
+
+    expect(await screen.findByText('Live capped supplier 199')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-rule-source-cap-"]')).toHaveLength(200);
+    const linkedSource = screen.getByRole('region', { name: 'Linked source rule' });
+    expect(linkedSource).toHaveTextContent('Linked retired supplier');
+    expect(screen.queryByRole('status', { name: 'Rule lifecycle truncated' })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['activated', 'Linked activated candidate'],
+    ['dismissed', 'Linked dismissed candidate'],
+  ] as const)('keeps all 100 candidates when an absent %s deep link is shown separately', async (state, matchText) => {
+    const candidates = Array.from({ length: 100 }, (_, index) => candidate({
+      id: `candidate-source-cap-${index}`,
+      matchText: `Live capped candidate ${index}`,
+    }));
+    const source = candidate({
+      id: `candidate-${state}-source`,
+      state,
+      matchText,
+      canActivate: false,
+      activatedRuleId: state === 'activated' ? 'rule-created' : null,
+    });
+    mocks.getCandidate.mockResolvedValue(source);
+    mocks.listCandidates.mockImplementation(async (
+      _companyId: string,
+      cursor?: string,
+    ) => {
+      const pageNumber = cursor ? Number(cursor.replace('candidate-source-page-', '')) : 0;
+      return {
+        candidates: candidates.slice(pageNumber * 20, pageNumber * 20 + 20),
+        nextCursor: pageNumber < 4 ? `candidate-source-page-${pageNumber + 1}` : null,
+      };
+    });
+    window.history.replaceState({}, '', `/rules?source=rule_candidate&sourceId=${source.id}`);
+    const user = userEvent.setup();
+    render(<Rules />);
+
+    for (let page = 1; page < 5; page += 1) {
+      await user.click(await screen.findByRole('button', { name: 'Load more candidates' }));
+    }
+
+    expect(await screen.findByText('Live capped candidate 99')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id^="rule-candidate-candidate-source-cap-"]')).toHaveLength(100);
+    const linkedSource = screen.getByRole('region', { name: 'Linked source candidate' });
+    expect(linkedSource).toHaveTextContent(matchText);
+    expect(within(linkedSource).queryByRole('button', { name: 'Activate rule' })).not.toBeInTheDocument();
+    expect(within(linkedSource).queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Rule candidates truncated' })).not.toBeInTheDocument();
+  });
+
+  it('does not repeat linked sources that already belong to their live collection', async () => {
+    const sourceRule = ruleDetail({
+      revision: {
+        ...ruleDetail().revision,
+        ruleId: 'rule-present-source',
+        condition: { matchField: 'payee', matchText: 'Present linked supplier' },
+      },
+    });
+    mocks.detail.mockResolvedValue(sourceRule);
+    mocks.lifecycleRules.mockImplementation(async (_companyId: string, state: string) => ({
+      items: state === 'all' ? [sourceRule] : [],
+      nextCursor: null,
+    }));
+    window.history.replaceState({}, '', '/rules?source=rule&sourceId=rule-present-source');
+    const view = render(<Rules />);
+
+    expect(await screen.findByText('Present linked supplier')).toBeInTheDocument();
+    expect(screen.getAllByText('Present linked supplier')).toHaveLength(1);
+    expect(screen.queryByRole('region', { name: 'Linked source rule' })).not.toBeInTheDocument();
+
+    const sourceCandidate = candidate({ id: 'candidate-present-source', matchText: 'Present linked candidate' });
+    mocks.getCandidate.mockResolvedValue(sourceCandidate);
+    mocks.listCandidates.mockResolvedValue({ candidates: [sourceCandidate], nextCursor: null });
+    window.history.replaceState({}, '', `/rules?source=rule_candidate&sourceId=${sourceCandidate.id}`);
+    view.unmount();
+    render(<Rules />);
+
+    expect(await screen.findByText('Present linked candidate')).toBeInTheDocument();
+    expect(screen.getAllByText('Present linked candidate')).toHaveLength(1);
+    expect(screen.queryByRole('region', { name: 'Linked source candidate' })).not.toBeInTheDocument();
   });
 
   it('fences late lifecycle and candidate pages after a company switch', async () => {
