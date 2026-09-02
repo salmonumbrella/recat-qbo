@@ -129,7 +129,7 @@ export default function RuleAffectedTransactionsSection({
                 </div>
                 {item.memo && <p style={{ margin: '7px 0 0', color: 'var(--mut)', fontSize: 13 }}>{item.memo}</p>}
                 <p style={{ margin: '7px 0 0', color: 'var(--mut)', fontSize: 13 }}>{item.status}</p>
-                {!item.ruleWins && <p style={{ margin: '7px 0 0', fontSize: 13 }}>Another enabled rule currently wins</p>}
+                {!item.ruleWins && item.winningRuleId !== null && <p style={{ margin: '7px 0 0', fontSize: 13 }}>Another enabled rule currently wins</p>}
               </article>
             ))}
           </div>

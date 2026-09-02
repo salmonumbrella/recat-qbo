@@ -69,6 +69,17 @@ describe('RuleAffectedTransactionsSection', () => {
     });
   });
 
+  it('does not claim another enabled rule wins when no enabled rule wins the transaction', async () => {
+    mocks.affectedTransactions.mockResolvedValue(page([affected({ winningRuleId: null })]));
+    const user = userEvent.setup();
+    render(<RuleAffectedTransactionsSection companyId="company-a" ruleId="rule-a" />);
+
+    await user.click(screen.getByRole('button', { name: 'View affected transactions' }));
+
+    expect(await screen.findByText(/Northwind Fuel/)).toBeInTheDocument();
+    expect(screen.queryByText(/Another enabled rule currently wins/i)).not.toBeInTheDocument();
+  });
+
   it('changes the filter and appends a deduplicated next page', async () => {
     mocks.affectedTransactions
       .mockResolvedValueOnce(page([affected()], 'cursor-2'))
