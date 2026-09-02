@@ -50,6 +50,7 @@ describe('classificationSearchForCompany', () => {
       mode: 'auto',
       limit: 12,
       accessibleCompanyIds: ['company-a'],
+      excludeTransactionId: 'transaction-a',
       context: {
         transactionDirection: 'out',
         currency: 'CAD',

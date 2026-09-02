@@ -335,6 +335,163 @@ describePostgres('classification search on PostgreSQL', () => {
     expect(activeOnly.some((candidate) => candidate.hit.vendorName === 'Coach gathering hidden')).toBe(false);
   });
 
+  it('excludes selected case evidence after lexical search and semantic rehydration', async () => {
+    const data = await fixtures();
+    const repository = new PrismaClassificationSearchRepository(db);
+    const createCase = async (label: string, date: string) => {
+      const transaction = await db.transaction.create({
+        data: {
+          companyId: data.current.id,
+          qboId: `purchase-${randomUUID()}`,
+          qboType: 'Purchase',
+          qboSyncToken: '1',
+          date: new Date(date),
+          payee: 'Synthetic Fuel',
+          memo: 'Synthetic fuel purchase',
+          amount: '-113.00',
+          bankAccount: 'Synthetic Bank',
+          category: data.account.name,
+          categoryQboId: data.account.qboId,
+          taxCalculation: 'TaxExcluded',
+          taxCode: data.taxCode.name,
+          taxCodeQboId: data.taxCode.qboId,
+        },
+      });
+      const attempt = await db.qboMutationAttempt.create({
+        data: {
+          transactionId: transaction.id,
+          requestId: `search-${label}-${randomUUID()}`,
+          operation: 'post',
+          status: 'VERIFIED',
+          expectedRevision: 0,
+          expectedSyncToken: '1',
+          requestHash: 'd'.repeat(64),
+          requestPayload: {},
+          beforeSnapshot: {},
+        },
+      });
+      const classificationCase = await db.classificationCase.create({
+        data: {
+          companyId: data.current.id,
+          transactionId: transaction.id,
+          vendorIdentityId: data.classificationCase.vendorIdentityId,
+          qboMutationAttemptId: attempt.id,
+          action: {
+            categoryQboId: data.account.qboId,
+            taxCalculation: 'TaxExcluded',
+            taxCodeQboId: data.taxCode.qboId,
+            tagIds: [data.tag.id],
+          },
+          actionFingerprint: randomUUID().replaceAll('-', '').padEnd(64, 'd'),
+          originIntent: 'apply_once',
+          rationale: 'Synthetic fuel purchase with verified business evidence.',
+          requiredEvidence: ['Synthetic fuel receipt'],
+          examples: ['Synthetic fuel purchase'],
+          counterexamples: ['Personal vehicle fuel'],
+          citations: [],
+          reviewer: { userId: null, configVersion: 'synthetic', decision: 'approved' },
+          jurisdiction: 'CA-ON',
+          currency: 'CAD',
+          context: {
+            transactionDirection: 'out',
+            qboType: 'Purchase',
+            sourceAccountName: 'Synthetic Bank',
+            businessPurpose: 'Fuel',
+          },
+          provenance: {
+            source: 'qbo_verified',
+            sourceId: attempt.requestId,
+            actorId: null,
+            recordedAt: date,
+          },
+          transactionSnapshot: {
+            schemaVersion: 'classification-case/v1',
+            transactionId: transaction.id,
+            transactionRevision: 0,
+            qboType: 'Purchase',
+            qboId: transaction.qboId,
+            date,
+            amountCents: -11300,
+            currency: 'CAD',
+            payee: 'Synthetic Fuel',
+            memo: 'Synthetic fuel purchase',
+            sourceAccountName: 'Synthetic Bank',
+          },
+          verifiedAt: new Date(date),
+        },
+      });
+      return { transaction, classificationCase };
+    };
+    const selected = await createCase('selected', '2026-06-16T00:00:00.000Z');
+    const prior = await createCase('prior', '2026-06-14T00:00:00.000Z');
+
+    const lexical = await searchClassificationMemory({
+      query: 'synthetic fuel', companyId: data.current.id, scope: 'current_company', mode: 'lexical',
+      limit: 20, accessibleCompanyIds: [data.current.id], excludeTransactionId: selected.transaction.id,
+    }, { repository, semantic: null });
+    expect(lexical.hits.map(({ sourceId }) => sourceId)).not.toContain(selected.classificationCase.id);
+    expect(lexical.hits.map(({ sourceId }) => sourceId)).toContain(prior.classificationCase.id);
+
+    const revision = (await db.classificationCorpusRevision.findFirstOrThrow({
+      where: { companyId: data.current.id }, orderBy: { revision: 'desc' },
+    })).revision.toString();
+    const generation = classificationEmbeddingGeneration({
+      baseUrl: 'https://api.voyageai.com/v1', fingerprintSalt: 'selected-case-exclusion',
+    });
+    const semantic = await searchClassificationMemory({
+      query: 'synthetic fuel', companyId: data.current.id, scope: 'current_company', mode: 'semantic',
+      limit: 20, accessibleCompanyIds: [data.current.id], excludeTransactionId: selected.transaction.id,
+    }, {
+      repository,
+      semantic: {
+        generation,
+        client: {
+          async embedDocuments() { throw new Error('not used'); },
+          async embedQuery() { return Array.from({ length: 1024 }, () => 0); },
+        },
+        store: {
+          async ensureAvailable() { return { available: true, reason: null }; },
+          async healthMany() {
+            return [{
+              activeGeneration: generation.fingerprint,
+              expectedGeneration: generation.fingerprint,
+              expectedState: 'succeeded',
+              embedded: 2, skipped: 0, backlog: 0, progress: 1,
+              lastSuccessAt: '2026-08-31T00:00:00.000Z', lastError: null,
+              latestAttemptGeneration: generation.fingerprint,
+              latestAttemptState: 'succeeded',
+              latestAttemptAt: '2026-08-31T00:00:00.000Z', latestAttemptError: null,
+              currentCorpusRevision: revision, indexedCorpusRevision: revision,
+              expectedCorpusRevision: revision, latestAttemptCorpusRevision: revision,
+            }];
+          },
+          async search() {
+            return [
+              {
+                documentId: `classification_case:${selected.classificationCase.id}`,
+                companyId: data.current.id,
+                kind: 'classification_case' as const,
+                sourceId: selected.classificationCase.id,
+                revisedAt: selected.classificationCase.verifiedAt.toISOString(),
+                similarity: 0.99,
+              },
+              {
+                documentId: `classification_case:${prior.classificationCase.id}`,
+                companyId: data.current.id,
+                kind: 'classification_case' as const,
+                sourceId: prior.classificationCase.id,
+                revisedAt: prior.classificationCase.verifiedAt.toISOString(),
+                similarity: 0.98,
+              },
+            ];
+          },
+        },
+      },
+    });
+    expect(semantic.hits.map(({ sourceId }) => sourceId)).not.toContain(selected.classificationCase.id);
+    expect(semantic.hits.map(({ sourceId }) => sourceId)).toContain(prior.classificationCase.id);
+  });
+
   it('keeps reviewed source names and aliases searchable while mapping hits to the final identity', async () => {
     const data = await fixtures();
     const source = await db.vendorIdentity.findFirstOrThrow({

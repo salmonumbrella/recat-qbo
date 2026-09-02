@@ -31,6 +31,7 @@ export function classificationSearchForCompany(
     mode,
     limit,
     accessibleCompanyIds: [companyId],
+    excludeTransactionId: transaction.transactionId,
     context: {
       transactionDirection: transaction.transactionDirection,
       ...(transaction.qboType === null ? {} : { qboType: transaction.qboType }),

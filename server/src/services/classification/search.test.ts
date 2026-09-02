@@ -261,6 +261,56 @@ describe('classification memory search', () => {
     expect(result.hits[1]?.matchedIn).toEqual(expect.arrayContaining(['rule', 'lexical']));
   });
 
+  it('excludes the selected transaction before lexical ranking but keeps other compatible evidence', async () => {
+    const self = record({
+      hit: { id: 'classification_case:self', sourceId: 'case-self', kind: 'classification_case' },
+      lexicalScore: 0.99,
+      sourceTransactionId: 'transaction-self',
+    });
+    const prior = record({
+      hit: { id: 'classification_case:prior', sourceId: 'case-prior', kind: 'classification_case' },
+      lexicalScore: 0.5,
+      sourceTransactionId: 'transaction-prior',
+    });
+
+    const result = await searchClassificationMemory({
+      query: 'fuel', companyId: 'company-a', scope: 'current_company', mode: 'lexical',
+      limit: 20, accessibleCompanyIds: ['company-a'],
+      excludeTransactionId: 'transaction-self',
+    }, { repository: repository([self, prior]), semantic: null });
+
+    expect(result.hits.map(({ id }) => id)).toEqual(['classification_case:prior']);
+    expect(result.noMatch).toBe(false);
+  });
+
+  it('reports completed no-match after exclusion instead of returning self evidence', async () => {
+    const result = await searchClassificationMemory({
+      query: 'fuel', companyId: 'company-a', scope: 'current_company', mode: 'auto',
+      limit: 20, accessibleCompanyIds: ['company-a'],
+      excludeTransactionId: 'transaction-self',
+    }, { repository: repository([record({ sourceTransactionId: 'transaction-self' })]), semantic: null });
+
+    expect(result).toMatchObject({
+      mode: 'lexical', requestedMode: 'auto', degraded: true,
+      degradedReason: 'embedding_not_configured', status: 'no_match', noMatch: true, total: 0,
+    });
+  });
+
+  it('changes the snapshot fingerprint when its private exclusion changes', async () => {
+    const input = {
+      query: 'fuel', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, limit: 20, accessibleCompanyIds: ['company-a'],
+    };
+    const dependencies = { repository: repository([record()]), semantic: null };
+    const first = await searchClassificationMemorySnapshot(
+      { ...input, excludeTransactionId: 'transaction-a' }, dependencies,
+    );
+    const second = await searchClassificationMemorySnapshot(
+      { ...input, excludeTransactionId: 'transaction-b' }, dependencies,
+    );
+    expect(first.fingerprint).not.toBe(second.fingerprint);
+  });
+
   it('filters known transaction-context mismatches before ranking while retaining explicit unknown evidence', async () => {
     const matching = record({
       hit: { id: 'classification_case:matching', sourceId: 'matching', kind: 'classification_case' },

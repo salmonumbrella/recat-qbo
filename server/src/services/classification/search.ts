@@ -55,6 +55,8 @@ export interface ClassificationSearchRecord {
   lexicalScore: number;
   exactReasons: ClassificationMatchReason[];
   document?: ClassificationSearchDocument;
+  /** Internal source identity; never returned to callers. */
+  sourceTransactionId?: string;
   /** Deterministic exact-key source; never returned to callers. */
   lookupValue?: string;
   /** Optional evidence-native transaction dimensions. Missing dimensions are
@@ -140,6 +142,9 @@ export interface ClassificationSearchInput {
   /** Internal-only evidence filters. Unknown evidence values are retained;
    * an evidence-native known mismatch is excluded before ranking. */
   context?: ClassificationSearchContextFilter;
+  /** Internal-only selected transaction identity; matching case evidence is
+   * excluded before ranking and never returned to callers. */
+  excludeTransactionId?: string;
 }
 
 type DegradedReason = Exclude<ClassificationSearchResult['degradedReason'], null>;
@@ -184,6 +189,12 @@ function checkedText(value: string, maximum: number): string {
     throw new ClassificationSearchError('INVALID_INPUT');
   }
   return normalized;
+}
+
+function checkedOptionalIdentifier(value: string | undefined): string | undefined {
+  return value === undefined
+    ? undefined
+    : checkedText(value, CLASSIFICATION_CONTRACT_LIMITS.identifier);
 }
 
 function selectedCompanyIds(input: ClassificationSearchInput): string[] {
@@ -246,12 +257,16 @@ function checkedContext(
 function recordsMatchingContext(
   records: readonly ClassificationSearchRecord[],
   filter: ClassificationSearchContextFilter | undefined,
+  excludeTransactionId?: string,
 ): ClassificationSearchRecord[] {
-  if (filter === undefined) return [...records];
-  const folded = (value: string) => value.normalize('NFC').trim().toLocaleLowerCase('en-US');
   return records.filter((record) => {
+    if (excludeTransactionId !== undefined && record.sourceTransactionId === excludeTransactionId) {
+      return false;
+    }
+    if (filter === undefined) return true;
     const value = record.context;
     if (value === undefined) return true;
+    const folded = (source: string) => source.normalize('NFC').trim().toLocaleLowerCase('en-US');
     if (filter.transactionDirection !== undefined
       && value.transactionDirection !== undefined
       && value.transactionDirection !== 'unknown'
@@ -445,6 +460,7 @@ export async function searchClassificationMemory(
   const companyId = checkedText(rawInput.companyId, CLASSIFICATION_CONTRACT_LIMITS.identifier);
   const companyIds = selectedCompanyIds(rawInput);
   const context = checkedContext(rawInput.context);
+  const excludeTransactionId = checkedOptionalIdentifier(rawInput.excludeTransactionId);
   const limit = Math.max(1, Math.min(
     CLASSIFICATION_CONTRACT_LIMITS.hits,
     Math.trunc(rawInput.limit ?? 20),
@@ -459,7 +475,7 @@ export async function searchClassificationMemory(
     const loaded = await boundedRepositoryRead(() => (
       repository.exact(companyIds, query, fetchLimit, context)
     ));
-    const records = recordsMatchingContext(loaded, context);
+    const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'exact', mode: 'exact',
       degradedReason: null, records, lists: exactLists(records), limit,
@@ -470,7 +486,7 @@ export async function searchClassificationMemory(
     const loaded = await boundedRepositoryRead(() => (
       repository.search(companyIds, query, fetchLimit, context)
     ));
-    const records = recordsMatchingContext(loaded, context);
+    const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'lexical', mode: 'lexical',
       degradedReason: null, records, lists: lexicalLists(records), limit,
@@ -484,7 +500,7 @@ export async function searchClassificationMemory(
     const loaded = await boundedRepositoryRead(() => (
       repository.search(companyIds, query, fetchLimit, context)
     ));
-    const records = recordsMatchingContext(loaded, context);
+    const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
       query, companyId, scope: rawInput.scope, requestedMode: 'auto', mode: 'lexical',
       degradedReason: 'embedding_not_configured', records, lists: lexicalLists(records), limit,
@@ -503,7 +519,7 @@ export async function searchClassificationMemory(
     const loaded = await boundedRepositoryRead(() => (
       repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
     ));
-    const records = recordsMatchingContext(loaded, context);
+    const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     const eligibleIds = new Set(records.map((record) => record.hit.id));
     const eligibleSemantic = rolled.filter((hit) => eligibleIds.has(hit.id));
     return finalResult({
@@ -528,7 +544,7 @@ export async function searchClassificationMemory(
     if (error instanceof ClassificationSearchError && error.code !== 'SEMANTIC_UNAVAILABLE') {
       throw error;
     }
-    lexical = recordsMatchingContext(await lexicalPromise, context);
+    lexical = recordsMatchingContext(await lexicalPromise, context, excludeTransactionId);
     const reason = error instanceof ClassificationSearchError && error.reason !== null
       ? error.reason
       : 'semantic_error';
@@ -545,10 +561,10 @@ export async function searchClassificationMemory(
   const loadedRehydrated = await boundedRepositoryRead(() => (
     repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
   ));
-  const rehydrated = recordsMatchingContext(loadedRehydrated, context);
+  const rehydrated = recordsMatchingContext(loadedRehydrated, context, excludeTransactionId);
   const eligibleSemanticIds = new Set(rehydrated.map((record) => record.hit.id));
   const eligibleSemantic = rolled.filter((hit) => eligibleSemanticIds.has(hit.id));
-  lexical = recordsMatchingContext(lexical, context);
+  lexical = recordsMatchingContext(lexical, context, excludeTransactionId);
   // Lexical rows carry query-specific exact-source provenance; queryless
   // semantic rehydration may fill only IDs that the lexical leg did not find.
   const records = [...new Map(
@@ -596,6 +612,7 @@ export async function searchClassificationMemorySnapshot(
       limit: rawInput.limit ?? 20,
       accessibleCompanyIds: [...new Set(rawInput.accessibleCompanyIds)].sort(),
       context: rawInput.context ?? null,
+      excludeTransactionId: rawInput.excludeTransactionId ?? null,
     },
     revisions: after,
     semanticGeneration: dependencies.semantic?.generation.fingerprint ?? null,
@@ -1063,6 +1080,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              memory."originIntent", memory."rationale", memory."requiredEvidence", memory."examples",
              memory."counterexamples", memory."reviewer", memory."jurisdiction", memory."currency",
              memory."context", memory."provenance", memory."verifiedAt", memory."verifiedAt" AS "revisedAt",
+             memory."transactionId" AS "sourceTransactionId",
              transaction."date" AS "transactionDate",
              ${snapshotPayee} AS "payee", ${snapshotMemo} AS "memo",
              COALESCE(account."name", transaction."category") AS "categoryName",
@@ -1311,6 +1329,7 @@ type ClassificationCaseSearchRow = BaseSearchRow & {
   currency: string;
   provenance: Prisma.JsonValue;
   verifiedAt: Date;
+  sourceTransactionId: string;
   transactionDate: Date;
   payee: string;
   memo: string | null;
@@ -1768,6 +1787,7 @@ function caseRecord(row: ClassificationCaseSearchRow): () => ClassificationSearc
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
       document: optionalDocumentFor(hit, revisedAt, row.searchText),
+      sourceTransactionId: row.sourceTransactionId,
       context: {
         ...(transactionDirection === undefined ? {} : { transactionDirection }),
         ...(qboType === undefined ? {} : { qboType }),
