@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { backfillHistoricalClassificationObservations } from './historicalObservations.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -35,7 +36,7 @@ describePostgres('historical classification observations on PostgreSQL', () => {
     return created;
   }
 
-  async function transaction(companyId: string) {
+  async function transaction(companyId: string, rawData: unknown = { CurrencyRef: { value: 'CAD' } }) {
     return db.transaction.create({
       data: {
         companyId,
@@ -48,8 +49,39 @@ describePostgres('historical classification observations on PostgreSQL', () => {
         amount: '-113.00',
         bankAccount: 'Synthetic bank account',
         status: 'POSTED',
+        category: 'Synthetic inventory',
+        categoryQboId: 'synthetic-category',
+        taxCalculation: 'TaxExcluded',
+        taxCode: 'Synthetic tax',
+        taxCodeQboId: 'synthetic-tax',
+        rawData: rawData as never,
       },
     });
+  }
+
+  async function counts(companyId: string) {
+    const [
+      observations,
+      transactions,
+      cases,
+      rules,
+      candidates,
+      candidateEvidence,
+      candidateFolds,
+      mutationAttempts,
+    ] = await Promise.all([
+      db.historicalClassificationObservation.count({ where: { companyId } }),
+      db.transaction.count({ where: { companyId } }),
+      db.classificationCase.count({ where: { companyId } }),
+      db.rule.count({ where: { companyId } }),
+      db.autopilotRuleCandidate.count({ where: { companyId } }),
+      db.autopilotRuleCandidateEvidence.count({ where: { companyId } }),
+      db.autopilotRuleCandidateFold.count({ where: { companyId } }),
+      db.qboMutationAttempt.count({ where: { transaction: { companyId } } }),
+    ]);
+    return {
+      observations, transactions, cases, rules, candidates, candidateEvidence, candidateFolds, mutationAttempts,
+    };
   }
 
   async function latestCorpusRevision(companyId: string): Promise<bigint> {
@@ -132,5 +164,36 @@ describePostgres('historical classification observations on PostgreSQL', () => {
     await expect(db.historicalClassificationObservation.create({
       data: { ...validObservation(companyA.id, source.id), sourceTransactionRevision: -1 },
     })).rejects.toThrow();
+  });
+
+  it('atomically snapshots only a valid projected currency without promoting source rows', async () => {
+    const companyA = await company('Apply currency source');
+    await transaction(companyA.id, { CurrencyRef: { value: 'CAD' } });
+    await transaction(companyA.id, { CurrencyRef: { value: 'cad' } });
+    await transaction(companyA.id, { CurrencyRef: { value: { code: 'CAD' } } });
+    await transaction(companyA.id, {});
+    const before = await counts(companyA.id);
+
+    const first = await backfillHistoricalClassificationObservations({
+      companyId: companyA.id, startDate: '2025-01-01', endDate: '2026-12-31', dryRun: false,
+    }, db);
+    const afterFirst = await counts(companyA.id);
+    const second = await backfillHistoricalClassificationObservations({
+      companyId: companyA.id, startDate: '2025-01-01', endDate: '2026-12-31', dryRun: false,
+    }, db);
+    const afterSecond = await counts(companyA.id);
+
+    expect(first).toMatchObject({ eligible: 1, inserted: 1, existing: 0 });
+    expect(first.excluded.missing_currency).toBe(3);
+    expect(afterFirst.observations).toBe(before.observations + 1);
+    expect(afterFirst.transactions).toBe(before.transactions);
+    expect(afterFirst.cases).toBe(before.cases);
+    expect(afterFirst.rules).toBe(before.rules);
+    expect(afterFirst.candidates).toBe(before.candidates);
+    expect(afterFirst.candidateEvidence).toBe(before.candidateEvidence);
+    expect(afterFirst.candidateFolds).toBe(before.candidateFolds);
+    expect(afterFirst.mutationAttempts).toBe(before.mutationAttempts);
+    expect(second).toMatchObject({ eligible: 1, inserted: 0, existing: 1 });
+    expect(afterSecond).toEqual(afterFirst);
   });
 });

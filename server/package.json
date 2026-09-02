@@ -11,7 +11,8 @@
     "test": "npm run test:unit && npm run test:pg",
     "test:unit": "vitest run",
     "test:pg": "vitest run --config vitest.pg.config.ts",
-    "seed": "tsx src/seed.ts"
+    "seed": "tsx src/seed.ts",
+    "classification:observations:backfill": "node dist/cli/backfillHistoricalClassificationObservations.js"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
