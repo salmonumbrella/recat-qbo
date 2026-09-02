@@ -761,6 +761,7 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
   it('reports a failed disposable database drop and retries until absence is verified', async () => {
     let dropAttempts = 0;
     const retryable = await createDisposablePgvectorDatabase(TASK8_DATABASE_ANCHOR_URL!, {
+      async runMigrations() {},
       async dropDatabase({ defaultDrop }) {
         dropAttempts += 1;
         if (dropAttempts === 1) throw new Error('task8-simulated-drop-failure');
