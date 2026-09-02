@@ -111,6 +111,21 @@ describe('Queue shared controls', () => {
     expect(document.querySelectorAll('select')).toHaveLength(0);
   });
 
+  it('does not activate another row when opening its category picker', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+
+    const genericRow = screen.getByText('Generic supplier').closest('.interactive-surface')!;
+    const otherRow = screen.getByText('Another supplier').closest('.interactive-surface')!;
+    await user.click(genericRow);
+    expect(genericRow).toHaveStyle({ background: 'var(--hl)' });
+
+    await user.click(screen.getByRole('combobox', { name: 'Category for Another supplier' }));
+
+    expect(genericRow).toHaveStyle({ background: 'var(--hl)' });
+    expect(otherRow).toHaveStyle({ background: 'transparent' });
+  });
+
   it('keeps an unselected rule suggestion visible and described on the category trigger', async () => {
     mocks.list.mockResolvedValue({
       transactions: [transaction({

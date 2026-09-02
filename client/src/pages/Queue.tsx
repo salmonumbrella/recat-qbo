@@ -1768,23 +1768,25 @@ export default function Queue() {
         {v.pickLabel}
       </button>
     ) : (
-      <CategoryPicker
-        label={`Category for ${v.t.payee}`}
-        value={v.t.categoryQboId}
-        options={rowCategoryOptions(v.t)}
-        onPick={(qboId) => pickRowCategory(v.t, qboId)}
-        onSplitFooter={() => doOpenSplit(v.t.id)}
-        showBadges={!mobile}
-        disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
-        triggerText={v.pickLabel}
-        triggerTone={v.suggested ? 'suggested' : undefined}
-        triggerBadge={v.suggested ? v.isRule ? 'rule' : 'suggested' : undefined}
-        triggerBadgeTooltip={
-          v.isRule && v.t.suggestion && (v.t.suggestion.matchedRules ?? 0) > 1
-            ? `Matched ${v.t.suggestion.matchedRules} rules — “${v.t.suggestion.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`
-            : undefined
-        }
-      />
+      <span onClick={(event) => event.stopPropagation()}>
+        <CategoryPicker
+          label={`Category for ${v.t.payee}`}
+          value={v.t.categoryQboId}
+          options={rowCategoryOptions(v.t)}
+          onPick={(qboId) => pickRowCategory(v.t, qboId)}
+          onSplitFooter={() => doOpenSplit(v.t.id)}
+          showBadges={!mobile}
+          disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
+          triggerText={v.pickLabel}
+          triggerTone={v.suggested ? 'suggested' : undefined}
+          triggerBadge={v.suggested ? v.isRule ? 'rule' : 'suggested' : undefined}
+          triggerBadgeTooltip={
+            v.isRule && v.t.suggestion && (v.t.suggestion.matchedRules ?? 0) > 1
+              ? `Matched ${v.t.suggestion.matchedRules} rules — “${v.t.suggestion.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`
+              : undefined
+          }
+        />
+      </span>
     );
 
   const tagChips = (t: TransactionDto) =>
