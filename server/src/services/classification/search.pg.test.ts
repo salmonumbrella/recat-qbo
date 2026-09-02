@@ -250,6 +250,9 @@ describePostgres('classification search on PostgreSQL', () => {
 
   it('finds live aliases, rules, candidates, and case evidence while excluding inactive rows', async () => {
     const data = await fixtures();
+    expect(await db.historicalClassificationObservation.count({
+      where: { companyId: data.current.id },
+    })).toBe(0);
     const repository = new PrismaClassificationSearchRepository(db);
 
     const aliasResult = await searchClassificationMemory({
@@ -1204,6 +1207,7 @@ describePostgres('classification search on PostgreSQL', () => {
       'classification_corpus_case_update',
       'classification_corpus_case_invalidation',
       'classification_corpus_case_invalidation_update',
+      'classification_corpus_historical_observation',
       'classification_corpus_rule',
       'classification_corpus_rule_update',
       'classification_corpus_rule_revision',

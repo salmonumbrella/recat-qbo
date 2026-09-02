@@ -246,6 +246,7 @@ model Company {
   vendorIdentityMerges        VendorIdentityMerge[]
   classificationCases         ClassificationCase[]
   classificationCaseInvalidations ClassificationCaseInvalidation[]
+  historicalClassificationObservations HistoricalClassificationObservation[]
   ruleRevisions               RuleRevision[]
   classificationCorpusRevisions ClassificationCorpusRevision[]
   ruleLifecycleRevision       RuleLifecycleRevision?
@@ -309,6 +310,7 @@ model Transaction {
   receiptMatchCandidates ReceiptMatchCandidate[]
   providerActionability TransactionActionability?
   classificationCases            ClassificationCase[]
+  historicalClassificationObservations HistoricalClassificationObservation[]
 
   @@unique([companyId, qboType, qboId])
   // Composite identity lets every company-owned child prove its tenant in
@@ -818,6 +820,39 @@ model VendorIdentityMerge {
   @@unique([companyId, id])
   @@unique([companyId, sourceVendorIdentityId])
   @@index([companyId, targetVendorIdentityId])
+}
+
+/// Append-only display-only historical source snapshots. They are advisory
+/// evidence, never verified classification cases or executable policy.
+model HistoricalClassificationObservation {
+  id                        String      @id @default(uuid())
+  companyId                 String
+  company                   Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  sourceTransactionId       String
+  sourceTransaction         Transaction @relation(fields: [companyId, sourceTransactionId], references: [companyId, id], onDelete: Restrict)
+  sourceQboType             String      @db.VarChar(32)
+  sourceQboId               String      @db.VarChar(128)
+  sourceTransactionRevision Int
+  sourceQboSyncToken        String      @db.VarChar(128)
+  sourceStatus              TxnStatus
+  sourceUpdatedAt           DateTime
+  observedAt                DateTime    @default(now())
+  transactionDate           DateTime
+  payee                     String      @db.VarChar(500)
+  memo                      String?     @db.VarChar(2000)
+  amountCents               BigInt
+  currency                  String      @db.Char(3)
+  sourceAccountName         String      @db.VarChar(500)
+  categoryName              String      @db.VarChar(500)
+  categoryQboId             String      @db.VarChar(120)
+  taxCalculation            String      @db.VarChar(32)
+  taxCodeName               String?     @db.VarChar(500)
+  taxCodeQboId              String?     @db.VarChar(120)
+  tagNames                  Json        @default("[]")
+
+  @@unique([companyId, sourceQboType, sourceQboId, sourceTransactionRevision, sourceQboSyncToken])
+  @@index([companyId, observedAt])
+  @@index([companyId, sourceTransactionId])
 }
 
 /// Immutable evidence produced only from a verified QBO mutation attempt.
