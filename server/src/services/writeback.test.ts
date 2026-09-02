@@ -399,6 +399,7 @@ describe('legacy write safety', () => {
       expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: 'blocked',
         txnId: 'txn-1',
+        before: 'Ask My Accountant',
         payload: expect.objectContaining({
           error: { code: 'QBO_TRANSACTION_LOCKED' },
         }),
@@ -2107,6 +2108,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
       expect(fixture.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: 'blocked',
         txnId: DURABLE_TRANSACTION_ID,
+        before: `QuickBooks ${qboType}`,
         payload: expect.objectContaining({ error: { code } }),
       }));
 
@@ -4139,7 +4141,7 @@ describe('undoCategorization', () => {
     expect(result).toMatchObject({
       requestId: 'undo-operation',
       outcome: 'VERIFIED',
-      status: 'REVERTED',
+      status: 'PENDING',
     });
     expect(fixture.db.qboMutationAttempt.findUnique)
       .toHaveBeenCalledWith({ where: { requestId: 'request-existing' } });
@@ -4282,7 +4284,7 @@ describe('undoCategorization', () => {
     expect(fixture.db.transactionRow.status).toBe('POSTED');
   });
 
-  it('persists and sends one exact restore, verifies readback, then marks REVERTED', async () => {
+  it('persists and sends one exact restore, verifies readback, then requeues PENDING', async () => {
     const fixture = postedFixture();
     fixture.fetchPurchaseSnapshot
       .mockReset()
@@ -4300,7 +4302,7 @@ describe('undoCategorization', () => {
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
     }, fixture.deps);
 
-    expect(result).toMatchObject({ ok: true, status: 'REVERTED', outcome: 'VERIFIED' });
+    expect(result).toMatchObject({ ok: true, status: 'PENDING', outcome: 'VERIFIED' });
     expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite.mock.calls[0]?.[0]).toMatchObject({
@@ -4311,7 +4313,9 @@ describe('undoCategorization', () => {
       operation: 'restore',
       status: 'VERIFIED',
     });
-    expect(fixture.db.transactionRow.status).toBe('REVERTED');
+    expect(fixture.db.transactionRow.status).toBe('PENDING');
+    expect(fixture.db.transactionRow.postedAt).toBeNull();
+    expect(fixture.db.transactionRow.postedByUserId).toBeNull();
   });
 
   it('blocks a reconciled transaction before a prepared undo can enter COMMITTING', async () => {
@@ -4398,7 +4402,7 @@ describe('undoCategorization', () => {
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
     }, fixture.deps);
 
-    expect(result).toMatchObject({ ok: true, status: 'REVERTED', outcome: 'VERIFIED' });
+    expect(result).toMatchObject({ ok: true, status: 'PENDING', outcome: 'VERIFIED' });
     expect(fixture.db.qboAccount.findMany).not.toHaveBeenCalled();
     expect(fixture.db.qboTaxCode.findMany).not.toHaveBeenCalled();
     expect(fixture.db.qboTaxRate.findMany).not.toHaveBeenCalled();
@@ -4578,7 +4582,7 @@ describe('undoCategorization', () => {
     expect(results.every((result) =>
       result.outcome === 'VERIFIED' || result.outcome === 'IN_PROGRESS')).toBe(true);
     expect(fixture.db.attempts.at(-1)?.status).toBe('VERIFIED');
-    expect(fixture.db.transactionRow.status).toBe('REVERTED');
+    expect(fixture.db.transactionRow.status).toBe('PENDING');
   });
 
   it('rejects reuse of a recategorization request ID for undo', async () => {
@@ -5081,7 +5085,7 @@ describe('Deposit durable lifecycle matrix', () => {
       }, fixture.deps),
     ).resolves.toMatchObject({
       ok: true,
-      status: 'REVERTED',
+      status: 'PENDING',
       outcome: 'VERIFIED',
     });
     expect(fixture.prepareRestore).toHaveBeenCalledWith(

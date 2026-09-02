@@ -489,7 +489,7 @@ beforeEach(() => {
   mocks.undoCategorization.mockResolvedValue(
     mutation({
       requestId: '00000000-0000-4000-8000-000000000202',
-      status: 'REVERTED',
+      status: 'PENDING',
     }),
   );
   mocks.categorize.mockResolvedValue(transaction());
@@ -1108,7 +1108,7 @@ describe('tax-aware manual queue', () => {
       } as TransactionDto;
       mocks.reconcile.mockResolvedValue(mutation({
         requestId: persistedRequestId,
-        status: operation === 'restore' ? 'REVERTED' : 'POSTED',
+        status: operation === 'restore' ? 'PENDING' : 'POSTED',
       }));
       const user = userEvent.setup();
       await renderQueue(reloaded);
@@ -1235,7 +1235,7 @@ describe('tax-aware manual queue', () => {
       });
       const result = mutation({
         requestId,
-        status: operation === 'restore' ? 'REVERTED' : 'POSTED',
+        status: operation === 'restore' ? 'PENDING' : 'POSTED',
       });
       const resumedEndpoint = operation === 'restore'
         ? mocks.undoCategorization
@@ -1273,7 +1273,11 @@ describe('tax-aware manual queue', () => {
           requestId,
         );
       }
-      await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+      if (operation === 'restore') {
+        expect(await screen.findByText('Generic supplier')).toBeInTheDocument();
+      } else {
+        await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+      }
       expect(mocks.reconcile).not.toHaveBeenCalled();
       expect(mocks.requestId).not.toHaveBeenCalled();
     },
@@ -1496,7 +1500,7 @@ describe('tax-aware manual queue', () => {
 
   it.each([
     ['recategorize', 'PENDING', 'Resume post', 'POSTED'],
-    ['restore', 'POSTED', 'Resume undo', 'REVERTED'],
+    ['restore', 'POSTED', 'Resume undo', 'PENDING'],
   ] as const)(
     'truthfully resumes a PREPARED %s through its original endpoint and exact UUID',
     async (operation, transactionStatus, buttonName, terminalStatus) => {

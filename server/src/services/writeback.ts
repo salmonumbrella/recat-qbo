@@ -219,6 +219,7 @@ async function assertWriteSafetyAndPersistBlocked(
           error,
           after,
           d.now(),
+          auditLabels(txn).before,
         );
       });
     }
@@ -605,6 +606,7 @@ export async function postTransaction(
               err,
               afterLabel,
               now,
+              before,
             );
           }
         });
@@ -2405,7 +2407,7 @@ function recordedAttemptResult(
   transactionStatus: string,
 ): DurableMutationResult {
   if (attempt.status === 'VERIFIED') {
-    const status = attempt.operation === 'restore' ? 'REVERTED' : 'POSTED';
+    const status = attempt.operation === 'restore' ? 'PENDING' : 'POSTED';
     return {
       transactionId: attempt.transactionId,
       requestId: attempt.requestId,
@@ -2833,10 +2835,10 @@ async function finalizeVerified(
       attempt,
       txn,
       {
-        status,
+        status: status === 'REVERTED' ? 'PENDING' : status,
         qboSyncToken: newSyncToken,
-        postedAt: status === 'POSTED' ? d.now() : txn.postedAt,
-        postedByUserId: status === 'POSTED' ? actor.id : txn.postedByUserId,
+        postedAt: status === 'POSTED' ? d.now() : null,
+        postedByUserId: status === 'POSTED' ? actor.id : null,
         errorCode: null,
         errorMessage: null,
       },
@@ -2884,7 +2886,7 @@ async function finalizeVerified(
     transactionId: txn.id,
     requestId: attempt.requestId,
     ok: true,
-    status,
+    status: status === 'REVERTED' ? 'PENDING' : status,
     outcome: 'VERIFIED',
   };
 }
