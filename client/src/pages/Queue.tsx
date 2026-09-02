@@ -70,11 +70,14 @@ const PROVIDER_BLOCKED = new Set([
 ]);
 
 function belongsInQueue(transaction: TransactionDto): boolean {
-  if (
-    transaction.status !== 'PENDING'
-    && transaction.status !== 'ERROR'
-    && transaction.status !== 'POSTING'
-  ) return false;
+  const pendingWork = transaction.status === 'PENDING'
+    || transaction.status === 'ERROR'
+    || transaction.status === 'POSTING'
+    || (
+      transaction.status === 'POSTED'
+      && transaction.activeCategorizationAttempt?.operation === 'restore'
+    );
+  if (!pendingWork) return false;
   return !PROVIDER_BLOCKED.has(transaction.providerActionability?.disposition ?? 'UNKNOWN');
 }
 

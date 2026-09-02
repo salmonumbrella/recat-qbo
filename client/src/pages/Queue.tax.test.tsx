@@ -1538,6 +1538,35 @@ describe('tax-aware manual queue', () => {
     },
   );
 
+  it('keeps an in-progress restore visible for reconciliation', async () => {
+    const requestId = '00000000-0000-4000-8000-000000000603';
+    mocks.undoCategorization.mockResolvedValue(mutation({
+      requestId,
+      ok: false,
+      status: 'POSTED',
+      outcome: 'IN_PROGRESS',
+      error: {
+        code: 'MUTATION_IN_PROGRESS',
+        message: 'The prepared restore is already in progress.',
+      },
+    }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({
+      status: 'POSTED',
+      activeCategorizationAttempt: {
+        requestId,
+        operation: 'restore',
+        status: 'PREPARED',
+      },
+    }));
+
+    await user.click(screen.getByRole('button', { name: 'Resume undo' }));
+
+    expect(await screen.findByText('Generic supplier')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^reconcile$/i })).toBeInTheDocument();
+    expect(mocks.undoCategorization).toHaveBeenCalledWith('TRANSACTION_GENERIC', requestId);
+  });
+
   it.each([
     ['recategorize', 'PENDING', 'Resume post', 'QBO_TRANSACTION_LOCKED'],
     ['restore', 'POSTED', 'Resume undo', 'QBO_PERIOD_CLOSED'],
