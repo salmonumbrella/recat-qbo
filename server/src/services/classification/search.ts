@@ -1700,6 +1700,7 @@ function baseHit(input: {
     currency: input.currency ?? null,
     verifiedAt: input.verifiedAt ?? null,
     ruleRevision: input.ruleRevision ?? null,
+    observation: null,
   });
 }
 

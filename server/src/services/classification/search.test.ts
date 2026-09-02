@@ -59,6 +59,7 @@ function hit(overrides: Partial<ClassificationSearchHit> = {}): ClassificationSe
     currency: null,
     verifiedAt: null,
     ruleRevision: null,
+    observation: null,
     ...overrides,
   };
 }
@@ -182,6 +183,36 @@ describe('classification memory search', () => {
     expect(queryRaw).toHaveBeenCalledTimes(1);
     expect(Object.keys(revisions)).toEqual(companyIds);
     expect(revisions['company-099']).toBe('100');
+  });
+
+  it('keeps canonical vendor aliases searchable when they have no historical observation', async () => {
+    let queryCount = 0;
+    const queryRaw = vi.fn(async () => {
+      queryCount += 1;
+      if (queryCount !== 2) return [];
+      return [{
+        id: 'alias-a',
+        companyId: 'company-a',
+        companyName: 'Company A',
+        vendorIdentityId: 'vendor-a',
+        value: 'Coach Calgary',
+        normalizedValue: 'coach calgary',
+        source: 'user',
+        revisedAt: new Date('2026-08-31T00:00:00.000Z'),
+        vendorName: 'Coach Calgary',
+        lexicalScore: 0.8,
+      }];
+    });
+    const repository = new PrismaClassificationSearchRepository({ $queryRaw: queryRaw } as never);
+
+    const records = await repository.search(['company-a'], 'Coach Calgary', 10);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]?.hit).toMatchObject({
+      id: 'vendor_alias:alias-a',
+      kind: 'vendor_alias',
+      observation: null,
+    });
   });
 
   it.each(['hybrid', 'auto'] as const)(
