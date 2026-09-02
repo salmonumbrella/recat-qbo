@@ -78,6 +78,19 @@ describe('historical classification observation selection', () => {
     }));
   });
 
+  it('accepts 50 tags and excludes 51 tags from an observation summary', () => {
+    const fiftyTags = Array.from({ length: 50 }, (_, index) => `Tag ${String(index + 1).padStart(2, '0')}`);
+
+    expect(toHistoricalObservation({ ...validSource(), tagNames: fiftyTags }, new Set())).toEqual(expect.objectContaining({
+      ok: true,
+      value: expect.objectContaining({ tagNames: fiftyTags }),
+    }));
+    expect(toHistoricalObservation({
+      ...validSource(),
+      tagNames: [...fiftyTags, 'Tag 51'],
+    }, new Set())).toEqual({ ok: false, reason: 'missing_display_summary' });
+  });
+
   it('preserves an absent memo as null without excluding an otherwise complete action', () => {
     expect(toHistoricalObservation({ ...validSource(), memo: '   ' }, new Set())).toEqual(expect.objectContaining({
       ok: true,

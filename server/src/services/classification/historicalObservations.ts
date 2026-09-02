@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
+import { CLASSIFICATION_CONTRACT_LIMITS } from './contracts.js';
 
 const SUPPORTED_QBO_TYPES = new Set(['Purchase', 'Deposit', 'JournalEntry']);
 const TAX_CALCULATIONS = new Set(['TaxInclusive', 'TaxExcluded']);
@@ -170,7 +171,7 @@ function exactCents(value: HistoricalObservationSource['amount']): bigint | null
 }
 
 function stableTagNames(values: readonly string[]): string[] | null {
-  if (values.length > 100) return null;
+  if (values.length > CLASSIFICATION_CONTRACT_LIMITS.tags) return null;
   const names: string[] = [];
   for (const value of values) {
     const name = boundedText(value, 500);
@@ -453,16 +454,18 @@ async function applyPage(
         transaction."taxCalculation" AS "taxCalculation",
         CASE WHEN transaction."taxCode" IS NULL THEN NULL ELSE btrim(transaction."taxCode") END AS "taxCodeName",
         transaction."taxCodeQboId" AS "taxCodeQboId",
-        COALESCE((
-          SELECT jsonb_agg(tag."name" ORDER BY tag."name" ASC)
-          FROM "TxnTag" transaction_tag
-          JOIN "Tag" tag ON tag."id" = transaction_tag."tagId"
-          WHERE transaction_tag."txnId" = transaction."id"
-        ), '[]'::jsonb) AS "tagNames"
+        tags."tagNames"
       FROM "Transaction" transaction
       JOIN selected ON selected."sourceTransactionId" = transaction."id"
         AND selected."sourceTransactionRevision" = transaction."revision"
         AND selected."sourceQboSyncToken" = transaction."qboSyncToken"
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(jsonb_agg(tag."name" ORDER BY tag."name" ASC), '[]'::jsonb) AS "tagNames"
+        FROM "TxnTag" transaction_tag
+        JOIN "Tag" tag ON tag."id" = transaction_tag."tagId"
+        WHERE transaction_tag."txnId" = transaction."id"
+        HAVING count(*) <= ${CLASSIFICATION_CONTRACT_LIMITS.tags}
+      ) tags
       WHERE transaction."companyId" = ${input.companyId}
         AND transaction."date" >= ${start}
         AND transaction."date" < ${endExclusive}

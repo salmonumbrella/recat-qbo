@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { backfillHistoricalClassificationObservations } from './historicalObservations.js';
+import {
+  backfillHistoricalClassificationObservations,
+  type HistoricalObservationDb,
+} from './historicalObservations.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
@@ -56,6 +59,19 @@ describePostgres('historical classification observations on PostgreSQL', () => {
         taxCodeQboId: 'synthetic-tax',
         rawData: rawData as never,
       },
+    });
+  }
+
+  async function addTags(companyId: string, sourceTransactionId: string, start: number, count: number) {
+    const tags = await Promise.all(Array.from({ length: count }, (_, index) => db.tag.create({
+      data: {
+        companyId,
+        name: `Historical tag ${String(start + index).padStart(2, '0')}`,
+        color: '#112233',
+      },
+    })));
+    await db.txnTag.createMany({
+      data: tags.map((tag) => ({ txnId: sourceTransactionId, tagId: tag.id })),
     });
   }
 
@@ -195,5 +211,57 @@ describePostgres('historical classification observations on PostgreSQL', () => {
     expect(afterFirst.mutationAttempts).toBe(before.mutationAttempts);
     expect(second).toMatchObject({ eligible: 1, inserted: 0, existing: 1 });
     expect(afterSecond).toEqual(afterFirst);
+  });
+
+  it('keeps 50 tags, excludes 51 tags, and rechecks the cap during the atomic insert', async () => {
+    const withinCapCompany = await company('Tag cap accepted');
+    const withinCap = await transaction(withinCapCompany.id);
+    await addTags(withinCapCompany.id, withinCap.id, 1, 50);
+
+    const withinCapResult = await backfillHistoricalClassificationObservations({
+      companyId: withinCapCompany.id, startDate: '2025-01-01', endDate: '2026-12-31', dryRun: false,
+    }, db);
+    const withinCapObservation = await db.historicalClassificationObservation.findFirstOrThrow({
+      where: { companyId: withinCapCompany.id, sourceTransactionId: withinCap.id },
+    });
+    expect(withinCapResult).toMatchObject({ eligible: 1, inserted: 1, existing: 0 });
+    expect(withinCapObservation.tagNames).toHaveLength(50);
+
+    const overCapCompany = await company('Tag cap excluded');
+    const overCap = await transaction(overCapCompany.id);
+    await addTags(overCapCompany.id, overCap.id, 51, 51);
+    const overCapResult = await backfillHistoricalClassificationObservations({
+      companyId: overCapCompany.id, startDate: '2025-01-01', endDate: '2026-12-31', dryRun: false,
+    }, db);
+    expect(overCapResult).toMatchObject({ eligible: 0, inserted: 0, existing: 0 });
+    expect(overCapResult.excluded.missing_display_summary).toBe(1);
+    expect(await db.historicalClassificationObservation.count({
+      where: { companyId: overCapCompany.id, sourceTransactionId: overCap.id },
+    })).toBe(0);
+
+    const staleReadCompany = await company('Tag cap stale read');
+    const changesAfterRead = await transaction(staleReadCompany.id);
+    await addTags(staleReadCompany.id, changesAfterRead.id, 102, 50);
+    let mutateAfterPreflight = true;
+    const staleReadDb = {
+      transaction: db.transaction,
+      historicalClassificationObservation: db.historicalClassificationObservation,
+      $transaction: db.$transaction.bind(db),
+      $queryRaw: async (query: unknown) => {
+        const rows = await db.$queryRaw(query as Prisma.Sql);
+        if (mutateAfterPreflight) {
+          mutateAfterPreflight = false;
+          await addTags(staleReadCompany.id, changesAfterRead.id, 152, 1);
+        }
+        return rows;
+      },
+    } as unknown as HistoricalObservationDb;
+    const staleReadResult = await backfillHistoricalClassificationObservations({
+      companyId: staleReadCompany.id, startDate: '2025-01-01', endDate: '2026-12-31', dryRun: false,
+    }, staleReadDb);
+    expect(staleReadResult).toMatchObject({ eligible: 0, inserted: 0, existing: 0 });
+    expect(await db.historicalClassificationObservation.count({
+      where: { companyId: staleReadCompany.id, sourceTransactionId: changesAfterRead.id },
+    })).toBe(0);
   });
 });
