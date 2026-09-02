@@ -9,6 +9,10 @@ const OPTIONS: ControlOption[] = [
   { value: 'archive', label: 'Archived account', disabled: true },
 ];
 
+async function waitForAnimationFrames(): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+}
+
 describe('Select', () => {
   it('opens a labelled listbox, selects with the keyboard, and restores focus after Escape', async () => {
     const onValueChange = vi.fn();
@@ -64,5 +68,47 @@ describe('Combobox', () => {
     await user.click(screen.getByRole('combobox', { name: 'Category' }));
     expect(screen.getByText('suggested')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Split into multiple categories' })).toBeInTheDocument();
+  });
+
+  it('does not restore a dismissed control focus over a newly opened control or unrelated field', async () => {
+    const user = userEvent.setup();
+    render(
+      <div className="rr">
+        <Combobox label="First category" value="all" options={OPTIONS} onValueChange={vi.fn()} />
+        <Combobox label="Second category" value="all" options={OPTIONS} onValueChange={vi.fn()} />
+        <input aria-label="Unrelated field" />
+      </div>,
+    );
+
+    await user.click(screen.getByRole('combobox', { name: 'First category' }));
+    expect(screen.getByRole('textbox', { name: 'First category' })).toHaveFocus();
+
+    const secondTrigger = screen.getByRole('combobox', { name: 'Second category' });
+    await user.click(secondTrigger);
+    const secondInput = screen.getByRole('textbox', { name: 'Second category' });
+    await waitForAnimationFrames();
+    expect(secondTrigger).toHaveAttribute('aria-expanded', 'true');
+    expect(secondInput).toHaveFocus();
+
+    const unrelatedField = screen.getByRole('textbox', { name: 'Unrelated field' });
+    await user.click(unrelatedField);
+    await waitForAnimationFrames();
+    expect(unrelatedField).toHaveFocus();
+  });
+
+  it('keeps the active listbox option programmatically associated with its focused search input', async () => {
+    const user = userEvent.setup();
+    render(<div className="rr"><Combobox label="Category" value="all" options={OPTIONS} onValueChange={vi.fn()} /></div>);
+
+    await user.click(screen.getByRole('combobox', { name: 'Category' }));
+    const input = screen.getByRole('textbox', { name: 'Category' });
+    await user.keyboard('{ArrowDown}');
+
+    const listbox = screen.getByRole('listbox', { name: 'Category' });
+    const activeOptionId = input.getAttribute('aria-activedescendant');
+    expect(input).toHaveFocus();
+    expect(input).toHaveAttribute('aria-controls', listbox.id);
+    expect(activeOptionId).not.toBeNull();
+    expect(document.getElementById(activeOptionId!)).toHaveAttribute('role', 'option');
   });
 });

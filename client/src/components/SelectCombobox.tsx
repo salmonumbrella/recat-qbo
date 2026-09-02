@@ -115,9 +115,13 @@ function ControlBase({
   };
   const selectedIndex = (): number => visibleOptions.findIndex((option) => option.value === value);
 
-  const close = () => {
+  const dismissMenu = () => {
     setOpen(false);
     setQuery('');
+  };
+
+  const closeAndRestoreTriggerFocus = () => {
+    dismissMenu();
     requestAnimationFrame(() => triggerRef.current?.focus());
   };
 
@@ -132,7 +136,7 @@ function ControlBase({
     open,
     onOpenChange: (nextOpen) => {
       if (nextOpen) openMenu();
-      else close();
+      else dismissMenu();
     },
     placement: 'bottom-start',
     middleware: [
@@ -176,9 +180,7 @@ function ControlBase({
     const option = visibleOptions[index];
     if (!option || option.disabled) return;
     onValueChange(option.clear ? null : option.value);
-    setOpen(false);
-    setQuery('');
-    requestAnimationFrame(() => triggerRef.current?.focus());
+    closeAndRestoreTriggerFocus();
   };
 
   const moveActive = (direction: 1 | -1) => {
@@ -217,7 +219,7 @@ function ControlBase({
     }
     if (event.key === 'Escape' && open) {
       event.preventDefault();
-      close();
+      closeAndRestoreTriggerFocus();
       return;
     }
     if (!allowTypeahead || !open || event.key.length !== 1 || event.altKey || event.ctrlKey || event.metaKey) return;
@@ -238,6 +240,7 @@ function ControlBase({
     refs.setReference(node);
   };
   const triggerText = selectedOption?.label ?? placeholder ?? label;
+  const activeDescendant = open && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined;
 
   return (
     <>
@@ -252,10 +255,10 @@ function ControlBase({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}
-        aria-activedescendant={open && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined}
+        aria-activedescendant={activeDescendant}
         aria-labelledby={labelId}
         aria-describedby={describedBy}
-        onClick={() => open ? close() : openMenu()}
+        onClick={() => open ? dismissMenu() : openMenu()}
         onKeyDown={(event) => handleNavigation(event, !combobox)}
       >
         <span>{triggerText}</span>
@@ -280,6 +283,8 @@ function ControlBase({
                     className="control-search"
                     value={query}
                     aria-label={label}
+                    aria-controls={listboxId}
+                    aria-activedescendant={activeDescendant}
                     placeholder={searchPlaceholder}
                     onChange={(event) => setQuery(event.target.value)}
                     onKeyDown={(event) => handleNavigation(event, false)}
