@@ -565,6 +565,8 @@ export default function Dashboard() {
         </div>
         <span style={{ position: 'relative' }}>
           <button
+            type="button"
+            disabled={widgets === null}
             onClick={(e) => {
               e.stopPropagation();
               setAddOpen((v) => !v);

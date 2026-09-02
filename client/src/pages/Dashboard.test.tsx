@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
-import type { DashboardDataDto } from '@recat/shared';
+import type { DashboardDataDto, DashboardWidget } from '@recat/shared';
 
 const mocks = vi.hoisted(() => ({
   dashboard: vi.fn(),
@@ -76,6 +76,26 @@ describe('Dashboard', () => {
     renderDashboard();
 
     expect(screen.getByLabelText('Loading dashboard')).toHaveAttribute('aria-busy', 'true');
+  });
+
+  it('prevents layout edits until the saved layout resolves', async () => {
+    let resolveLayout!: (value: { widgets: DashboardWidget[] | null }) => void;
+    mocks.layoutGet.mockReturnValue(new Promise((resolve) => {
+      resolveLayout = resolve;
+    }));
+    const user = userEvent.setup();
+
+    renderDashboard();
+
+    const addWidget = screen.getByRole('button', { name: /add widget/i });
+    expect(addWidget).toBeDisabled();
+    await user.click(addWidget);
+    expect(screen.queryByRole('button', { name: 'Expenses' })).not.toBeInTheDocument();
+
+    resolveLayout({ widgets: [{ t: 'rev', sp: 1 }] });
+
+    expect(await screen.findByText('Revenue')).toBeVisible();
+    expect(mocks.layoutSave).not.toHaveBeenCalled();
   });
 
   it('keeps dashboard failure in page and retries', async () => {
