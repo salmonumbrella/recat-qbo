@@ -705,7 +705,9 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
   });
   if (!txn) throw new Error(`Transaction ${txnId} not found`);
   const company = txn.company;
-  if (await legacyNeedsStaging(d.db, txn)) {
+  // A dry-run never touched QBO, so re-queuing it is a local transition and
+  // does not need the staged restore lifecycle used for real tax-aware writes.
+  if (txn.status !== 'DRY_RUN' && await legacyNeedsStaging(d.db, txn)) {
     throw new WritebackLifecycleError(
       'TAX_AWARE_STAGING_REQUIRED',
       `Tax-ready ${txn.qboType}s must use staged categorization.`,
@@ -756,7 +758,30 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
     if (fromIds.length === 0) {
       throw new Error('Cannot undo — the posted category could not be resolved. Re-sync the chart of accounts.');
     }
-    await assertTxnWriteSafety(client, fresh);
+    const safetyRead = await readTxnWriteSafety(client, fresh);
+    try {
+      if (safetyRead) assertQboWriteAllowed(safetyRead.target, safetyRead.evidence);
+    } catch (error) {
+      if (
+        safetyRead
+        && error instanceof QboWriteSafetyError
+        && error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE'
+      ) {
+        await d.db.$transaction(async (tx) => {
+          await persistBlockedProviderOutcome(
+            tx,
+            d.audit,
+            { ...txn, amount },
+            actor,
+            safetyRead,
+            error,
+            `${holdingName} (re-queued)`,
+            new Date(),
+          );
+        });
+      }
+      throw error;
+    }
     const result = await client.moveToAccount(fresh, holdingId, fromIds);
     newSyncToken = result.newSyncToken;
     qboWrote = true;

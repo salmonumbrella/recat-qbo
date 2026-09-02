@@ -467,7 +467,7 @@ describe('undoPost', () => {
         company: postedCompany,
       });
       const moveToAccount = vi.fn();
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('4', qboType),
         fetchWriteSafety: async () => ({
           bookCloseDate: null,
@@ -482,6 +482,14 @@ describe('undoPost', () => {
       ).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
       expect(moveToAccount).not.toHaveBeenCalled();
       expect(row.status).toBe('POSTED');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        txnId: 'txn-1',
+        action: 'blocked',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_TRANSACTION_LOCKED' },
+        }),
+      }));
     },
   );
 
@@ -514,7 +522,7 @@ describe('undoPost', () => {
     expect(row.status).toBe('PENDING');
   });
 
-  it('blocks a canonically sales-ready Deposit before legacy undo work', async () => {
+  it('requeues a canonically sales-ready Deposit dry-run without QBO work', async () => {
     const row = makeTxnRow({
       qboType: 'Deposit',
       status: 'DRY_RUN',
@@ -544,16 +552,13 @@ describe('undoPost', () => {
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
-      code: 'TAX_AWARE_STAGING_REQUIRED',
-      message: 'Tax-ready Deposits must use staged categorization.',
-    });
-    expect(db.transaction.update).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ ok: true, status: 'PENDING' });
+    expect(db.transaction.update).toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
     expect(moveToAccount).not.toHaveBeenCalled();
   });
 
-  it('keeps a staged Deposit out of legacy undo after sales-tax readiness is lost', async () => {
+  it('requeues a staged Deposit dry-run after sales-tax readiness is lost', async () => {
     const row = makeTxnRow({
       qboType: 'Deposit',
       status: 'DRY_RUN',
@@ -576,9 +581,7 @@ describe('undoPost', () => {
 
     await expect(
       undoPost('transaction-generic', { id: 'actor-generic', label: 'Generic actor' }, deps),
-    ).rejects.toMatchObject<WritebackLifecycleError>({
-      code: 'TAX_AWARE_STAGING_REQUIRED',
-    });
+    ).resolves.toMatchObject({ ok: true, status: 'PENDING' });
     expect(db.qboTaxCode.findMany).not.toHaveBeenCalled();
     expect(fetchTxn).not.toHaveBeenCalled();
     expect(moveToAccount).not.toHaveBeenCalled();

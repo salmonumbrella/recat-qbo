@@ -8,12 +8,12 @@ const mocks = vi.hoisted(() => ({
   bs: vi.fn(),
   transactionLog: vi.fn(),
   custom: vi.fn(),
+  bankAccounts: vi.fn(),
   drilldown: vi.fn(),
   setLogTags: vi.fn(),
   savedList: vi.fn(),
   savedCreate: vi.fn(),
   savedDel: vi.fn(),
-  transactionList: vi.fn(),
   toast: vi.fn(),
 }));
 
@@ -36,6 +36,7 @@ vi.mock('../lib/api', async () => {
       bs: mocks.bs,
       transactionLog: mocks.transactionLog,
       custom: mocks.custom,
+      bankAccounts: mocks.bankAccounts,
       drilldown: mocks.drilldown,
       setLogTags: mocks.setLogTags,
     },
@@ -44,7 +45,6 @@ vi.mock('../lib/api', async () => {
       create: mocks.savedCreate,
       del: mocks.savedDel,
     },
-    transactions: { list: mocks.transactionList },
   };
 });
 
@@ -71,12 +71,12 @@ beforeEach(() => {
   mocks.bs.mockResolvedValue(statement({ title: 'Balance Sheet' }));
   mocks.transactionLog.mockResolvedValue({ start: '2026-06-01', end: '2026-09-01', rows: [] });
   mocks.custom.mockResolvedValue({ rows: [], count: 0, total: 0 });
+  mocks.bankAccounts.mockResolvedValue([]);
   mocks.drilldown.mockResolvedValue({ accountName: '', rows: [] });
   mocks.setLogTags.mockResolvedValue({ ok: true });
   mocks.savedList.mockResolvedValue([]);
   mocks.savedCreate.mockResolvedValue({});
   mocks.savedDel.mockResolvedValue(undefined);
-  mocks.transactionList.mockResolvedValue({ transactions: [] });
 });
 
 describe('Reports', () => {
@@ -146,5 +146,17 @@ describe('Reports', () => {
     expect(screen.getByLabelText('Period')).toBeEnabled();
     await user.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('No transactions in this period.')).toBeVisible();
+  });
+
+  it('loads custom-report bank accounts independently of the interactive queue', async () => {
+    mocks.bankAccounts.mockResolvedValue(['Airwallex (CAD)', 'Sinopac (TWD)']);
+    const user = userEvent.setup();
+
+    render(<Reports />);
+    await user.selectOptions(screen.getByLabelText('Report'), 'custom');
+
+    expect(await screen.findByRole('option', { name: 'Airwallex (CAD)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Sinopac (TWD)' })).toBeInTheDocument();
+    expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_GENERIC');
   });
 });

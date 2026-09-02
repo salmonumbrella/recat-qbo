@@ -202,15 +202,17 @@ companyTransactionsRouter.get(
     }
 
     // Default reads power the interactive Queue and therefore return only
-    // pending/error work. Explicit status reads remain available to other
-    // surfaces and diagnostics, except SUPERSEDED which is never interactive.
+    // pending/error work plus in-flight posts so a refresh cannot hide an
+    // operation before its terminal outcome. Explicit status reads remain
+    // available to other surfaces and diagnostics, except SUPERSEDED which is
+    // never interactive.
     // Prototype order: date ascending as entered.
     const queueWhere: Record<string, unknown> = {
       companyId: company.id,
       status:
         query.status === 'SUPERSEDED'
           ? { in: [] }
-          : query.status ?? { in: ['PENDING', 'ERROR'] },
+          : query.status ?? { in: ['PENDING', 'ERROR', 'POSTING'] },
     };
     const rows = await prisma.transaction.findMany({
       where: queueWhere,

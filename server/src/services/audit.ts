@@ -207,7 +207,7 @@ interface AuditUndoTransactionState {
   postedAt: Date | null;
 }
 
-interface LatestPostedAuditState {
+interface LatestUndoableAuditState {
   id: string;
   txnId: string | null;
   payload: unknown;
@@ -228,13 +228,13 @@ function isVerifiedCategorizationPayload(payload: unknown): boolean {
 export function decorateAuditEntriesWithUndo(
   entries: AuditEntryDto[],
   transactions: AuditUndoTransactionState[],
-  latestPostedEntries: LatestPostedAuditState[],
+  latestUndoableEntries: LatestUndoableAuditState[],
   now = new Date(),
 ): AuditEntryDto[] {
   const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
-  const latestByTransactionId = new Map<string, LatestPostedAuditState>();
+  const latestByTransactionId = new Map<string, LatestUndoableAuditState>();
   const transactionIdByLatestEntryId = new Map<string, string>();
-  for (const row of latestPostedEntries) {
+  for (const row of latestUndoableEntries) {
     if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
     latestByTransactionId.set(row.txnId, row);
     transactionIdByLatestEntryId.set(row.id, row.txnId);
@@ -248,10 +248,12 @@ export function decorateAuditEntriesWithUndo(
     const latest = latestByTransactionId.get(transactionId);
     const postedAt = txn?.postedAt?.getTime();
     const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
+    const postedWrite = txn?.status === 'POSTED'
+      && (entry.action === 'posted' || entry.action === 'auto-posted');
+    const dryRun = txn?.status === 'DRY_RUN' && entry.action === 'dry-run';
     if (
-      txn?.status !== 'POSTED'
+      (!postedWrite && !dryRun)
       || latest?.id !== entry.id
-      || (entry.action !== 'posted' && entry.action !== 'auto-posted')
       || elapsed < 0
       || elapsed > UNDO_WINDOW_MS
     ) {
@@ -260,7 +262,7 @@ export function decorateAuditEntriesWithUndo(
     return {
       ...withTransaction,
       undo: {
-        kind: isVerifiedCategorizationPayload(latest.payload)
+        kind: postedWrite && isVerifiedCategorizationPayload(latest.payload)
           ? 'categorization'
           : 'legacy',
       },
@@ -285,7 +287,7 @@ async function decoratePageWithUndo(
       where: {
         companyId,
         txnId: { in: transactionIds },
-        action: { in: ['posted', 'auto-posted'] },
+        action: { in: ['posted', 'auto-posted', 'dry-run'] },
       },
       select: { id: true, txnId: true, payload: true },
       orderBy: [{ at: 'desc' }, { id: 'desc' }],

@@ -8,6 +8,13 @@ const mocks = vi.hoisted(() => ({
   balanceSheet: vi.fn(),
   profitAndLoss: vi.fn(),
   transactionLog: vi.fn(),
+  transactionFindMany: vi.fn(),
+}));
+
+vi.mock('../lib/prisma.js', () => ({
+  prisma: {
+    transaction: { findMany: mocks.transactionFindMany },
+  },
 }));
 
 vi.mock('../middleware/auth.js', () => ({
@@ -130,5 +137,26 @@ describe('primary report read routes', () => {
     });
     expect(body.requestId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(JSON.stringify(body)).not.toContain('RAW_QBO_BODY_SENTINEL');
+  });
+
+  it('returns distinct bank accounts from all locally synced transaction states', async () => {
+    mocks.transactionFindMany.mockResolvedValue([
+      { bankAccount: 'Airwallex (CAD)' },
+      { bankAccount: 'Sinopac (TWD)' },
+    ]);
+
+    const response = await request(
+      testApp(),
+      '/api/companies/company-1/reports/bank-accounts',
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(['Airwallex (CAD)', 'Sinopac (TWD)']);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith({
+      where: { companyId: 'company-1' },
+      distinct: ['bankAccount'],
+      orderBy: { bankAccount: 'asc' },
+      select: { bankAccount: true },
+    });
   });
 });

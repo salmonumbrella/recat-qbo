@@ -118,6 +118,26 @@ describe('decorateAuditEntriesWithUndo', () => {
     expect(expired[0]?.undo).toBeUndefined();
   });
 
+  it('offers legacy requeue for the latest dry-run outcome', () => {
+    const dryRun = entry({
+      id: 'audit-dry-run',
+      action: 'dry-run',
+      transactionId: 'transaction-dry-run',
+    });
+    const [decorated] = decorateAuditEntriesWithUndo(
+      [dryRun],
+      [{
+        id: 'transaction-dry-run',
+        status: 'DRY_RUN',
+        postedAt: new Date('2026-07-15T12:00:00.000Z'),
+      }],
+      [{ id: 'audit-dry-run', txnId: 'transaction-dry-run', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+
+    expect(decorated?.undo).toEqual({ kind: 'legacy' });
+  });
+
   it('does not offer undo when QuickBooks is no longer in the posted state', () => {
     const posted = entry({ id: 'audit-post', transactionId: 'transaction-generic' });
     const [decorated] = decorateAuditEntriesWithUndo(

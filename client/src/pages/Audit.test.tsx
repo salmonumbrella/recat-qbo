@@ -126,4 +126,25 @@ describe('Audit', () => {
     expect(mocks.requestId).not.toHaveBeenCalled();
     expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
   });
+
+  it('refreshes the log when a blocked Undo returns an error', async () => {
+    mocks.list.mockResolvedValue({
+      entries: [{
+        ...blockedEntry,
+        id: 'audit-posted',
+        action: 'posted',
+        transactionId: 'transaction-generic',
+        undo: { kind: 'categorization' },
+      }],
+      nextCursor: null,
+    });
+    mocks.undoCategorization.mockRejectedValue(new Error('QuickBooks reports this transaction as reconciled.'));
+    const user = userEvent.setup();
+    render(<Audit />);
+
+    await user.click(await screen.findByRole('button', { name: /undo locked supplier/i }));
+
+    await waitFor(() => expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1));
+    expect(mocks.toast).toHaveBeenCalledWith('QuickBooks reports this transaction as reconciled.');
+  });
 });

@@ -124,7 +124,11 @@ export default function Audit() {
         notifyQboMutation();
         toast('Reverted in QuickBooks.');
       })
-      .catch((error: Error) => toast(error.message))
+      .catch((error: Error) => {
+        // Safety failures are themselves append-only audit outcomes.
+        notifyQboMutation();
+        toast(error.message);
+      })
       .finally(() => setUndoingEntryId(null));
   }, [notifyQboMutation, toast, undoingEntryId]);
 

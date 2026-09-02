@@ -340,6 +340,9 @@ describe('tax-aware categorization action routes', () => {
       'UNKNOWN_TXN',
       'WRITABLE_TXN',
     ]);
+    expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: COMPANY_ID, status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+    }));
   });
 
   it('keeps explicit SUPERSEDED queue reads empty', async () => {

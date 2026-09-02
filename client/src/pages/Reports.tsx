@@ -15,7 +15,7 @@ import type {
   TransactionLogDto,
 } from '@recat/shared';
 import { useApp } from '../state/AppContext';
-import { ApiError, reports, savedReports, transactions } from '../lib/api';
+import { ApiError, reports, savedReports } from '../lib/api';
 import { fmtDate, fmtDateY, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import { ReadFailureCard } from '../components/ReadFailureCard';
@@ -334,15 +334,14 @@ export default function Reports() {
     };
   }, [activeCompanyId, tab, config, toast]);
 
-  // ---- bank account options: one transactions fetch, first time the custom tab opens ----
-  // Viewers can't call transactions.list — their dropdown shows 'All bank accounts' only.
+  // ---- bank account options: one bounded distinct read, first time the custom tab opens ----
   useEffect(() => {
-    if (!activeCompanyId || tab !== 'custom' || banks !== null || isViewer) return;
+    if (!activeCompanyId || tab !== 'custom' || banks !== null) return;
     let cancelled = false;
-    transactions
-      .list(activeCompanyId)
-      .then((res) => {
-        if (!cancelled) setBanks([...new Set(res.transactions.map((t) => t.bankAccount))]);
+    reports
+      .bankAccounts(activeCompanyId)
+      .then((accounts) => {
+        if (!cancelled) setBanks(accounts);
       })
       .catch(() => {
         if (!cancelled) setBanks([]);
@@ -350,7 +349,7 @@ export default function Reports() {
     return () => {
       cancelled = true;
     };
-  }, [activeCompanyId, tab, banks, isViewer]);
+  }, [activeCompanyId, tab, banks]);
 
   // ---- saved reports ----
   useEffect(() => {
