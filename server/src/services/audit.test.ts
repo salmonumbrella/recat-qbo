@@ -189,6 +189,24 @@ describe('decorateAuditEntriesWithUndo', () => {
 
     expect(decorated?.undo).toBeUndefined();
   });
+
+  it('does not offer a competing undo while a prepared write is active', () => {
+    const posted = entry({ id: 'audit-post', transactionId: 'transaction-generic' });
+    const [decorated] = decorateAuditEntriesWithUndo(
+      [posted],
+      [{
+        id: 'transaction-generic',
+        status: 'POSTED',
+        postedAt: new Date('2026-07-15T12:00:00.000Z'),
+        legacyUndoAllowed: true,
+        hasActiveAttempt: true,
+      }],
+      [{ id: 'audit-post', txnId: 'transaction-generic', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+
+    expect(decorated?.undo).toBeUndefined();
+  });
 });
 
 describe('auditPageNeedsSalesTaxCodes', () => {

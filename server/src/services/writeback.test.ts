@@ -12,6 +12,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTxn,
 } from '../lib/qbo/types.js';
+import { QboWriteSafetyError } from '../lib/qbo/writeSafety.js';
 import {
   bulkPost,
   commitStagedCategorization,
@@ -3250,6 +3251,26 @@ describe('commitStagedCategorization durable lifecycle', () => {
     const recovered = await commitStagedCategorization(commitInput(), restarted.deps);
     expect(recovered).toMatchObject({ ok: true, outcome: 'VERIFIED', status: 'POSTED' });
     expect(restarted.sendPreparedWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a PREPARED resume live when QuickBooks write safety is temporarily unavailable', async () => {
+    const db = new FakeDurableDb();
+    seedAttempt(db, 'PREPARED', 'request-generic');
+    const fixture = durableDeps(db);
+    fixture.fetchWriteSafety.mockRejectedValueOnce(
+      new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE'),
+    );
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_WRITE_SAFETY_UNAVAILABLE' });
+
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(db.attempts[0]).toMatchObject({
+      status: 'PREPARED',
+      errorCode: null,
+      errorMessage: null,
+    });
   });
 
   it.each(['PREPARED', 'COMMITTING', 'UNCERTAIN'])(

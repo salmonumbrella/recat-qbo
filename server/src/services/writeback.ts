@@ -3287,6 +3287,14 @@ async function enterCommitting(
     }
     if (finalQboProof) await finalQboProof(currentTxn);
   } catch (error) {
+    if (
+      error instanceof QboWriteSafetyError
+      && error.code === 'QBO_WRITE_SAFETY_UNAVAILABLE'
+    ) {
+      // No mutation was attempted and the provider could not prove safety.
+      // Keep the exact prepared request resumable once QBO recovers.
+      throw error;
+    }
     const retryable = await markRetryable(
       d,
       attempt,

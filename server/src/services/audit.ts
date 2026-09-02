@@ -211,6 +211,7 @@ interface AuditUndoTransactionState {
   status: string;
   postedAt: Date | null;
   legacyUndoAllowed: boolean;
+  hasActiveAttempt?: boolean;
 }
 
 interface LatestUndoableAuditState {
@@ -224,6 +225,7 @@ interface AuditTaxCodeCandidateState {
   qboType: string;
   status: string;
   postedAt: Date | null;
+  hasActiveAttempt?: boolean;
 }
 
 function isVerifiedCategorizationPayload(payload: unknown): boolean {
@@ -238,10 +240,11 @@ function isVerifiedCategorizationPayload(payload: unknown): boolean {
 
 function auditUndoCandidateKind(
   entry: AuditEntryDto,
-  txn: Pick<AuditUndoTransactionState, 'status' | 'postedAt'> | undefined,
+  txn: Pick<AuditUndoTransactionState, 'status' | 'postedAt' | 'hasActiveAttempt'> | undefined,
   latest: LatestUndoableAuditState | undefined,
   now: Date,
 ): 'categorization' | 'legacy' | null {
+  if (txn?.hasActiveAttempt === true) return null;
   const postedAt = txn?.postedAt?.getTime();
   const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
   const postedWrite = txn?.status === 'POSTED'
@@ -337,7 +340,12 @@ async function decoratePageWithUndo(
         taxCalculation: true,
         taxCodeQboId: true,
         splitLines: { select: { taxCodeQboId: true } },
-        qboMutationAttempts: { select: { id: true }, take: 1 },
+        qboMutationAttempts: {
+          where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+          select: { id: true },
+          take: 1,
+        },
+        _count: { select: { qboMutationAttempts: true } },
         company: {
           select: {
             taxSupportStatus: true,
@@ -357,9 +365,13 @@ async function decoratePageWithUndo(
       orderBy: [{ at: 'desc' }, { id: 'desc' }],
     }),
   ]);
+  const transactionsWithAttemptState = transactions.map((txn) => ({
+    ...txn,
+    hasActiveAttempt: txn.qboMutationAttempts.length > 0,
+  }));
   const cachedSalesTaxCodes = auditPageNeedsSalesTaxCodes(
     entries,
-    transactions,
+    transactionsWithAttemptState,
     postedEntries,
   )
     ? await prisma.qboTaxCode.findMany({
@@ -374,7 +386,7 @@ async function decoratePageWithUndo(
     : [];
   return decorateAuditEntriesWithUndo(
     entries,
-    transactions.map((txn) => ({
+    transactionsWithAttemptState.map((txn) => ({
       id: txn.id,
       status: txn.status,
       postedAt: txn.postedAt,
@@ -383,7 +395,7 @@ async function decoratePageWithUndo(
         taxCalculation: txn.taxCalculation,
         taxCodeQboId: txn.taxCodeQboId,
         splitTaxCodeQboIds: txn.splitLines.map((line) => line.taxCodeQboId),
-        hasDurableAttempt: txn.qboMutationAttempts.length > 0,
+        hasDurableAttempt: txn._count.qboMutationAttempts > 0,
         company: txn.company,
         cachedSalesTaxCodes,
       }),
