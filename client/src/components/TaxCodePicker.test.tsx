@@ -49,6 +49,20 @@ const READY: TaxReadinessDto = {
 };
 
 describe('TaxCodePicker', () => {
+  it('shows no tax while ready without a selected tax code', () => {
+    render(
+      <TaxCodePicker
+        id="tax-no-selection"
+        label="Purchase tax"
+        readiness={READY}
+        value={null}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('combobox', { name: 'Purchase tax' })).toHaveTextContent('No tax');
+  });
+
   it('offers explicit no tax and only usable purchase tax codes', async () => {
     const onChange = vi.fn();
     const user = userEvent.setup();

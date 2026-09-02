@@ -64,7 +64,7 @@ export default function TaxCodePicker({
       <Combobox
         id={id}
         label={label}
-        value={available ? value : ''}
+        value={available ? (value ?? '') : ''}
         disabled={disabled || !available}
         searchPlaceholder="Search tax codes…"
         emptyText="No matching tax codes"
