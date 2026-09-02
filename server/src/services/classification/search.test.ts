@@ -419,6 +419,15 @@ describe('classification memory search', () => {
     expect(first.fingerprint).not.toBe(second.fingerprint);
   });
 
+  it('preserves the legacy snapshot fingerprint when no transaction is excluded', async () => {
+    const snapshot = await searchClassificationMemorySnapshot({
+      query: 'fuel', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', limit: 20, accessibleCompanyIds: ['company-a'],
+    }, { repository: repository([]), semantic: null });
+
+    expect(snapshot.fingerprint).toBe('eda0e7b47cdcd7e2459e222dc8e08619f2ee4f2383c88ffabfa0c2d4b9cfdae8');
+  });
+
   it('filters known transaction-context mismatches before ranking while retaining explicit unknown evidence', async () => {
     const matching = record({
       hit: { id: 'classification_case:matching', sourceId: 'matching', kind: 'classification_case' },

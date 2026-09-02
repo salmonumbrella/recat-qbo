@@ -676,7 +676,9 @@ export async function searchClassificationMemorySnapshot(
       limit: rawInput.limit ?? 20,
       accessibleCompanyIds: [...new Set(rawInput.accessibleCompanyIds)].sort(),
       context: rawInput.context ?? null,
-      excludeTransactionId: rawInput.excludeTransactionId ?? null,
+      ...(rawInput.excludeTransactionId === undefined
+        ? {}
+        : { excludeTransactionId: rawInput.excludeTransactionId }),
     },
     revisions: after,
     semanticGeneration: dependencies.semantic?.generation.fingerprint ?? null,
