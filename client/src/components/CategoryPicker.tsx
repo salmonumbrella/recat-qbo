@@ -1,30 +1,31 @@
 import { Combobox, type ControlOption } from './SelectCombobox';
+import { useEffect, useRef } from 'react';
 import type { CSSProperties, MouseEvent } from 'react';
 
 export interface CategoryOption {
-  value?: string;
+  value: string;
   group: string;
   name: string;
   sug: boolean;
 }
 
-type StableCategoryOption = CategoryOption & { value: string };
-
 type StableCategoryPickerProps = {
   label: string;
   value: string | null;
   onPick: (value: string) => void;
-  options: readonly StableCategoryOption[];
+  options: readonly CategoryOption[];
   onSplitFooter?: () => void;
   showBadges: boolean;
   disabled?: boolean;
 };
 
 // Temporary Queue compatibility; Task 3 removes this after its stable-value migration.
+export type LegacyCategoryOption = Omit<CategoryOption, 'value'>;
+
 type LegacyCategoryPickerProps = {
   query: string;
   onQueryChange: (value: string) => void;
-  options: readonly CategoryOption[];
+  options: readonly LegacyCategoryOption[];
   empty: boolean;
   activeIdx: number;
   onPick: (name: string) => void;
@@ -45,11 +46,17 @@ function LegacyCategoryPicker({
   containerStyle,
 }: LegacyCategoryPickerProps) {
   const stop = (event: MouseEvent) => event.stopPropagation();
+  const listRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const activeOption = listRef.current?.children[activeIdx] as HTMLElement | undefined;
+    activeOption?.scrollIntoView?.({ block: 'nearest' });
+  }, [activeIdx]);
 
   return (
     <span onClick={stop} onMouseDown={stop} style={{ position: 'absolute', left: 0, ...containerStyle }}>
       <input autoFocus value={query} aria-label="Search categories" onChange={(event) => onQueryChange(event.target.value)} />
-      <span style={{ display: 'block', maxHeight: 246, overflow: 'auto' }}>
+      <span ref={listRef} style={{ display: 'block', maxHeight: 246, overflow: 'auto' }}>
         {options.map((option, index) => (
           <button
             key={`${option.group}·${option.name}`}

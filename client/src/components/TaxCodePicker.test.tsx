@@ -110,6 +110,7 @@ describe('TaxCodePicker', () => {
     );
 
     expect(screen.getByLabelText('Purchase tax')).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'Purchase tax' })).toHaveTextContent('No tax');
     expect(screen.getByText(/purchase tax is disabled/i)).toBeInTheDocument();
   });
 
@@ -125,6 +126,7 @@ describe('TaxCodePicker', () => {
     );
 
     expect(screen.getByLabelText('Purchase tax')).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'Purchase tax' })).toHaveTextContent('No tax');
     expect(screen.getByText(/tax availability is unavailable/i)).toBeInTheDocument();
     expect(screen.queryByText('Standard purchase tax')).not.toBeInTheDocument();
   });

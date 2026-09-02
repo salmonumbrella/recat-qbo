@@ -33,7 +33,7 @@ import {
 import { fmtDate, fmtMoney } from '../lib/format';
 import { InfoDot, Spinner } from '../components/ui';
 import CategoryPicker from '../components/CategoryPicker';
-import type { CategoryOption } from '../components/CategoryPicker';
+import type { LegacyCategoryOption } from '../components/CategoryPicker';
 import TagPicker from '../components/TagPicker';
 import SplitEditor from '../components/SplitEditor';
 import type { SplitLineDraft } from '../components/SplitEditor';
@@ -596,7 +596,7 @@ export default function Queue() {
     return opts;
   }, [pickQ, picker, rows, catAccounts]);
 
-  const pickOpts = useMemo<CategoryOption[]>(() => {
+  const pickOpts = useMemo<LegacyCategoryOption[]>(() => {
     const t = picker !== null && picker !== 'bulk' ? rows.find((x) => x.id === picker) : undefined;
     const sg = t?.suggestion?.category;
     return filteredOpts.slice(0, 40).map((a) => ({
