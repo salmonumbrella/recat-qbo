@@ -129,6 +129,20 @@ function canUndoPosted(postedAt: string | null | undefined): boolean {
   return Date.now() - new Date(postedAt).getTime() <= UNDO_WINDOW_MS;
 }
 
+export function similarDecisionsQuery(
+  transaction: Pick<TransactionDto, 'payee' | 'memo'>,
+): string {
+  const normalize = (value: string | null | undefined) => value
+    ? value.normalize('NFC').trim().replace(/\s+/gu, ' ')
+    : '';
+  const payee = normalize(transaction.payee);
+  const memo = normalize(transaction.memo);
+  const parts = memo !== '' && memo.localeCompare(payee, undefined, { sensitivity: 'accent' }) !== 0
+    ? [payee, memo]
+    : [payee];
+  return parts.filter(Boolean).join(' ').slice(0, 256);
+}
+
 function errText(e: unknown): string {
   if (e instanceof ApiError || e instanceof Error) return e.message;
   return 'Something went wrong';
@@ -2294,7 +2308,7 @@ export default function Queue() {
         <ClassificationMemoryPanel
           key={`${activeCompanyId}:${activeRow.id}`}
           companyId={activeCompanyId}
-          initialQuery={[activeRow.payee, activeRow.memo].filter(Boolean).join(' ')}
+          initialQuery={similarDecisionsQuery(activeRow)}
           transactionId={activeRow.id}
           title="Similar Decisions"
           autoSearch

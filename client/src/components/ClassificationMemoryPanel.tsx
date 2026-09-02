@@ -2,11 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { ClassificationSearchHit, ClassificationSearchMode } from '@recat/shared';
 import {
+  ApiError,
   classificationMemory,
   type ClassificationSearchPageDto,
   type ClassificationSemanticHealthDto,
 } from '../lib/api';
 import { Select } from './SelectCombobox';
+
+const SEARCH_MODES: ClassificationSearchMode[] = ['auto', 'exact', 'lexical', 'hybrid', 'semantic'];
 
 interface ClassificationMemoryPanelProps {
   companyId: string;
@@ -17,7 +20,8 @@ interface ClassificationMemoryPanelProps {
 }
 
 function readable(value: string): string {
-  return value.replaceAll('_', ' ');
+  const normalized = value.replaceAll('_', ' ');
+  return normalized.slice(0, 1).toUpperCase() + normalized.slice(1);
 }
 
 function sourceNavigation(hit: ClassificationSearchHit): { href: string; label: string } | null {
@@ -40,31 +44,40 @@ function verifiedLabel(value: string | null): string {
   }).format(new Date(value))}`;
 }
 
-function searchState(result: ClassificationSearchPageDto): string {
-  const mode = `${readable(result.mode)} results`;
-  if (!result.degraded) return mode;
-  return `${mode} · Degraded: ${readable(result.degradedReason ?? 'semantic unavailable')}`;
+function sourceTypeLabel(hit: ClassificationSearchHit): string {
+  switch (hit.kind) {
+    case 'rule': return 'Rule';
+    case 'classification_case': return 'Verified decision';
+    case 'rule_candidate': return 'Learned candidate';
+    case 'vendor_alias': return 'Vendor alias';
+    case 'vendor_identity': return 'Vendor identity';
+  }
 }
 
-function BackfillState({ health }: { health: ClassificationSemanticHealthDto | null }) {
-  if (health === null) return null;
-  if (!health.configured) return <span>Semantic search not configured</span>;
-  if (!health.vectorAvailable) return <span>Semantic index unavailable</span>;
-  if (health.backlog > 0 || health.expectedState === 'building') {
-    return (
-      <span>
-        Semantic backfill · {health.backlog} remaining · {Math.round(health.progress * 100)}%
-      </span>
-    );
+function searchFailureCopy(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'SEMANTIC_UNAVAILABLE') {
+    return 'Semantic search is unavailable for this request. Try Auto, Exact, or Lexical search.';
   }
-  return <span>Semantic index ready</span>;
+  return 'Could not search prior decisions. Try again; manual categorization is still available.';
+}
+
+function semanticIndexStatus(health: ClassificationSemanticHealthDto): string {
+  if (!health.configured) return 'not configured';
+  if (!health.vectorAvailable) return 'unavailable';
+  if (health.expectedState === 'failed' || health.latestAttemptState === 'failed') {
+    return 'unavailable';
+  }
+  if (health.backlog > 0 || health.expectedState === 'building') {
+    return `building — ${health.backlog} remaining — ${Math.round(health.progress * 100)}%`;
+  }
+  return 'ready';
 }
 
 export default function ClassificationMemoryPanel({
   companyId,
   initialQuery = '',
   transactionId,
-  title = 'Classification knowledge',
+  title = 'Classification rules',
   autoSearch = false,
 }: ClassificationMemoryPanelProps) {
   const [query, setQuery] = useState(initialQuery);
@@ -131,9 +144,7 @@ export default function ClassificationMemoryPanel({
     if (healthOutcome.status === 'fulfilled') setHealth(healthOutcome.value);
     else setHealth(null);
     if (searchOutcome.status === 'fulfilled') setResult(searchOutcome.value);
-    else setError(searchOutcome.reason instanceof Error
-      ? searchOutcome.reason.message
-      : 'Classification search is unavailable.');
+    else setError(searchFailureCopy(searchOutcome.reason));
     setBusy(false);
   }, [companyId, mode, query, transactionId]);
 
@@ -170,7 +181,7 @@ export default function ClassificationMemoryPanel({
       });
     } catch (loadError) {
       if (requestRef.current === requestId && searchContextRef.current === context) {
-        setError(loadError instanceof Error ? loadError.message : 'More classification results are unavailable.');
+        setError(searchFailureCopy(loadError));
       }
     } finally {
       if (requestRef.current === requestId && searchContextRef.current === context) setLoadingMore(false);
@@ -221,36 +232,46 @@ export default function ClassificationMemoryPanel({
           <Select
             label="Search mode"
             value={mode}
-            options={[
-              { value: 'auto', label: 'Auto' },
-              { value: 'exact', label: 'Exact' },
-              { value: 'lexical', label: 'Lexical' },
-              { value: 'hybrid', label: 'Hybrid' },
-              { value: 'semantic', label: 'Semantic' },
-            ]}
             onValueChange={(next) => {
               if (next === null) return;
               invalidatePendingRequest();
               setMode(next as ClassificationSearchMode);
             }}
+            options={SEARCH_MODES.map((option) => ({ value: option, label: readable(option) }))}
           />
         </span>
         <button className="btn-ghost" type="submit" disabled={busy || !query.trim()}>
-          {busy ? 'Searching…' : 'Search knowledge'}
+          {busy ? 'Searching…' : 'Search rules'}
         </button>
       </form>
-      {(result !== null || health !== null) && (
+      {busy && (
         <div role="status" style={{ fontSize: 12.5, color: 'var(--mut)', marginTop: 8 }}>
-          {result && <span>{searchState(result)}</span>}
-          {result && health && <span> · </span>}
-          <BackfillState health={health} />
+          Searching prior decisions…
         </div>
       )}
-      {error && <div role="alert" style={{ color: 'var(--erT)', marginTop: 10 }}>{error}</div>}
-      {result?.noMatch && !error && (
-        <div style={{ color: 'var(--mut)', marginTop: 12 }}>Nothing matched this classification context.</div>
+      {result && (
+        <div role="status" style={{ fontSize: 12.5, color: 'var(--mut)', marginTop: 8 }}>
+          {result.degraded
+            ? `This search: lexical fallback — ${readable(result.degradedReason ?? 'semantic unavailable')}`
+            : `This search: ${readable(result.mode)}`}
+        </div>
       )}
-      {result && !result.noMatch && (
+      {health && (
+        <div role="status" style={{ fontSize: 12.5, color: 'var(--mut)', marginTop: 4 }}>
+          Semantic index status: {semanticIndexStatus(health)}
+        </div>
+      )}
+      {error && (
+        <div role="alert" style={{ color: 'var(--erT)', marginTop: 10 }}>
+          {error}
+        </div>
+      )}
+      {result?.noMatch && !error && (
+        <div style={{ color: 'var(--mut)', marginTop: 12 }}>
+          No prior matching rule or decision was found. Manual categorization is still available.
+        </div>
+      )}
+      {result && !result.noMatch && !error && (
         <div style={{ display: 'grid', gap: 10, marginTop: 12 }}>
           {result.items.slice(0, 100).map((hit) => {
             const summary = hit.actionSummary;
@@ -276,7 +297,7 @@ export default function ClassificationMemoryPanel({
                     : 'No executable category or tax action'}
                 </div>
                 <div style={{ color: 'var(--mut)', fontSize: 12.5, marginTop: 5 }}>
-                  Matched in {hit.matchedIn.map(readable).join(' · ')} · {hit.evidenceCount} verified evidence · {hit.conflictingEvidenceCount} conflict
+                  {sourceTypeLabel(hit)} · Matched in {hit.matchedIn.map(readable).join(' · ')} · {hit.evidenceCount} verified evidence · {hit.conflictingEvidenceCount} conflict
                   {hit.conflictingEvidenceCount === 1 ? '' : 's'} · {verifiedLabel(hit.verifiedAt)}
                 </div>
                 {hit.rationale && <p style={{ margin: '8px 0 0', fontSize: 13.5 }}>{hit.rationale}</p>}

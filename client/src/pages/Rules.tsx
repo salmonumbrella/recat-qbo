@@ -608,7 +608,7 @@ export default function Rules() {
         />
       </header>
 
-      {activeCompanyId && <ClassificationMemoryPanel companyId={activeCompanyId} title="Search classification knowledge" />}
+      {activeCompanyId && <ClassificationMemoryPanel companyId={activeCompanyId} title="Search rules" />}
 
       {sourceCase && (
         <section id={`classification-case-${sourceCase.id}`} aria-label="Source classification case" style={{ border: '1px solid var(--bd)', borderRadius: 10, padding: 16, marginBottom: 18 }}>

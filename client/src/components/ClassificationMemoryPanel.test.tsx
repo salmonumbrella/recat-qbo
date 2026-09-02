@@ -8,13 +8,22 @@ const mocks = vi.hoisted(() => ({
   health: vi.fn(),
 }));
 
-vi.mock('../lib/api', () => ({
-  classificationMemory: {
-    search: mocks.search,
-    health: mocks.health,
-  },
-}));
+vi.mock('../lib/api', () => {
+  class ApiError extends Error {
+    constructor(readonly status: number, message: string, readonly code?: string) {
+      super(message);
+    }
+  }
+  return {
+    ApiError,
+    classificationMemory: {
+      search: mocks.search,
+      health: mocks.health,
+    },
+  };
+});
 
+import { ApiError, type ClassificationSearchPageDto } from '../lib/api';
 import ClassificationMemoryPanel from './ClassificationMemoryPanel';
 
 async function chooseControl(
@@ -110,6 +119,23 @@ const healthy = {
   latestAttemptCorpusRevision: '8',
 };
 
+function noMatchPage(query: string): ClassificationSearchPageDto {
+  return {
+    query,
+    companyId: 'company-1',
+    scope: 'current_company',
+    mode: 'exact',
+    requestedMode: 'exact',
+    degraded: false,
+    degradedReason: null,
+    status: 'no_match',
+    noMatch: true,
+    total: 0,
+    items: [],
+    nextCursor: null,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.search.mockReset();
@@ -132,11 +158,11 @@ beforeEach(() => {
 });
 
 describe('ClassificationMemoryPanel', () => {
-  it('keeps the search mode accessible through the shared control label', () => {
+  it('keeps Search mode accessible while naming the visible action Search rules', () => {
     render(<ClassificationMemoryPanel companyId="company-1" initialQuery="Northwind Fuel" />);
 
-    expect(screen.getByRole('combobox', { name: 'Search mode' })).toBeInTheDocument();
-    expect(screen.getByText('Search mode')).toBeInTheDocument();
+    expect(screen.getByLabelText('Search mode')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Search rules' })).toBeInTheDocument();
   });
 
   it('searches with transaction context and renders bounded provenance with source navigation', async () => {
@@ -166,46 +192,48 @@ describe('ClassificationMemoryPanel', () => {
     expect(screen.getByText(/Receipt showed a personal purchase/i)).toBeInTheDocument();
     expect(screen.getByText(/verified Aug 30, 2026/i)).toBeInTheDocument();
     expect(screen.getByText('Executable')).toBeInTheDocument();
+    expect(screen.getByText(/Verified decision.*Matched in alias.*case/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /open source case/i })).toHaveAttribute(
       'href',
       '/rules?source=classification_case&sourceId=case-1',
     );
   });
 
-  it('labels lexical degradation and semantic backfill without overstating hybrid search', async () => {
-    mocks.health.mockResolvedValue({ ...healthy, backlog: 3, progress: 0.625, expectedState: 'building' });
+  it('labels request result and semantic index status as separate facts', async () => {
     mocks.search.mockResolvedValue({
       query: 'fuel', companyId: 'company-1', scope: 'current_company',
       mode: 'lexical', requestedMode: 'auto', degraded: true,
       degradedReason: 'semantic_unavailable', status: 'matched', noMatch: false,
-      total: 1, items: [hit({ advisory: true, executable: false })], nextCursor: null,
+      total: 1, items: [hit()], nextCursor: null,
     });
 
     render(<ClassificationMemoryPanel companyId="company-1" initialQuery="fuel" autoSearch />);
 
-    expect(await screen.findByText(/lexical results/i)).toBeInTheDocument();
-    expect(screen.getByText(/degraded.*semantic unavailable/i)).toBeInTheDocument();
-    expect(screen.getByText(/semantic backfill.*3 remaining.*63%/i)).toBeInTheDocument();
-    expect(screen.getByText('Advisory')).toBeInTheDocument();
+    expect(await screen.findByText(/this search: lexical fallback/i)).toBeInTheDocument();
+    expect(screen.getByText(/semantic index status: ready/i)).toBeInTheDocument();
   });
 
-  it('distinguishes a successful no-match from unavailable semantic search', async () => {
-    const user = userEvent.setup();
-    mocks.search.mockResolvedValueOnce({
-      query: 'unknown', companyId: 'company-1', scope: 'current_company', mode: 'exact',
-      requestedMode: 'exact', degraded: false, degradedReason: null, status: 'no_match',
-      noMatch: true, total: 0, items: [], nextCursor: null,
-    });
-    const view = render(<ClassificationMemoryPanel companyId="company-1" initialQuery="unknown" />);
-    await user.click(screen.getByRole('button', { name: 'Search knowledge' }));
-    expect(await screen.findByText(/nothing matched/i)).toBeInTheDocument();
+  it('explains a completed no-match without disabling manual categorization', async () => {
+    mocks.search.mockResolvedValueOnce(noMatchPage('unknown'));
+    render(<ClassificationMemoryPanel companyId="company-1" initialQuery="unknown" autoSearch />);
 
-    mocks.search.mockRejectedValueOnce(new Error('Hybrid classification search is unavailable.'));
-    view.rerender(<ClassificationMemoryPanel companyId="company-1" initialQuery="unknown" />);
-    await chooseControl(user, 'Search mode', 'Hybrid');
-    await user.click(screen.getByRole('button', { name: 'Search knowledge' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/hybrid classification search is unavailable/i);
-    expect(screen.queryByText(/nothing matched/i)).not.toBeInTheDocument();
+    expect(await screen.findByText(
+      'No prior matching rule or decision was found. Manual categorization is still available.',
+    )).toBeInTheDocument();
+  });
+
+  it('distinguishes explicit semantic unavailability from a full request failure', async () => {
+    const user = userEvent.setup();
+    mocks.search.mockRejectedValueOnce(new ApiError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE'));
+    render(<ClassificationMemoryPanel companyId="company-1" initialQuery="fuel" />);
+    await user.click(screen.getByRole('combobox', { name: 'Search mode' }));
+    await user.click(screen.getByRole('option', { name: 'Semantic' }));
+    await user.click(screen.getByRole('button', { name: 'Search rules' }));
+    expect(await screen.findByText(/semantic search is unavailable/i)).toBeInTheDocument();
+
+    mocks.search.mockRejectedValueOnce(new ApiError(503, 'Classification search is temporarily unavailable.', 'COMPANY_UNAVAILABLE'));
+    await user.click(screen.getByRole('button', { name: 'Search rules' }));
+    expect(await screen.findByText(/could not search prior decisions/i)).toBeInTheDocument();
   });
 
   it('invalidates an in-flight result when company context changes', async () => {
@@ -223,9 +251,50 @@ describe('ClassificationMemoryPanel', () => {
       <ClassificationMemoryPanel companyId="company-1" initialQuery="old supplier" autoSearch />,
     );
     await waitFor(() => expect(mocks.search).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('status')).toHaveTextContent(/Searching prior decisions/i);
 
     view.rerender(
       <ClassificationMemoryPanel companyId="company-2" initialQuery="new supplier" autoSearch />,
+    );
+    expect(await screen.findByText('New Company')).toBeInTheDocument();
+
+    resolveOld({
+      query: 'old supplier', companyId: 'company-1', scope: 'current_company', mode: 'hybrid',
+      requestedMode: 'auto', degraded: false, degradedReason: null, status: 'matched',
+      noMatch: false, total: 1, items: [hit({ companyName: 'Old Company' })], nextCursor: null,
+    });
+    await waitFor(() => expect(screen.queryByText('Old Company')).not.toBeInTheDocument());
+  });
+
+  it('fences a late automatic base search when the active transaction changes', async () => {
+    let resolveOld!: (value: ClassificationSearchPageDto) => void;
+    mocks.search.mockImplementationOnce(() => new Promise<ClassificationSearchPageDto>((resolve) => {
+      resolveOld = resolve;
+    }));
+    mocks.search.mockResolvedValueOnce({
+      query: 'new supplier', companyId: 'company-1', scope: 'current_company', mode: 'hybrid',
+      requestedMode: 'auto', degraded: false, degradedReason: null, status: 'matched',
+      noMatch: false, total: 1, items: [hit({
+        id: 'hit-new', companyName: 'New Company', vendorName: 'New supplier', sourceId: 'case-new',
+      })], nextCursor: null,
+    });
+    const view = render(
+      <ClassificationMemoryPanel
+        companyId="company-1"
+        initialQuery="old supplier"
+        transactionId="transaction-old"
+        autoSearch
+      />,
+    );
+    await waitFor(() => expect(mocks.search).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <ClassificationMemoryPanel
+        companyId="company-1"
+        initialQuery="new supplier"
+        transactionId="transaction-new"
+        autoSearch
+      />,
     );
     expect(await screen.findByText('New Company')).toBeInTheDocument();
 
@@ -306,7 +375,7 @@ describe('ClassificationMemoryPanel', () => {
     const user = userEvent.setup();
     render(<ClassificationMemoryPanel companyId="company-1" initialQuery="Northwind" />);
     await chooseControl(user, 'Search mode', 'Exact');
-    await user.click(screen.getByRole('button', { name: 'Search knowledge' }));
+    await user.click(screen.getByRole('button', { name: 'Search rules' }));
 
     expect(await screen.findByText('Northwind Books')).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /open source/i })).not.toBeInTheDocument();

@@ -155,7 +155,7 @@ vi.mock('../lib/api', () => {
   };
 });
 
-import Queue from './Queue';
+import Queue, { similarDecisionsQuery } from './Queue';
 import { ApiError } from '../lib/api';
 import { installGlobalStyles } from '../test/globalStyles';
 
@@ -509,6 +509,33 @@ beforeEach(() => {
 });
 
 describe('tax-aware manual queue', () => {
+  it('normalizes the selected transaction into a similar-decisions query', () => {
+    expect(similarDecisionsQuery({ payee: '  Northwind  Fuel ', memo: '  Fleet card  ' }))
+      .toBe('Northwind Fuel Fleet card');
+    expect(similarDecisionsQuery({ payee: 'Northwind Fuel', memo: 'northwind   fuel' }))
+      .toBe('Northwind Fuel');
+    expect(similarDecisionsQuery({ payee: 'Northwind Fuel', memo: null }))
+      .toBe('Northwind Fuel');
+  });
+
+  it('refreshes similar decisions for the newly selected transaction', async () => {
+    const second = transaction({
+      id: 'TRANSACTION_SECOND',
+      qboId: 'PURCHASE_SECOND',
+      payee: '  Second supplier  ',
+      memo: ' Freight ',
+    });
+    const user = userEvent.setup();
+    await renderQueue([transaction(), second]);
+
+    await user.click(screen.getByText('Second supplier'));
+
+    await waitFor(() => expect(mocks.classificationSearch).toHaveBeenLastCalledWith(
+      'COMPANY_GENERIC',
+      expect.objectContaining({ transactionId: 'TRANSACTION_SECOND', query: 'Second supplier Freight' }),
+    ));
+  });
+
   it('shows transaction-aware similar decisions for the active row', async () => {
     mocks.classificationSearch.mockResolvedValue({
       query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company',
