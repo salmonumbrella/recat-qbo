@@ -219,6 +219,13 @@ interface LatestUndoableAuditState {
   payload: unknown;
 }
 
+interface AuditTaxCodeCandidateState {
+  id: string;
+  qboType: string;
+  status: string;
+  postedAt: Date | null;
+}
+
 function isVerifiedCategorizationPayload(payload: unknown): boolean {
   if (typeof payload !== 'object' || payload === null) return false;
   const record = payload as Record<string, unknown>;
@@ -227,6 +234,36 @@ function isVerifiedCategorizationPayload(payload: unknown): boolean {
   return typeof references === 'object'
     && references !== null
     && (references as Record<string, unknown>).operation === 'recategorize';
+}
+
+export function auditPageNeedsSalesTaxCodes(
+  entries: AuditEntryDto[],
+  transactions: AuditTaxCodeCandidateState[],
+  latestUndoableEntries: LatestUndoableAuditState[],
+  now = new Date(),
+): boolean {
+  const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
+  const latestByTransactionId = new Map<string, LatestUndoableAuditState>();
+  for (const row of latestUndoableEntries) {
+    if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
+    latestByTransactionId.set(row.txnId, row);
+  }
+
+  return entries.some((entry) => {
+    const transactionId = entry.transactionId;
+    if (transactionId === undefined) return false;
+    const txn = transactionById.get(transactionId);
+    const latest = latestByTransactionId.get(transactionId);
+    const postedAt = txn?.postedAt?.getTime();
+    const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
+    return txn?.qboType === 'Deposit'
+      && txn.status === 'POSTED'
+      && (entry.action === 'posted' || entry.action === 'auto-posted')
+      && latest?.id === entry.id
+      && !isVerifiedCategorizationPayload(latest.payload)
+      && elapsed >= 0
+      && elapsed <= AUDIT_UNDO_WINDOW_MS;
+  });
 }
 
 export function decorateAuditEntriesWithUndo(
@@ -284,7 +321,7 @@ async function decoratePageWithUndo(
     entries.flatMap((entry) => entry.transactionId === undefined ? [] : [entry.transactionId]),
   )];
   if (transactionIds.length === 0) return entries;
-  const [transactions, postedEntries, cachedSalesTaxCodes] = await Promise.all([
+  const [transactions, postedEntries] = await Promise.all([
     prisma.transaction.findMany({
       where: { companyId, id: { in: transactionIds } },
       select: {
@@ -314,7 +351,13 @@ async function decoratePageWithUndo(
       select: { id: true, txnId: true, payload: true },
       orderBy: [{ at: 'desc' }, { id: 'desc' }],
     }),
-    prisma.qboTaxCode.findMany({
+  ]);
+  const cachedSalesTaxCodes = auditPageNeedsSalesTaxCodes(
+    entries,
+    transactions,
+    postedEntries,
+  )
+    ? await prisma.qboTaxCode.findMany({
       where: { companyId },
       select: {
         active: true,
@@ -322,8 +365,8 @@ async function decoratePageWithUndo(
         salesTaxRateList: true,
         combinedSalesRate: true,
       },
-    }),
-  ]);
+    })
+    : [];
   return decorateAuditEntriesWithUndo(
     entries,
     transactions.map((txn) => ({

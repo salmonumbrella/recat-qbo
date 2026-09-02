@@ -5,6 +5,7 @@ import {
   buildAuditCsv,
   csvEscape,
   decorateAuditEntriesWithUndo,
+  auditPageNeedsSalesTaxCodes,
   writeAudit,
 } from './audit.js';
 
@@ -187,6 +188,41 @@ describe('decorateAuditEntriesWithUndo', () => {
     );
 
     expect(decorated?.undo).toBeUndefined();
+  });
+});
+
+describe('auditPageNeedsSalesTaxCodes', () => {
+  const deposit = {
+    id: 'transaction-deposit',
+    qboType: 'Deposit',
+    status: 'POSTED',
+    postedAt: new Date('2026-07-15T12:00:00.000Z'),
+  };
+
+  it('skips the company tax-code scan when the page has no undo candidate', () => {
+    expect(auditPageNeedsSalesTaxCodes(
+      [entry({
+        id: 'audit-error',
+        transactionId: deposit.id,
+        action: 'error',
+      })],
+      [deposit],
+      [{ id: 'audit-posted', txnId: deposit.id, payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    )).toBe(false);
+  });
+
+  it('loads sales tax codes for a current legacy Deposit undo candidate', () => {
+    expect(auditPageNeedsSalesTaxCodes(
+      [entry({
+        id: 'audit-posted',
+        transactionId: deposit.id,
+        action: 'posted',
+      })],
+      [deposit],
+      [{ id: 'audit-posted', txnId: deposit.id, payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    )).toBe(true);
   });
 });
 
