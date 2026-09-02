@@ -996,7 +996,7 @@ autopilotRouter.patch(
     if (req.company?.disconnectedAt != null && body.mode === 'shadow') {
       throw new HttpError(
         409,
-        'Shadow autopilot cannot be enabled for a disconnected company.',
+        'Autopilot cannot be enabled for a disconnected company.',
         'COMPANY_DISCONNECTED',
       );
     }

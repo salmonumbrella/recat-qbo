@@ -45,7 +45,6 @@ import TaxCodePicker, {
   usableTaxCodesForDirection,
 } from '../components/TaxCodePicker';
 import type { TaxDirection } from '../components/TaxCodePicker';
-import { AutopilotQueueStatus } from './settings/AutopilotCard';
 import AttachmentPanel from '../components/AttachmentPanel';
 
 // ---------------------------------------------------------------------------
@@ -2266,14 +2265,6 @@ export default function Queue() {
           </button>
         </div>
       </div>
-
-      {activeCompanyId && (role === 'categorizer' || role === 'admin') && (
-        <AutopilotQueueStatus
-          key={activeCompanyId}
-          companyId={activeCompanyId}
-          surface="queue"
-        />
-      )}
 
       {activeCompanyId && activeRow && (
         <ClassificationMemoryPanel

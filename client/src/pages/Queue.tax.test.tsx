@@ -8,6 +8,11 @@ import type {
   TaxReadinessDto,
   TransactionDto,
 } from '@recat/shared';
+import type {
+  AutopilotOverviewDto,
+  AutopilotRunListDto,
+  LiveReadinessDto,
+} from '../lib/api';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
@@ -34,7 +39,11 @@ const mocks = vi.hoisted(() => ({
   setPendingCount: vi.fn(),
   refreshCompanies: vi.fn(),
   requestId: vi.fn(),
+  autopilotGet: vi.fn(),
+  autopilotListRuns: vi.fn(),
+  autopilotGetReadiness: vi.fn(),
   activeCompanyId: 'COMPANY_GENERIC',
+  role: 'admin',
   taxReadiness: null as TaxReadinessDto | null,
   tags: [] as Array<{ id: string; companyId: string; name: string; color: string }>,
 }));
@@ -53,6 +62,7 @@ vi.mock('../state/AppContext', () => ({
       lastSyncedAt: null,
     },
     activeCompanyId: mocks.activeCompanyId,
+    role: mocks.role,
     accounts: [
       {
         id: 'ACCOUNT_GENERIC',
@@ -122,6 +132,11 @@ vi.mock('../lib/api', () => {
       commit: mocks.commitRuleOperation,
     },
     rules: { create: mocks.rulesCreate, lifecycle: mocks.lifecycleRules },
+    autopilot: {
+      get: mocks.autopilotGet,
+      listRuns: mocks.autopilotListRuns,
+      getReadiness: mocks.autopilotGetReadiness,
+    },
     transactions: {
       list: mocks.list,
       categorize: mocks.categorize,
@@ -192,6 +207,82 @@ const SALES_NON_DIRECTIONAL_CODE = {
   combinedPurchaseRate: 5,
   combinedSalesRate: null,
 };
+
+const AUTOPILOT_OVERVIEW: AutopilotOverviewDto = {
+  settings: {
+    mode: 'shadow',
+    provider: 'custom',
+    decisionModel: 'decision-model',
+    verifierModel: 'verifier-model',
+    scheduleMinutes: 10,
+    companyConcurrency: 1,
+    evidenceThreshold: 50,
+    dailyLiveWriteLimit: 100,
+    limits: {
+      maxToolCalls: 8,
+      maxTurns: 4,
+      maxContextBytes: 65_536,
+      maxResponseBytes: 32_768,
+      timeoutMs: 30_000,
+    },
+    configVersion: 'a'.repeat(64),
+  },
+  queue: {
+    queued: 0,
+    running: 0,
+    retrying: 0,
+    terminal: 0,
+    cancelled: 0,
+    earliestDueAt: null,
+    earliestLeaseExpiryAt: null,
+  },
+  liveWrites: { used: 0, limit: 100, resetsInMs: 60_000, utcDay: '2026-09-01' },
+  evidence: {
+    eligibleRuns: 0,
+    agreements: 0,
+    disagreements: 0,
+    threshold: 50,
+    thresholdMet: false,
+  },
+};
+
+const AUTOPILOT_READINESS: LiveReadinessDto = {
+  policyVersion: 'recat-live-purchase-v1',
+  gates: [],
+  evidence: {
+    completedSince: '2026-08-01T00:00:00.000Z',
+    completedThrough: '2026-09-01T00:00:00.000Z',
+    eligibleRuns: 0,
+    threshold: 50,
+    minimumAgreement: 0.98,
+    maximumAbstentionRate: 0.25,
+    maximumErrorRate: 0.05,
+  },
+  models: {
+    provider: 'custom',
+    decisionAlias: 'decision-model',
+    verifierAlias: 'verifier-model',
+    decisionIdentity: 'provider/decision-v1',
+    verifierIdentity: 'provider/verifier-v1',
+  },
+  policy: {
+    supportedEntities: ['Purchase'],
+    minimumConfidence: 0.9,
+    policyAccepted: true,
+    configurationAccepted: true,
+    modelBindingAccepted: true,
+  },
+  state: {
+    liveRequested: false,
+    enabled: false,
+    paused: false,
+    pauseCode: null,
+    pauseMessage: null,
+  },
+  lastAction: null,
+};
+
+const AUTOPILOT_RUNS: AutopilotRunListDto = { runs: [], nextCursor: null };
 
 const INVALID_SALES_CODE_CASES: Array<[string, string, TaxReadinessDto]> = [
   ['purchase-only', 'TAX_CODE_STANDARD', SALES_READY],
@@ -349,7 +440,11 @@ beforeEach(() => {
   });
   mocks.taxReadiness = READY;
   mocks.activeCompanyId = 'COMPANY_GENERIC';
+  mocks.role = 'admin';
   mocks.tags = [];
+  mocks.autopilotGet.mockResolvedValue(AUTOPILOT_OVERVIEW);
+  mocks.autopilotListRuns.mockResolvedValue(AUTOPILOT_RUNS);
+  mocks.autopilotGetReadiness.mockResolvedValue(AUTOPILOT_READINESS);
   mocks.stage.mockResolvedValue(STAGED);
   mocks.commit.mockResolvedValue(mutation());
   mocks.reconcile.mockResolvedValue(mutation());
@@ -1677,6 +1772,19 @@ describe('single interactive queue', () => {
         : { providerActionability: { disposition, ...(reason ? { reason } : {}) } }),
     });
   }
+
+  it('does not render the supplementary Autopilot status card or read its APIs in Queue', async () => {
+    await renderQueue();
+
+    await waitFor(() => {
+      expect(mocks.autopilotGet).not.toHaveBeenCalled();
+      expect(mocks.autopilotListRuns).not.toHaveBeenCalled();
+      expect(mocks.autopilotGetReadiness).not.toHaveBeenCalled();
+    });
+    expect(screen.queryByRole('complementary', {
+      name: 'Queue live autopilot status',
+    })).not.toBeInTheDocument();
+  });
 
   it('shows and counts every pending transaction without actionability tabs', async () => {
     await renderQueue([

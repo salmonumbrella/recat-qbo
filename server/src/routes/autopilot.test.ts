@@ -473,7 +473,7 @@ describe('autopilot route authorization and settings', () => {
 
     expect(enabled.status).toBe(409);
     expect(enabled.body).toEqual({
-      error: 'Shadow autopilot cannot be enabled for a disconnected company.',
+      error: 'Autopilot cannot be enabled for a disconnected company.',
       code: 'COMPANY_DISCONNECTED',
     });
     expect(disabled.status).toBe(200);
