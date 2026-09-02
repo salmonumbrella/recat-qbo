@@ -111,7 +111,7 @@ describe('Queue shared controls', () => {
     expect(document.querySelectorAll('select')).toHaveLength(0);
   });
 
-  it('keeps an unselected rule suggestion visible on the category trigger', async () => {
+  it('keeps an unselected rule suggestion visible and described on the category trigger', async () => {
     mocks.list.mockResolvedValue({
       transactions: [transaction({
         category: null,
@@ -129,8 +129,11 @@ describe('Queue shared controls', () => {
     });
     await renderQueue();
 
-    expect(screen.getByRole('combobox', { name: 'Category for Generic supplier' }))
-      .toHaveTextContent('Office expense');
+    const category = screen.getByRole('combobox', { name: 'Category for Generic supplier' });
+    expect(category).toHaveTextContent('Office expense');
+    expect(category).toHaveAccessibleDescription(
+      'Suggested category: Office expense. Suggested by rule. Matched 2 rules — “office supply” won (topmost). Reorder in Rules.',
+    );
     expect(screen.getByText('rule')).toHaveAttribute(
       'data-tip',
       'Matched 2 rules — “office supply” won (topmost). Reorder in Rules.',

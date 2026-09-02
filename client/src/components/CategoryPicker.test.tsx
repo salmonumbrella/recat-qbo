@@ -15,8 +15,9 @@ describe('CategoryPicker', () => {
   it('searches grouped categories, marks the suggested option, and selects its stable value', async () => {
     const onPick = vi.fn();
     const user = userEvent.setup();
-    render(<div className="rr"><CategoryPicker label="Category for Northwind" value={null} onPick={onPick} showBadges options={[{ value: 'expense-office', group: 'Expenses', name: 'Office expense', sug: true }, { value: 'expense-travel', group: 'Expenses', name: 'Travel', sug: false }]} /></div>);
+    render(<div className="rr"><CategoryPicker label="Category for Northwind" value={null} onPick={onPick} showBadges triggerText="Choose category…" options={[{ value: 'expense-office', group: 'Expenses', name: 'Office expense', sug: true }, { value: 'expense-travel', group: 'Expenses', name: 'Travel', sug: false }]} /></div>);
 
+    expect(screen.getByRole('combobox', { name: 'Category for Northwind' })).not.toHaveAccessibleDescription();
     await user.click(screen.getByRole('combobox', { name: 'Category for Northwind' }));
     await user.type(screen.getByRole('textbox', { name: 'Category for Northwind' }), 'office');
     expect(screen.getByText('suggested')).toBeInTheDocument();
@@ -32,5 +33,22 @@ describe('CategoryPicker', () => {
     await user.click(screen.getByRole('combobox', { name: 'Category' }));
     await user.click(screen.getByRole('button', { name: /split into multiple categories/i }));
     expect(onSplitFooter).toHaveBeenCalledTimes(1);
+  });
+
+  it('connects each non-selected trigger description through a unique id', () => {
+    render(
+      <div className="rr">
+        <CategoryPicker label="Category for Northwind" value={null} onPick={vi.fn()} showBadges={false} triggerText="Office expense" triggerBadge="rule" triggerBadgeTooltip="Matched 2 rules — “office supply” won (topmost). Reorder in Rules." options={[]} />
+        <CategoryPicker label="Category for Contoso" value={null} onPick={vi.fn()} showBadges={false} triggerText="Travel" triggerBadge="suggested" options={[]} />
+      </div>,
+    );
+
+    const northwind = screen.getByRole('combobox', { name: 'Category for Northwind' });
+    const contoso = screen.getByRole('combobox', { name: 'Category for Contoso' });
+    expect(northwind).toHaveAccessibleDescription('Suggested category: Office expense. Suggested by rule. Matched 2 rules — “office supply” won (topmost). Reorder in Rules.');
+    expect(contoso).toHaveAccessibleDescription('Suggested category: Travel. Suggested.');
+    expect(northwind).toHaveAttribute('aria-describedby');
+    expect(contoso).toHaveAttribute('aria-describedby');
+    expect(northwind.getAttribute('aria-describedby')).not.toBe(contoso.getAttribute('aria-describedby'));
   });
 });

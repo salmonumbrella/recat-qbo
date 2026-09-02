@@ -1,4 +1,5 @@
 import { Combobox, type ControlOption } from './SelectCombobox';
+import { useId } from 'react';
 
 export interface CategoryOption {
   value: string;
@@ -40,6 +41,14 @@ export default function CategoryPicker(props: CategoryPickerProps) {
     group,
     searchText: `${group} ${name}`,
   }));
+  const descriptionId = `category-picker-${useId()}-description`;
+  const triggerDescription = value === null && triggerText && triggerBadge
+    ? [
+      `Suggested category: ${triggerText}.`,
+      triggerBadge === 'rule' ? 'Suggested by rule.' : 'Suggested.',
+      triggerBadgeTooltip,
+    ].filter(Boolean).join(' ')
+    : undefined;
 
   return (
     <span className="category-picker">
@@ -50,6 +59,7 @@ export default function CategoryPicker(props: CategoryPickerProps) {
         onValueChange={(next) => { if (next !== null) onPick(next); }}
         disabled={disabled}
         placeholder={triggerText}
+        describedBy={triggerDescription ? descriptionId : undefined}
         className={triggerTone === 'suggested' ? 'category-picker-suggested' : undefined}
         searchPlaceholder="Search categories…"
         emptyText="No matching categories"
@@ -65,6 +75,14 @@ export default function CategoryPicker(props: CategoryPickerProps) {
           style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--amT)', marginLeft: 7 }}
         >
           {triggerBadge}
+        </span>
+      )}
+      {triggerDescription && (
+        <span
+          id={descriptionId}
+          style={{ position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 }}
+        >
+          {triggerDescription}
         </span>
       )}
     </span>
