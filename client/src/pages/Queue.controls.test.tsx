@@ -5,6 +5,7 @@ import type { TransactionDto } from '@recat/shared';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
+  bankAccounts: vi.fn(),
   classificationSearch: vi.fn(),
   classificationHealth: vi.fn(),
   categorize: vi.fn(),
@@ -47,6 +48,7 @@ vi.mock('../lib/api', () => ({
   ruleOperations: { prepareFromCase: vi.fn(), commit: vi.fn() },
   rules: { create: vi.fn(), lifecycle: vi.fn() },
   autopilot: { get: vi.fn(), listRuns: vi.fn(), getReadiness: vi.fn() },
+  reports: { bankAccounts: mocks.bankAccounts },
   transactions: {
     list: mocks.list, categorize: mocks.categorize, stageCategorization: vi.fn(), commitCategorization: vi.fn(),
     reconcileCategorization: vi.fn(), retryCategorization: vi.fn(), undoCategorization: vi.fn(),
@@ -79,6 +81,7 @@ beforeEach(() => {
     pendingCount: 2,
   });
   mocks.categorize.mockResolvedValue(transaction({ category: 'Office expense', categoryQboId: 'EXPENSE_OFFICE' }));
+  mocks.bankAccounts.mockResolvedValue(['Operating account', 'Savings account']);
   mocks.tags = [];
   mocks.classificationSearch.mockResolvedValue({
     query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company', mode: 'hybrid', requestedMode: 'auto',
@@ -93,6 +96,21 @@ async function renderQueue() {
 }
 
 describe('Queue shared controls', () => {
+  it('keeps company bank accounts available when their transactions are not in the queue', async () => {
+    const user = userEvent.setup();
+    mocks.bankAccounts.mockResolvedValue([
+      'Operating account',
+      'Savings account',
+      'Cleared account',
+    ]);
+    await renderQueue();
+
+    await user.click(screen.getByRole('combobox', { name: 'Account filter' }));
+
+    expect(await screen.findByRole('option', { name: 'Cleared account' })).toBeInTheDocument();
+    expect(mocks.bankAccounts).toHaveBeenCalledWith('COMPANY_GENERIC');
+  });
+
   it('uses shared controls for account filtering and category selection without the legacy global picker handler', async () => {
     const user = userEvent.setup();
     await renderQueue();

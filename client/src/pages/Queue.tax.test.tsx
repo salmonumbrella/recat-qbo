@@ -16,6 +16,7 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
+  bankAccounts: vi.fn(),
   categorize: vi.fn(),
   stage: vi.fn(),
   commit: vi.fn(),
@@ -140,6 +141,7 @@ vi.mock('../lib/api', () => {
       listRuns: mocks.autopilotListRuns,
       getReadiness: mocks.autopilotGetReadiness,
     },
+    reports: { bankAccounts: mocks.bankAccounts },
     transactions: {
       list: mocks.list,
       categorize: mocks.categorize,
@@ -474,6 +476,7 @@ beforeEach(() => {
   mocks.activeCompanyName = 'Generic company';
   mocks.role = 'admin';
   mocks.refreshCompanies.mockResolvedValue(undefined);
+  mocks.bankAccounts.mockResolvedValue(['Generic bank']);
   mocks.tags = [];
   mocks.autopilotGet.mockResolvedValue(AUTOPILOT_OVERVIEW);
   mocks.autopilotListRuns.mockResolvedValue(AUTOPILOT_RUNS);
