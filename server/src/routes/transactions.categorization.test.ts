@@ -512,6 +512,7 @@ describe('tax-aware categorization action routes', () => {
   it.each([
     ['QBO_PERIOD_CLOSED', 409, 'QuickBooks has closed this accounting period.'],
     ['QBO_TRANSACTION_LOCKED', 409, 'QuickBooks reports this transaction as cleared or reconciled.'],
+    ['SUPERSEDED', 409, 'This transaction was already categorized in QuickBooks.'],
     ['QBO_WRITE_SAFETY_UNAVAILABLE', 503, 'QuickBooks write-safety status is unavailable.'],
   ])('maps a legacy post result error %s to a bounded response', async (code, status, message) => {
     mocks.postTransaction.mockResolvedValue({
@@ -1120,6 +1121,7 @@ describe('tax-aware categorization action routes', () => {
   it.each([
     ['QBO_PERIOD_CLOSED', 'QuickBooks has closed this accounting period.'],
     ['QBO_TRANSACTION_LOCKED', 'QuickBooks reports this transaction as cleared or reconciled.'],
+    ['SUPERSEDED', 'This transaction was already categorized in QuickBooks.'],
     ['QBO_WRITE_SAFETY_UNAVAILABLE', 'QuickBooks write-safety status is unavailable.'],
   ])('maps %s to a bounded conflict response', async (code, message) => {
     mocks.commitStagedCategorization.mockRejectedValue({
