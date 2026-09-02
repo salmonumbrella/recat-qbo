@@ -1,13 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { PrismaClient } from '@prisma/client';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describePostgres = TEST_DATABASE_URL ? describe : describe.skip;
 
 describePostgres('legacy durable restore migration on PostgreSQL', () => {
-  const db = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+  let db: PrismaClient;
+
+  beforeAll(() => {
+    db = new PrismaClient({ datasources: { db: { url: TEST_DATABASE_URL! } } });
+  });
 
   afterAll(async () => {
     await db.$disconnect();
