@@ -6,7 +6,7 @@ import { errorMiddleware } from '../lib/http.js';
 
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(), list: vi.fn(),
-  lifecycle: vi.fn(), detail: vi.fn(), history: vi.fn(), test: vi.fn(),
+  lifecycle: vi.fn(), detail: vi.fn(), history: vi.fn(), affected: vi.fn(), test: vi.fn(),
 }));
 vi.mock('../lib/prisma.js', () => ({ prisma: {
   session: { findUnique: mocks.session }, company: { findUnique: mocks.company },
@@ -14,6 +14,7 @@ vi.mock('../lib/prisma.js', () => ({ prisma: {
 } }));
 vi.mock('../services/companyReads.js', () => ({
   listRuleLifecycle: mocks.lifecycle, getRule: mocks.detail, listRuleRevisions: mocks.history,
+  listRuleAffectedTransactions: mocks.affected,
 }));
 vi.mock('../services/rules.js', async (original) => ({
   ...(await original<typeof import('../services/rules.js')>()), listRules: mocks.list, testRule: mocks.test,
@@ -41,6 +42,9 @@ beforeEach(() => {
   } }], nextCursor: 'signed-next' });
   mocks.detail.mockResolvedValue({ revision: { revision: 4, state: 'disabled' } });
   mocks.history.mockResolvedValue({ items: [], nextCursor: null });
+  mocks.affected.mockResolvedValue({
+    items: [], nextCursor: null, matchedCount: 0, pendingCount: 0, postedCount: 0,
+  });
 });
 
 describe('governed rule REST', () => {
@@ -89,6 +93,23 @@ describe('governed rule REST', () => {
     expect(detail.status).toBe(200); expect(history.status).toBe(200);
     expect(mocks.detail).toHaveBeenCalledWith('user-a', 'company-a', 'rule-a');
     expect(mocks.history).toHaveBeenCalledWith('user-a', 'company-a', 'rule-a', { limit: 10 });
+  });
+
+  it('allows a viewer to read a company-scoped affected page but preserves the write migration fence', async () => {
+    mocks.membership.mockResolvedValue({ role: 'viewer' });
+    const response = await request(app())
+      .get('/api/companies/company-a/rules/rule-a/affected-transactions')
+      .query({ status: 'posted', limit: 20, cursor: 'signed-cursor' })
+      .set('Cookie', 'recat_session=x');
+
+    expect(response.status).toBe(200);
+    expect(mocks.affected).toHaveBeenCalledWith('user-a', 'company-a', 'rule-a', {
+      status: 'posted', limit: 20, cursor: 'signed-cursor',
+    });
+    mocks.membership.mockResolvedValue({ role: 'categorizer' });
+    await request(app()).patch('/api/companies/company-a/rules/rule-a')
+      .set('Cookie', 'recat_session=x').send({ categoryQboId: 'account-a' })
+      .expect(409);
   });
 
   it('keeps list, test, and legacy write migration responses categorizer-only', async () => {

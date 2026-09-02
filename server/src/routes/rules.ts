@@ -13,7 +13,12 @@ import {
   testRule,
   toRuleDto,
 } from '../services/rules.js';
-import { getRule, listRuleLifecycle, listRuleRevisions } from '../services/companyReads.js';
+import {
+  getRule,
+  listRuleAffectedTransactions,
+  listRuleLifecycle,
+  listRuleRevisions,
+} from '../services/companyReads.js';
 
 export { toRuleDto } from '../services/rules.js';
 
@@ -27,6 +32,12 @@ const testBody = z.object({
 const lifecycleQuery = z.object({
   state: z.enum(['enabled', 'disabled', 'retired', 'all']).default('all'),
   limit: z.coerce.number().int().min(1).max(100).default(20),
+  cursor: z.string().min(1).max(2_048).optional(),
+}).strict();
+
+const affectedQuery = z.object({
+  status: z.enum(['all', 'pending', 'posted']).default('all'),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
   cursor: z.string().min(1).max(2_048).optional(),
 }).strict();
 
@@ -89,6 +100,13 @@ rulesRouter.get('/:id/revisions', requireRole('viewer'), withReadableCompany, as
     ...(limit === undefined ? {} : { limit }),
     ...(typeof req.query.cursor === 'string' ? { cursor: req.query.cursor } : {}),
   }));
+}));
+
+rulesRouter.get('/:id/affected-transactions', requireRole('viewer'), withReadableCompany, asyncHandler(async (req, res) => {
+  if (!req.user) throw new HttpError(401, 'Not signed in', 'UNAUTHENTICATED');
+  res.json(await listRuleAffectedTransactions(
+    req.user.id, scopedCompany(req).id, req.params.id ?? '', validate(affectedQuery)(req.query),
+  ));
 }));
 
 rulesRouter.get('/:id', requireRole('viewer'), withReadableCompany, asyncHandler(async (req, res) => {

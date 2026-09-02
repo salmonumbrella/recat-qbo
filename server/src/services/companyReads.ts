@@ -16,6 +16,8 @@ import type {
   ProviderActionabilityDto,
   QboAccountDto,
   Role,
+  RuleAffectedTransactionFilter,
+  RuleAffectedTransactionPageDto,
   RuleDetailDto,
   RuleDto,
   RuleLifecycleFilter,
@@ -1994,6 +1996,108 @@ export function createCompanyReadService(
     return getClassificationCaseForUser(userId, companyId, String(row.id));
   }
 
+  async function listRuleAffectedTransactionsForUser(
+    userId: string,
+    companyId: string,
+    ruleId: string,
+    input: { status?: RuleAffectedTransactionFilter; limit?: number; cursor?: string } = {},
+  ): Promise<RuleAffectedTransactionPageDto> {
+    await authorizeCompany(userId, companyId, 'viewer');
+    boundedId(ruleId, 'ruleId');
+    const status = input.status ?? 'all';
+    if (status !== 'all' && status !== 'pending' && status !== 'posted') {
+      badRequest('Invalid affected transaction status');
+    }
+    const limit = readLimit(input.limit);
+    const filter = canonicalFilter({ ruleId, status, limit });
+    const expected = { resource: 'rule-affected-transactions', userId, companyId, filter };
+    const position = decodeCursor(cursorSecret, input.cursor, expected);
+    const cursorDate = typeof position?.date === 'string' ? new Date(position.date) : null;
+    const cursorId = typeof position?.id === 'string' ? position.id : null;
+    const cursorFingerprint = typeof position?.fingerprint === 'string' ? position.fingerprint : null;
+    if (position && (!cursorDate || Number.isNaN(cursorDate.getTime()) || !cursorId || !cursorFingerprint)) {
+      badRequest('Invalid cursor', 'INVALID_CURSOR');
+    }
+
+    // This is intentionally the same current RuleRevision read that powers the
+    // canonical rule detail. Disabled and retired rules remain browseable.
+    const rule = await getRuleForCompany(companyId, ruleId);
+    const matchText = rule.revision.condition.matchText.trim();
+    if (matchText === '') throw new HttpError(503, 'Rule history is unavailable', 'COMPANY_UNAVAILABLE');
+
+    return db.$transaction(async (tx) => {
+      const fingerprint = await ruleLifecycleFingerprint(tx, companyId);
+      if (cursorFingerprint !== null && cursorFingerprint !== fingerprint) {
+        badRequest('Affected transaction population changed; restart pagination', 'INVALID_CURSOR');
+      }
+      const matchingWhere = {
+        companyId,
+        status: { in: ['PENDING', 'POSTED', 'DRY_RUN'] },
+        payee: { contains: matchText, mode: 'insensitive' as const },
+      };
+      const statusWhere = status === 'all' ? {} : status === 'pending'
+        ? { status: 'PENDING' }
+        : { status: { in: ['POSTED', 'DRY_RUN'] } };
+      const cursorWhere = cursorDate && cursorId
+        ? { OR: [{ date: { lt: cursorDate } }, { date: cursorDate, id: { lt: cursorId } }] }
+        : {};
+      const [matchedCount, pendingCount, postedCount, rows, enabledRules] = await Promise.all([
+        tx.transaction.count({ where: matchingWhere }) as Promise<number>,
+        tx.transaction.count({ where: { ...matchingWhere, status: 'PENDING' } }) as Promise<number>,
+        tx.transaction.count({ where: { ...matchingWhere, status: { in: ['POSTED', 'DRY_RUN'] } } }) as Promise<number>,
+        tx.transaction.findMany({
+          where: { ...matchingWhere, ...statusWhere, ...cursorWhere },
+          select: {
+            id: true, qboType: true, qboId: true, date: true, payee: true, memo: true, amount: true, status: true,
+          },
+          orderBy: [{ date: 'desc' }, { id: 'desc' }],
+          take: limit + 1,
+        }) as Promise<Row[]>,
+        tx.rule.findMany({
+          where: { companyId, enabled: true, retiredAt: null },
+          select: { id: true, matchText: true, priority: true, createdAt: true },
+          orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }, { id: 'asc' }],
+        }) as Promise<Row[]>,
+      ]);
+      const page = pageRows(rows, limit, (row) => encodeCursor(cursorSecret, {
+        v: 1,
+        ...expected,
+        position: { date: iso(row.date), id: String(row.id), fingerprint },
+      }));
+      const winnerFor = (payee: string): string | null => {
+        const loweredPayee = payee.toLocaleLowerCase('en-US');
+        const winner = enabledRules.find((candidate) => {
+          const needle = String(candidate.matchText).trim().toLocaleLowerCase('en-US');
+          return needle !== '' && loweredPayee.includes(needle);
+        });
+        return winner === undefined ? null : String(winner.id);
+      };
+      return {
+        items: page.rows.map((row) => {
+          const qboType = row.qboType;
+          if (qboType !== 'Purchase' && qboType !== 'Deposit' && qboType !== 'JournalEntry') {
+            throw new HttpError(503, 'Affected transaction data is unavailable', 'COMPANY_UNAVAILABLE');
+          }
+          const rowStatus = row.status;
+          if (rowStatus !== 'PENDING' && rowStatus !== 'POSTED' && rowStatus !== 'DRY_RUN') {
+            throw new HttpError(503, 'Affected transaction data is unavailable', 'COMPANY_UNAVAILABLE');
+          }
+          const winningRuleId = winnerFor(String(row.payee));
+          return {
+            transactionId: String(row.id), qboType, qboId: String(row.qboId), date: iso(row.date),
+            payee: String(row.payee), memo: row.memo == null ? null : String(row.memo),
+            amountCents: Math.round(Number(row.amount) * 100), status: rowStatus,
+            ruleWins: winningRuleId === ruleId, winningRuleId,
+          };
+        }),
+        nextCursor: page.nextCursor,
+        matchedCount,
+        pendingCount,
+        postedCount,
+      };
+    }, { isolationLevel: 'RepeatableRead' });
+  }
+
   async function testRuleForUser(
     userId: string,
     companyId: string,
@@ -2588,6 +2692,7 @@ export function createCompanyReadService(
     listRuleLifecycle: listRuleLifecycleForUser,
     getRule: getRuleForUser,
     listRuleRevisions: listRuleRevisionsForUser,
+    listRuleAffectedTransactions: listRuleAffectedTransactionsForUser,
     testRule: testRuleForUser,
     listRuleCandidates: listRuleCandidatesForUser,
     getRuleCandidate: getRuleCandidateForUser,
@@ -2616,6 +2721,7 @@ export const listRules = defaultService.listRules;
 export const listRuleLifecycle = defaultService.listRuleLifecycle;
 export const getRule = defaultService.getRule;
 export const listRuleRevisions = defaultService.listRuleRevisions;
+export const listRuleAffectedTransactions = defaultService.listRuleAffectedTransactions;
 export const testRule = defaultService.testRule;
 export const listRuleCandidates = defaultService.listRuleCandidates;
 export const getRuleCandidate = defaultService.getRuleCandidate;
