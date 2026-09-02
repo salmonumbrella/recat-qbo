@@ -242,6 +242,9 @@ function makeFakeDb(row: FakeTxnRow) {
     qboMutationAttempt: {
       findFirst: vi.fn(async () => null),
     },
+    transactionActionability: {
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
     },
@@ -357,7 +360,7 @@ describe('legacy write safety', () => {
         cleared: qboType === 'Purchase',
         reconciled: qboType === 'Deposit',
       }));
-      const { deps } = makeDeps(row, {
+      const { deps, db, audit } = makeDeps(row, {
         fetchTxn: async () => freshQboTxn('0', qboType),
         fetchWriteSafety,
         recategorize,
@@ -383,6 +386,23 @@ describe('legacy write safety', () => {
       });
       expect(recategorize).not.toHaveBeenCalled();
       expect(row.status).toBe('PENDING');
+      expect(db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: qboType === 'Purchase' ? 'BLOCKED_CLEARED' : 'BLOCKED_RECONCILED',
+            cleared: qboType === 'Purchase',
+            reconciled: qboType === 'Deposit',
+          }),
+        }),
+      );
+      expect(audit).toHaveBeenCalledTimes(1);
+      expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: 'txn-1',
+        payload: expect.objectContaining({
+          error: { code: 'QBO_TRANSACTION_LOCKED' },
+        }),
+      }));
     },
   );
 
@@ -1314,6 +1334,10 @@ class FakeDurableDb {
     findUnique: vi.fn(async () => ({ configVersion: 'verified-writeback-v1' })),
   };
 
+  transactionActionability = {
+    updateMany: vi.fn(async () => ({ count: 1 })),
+  };
+
   constructor(qboType: PreparedEntity = 'Purchase') {
     this.transactionRow = durableTransaction(qboType);
   }
@@ -2065,6 +2089,21 @@ describe('commitStagedCategorization durable lifecycle', () => {
         expect.objectContaining({ data: { status: 'COMMITTING' } }),
       ]);
       expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+      expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            disposition: code === 'QBO_PERIOD_CLOSED'
+              ? 'BLOCKED_PERIOD_CLOSED'
+              : 'BLOCKED_RECONCILED',
+          }),
+        }),
+      );
+      expect(fixture.audit).toHaveBeenCalledTimes(1);
+      expect(fixture.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'blocked',
+        txnId: DURABLE_TRANSACTION_ID,
+        payload: expect.objectContaining({ error: { code } }),
+      }));
 
       const retry = durableDeps(fixture.db);
       await expect(

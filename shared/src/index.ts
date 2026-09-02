@@ -348,6 +348,7 @@ export interface LiveReadinessDto {
 }
 export type AuditAction =
   | 'posted'
+  | 'blocked'
   | 'dry-run'
   | 'error'
   | 'reverted'
