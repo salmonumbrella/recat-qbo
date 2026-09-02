@@ -1,4 +1,6 @@
 import { render, screen } from '@testing-library/react';
+import { createElement } from 'react';
+import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -51,6 +53,11 @@ vi.mock('../lib/api', () => ({
   ruleCandidates: {
     list: vi.fn().mockResolvedValue({ candidates: [], nextCursor: null }),
   },
+}));
+
+vi.mock('react-router-dom', () => ({
+  Link: ({ to, children, ...props }: { to: string; children: ReactNode } & AnchorHTMLAttributes<HTMLAnchorElement>) =>
+    createElement('a', { href: to, ...props }, children),
 }));
 
 import Rules from './Rules';

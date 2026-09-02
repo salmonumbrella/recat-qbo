@@ -1,5 +1,7 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { createElement } from 'react';
+import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RuleCandidateDto, RuleDetailDto, RuleMutationResult } from '@recat/shared';
 
@@ -77,6 +79,11 @@ vi.mock('../lib/api', () => ({
     list: mocks.listCandidates,
     get: mocks.getCandidate,
   },
+}));
+
+vi.mock('react-router-dom', () => ({
+  Link: ({ to, children, ...props }: { to: string; children: ReactNode } & AnchorHTMLAttributes<HTMLAnchorElement>) =>
+    createElement('a', { href: to, ...props }, children),
 }));
 
 import Rules from './Rules';
@@ -204,10 +211,11 @@ describe('Rules candidate review', () => {
   // into the account Recat is watching.
   it('excludes a designated holding account whatever the operator named it', async () => {
     mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
+    const user = userEvent.setup();
 
     render(<Rules />);
 
-    await waitFor(() => expect(mocks.lifecycleRules).toHaveBeenCalled());
+    await user.click(await screen.findByRole('combobox', { name: 'Category for Generic supplier' }));
     expect(screen.queryAllByRole('option', {
       name: /Uncategorized Expenses Pending Review/,
     })).toHaveLength(0);
@@ -220,10 +228,11 @@ describe('Rules candidate review', () => {
 
   it('excludes localized Uncategorised holding accounts from category destinations', async () => {
     mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
+    const user = userEvent.setup();
 
     render(<Rules />);
 
-    await waitFor(() => expect(mocks.lifecycleRules).toHaveBeenCalled());
+    await user.click(await screen.findByRole('combobox', { name: 'Category for Generic supplier' }));
     expect(screen.queryAllByRole('option', {
       name: /Uncategorised Expense/,
     })).toHaveLength(0);
@@ -880,7 +889,8 @@ describe('Rules candidate review', () => {
     const user = userEvent.setup();
     render(<Rules />);
 
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Rule lifecycle' }), 'enabled');
+    await user.click(screen.getByRole('combobox', { name: 'Rule lifecycle' }));
+    await user.click(screen.getByRole('option', { name: 'Enabled' }));
     await user.click(await screen.findByRole('button', { name: 'Load more rules' }));
 
     expect(await screen.findByText('Live capped supplier 199')).toBeInTheDocument();

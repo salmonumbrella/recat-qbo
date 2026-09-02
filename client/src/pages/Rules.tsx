@@ -10,6 +10,7 @@ import type {
   RuleTestResult,
 } from '@recat/shared';
 import { isQboHoldingAccountName } from '@recat/shared';
+import { Link } from 'react-router-dom';
 import {
   classificationMemory,
   createCategorizationRequestId,
@@ -20,6 +21,7 @@ import {
 } from '../lib/api';
 import ClassificationMemoryPanel from '../components/ClassificationMemoryPanel';
 import ConfirmDialog from '../components/ConfirmDialog';
+import { Combobox, Select } from '../components/SelectCombobox';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { useApp } from '../state/AppContext';
 
@@ -587,19 +589,24 @@ export default function Rules() {
   }, [commitBusy]);
 
   return (
-    <div className="rr" style={{ maxWidth: 1040 }}>
-      <div style={{ display: 'flex', alignItems: 'end', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 18 }}>
+    <main style={{ maxWidth: 1040, margin: '0 auto', padding: '28px clamp(14px,3.5vw,32px) 80px' }}>
+      <header style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 14, flexWrap: 'wrap', marginBottom: 18 }}>
         <div>
-          <h1 style={{ marginBottom: 5 }}>Rules &amp; classification memory</h1>
-          <p style={{ margin: 0, color: 'var(--mut)' }}>Search reviewed decisions, then manage every durable rule through a preview and explicit commit.</p>
+          <h1 className="page-title" style={{ margin: 0 }}>Rules</h1>
+          <p className="page-sub" style={{ marginBottom: 0 }}>Manage executable rules and review their governed history.</p>
         </div>
-        <label style={{ fontSize: 13 }}>
-          Lifecycle{' '}
-          <select aria-label="Rule lifecycle" value={filter} onChange={(event) => setFilter(event.target.value as RuleLifecycleFilter)}>
-            <option value="all">All</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="retired">Retired</option>
-          </select>
-        </label>
-      </div>
+        <Select
+          label="Rule lifecycle"
+          value={filter}
+          onValueChange={(next) => { if (next !== null) setFilter(next as RuleLifecycleFilter); }}
+          options={[
+            { value: 'all', label: 'All' },
+            { value: 'enabled', label: 'Enabled' },
+            { value: 'disabled', label: 'Disabled' },
+            { value: 'retired', label: 'Retired' },
+          ]}
+        />
+      </header>
 
       {activeCompanyId && <ClassificationMemoryPanel companyId={activeCompanyId} title="Search classification knowledge" />}
 
@@ -617,7 +624,7 @@ export default function Rules() {
       )}
 
       <section aria-labelledby="lifecycle-rules-title">
-        <h2 id="lifecycle-rules-title" style={{ fontSize: 19 }}>Rule lifecycle</h2>
+        <h2 id="lifecycle-rules-title" style={{ fontSize: 19 }}>Executable Rules</h2>
         {rulesError && <div role="alert" aria-label="Rules unavailable" style={{ color: 'var(--erT)', marginBottom: 10 }}>
           {rulesError}{' '}<button style={buttonStyle} disabled={rulesBusy} onClick={() => activeCompanyId && void loadFirstPage(activeCompanyId, filter)}>Retry rules</button>
         </div>}
@@ -625,7 +632,13 @@ export default function Rules() {
           {reorderError}{' '}<button style={buttonStyle} disabled={reorderBusy} onClick={() => activeCompanyId && void loadReorderRules(activeCompanyId)}>Retry ordering</button>
         </div>}
         {rulesBusy && ruleList.length === 0 && <div role="status">Loading rules…</div>}
-        {!rulesBusy && !rulesError && ruleList.length === 0 && <p style={{ color: 'var(--mut)' }}>No rules in this lifecycle state.</p>}
+        {!rulesBusy && !rulesError && ruleList.length === 0 && (
+          <section className="card" role="status" aria-label="No executable rules" style={{ padding: 18, marginTop: 12 }}>
+            <strong>No executable rules match this lifecycle.</strong>
+            <p style={{ color: 'var(--mut)', marginBottom: 12 }}>Rules are optional. Continue categorizing transactions manually, then create a governed rule from a reviewed Queue decision when a pattern is stable.</p>
+            <Link to="/" className="btn-ghost">Create rule from Queue</Link>
+          </section>
+        )}
         {ruleGroups.map((group) => group.items.length > 0 && (
           <div
             key={group.key}
@@ -656,13 +669,24 @@ export default function Rules() {
 
                 {revision.action ? (
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) minmax(180px,1fr)', gap: 10, marginTop: 12 }}>
-                    <label style={{ fontSize: 12.5, color: 'var(--mut)' }}>
-                      Category
-                      <select aria-label={`Category for ${revision.condition.matchText}`} value={revision.action.categoryQboId} disabled={state !== 'enabled'} onChange={(event) => startRuleOperation(rule, 'update', { categoryQboId: event.target.value })} style={{ width: '100%', display: 'block', marginTop: 4 }}>
-                        {!categoryOptions.some((option) => option.qboId === revision.action?.categoryQboId) && <option value={revision.action.categoryQboId}>{revision.categoryName}</option>}
-                        {categoryOptions.map((option) => <option key={option.qboId} value={option.qboId}>{option.label}</option>)}
-                      </select>
-                    </label>
+                    <div>
+                      <Combobox
+                        label={`Category for ${revision.condition.matchText}`}
+                        value={revision.action.categoryQboId}
+                        disabled={state !== 'enabled'}
+                        options={[
+                          ...(!categoryOptions.some((option) => option.qboId === revision.action!.categoryQboId)
+                            ? [{ value: revision.action.categoryQboId, label: revision.categoryName, disabled: true }]
+                            : []),
+                          ...categoryOptions.map((option) => ({ value: option.qboId, label: option.label, searchText: option.label })),
+                        ]}
+                        onValueChange={(next) => {
+                          if (next !== null) startRuleOperation(rule, 'update', { categoryQboId: next });
+                        }}
+                        searchPlaceholder="Search categories…"
+                        emptyText="No matching categories"
+                      />
+                    </div>
                     <div style={{ fontSize: 13.5 }}>
                       <div>{revision.categoryName}</div>
                       <div style={{ color: 'var(--mut)', marginTop: 4 }}>{readable(revision.action.taxCalculation)}{revision.taxCodeName ? ` · ${revision.taxCodeName}` : ''} · Auto-post {revision.autoPost ? 'on' : 'off'}</div>
@@ -803,6 +827,6 @@ export default function Rules() {
       >
         {prepared && <PreviewBody operation={prepared} />}
       </ConfirmDialog>
-    </div>
+    </main>
   );
 }
