@@ -96,6 +96,16 @@ describe('Combobox', () => {
     expect(unrelatedField).toHaveFocus();
   });
 
+  it('dismisses a portalled menu after an outside pointer interaction', async () => {
+    const user = userEvent.setup();
+    render(<div className="rr"><Combobox label="Category" value="all" options={OPTIONS} onValueChange={vi.fn()} /></div>);
+
+    await user.click(screen.getByRole('combobox', { name: 'Category' }));
+    expect(screen.getByRole('listbox', { name: 'Category' })).toBeInTheDocument();
+    await user.click(document.body);
+    expect(screen.queryByRole('listbox', { name: 'Category' })).not.toBeInTheDocument();
+  });
+
   it('keeps the active listbox option programmatically associated with its focused search input', async () => {
     const user = userEvent.setup();
     render(<div className="rr"><Combobox label="Category" value="all" options={OPTIONS} onValueChange={vi.fn()} /></div>);

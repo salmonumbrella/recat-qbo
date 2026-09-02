@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TransactionDto } from '@recat/shared';
@@ -164,5 +164,23 @@ describe('Queue shared controls', () => {
 
     await user.click(document.body);
     expect(screen.queryByRole('button', { name: 'Generic tag' })).not.toBeInTheDocument();
+  });
+
+  it('opens the split editor from a portalled category footer without activating its row', async () => {
+    const user = userEvent.setup();
+    await renderQueue();
+
+    const genericRow = screen.getByText('Generic supplier').closest('.interactive-surface')!;
+    const otherRow = screen.getByText('Another supplier').closest('.interactive-surface')!;
+    await user.click(screen.getByRole('combobox', { name: 'Category for Another supplier' }));
+    fireEvent.keyDown(document.body, { key: 'ArrowUp' });
+    expect(genericRow).toHaveStyle({ background: 'var(--hl)' });
+    expect(otherRow).toHaveStyle({ background: 'transparent' });
+
+    await user.click(screen.getByRole('button', { name: /split into multiple categories/i }));
+
+    expect(screen.getByText('Split transaction')).toBeInTheDocument();
+    expect(genericRow).toHaveStyle({ background: 'var(--hl)' });
+    expect(otherRow).toHaveStyle({ background: 'transparent' });
   });
 });
