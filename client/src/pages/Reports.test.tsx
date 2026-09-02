@@ -123,6 +123,16 @@ describe('Reports', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('announces a pending transaction-log read', async () => {
+    mocks.transactionLog.mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+
+    render(<Reports />);
+    await user.selectOptions(screen.getByLabelText('Report'), 'txns');
+
+    expect(await screen.findByLabelText('Loading transaction log')).toHaveAttribute('aria-busy', 'true');
+  });
+
   it('keeps transaction log failure in its card and retries', async () => {
     mocks.transactionLog
       .mockRejectedValueOnce(new ApiError(502, 'QuickBooks could not provide this report right now.', 'QBO_REPORT_UNAVAILABLE', undefined, '8c9ed2fd-f3e0-4f6c-8784-41464977d558'))

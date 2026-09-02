@@ -566,7 +566,7 @@ export default function Reports() {
           }}
         >
           {logState === 'loading' ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '24px 0' }}>
+            <div aria-busy="true" aria-label="Loading transaction log" style={{ display: 'flex', justifyContent: 'center', padding: '24px 0' }}>
               <Spinner />
             </div>
           ) : logState === 'error' ? (
