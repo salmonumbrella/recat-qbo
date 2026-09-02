@@ -1050,6 +1050,61 @@ export default function Queue() {
     [notifyQboMutation, patchRow, removeRow, updateTaxState, recordTaxMutation, toast],
   );
 
+  const recoverInitiatedTaxFailure = useCallback(
+    (t: TransactionDto, error: unknown, mutation: TaxMutationState) => {
+      if (!(error instanceof ApiError) || error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE') {
+        recordTaxMutationFailure(t, error, mutation);
+        return;
+      }
+      const companyId = activeCompanyIdRef.current;
+      if (!companyId) {
+        recordTaxMutationFailure(t, error, mutation);
+        return;
+      }
+      updateTaxState(t, (state) => ({
+        ...state,
+        mutation: state.mutation?.requestId === mutation.requestId
+          ? { ...state.mutation, busy: true, phase: 'resolving', resolution: 'resolving' }
+          : state.mutation,
+      }));
+      void fetchAllTxns(companyId)
+        .then((freshRows) => {
+          if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+          setRows(freshRows);
+          const fresh = freshRows.find((row) => row.id === t.id);
+          if (!fresh) {
+            delete taxVersionsRef.current[t.id];
+            setTaxRows((current) => {
+              const next = { ...current };
+              delete next[t.id];
+              return next;
+            });
+            toast(error.message);
+            return;
+          }
+          const persistedMutation = initialTaxState(fresh).mutation;
+          updateTaxState(fresh, (state) => ({ ...state, mutation: persistedMutation }));
+          toast(error.message);
+        })
+        .catch(() => {
+          if (!aliveRef.current || activeCompanyIdRef.current !== companyId) return;
+          updateTaxState(t, (state) => ({
+            ...state,
+            mutation: state.mutation?.requestId === mutation.requestId
+              ? {
+                  ...state.mutation,
+                  busy: false,
+                  phase: 'idle',
+                  resolution: 'unresolved',
+                }
+              : state.mutation,
+          }));
+          toast(`${error.message} Reload the page to recover the prepared write.`);
+        });
+    },
+    [fetchAllTxns, recordTaxMutationFailure, toast, updateTaxState],
+  );
+
   const commitTax = useCallback(
     (t: TransactionDto) => {
       const current = taxState(t);
@@ -1080,10 +1135,10 @@ export default function Queue() {
         })
         .catch((error) => {
           if (!aliveRef.current) return;
-          recordTaxMutationFailure(t, error, mutation);
+          recoverInitiatedTaxFailure(t, error, mutation);
         });
     },
-    [taxState, canMutate, updateTaxState, patchRow, recordTaxMutation, recordTaxMutationFailure],
+    [taxState, canMutate, updateTaxState, patchRow, recordTaxMutation, recoverInitiatedTaxFailure],
   );
 
   const reconcileTax = useCallback(
@@ -1312,10 +1367,10 @@ export default function Queue() {
         })
         .catch((error) => {
           if (!aliveRef.current) return;
-          recordTaxMutationFailure(t, error, mutation);
+          recoverInitiatedTaxFailure(t, error, mutation);
         });
     },
-    [canMutate, updateTaxState, recordTaxMutation, recordTaxMutationFailure],
+    [canMutate, updateTaxState, recordTaxMutation, recoverInitiatedTaxFailure],
   );
 
   const doPost = useCallback(

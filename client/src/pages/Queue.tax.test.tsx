@@ -1104,6 +1104,68 @@ describe('tax-aware manual queue', () => {
     );
   });
 
+  it('reloads a fresh Post safety outage into its persisted PREPARED resume state', async () => {
+    const requestId = '00000000-0000-4000-8000-000000000101';
+    mocks.commit.mockRejectedValue(new ApiError(
+      503,
+      'QuickBooks write safety is temporarily unavailable.',
+      'QBO_WRITE_SAFETY_UNAVAILABLE',
+    ));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    mocks.list.mockResolvedValue({
+      transactions: [transaction({
+        activeCategorizationAttempt: {
+          requestId,
+          operation: 'recategorize',
+          status: 'PREPARED',
+        },
+      })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+
+    await user.click(await screen.findByRole('button', { name: /^post$/i }));
+
+    expect(await screen.findByRole('button', { name: 'Resume post' })).toBeEnabled();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(mocks.toast).toHaveBeenCalledWith(
+      'QuickBooks write safety is temporarily unavailable.',
+    );
+  });
+
+  it('reloads a fresh Undo safety outage into its persisted PREPARED resume state', async () => {
+    const requestId = '00000000-0000-4000-8000-000000000101';
+    mocks.undoCategorization.mockRejectedValue(new ApiError(
+      503,
+      'QuickBooks write safety is temporarily unavailable.',
+      'QBO_WRITE_SAFETY_UNAVAILABLE',
+    ));
+    const user = userEvent.setup();
+    await renderQueue(transaction({ status: 'POSTED' }));
+    mocks.list.mockResolvedValue({
+      transactions: [transaction({
+        status: 'POSTED',
+        activeCategorizationAttempt: {
+          requestId,
+          operation: 'restore',
+          status: 'PREPARED',
+        },
+      })],
+      nextCursor: null,
+      pendingCount: 0,
+    });
+
+    await user.click(screen.getByRole('button', { name: /^undo$/i }));
+
+    expect(await screen.findByRole('button', { name: 'Resume undo' })).toBeEnabled();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(mocks.toast).toHaveBeenCalledWith(
+      'QuickBooks write safety is temporarily unavailable.',
+    );
+  });
+
   it('treats an unstructured transport failure as genuinely uncertain', async () => {
     mocks.commit.mockRejectedValue(new TypeError('Network request failed'));
     const user = userEvent.setup();
