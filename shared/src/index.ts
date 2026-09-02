@@ -1020,6 +1020,7 @@ export type ClassificationMatchReason =
   | 'rule'
   | 'candidate'
   | 'case'
+  | 'observation'
   | 'lexical'
   | 'semantic';
 
@@ -1028,7 +1029,8 @@ export type ClassificationKnowledgeKind =
   | 'vendor_alias'
   | 'classification_case'
   | 'rule'
-  | 'rule_candidate';
+  | 'rule_candidate'
+  | 'historical_observation';
 
 export type ClassificationCompanyRelation = 'current' | 'foreign';
 
@@ -1101,10 +1103,35 @@ export interface ClassificationConflict {
 }
 
 export interface ClassificationProvenance {
-  source: 'user' | 'mcp' | 'autopilot' | 'qbo_verified' | 'rule' | 'candidate';
+  source: 'user' | 'mcp' | 'autopilot' | 'qbo_verified' | 'rule' | 'candidate' | 'historical_observation';
   sourceId: string;
   actorId: string | null;
   recordedAt: string;
+}
+
+export interface HistoricalObservationProvenance {
+  sourceTransactionId: string;
+  sourceQboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  sourceQboId: string;
+  sourceTransactionRevision: number;
+  sourceQboSyncToken: string;
+  sourceStatus: 'POSTED';
+  sourceUpdatedAt: string;
+  observedAt: string;
+}
+
+export interface HistoricalClassificationObservation {
+  id: string;
+  companyId: string;
+  provenance: HistoricalObservationProvenance;
+  transactionDate: string;
+  payee: string;
+  memo: string | null;
+  amountCents: number;
+  currency: string;
+  sourceAccountName: string;
+  actionSummary: ClassificationActionSummary;
+  tagNames: string[];
 }
 
 export interface VendorAlias {
@@ -1196,6 +1223,8 @@ export interface ClassificationSearchHit {
   currency: string | null;
   verifiedAt: string | null;
   ruleRevision: number | null;
+  /** Snapshot provenance for display-only historical observations. */
+  observation: HistoricalObservationProvenance | null;
 }
 
 export interface ClassificationSearchResult {

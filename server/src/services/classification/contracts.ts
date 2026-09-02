@@ -7,6 +7,7 @@ import type {
   ClassificationConflict,
   ClassificationError,
   ClassificationErrorCode,
+  HistoricalObservationProvenance,
   ClassificationProvenance,
   ClassificationSearchHit,
   ClassificationSearchResult,
@@ -192,10 +193,21 @@ export const classificationCitationSchema = z.object({
 }).strict();
 
 export const classificationProvenanceSchema = z.object({
-  source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate']),
+  source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate', 'historical_observation']),
   sourceId: identifier,
   actorId: nullableIdentifier,
   recordedAt: dateTime,
+}).strict();
+
+export const historicalObservationProvenanceSchema: z.ZodType<HistoricalObservationProvenance> = z.object({
+  sourceTransactionId: identifier,
+  sourceQboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+  sourceQboId: boundedText(128),
+  sourceTransactionRevision: safeInteger.min(0),
+  sourceQboSyncToken: boundedText(128),
+  sourceStatus: z.literal('POSTED'),
+  sourceUpdatedAt: dateTime,
+  observedAt: dateTime,
 }).strict();
 
 export const classificationConflictSchema = z.object({
@@ -342,9 +354,10 @@ const matchedIn = z.array(z.enum([
   'rule',
   'candidate',
   'case',
+  'observation',
   'lexical',
   'semantic',
-])).min(1).max(6).refine(
+])).min(1).max(7).refine(
   (values) => new Set(values).size === values.length,
   'matchedIn values must be unique.',
 );
@@ -358,6 +371,7 @@ export const classificationSearchHitSchema = z.object({
     'classification_case',
     'rule',
     'rule_candidate',
+    'historical_observation',
   ]),
   companyId: identifier,
   companyName: boundedText(CLASSIFICATION_CONTRACT_LIMITS.companyName),
@@ -383,6 +397,7 @@ export const classificationSearchHitSchema = z.object({
   currency: z.union([currency, z.null()]),
   verifiedAt: z.union([dateTime, z.null()]),
   ruleRevision: z.union([revision, z.null()]),
+  observation: historicalObservationProvenanceSchema.nullable(),
 }).strict().superRefine((value, context) => {
   if (value.advisory && value.executable) {
     context.addIssue({
@@ -469,6 +484,19 @@ export const classificationSearchHitSchema = z.object({
       path: ['conflictingEvidenceCount'],
       message: 'Conflict count cannot be lower than returned conflicts.',
     });
+  }
+  if (value.kind === 'historical_observation') {
+    if (!value.advisory) context.addIssue({ code: z.ZodIssueCode.custom, path: ['advisory'], message: 'Historical observations must be advisory.' });
+    if (value.executable) context.addIssue({ code: z.ZodIssueCode.custom, path: ['executable'], message: 'Historical observations cannot be executable.' });
+    if (value.action !== null) context.addIssue({ code: z.ZodIssueCode.custom, path: ['action'], message: 'Historical observations cannot carry an executable action.' });
+    if (value.actionSummary === null) context.addIssue({ code: z.ZodIssueCode.custom, path: ['actionSummary'], message: 'Historical observations require a display action summary.' });
+    if (value.originIntent !== null) context.addIssue({ code: z.ZodIssueCode.custom, path: ['originIntent'], message: 'Historical observations have no origin intent.' });
+    if (value.verifiedAt !== null) context.addIssue({ code: z.ZodIssueCode.custom, path: ['verifiedAt'], message: 'Historical observations are not verified cases.' });
+    if (value.evidenceCount !== 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ['evidenceCount'], message: 'Historical observations have no verified evidence.' });
+    if (value.observation === null) context.addIssue({ code: z.ZodIssueCode.custom, path: ['observation'], message: 'Historical observations require snapshot provenance.' });
+    if (value.provenance.source !== 'historical_observation') context.addIssue({ code: z.ZodIssueCode.custom, path: ['provenance', 'source'], message: 'Historical observations require historical-observation provenance.' });
+  } else if (value.observation !== null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['observation'], message: 'Only historical observations can carry snapshot provenance.' });
   }
   for (const [index, conflict] of value.conflicts.entries()) {
     if (conflict.companyId !== value.companyId) {

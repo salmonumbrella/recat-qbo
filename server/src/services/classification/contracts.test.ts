@@ -64,9 +64,62 @@ const hit = {
   currency: 'CAD',
   verifiedAt: at,
   ruleRevision: null,
+  observation: null,
+};
+
+const observationHit = {
+  ...hit,
+  id: 'historical_observation:observation-1',
+  sourceId: 'observation-1',
+  kind: 'historical_observation' as const,
+  executable: false,
+  advisory: true,
+  matchedIn: ['observation'] as const,
+  action: null,
+  actionSummary,
+  originIntent: null,
+  evidenceCount: 0,
+  provenance: {
+    source: 'historical_observation' as const,
+    sourceId: 'observation-1',
+    actorId: null,
+    recordedAt: at,
+  },
+  rationale: null,
+  verifiedAt: null,
+  observation: {
+    sourceTransactionId: 'transaction-1',
+    sourceQboType: 'Purchase' as const,
+    sourceQboId: 'purchase-1',
+    sourceTransactionRevision: 3,
+    sourceQboSyncToken: '3',
+    sourceStatus: 'POSTED' as const,
+    sourceUpdatedAt: at,
+    observedAt: at,
+  },
 };
 
 describe('classification public contracts', () => {
+  it('accepts only a display-only historical observation card', () => {
+    expect(classificationSearchHitSchema.safeParse(observationHit).success).toBe(true);
+    for (const unsafe of [
+      { executable: true },
+      { advisory: false },
+      { action },
+      { verifiedAt: at },
+      { originIntent: 'apply_once' },
+      { evidenceCount: 1 },
+      { observation: null },
+      { provenance: { ...observationHit.provenance, source: 'qbo_verified' } },
+      { observation: { ...observationHit.observation, sourceQboId: '\u{1F642}'.repeat(129) } },
+    ]) {
+      expect(classificationSearchHitSchema.safeParse({ ...observationHit, ...unsafe }).success)
+        .toBe(false);
+    }
+    expect(classificationSearchHitSchema.safeParse({ ...hit, observation: observationHit.observation }).success)
+      .toBe(false);
+  });
+
   it('normalizes bounded text and rejects control characters, oversized arrays, and unknown keys', () => {
     const identity = vendorIdentitySchema.safeParse({
       id: 'vendor-1',

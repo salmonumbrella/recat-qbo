@@ -122,7 +122,7 @@ function conflictingCandidate(conflictingEvidenceCount: number) {
       recordedAt: '2026-08-31T00:00:00.000Z',
     },
     rationale: null, examples: [], counterexamples: [], jurisdiction: null, currency: null,
-    verifiedAt: null, ruleRevision: null,
+    verifiedAt: null, ruleRevision: null, observation: null,
   };
 }
 
@@ -229,6 +229,46 @@ describe('createSnapshotTools', () => {
 
     const rejected = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
       classificationSearch: async () => result(0),
+    });
+    await expect(rejected.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).rejects.toMatchObject({ code: 'AGENT_TOOL_INVALID_OUTPUT' });
+  });
+
+  it('returns display-only historical observations and rejects executable observation data', async () => {
+    const observation = {
+      ...conflictingCandidate(0),
+      id: 'historical_observation:observation-1', sourceId: 'observation-1',
+      kind: 'historical_observation' as const, matchedIn: ['observation'] as const,
+      action: null, originIntent: null, evidenceCount: 0, conflicts: [],
+      provenance: {
+        source: 'historical_observation' as const, sourceId: 'observation-1', actorId: null,
+        recordedAt: '2026-08-31T00:00:00.000Z',
+      },
+      observation: {
+        sourceTransactionId: TRANSACTION_ID, sourceQboType: 'Purchase' as const, sourceQboId: 'purchase-1',
+        sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED' as const,
+        sourceUpdatedAt: '2026-08-31T00:00:00.000Z', observedAt: '2026-08-31T00:00:00.000Z',
+      },
+    };
+    const result = (item: typeof observation) => ({
+      query: 'merchant', companyId: 'company-a', scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      hits: [item], total: 1,
+    });
+    const accepted = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result(observation),
+    });
+    await expect(accepted.call('search_classification_knowledge', {
+      query: 'merchant', mode: 'lexical', limit: 5,
+    })).resolves.toMatchObject({ items: [{ kind: 'historical_observation', executable: false, action: null }] });
+
+    const rejected = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
+      classificationSearch: async () => result({
+        ...observation,
+        action: { categoryQboId: 'category-01', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
+      }),
     });
     await expect(rejected.call('search_classification_knowledge', {
       query: 'merchant', mode: 'lexical', limit: 5,

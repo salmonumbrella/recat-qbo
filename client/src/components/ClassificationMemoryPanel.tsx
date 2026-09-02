@@ -51,6 +51,7 @@ function sourceTypeLabel(hit: ClassificationSearchHit): string {
     case 'rule_candidate': return 'Learned candidate';
     case 'vendor_alias': return 'Vendor alias';
     case 'vendor_identity': return 'Vendor identity';
+    case 'historical_observation': return 'Advisory historical observation';
   }
 }
 

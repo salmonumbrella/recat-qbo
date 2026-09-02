@@ -304,6 +304,8 @@ const text = z.string().max(2_048);
 const isoDate = z.string().max(64);
 const nullableText = text.nullable();
 const nullableIsoDate = isoDate.nullable();
+const observationProvenanceText = z.string().min(1).max(256)
+  .refine((value) => Array.from(value).length <= 128, 'Expected at most 128 code points.');
 const taxCalculation = z.enum([
   'TaxInclusive',
   'TaxExcluded',
@@ -324,10 +326,20 @@ const actionSummary = z.strictObject({
   tagNames: z.array(text).max(50),
 });
 const provenance = z.strictObject({
-  source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate']),
+  source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate', 'historical_observation']),
   sourceId: id,
   actorId: id.nullable(),
   recordedAt: isoDate,
+});
+const observation = z.strictObject({
+  sourceTransactionId: id,
+  sourceQboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+  sourceQboId: observationProvenanceText,
+  sourceTransactionRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  sourceQboSyncToken: observationProvenanceText,
+  sourceStatus: z.literal('POSTED'),
+  sourceUpdatedAt: isoDate,
+  observedAt: isoDate,
 });
 const conflict = z.strictObject({
   id,
@@ -342,13 +354,13 @@ const conflict = z.strictObject({
 const evidenceCard = z.strictObject({
   id,
   sourceId: id,
-  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate']),
+  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate', 'historical_observation']),
   companyId: id,
   companyName: z.string().min(1).max(200),
   companyRelation: z.enum(['current', 'foreign']),
   executable: z.boolean(),
   advisory: z.boolean(),
-  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'lexical', 'semantic'])).min(1).max(6),
+  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'observation', 'lexical', 'semantic'])).min(1).max(7),
   score: z.number().finite().nonnegative(),
   vendorIdentityId: id.nullable(),
   vendorName: nullableText,
@@ -366,6 +378,7 @@ const evidenceCard = z.strictObject({
   currency: z.string().regex(/^[A-Z]{3}$/u).nullable(),
   verifiedAt: nullableIsoDate,
   ruleRevision: z.number().int().nonnegative().nullable(),
+  observation: observation.nullable(),
 }).superRefine((card, issue) => {
   if (
     card.companyRelation === 'foreign'
@@ -381,6 +394,15 @@ const evidenceCard = z.strictObject({
       path: ['action'],
       message: 'Foreign evidence must be advisory and omit executable action identifiers.',
     });
+  }
+  if (card.kind === 'historical_observation') {
+    if (!card.advisory || card.executable || card.action !== null || card.actionSummary === null
+      || card.originIntent !== null || card.verifiedAt !== null || card.evidenceCount !== 0
+      || card.observation === null || card.provenance.source !== 'historical_observation') {
+      issue.addIssue({ code: 'custom', path: ['kind'], message: 'Historical observations are display-only evidence.' });
+    }
+  } else if (card.observation !== null) {
+    issue.addIssue({ code: 'custom', path: ['observation'], message: 'Only historical observations carry snapshot provenance.' });
   }
 });
 const role = z.enum(['viewer', 'categorizer', 'admin']);

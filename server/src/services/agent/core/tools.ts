@@ -308,6 +308,8 @@ const classificationActionSummarySchema = z.object({
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['taxCodeName'], message: 'Invalid tax summary.' });
   }
 });
+const observationProvenanceText = z.string().min(1).max(256)
+  .refine((value) => Array.from(value).length <= 128, 'Expected at most 128 code points.');
 const classificationConflictSchema = z.object({
   id: z.string().min(1).max(128),
   companyId: z.string().min(1).max(128),
@@ -329,13 +331,13 @@ const classificationConflictSchema = z.object({
 const classificationEvidenceCardSchema = z.object({
   id: z.string().min(1).max(128),
   sourceId: z.string().min(1).max(128),
-  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate']),
+  kind: z.enum(['vendor_identity', 'vendor_alias', 'classification_case', 'rule', 'rule_candidate', 'historical_observation']),
   companyId: z.string().min(1).max(128),
   companyName: z.string().min(1).max(200),
   companyRelation: z.literal('current'),
   executable: z.boolean(),
   advisory: z.boolean(),
-  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'lexical', 'semantic'])).min(1).max(6),
+  matchedIn: z.array(z.enum(['alias', 'rule', 'candidate', 'case', 'observation', 'lexical', 'semantic'])).min(1).max(7),
   score: z.number().finite().min(0),
   vendorIdentityId: z.string().min(1).max(128).nullable(),
   vendorName: z.string().min(1).max(500).nullable(),
@@ -346,7 +348,7 @@ const classificationEvidenceCardSchema = z.object({
   conflictingEvidenceCount: z.number().int().min(0).max(10_000),
   conflicts: z.array(classificationConflictSchema).max(20),
   provenance: z.object({
-    source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate']),
+    source: z.enum(['user', 'mcp', 'autopilot', 'qbo_verified', 'rule', 'candidate', 'historical_observation']),
     sourceId: z.string().min(1).max(128),
     actorId: z.string().min(1).max(128).nullable(),
     recordedAt: z.string().min(1).max(64),
@@ -358,6 +360,16 @@ const classificationEvidenceCardSchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/u).nullable(),
   verifiedAt: z.string().min(1).max(64).nullable(),
   ruleRevision: z.number().int().min(0).nullable(),
+  observation: z.object({
+    sourceTransactionId: z.string().min(1).max(128),
+    sourceQboType: z.enum(['Purchase', 'Deposit', 'JournalEntry']),
+    sourceQboId: observationProvenanceText,
+    sourceTransactionRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    sourceQboSyncToken: observationProvenanceText,
+    sourceStatus: z.literal('POSTED'),
+    sourceUpdatedAt: z.string().min(1).max(64),
+    observedAt: z.string().min(1).max(64),
+  }).strict().nullable(),
 }).strict().superRefine((value, context) => {
   if (value.executable && value.advisory) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['executable'], message: 'Executable evidence is not advisory.' });
@@ -380,6 +392,15 @@ const classificationEvidenceCardSchema = z.object({
     && value.jurisdiction === 'unknown'
     && (!value.advisory || value.executable)) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['jurisdiction'], message: 'Unknown tax jurisdiction is advisory.' });
+  }
+  if (value.kind === 'historical_observation') {
+    if (!value.advisory || value.executable || value.action !== null || value.actionSummary === null
+      || value.originIntent !== null || value.verifiedAt !== null || value.evidenceCount !== 0
+      || value.observation === null || value.provenance.source !== 'historical_observation') {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['kind'], message: 'Historical observations are display-only evidence.' });
+    }
+  } else if (value.observation !== null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['observation'], message: 'Only historical observations carry snapshot provenance.' });
   }
 });
 const canonicalClassificationResultBaseSchema = z.object({

@@ -64,7 +64,7 @@ function evidenceCard(overrides: Record<string, unknown> = {}) {
     originIntent: 'apply_once' as const, evidenceCount: 1, conflictingEvidenceCount: 0,
     conflicts: [], provenance: { source: 'qbo_verified' as const, sourceId: 'case-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
     rationale: 'Verified.', examples: [], counterexamples: [], jurisdiction: 'unknown',
-    currency: 'CAD', verifiedAt: '2026-01-01T00:00:00.000Z', ruleRevision: null,
+    currency: 'CAD', verifiedAt: '2026-01-01T00:00:00.000Z', ruleRevision: null, observation: null,
     ...overrides,
   };
 }
@@ -621,6 +621,53 @@ describe('Recat MCP read tools', () => {
       structuredContent: { error: { code: 'INVALID_INPUT' } },
     });
     expect(JSON.stringify(response)).not.toContain(outputSentinel);
+  });
+
+  it('accepts display-only historical observations and rejects executable action data', async () => {
+    const operations = reads();
+    const observation = evidenceCard({
+      id: 'historical_observation:observation-a', sourceId: 'observation-a',
+      kind: 'historical_observation', executable: false, advisory: true,
+      matchedIn: ['observation'], action: null,
+      actionSummary: { categoryName: 'Meals', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+      originIntent: null, evidenceCount: 0,
+      provenance: { source: 'historical_observation', sourceId: 'observation-a', actorId: null, recordedAt: '2026-01-01T00:00:00.000Z' },
+      rationale: null, verifiedAt: null,
+      observation: {
+        sourceTransactionId: 'transaction-a', sourceQboType: 'Purchase', sourceQboId: 'purchase-a',
+        sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED',
+        sourceUpdatedAt: '2026-01-01T00:00:00.000Z', observedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null, items: [observation] as never,
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
+      { legacy: 'stateless' },
+    );
+    const accepted = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical' },
+    });
+    expect(accepted.result.isError).not.toBe(true);
+    expect(accepted.result.structuredContent.items).toMatchObject([
+      { kind: 'historical_observation', executable: false, action: null },
+    ]);
+
+    vi.mocked(operations.searchClassificationKnowledge).mockResolvedValueOnce({
+      query: 'Coffee', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [{ ...observation, action: evidenceCard().action }] as never,
+    });
+    const rejected = await legacy(handler, 'tools/call', {
+      name: 'search_classification_knowledge',
+      arguments: { companyId: 'company-a', query: 'Coffee', mode: 'lexical' },
+    });
+    expect(rejected.result.isError).toBe(true);
   });
 
   it('rejects foreign evidence carrying QBO identifiers in nested conflicts', async () => {

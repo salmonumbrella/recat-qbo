@@ -89,6 +89,7 @@ function hit(overrides: Partial<ClassificationSearchHit> = {}): ClassificationSe
     currency: 'CAD',
     verifiedAt: '2026-08-30T12:00:00.000Z',
     ruleRevision: null,
+    observation: null,
     ...overrides,
   };
 }
@@ -211,6 +212,37 @@ describe('ClassificationMemoryPanel', () => {
 
     expect(await screen.findByText(/this search: lexical fallback/i)).toBeInTheDocument();
     expect(screen.getByText(/semantic index status: ready/i)).toBeInTheDocument();
+  });
+
+  it('labels historical observations as advisory and exposes no source write control', async () => {
+    mocks.search.mockResolvedValueOnce({
+      query: 'northwind', companyId: 'company-1', scope: 'current_company',
+      mode: 'lexical', requestedMode: 'lexical', degraded: false, degradedReason: null,
+      status: 'matched', noMatch: false, total: 1, nextCursor: null,
+      items: [hit({
+        id: 'historical_observation:observation-1', sourceId: 'observation-1',
+        kind: 'historical_observation', executable: false, advisory: true,
+        matchedIn: ['observation'], action: null, originIntent: null, evidenceCount: 0,
+        provenance: {
+          source: 'historical_observation', sourceId: 'observation-1', actorId: null,
+          recordedAt: '2026-08-30T12:00:00.000Z',
+        },
+        rationale: null, verifiedAt: null,
+        observation: {
+          sourceTransactionId: 'transaction-1', sourceQboType: 'Purchase', sourceQboId: 'purchase-1',
+          sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED',
+          sourceUpdatedAt: '2026-08-30T12:00:00.000Z', observedAt: '2026-08-30T12:00:00.000Z',
+        },
+      })],
+    });
+
+    const view = render(<ClassificationMemoryPanel companyId="company-1" initialQuery="northwind" autoSearch />);
+
+    await screen.findByText(/Matched in Observation/);
+    expect(view.container.querySelector('article')).toHaveTextContent('Advisory historical observation');
+    expect(screen.getByText('Advisory')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /open source/i })).not.toBeInTheDocument();
+    expect(screen.queryByText('Executable')).not.toBeInTheDocument();
   });
 
   it('explains a completed no-match without disabling manual categorization', async () => {

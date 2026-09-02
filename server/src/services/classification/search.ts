@@ -301,6 +301,7 @@ function kindReason(
     case 'rule_candidate': return 'candidate';
     case 'classification_case': return 'case';
     case 'vendor_identity': return 'alias';
+    case 'historical_observation': return 'observation';
   }
 }
 
