@@ -241,7 +241,10 @@ describe('ClassificationMemoryPanel', () => {
     await screen.findByText(/Matched in Observation/);
     expect(view.container.querySelector('article')).toHaveTextContent('Advisory historical observation');
     expect(screen.getByText('Advisory')).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /open source/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /open source observation/i })).toHaveAttribute(
+      'href',
+      '/rules?source=historical_observation&sourceId=observation-1',
+    );
     expect(screen.queryByText('Executable')).not.toBeInTheDocument();
   });
 

@@ -27,6 +27,8 @@ function readable(value: string): string {
 function sourceNavigation(hit: ClassificationSearchHit): { href: string; label: string } | null {
   const label = hit.kind === 'classification_case'
     ? 'case'
+    : hit.kind === 'historical_observation'
+      ? 'observation'
     : hit.kind === 'rule_candidate'
       ? 'candidate'
       : hit.kind === 'rule'

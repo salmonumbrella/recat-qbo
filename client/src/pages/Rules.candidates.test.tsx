@@ -17,6 +17,9 @@ const mocks = vi.hoisted(() => ({
   intentId: vi.fn(),
   search: vi.fn(),
   health: vi.fn(),
+  pastDecisions: vi.fn(),
+  getObservation: vi.fn(),
+  affectedTransactions: vi.fn(),
   toast: vi.fn(),
   activeCompanyId: 'COMPANY_GENERIC',
   activeCompany: { id: 'COMPANY_GENERIC', holdingAccountIds: ['DESIGNATED_HOLDING'] } as never,
@@ -64,6 +67,8 @@ vi.mock('../lib/api', () => ({
   classificationMemory: {
     search: mocks.search,
     health: mocks.health,
+    pastDecisions: mocks.pastDecisions,
+    getObservation: mocks.getObservation,
   },
   ruleOperations: {
     prepare: mocks.prepare,
@@ -74,6 +79,7 @@ vi.mock('../lib/api', () => ({
     detail: mocks.detail,
     revisions: mocks.revisions,
     test: mocks.testRule,
+    affectedTransactions: mocks.affectedTransactions,
   },
   ruleCandidates: {
     list: mocks.listCandidates,
@@ -103,6 +109,11 @@ beforeEach(() => {
     status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
   });
   mocks.health.mockResolvedValue({ configured: false, vectorAvailable: false, backlog: 0, progress: 0 });
+  mocks.pastDecisions.mockResolvedValue({ items: [], nextCursor: null });
+  mocks.getObservation.mockResolvedValue(null);
+  mocks.affectedTransactions.mockResolvedValue({
+    items: [], nextCursor: null, matchedCount: 0, pendingCount: 0, postedCount: 0,
+  });
   mocks.intentId.mockReturnValue('99999999-9999-4999-8999-999999999999');
   window.history.replaceState({}, '', '/rules');
 });
@@ -254,7 +265,7 @@ describe('Rules candidate review', () => {
 
     render(<Rules />);
 
-    expect(await screen.findByText('Learned rule candidates')).toBeInTheDocument();
+    expect(await screen.findByText('Learned Candidates')).toBeInTheDocument();
     expect(screen.getByText('northwind market')).toBeInTheDocument();
     expect(screen.getByText(/3 verified outcomes/i)).toBeInTheDocument();
     expect(screen.getByText(/2 reviewed by a person · 1 by autopilot/i)).toBeInTheDocument();

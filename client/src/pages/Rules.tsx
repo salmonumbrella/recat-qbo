@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ClassificationCase,
+  HistoricalObservationPastDecision,
   RuleCandidateDto,
   RuleDetailDto,
   RuleLifecycleFilter,
@@ -24,6 +25,8 @@ import ConfirmDialog from '../components/ConfirmDialog';
 import { Combobox, Select } from '../components/SelectCombobox';
 import { fmtDate, fmtMoney } from '../lib/format';
 import { useApp } from '../state/AppContext';
+import PastDecisionsSection from './rules/PastDecisionsSection';
+import RuleAffectedTransactionsSection from './rules/RuleAffectedTransactionsSection';
 
 const PAGE_SIZE = 100;
 const HISTORY_WINDOW_SIZE = 100;
@@ -198,6 +201,7 @@ export default function Rules() {
   const [testResult, setTestResult] = useState<Record<string, RuleTestResult>>({});
   const [testBusy, setTestBusy] = useState<string | null>(null);
   const [sourceCase, setSourceCase] = useState<ClassificationCase | null>(null);
+  const [sourceObservation, setSourceObservation] = useState<HistoricalObservationPastDecision | null>(null);
   const [sourceRule, setSourceRule] = useState<RuleDetailDto | null>(null);
   const [sourceCandidate, setSourceCandidate] = useState<RuleCandidateDto | null>(null);
   const companyRef = useRef(activeCompanyId);
@@ -354,6 +358,7 @@ export default function Rules() {
     setHistory({});
     setTestResult({});
     setSourceCase(null);
+    setSourceObservation(null);
     setSourceRule(null);
     setSourceCandidate(null);
     if (!companyId) return;
@@ -368,6 +373,14 @@ export default function Rules() {
       classificationMemory.getCase(companyId, sourceId)
         .then((classificationCase) => {
           if (companyRef.current === companyId) setSourceCase(classificationCase);
+        })
+        .catch((error: Error) => {
+          if (companyRef.current === companyId) toast(error.message);
+        });
+    } else if (sourceKind === 'historical_observation' && sourceId) {
+      classificationMemory.getObservation(companyId, sourceId)
+        .then((observation) => {
+          if (companyRef.current === companyId) setSourceObservation(observation);
         })
         .catch((error: Error) => {
           if (companyRef.current === companyId) toast(error.message);
@@ -623,6 +636,29 @@ export default function Rules() {
         </section>
       )}
 
+      {sourceObservation && (
+        <section
+          id={`classification-historical_observation-${sourceObservation.id}`}
+          aria-label="Source historical observation"
+          style={{ border: '1px solid var(--bd)', borderRadius: 10, padding: 16, marginBottom: 18 }}
+        >
+          <h2 style={{ fontSize: 17, margin: 0 }}>Advisory historical observation</h2>
+          <p style={{ margin: '8px 0 0' }}>{sourceObservation.payee}</p>
+          {sourceObservation.memo && <p style={{ margin: '8px 0 0' }}>{sourceObservation.memo}</p>}
+          <p style={{ color: 'var(--mut)', fontSize: 13, margin: '8px 0 0' }}>
+            Observed {fmtDate(sourceObservation.observedAt)} · Source status {sourceObservation.sourceStatus ?? 'unknown'}
+          </p>
+          <p style={{ color: 'var(--mut)', fontSize: 13, margin: '8px 0 0' }}>
+            Observed Recat revision {sourceObservation.observedRecatRevision} · Observed QBO revision {sourceObservation.observedQboRevision}
+          </p>
+          {sourceObservation.supersededByCaseId && (
+            <Link to={`/rules?source=classification_case&sourceId=${sourceObservation.supersededByCaseId}`} style={{ display: 'inline-block', marginTop: 8 }}>
+              Superseded by verified decision
+            </Link>
+          )}
+        </section>
+      )}
+
       <section aria-labelledby="lifecycle-rules-title">
         <h2 id="lifecycle-rules-title" style={{ fontSize: 19 }}>Executable Rules</h2>
         {rulesError && <div role="alert" aria-label="Rules unavailable" style={{ color: 'var(--erT)', marginBottom: 10 }}>
@@ -757,6 +793,7 @@ export default function Rules() {
                     Showing {currentHistory.items.length} newest revision{currentHistory.items.length === 1 ? '' : 's'}; older history exists.
                   </div>}
                 </div>}
+                {activeCompanyId && <RuleAffectedTransactionsSection companyId={activeCompanyId} ruleId={revision.ruleId} />}
               </article>
             );
           })}
@@ -769,8 +806,10 @@ export default function Rules() {
         {ruleCursor && <button style={{ ...buttonStyle, marginTop: 12 }} disabled={rulesBusy} onClick={() => void loadMoreRules()}>{rulesBusy ? 'Loading…' : 'Load more rules'}</button>}
       </section>
 
+      {activeCompanyId && <PastDecisionsSection companyId={activeCompanyId} />}
+
       <section aria-labelledby="candidate-title" style={{ marginTop: 28 }}>
-        <h2 id="candidate-title" style={{ fontSize: 19 }}>Learned rule candidates</h2>
+        <h2 id="candidate-title" style={{ fontSize: 19 }}>Learned Candidates</h2>
         <p style={{ color: 'var(--mut)', marginTop: 0 }}>These suggestions come from verified outcomes. Activation is explicit and never posts automatically; auto-post remains off.</p>
         {candidatesError && <div role="alert" aria-label="Candidates unavailable" style={{ color: 'var(--erT)', marginBottom: 10 }}>
           {candidatesError}{' '}<button style={buttonStyle} disabled={candidateBusy} onClick={() => activeCompanyId && void loadCandidates(activeCompanyId)}>Retry candidates</button>
