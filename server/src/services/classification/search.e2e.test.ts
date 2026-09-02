@@ -754,7 +754,7 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
     expect(database[0]?.name).toBe(disposable.databaseName);
     expect(database[0]?.name).not.toBe(anchorName);
     expect(disposable.databaseName).toMatch(/^recat_task8_[0-9]+_[0-9a-f]{12}$/u);
-    expect(migrations[0]?.count).toBe(39n);
+    expect(migrations[0]?.count).toBe(40n);
     expect(vector[0]?.count).toBe(1n);
   });
 

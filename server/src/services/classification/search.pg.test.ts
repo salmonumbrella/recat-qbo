@@ -248,6 +248,133 @@ describePostgres('classification search on PostgreSQL', () => {
     return { current, foreign, account, taxCode, tag, alias, rule, candidate, classificationCase, transaction };
   }
 
+  async function createObservation(input: {
+    companyId: string;
+    transactionId: string;
+    sourceQboId?: string;
+    sourceQboSyncToken?: string;
+    payee?: string;
+    memo?: string | null;
+    observedAt?: Date;
+  }) {
+    return db.historicalClassificationObservation.create({
+      data: {
+        companyId: input.companyId,
+        sourceTransactionId: input.transactionId,
+        sourceQboType: 'Purchase',
+        sourceQboId: input.sourceQboId ?? `observation-${randomUUID()}`,
+        sourceTransactionRevision: 1,
+        sourceQboSyncToken: input.sourceQboSyncToken ?? '1',
+        sourceStatus: 'POSTED',
+        sourceUpdatedAt: new Date('2026-08-30T00:00:00.000Z'),
+        observedAt: input.observedAt ?? new Date('2026-08-30T00:00:00.000Z'),
+        transactionDate: new Date('2026-06-15T00:00:00.000Z'),
+        payee: input.payee ?? 'Northwind Supplies Advisory',
+        memo: input.memo ?? 'Historical inventory restock',
+        amountCents: -11300n,
+        currency: 'CAD',
+        sourceAccountName: 'Synthetic Bank',
+        categoryName: 'Inventory purchases',
+        categoryQboId: 'observation-category-qbo-id',
+        taxCalculation: 'TaxExcluded',
+        taxCodeName: 'HST ON 13%',
+        taxCodeQboId: 'observation-tax-qbo-id',
+        tagNames: ['Inventory'],
+      },
+    });
+  }
+
+  it('loads display-only observations into lexical search, rehydration, and the corpus', async () => {
+    const data = await fixtures();
+    const observation = await createObservation({
+      companyId: data.current.id, transactionId: data.transaction.id, sourceQboSyncToken: 'sync-secret',
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+    const result = await searchClassificationMemory({
+      query: 'northwind inventory', companyId: data.current.id,
+      scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    const hit = result.hits.find((candidate) => candidate.sourceId === observation.id);
+    expect(hit).toMatchObject({
+      kind: 'historical_observation', advisory: true, executable: false, action: null,
+      originIntent: null, verifiedAt: null, evidenceCount: 0,
+      observation: expect.objectContaining({ sourceTransactionId: data.transaction.id }),
+    });
+    await expect(repository.rehydrate([data.current.id], [`historical_observation:${observation.id}`]))
+      .resolves.toHaveLength(1);
+    const corpus = await repository.documents(data.current.id);
+    expect(corpus.documents).toContainEqual(expect.objectContaining({
+      id: `historical_observation:${observation.id}`,
+      kind: 'historical_observation', sourceId: observation.id,
+    }));
+    const document = corpus.documents.find(({ id }) => id === `historical_observation:${observation.id}`)!;
+    expect(document.text).toContain('historical advisory observation');
+    expect(document.text).not.toContain(observation.sourceQboId);
+    expect(document.text).not.toContain(observation.sourceQboSyncToken);
+
+    const selfExcluded = await searchClassificationMemory({
+      query: 'northwind inventory', companyId: data.current.id,
+      scope: 'current_company', mode: 'lexical', accessibleCompanyIds: [data.current.id],
+      excludeTransactionId: data.transaction.id,
+    }, { repository, semantic: null });
+    expect(selfExcluded.hits.map(({ sourceId }) => sourceId)).not.toContain(observation.id);
+
+    await db.historicalClassificationObservation.delete({ where: { id: observation.id } });
+    await expect(repository.rehydrate([data.current.id], [`historical_observation:${observation.id}`]))
+      .resolves.toEqual([]);
+  });
+
+  it('keeps foreign observation identifiers redacted and ranks verified evidence above advisory history', async () => {
+    const data = await fixtures();
+    const currentObservation = await createObservation({
+      companyId: data.current.id, transactionId: data.transaction.id, payee: 'Inventory Northwind Supplies',
+    });
+    const foreignTransaction = await db.transaction.create({
+      data: {
+        companyId: data.foreign.id, qboId: `foreign-observation-${randomUUID()}`, qboType: 'Purchase',
+        qboSyncToken: 'foreign-sync', date: new Date('2026-06-15T00:00:00.000Z'),
+        payee: 'Foreign Northwind Supplies', amount: '-10.00', bankAccount: 'Foreign Bank', status: 'POSTED',
+      },
+    });
+    const foreignObservation = await createObservation({
+      companyId: data.foreign.id, transactionId: foreignTransaction.id,
+      sourceQboId: 'foreign-qbo-observation-id', payee: 'Foreign Northwind Supplies',
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+    const ranked = await searchClassificationMemory({
+      query: 'inventory', companyId: data.current.id, scope: 'current_company', mode: 'lexical',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null });
+    expect(ranked.hits.findIndex(({ kind }) => kind === 'classification_case'))
+      .toBeLessThan(ranked.hits.findIndex(({ sourceId }) => sourceId === currentObservation.id));
+
+    const foreign = await searchClassificationMemory({
+      query: 'northwind', companyId: data.current.id, scope: 'accessible_companies', mode: 'lexical',
+      accessibleCompanyIds: [data.current.id, data.foreign.id],
+    }, { repository, semantic: null });
+    expect(foreign.hits.find(({ sourceId }) => sourceId === foreignObservation.id)).toMatchObject({
+      companyRelation: 'foreign', advisory: true, executable: false, action: null,
+      observation: {
+        sourceTransactionId: 'redacted', sourceQboId: 'redacted', sourceQboSyncToken: 'redacted',
+      },
+    });
+  });
+
+  it('skips malformed legacy observations without failing unrelated lexical results', async () => {
+    const data = await fixtures();
+    await createObservation({
+      companyId: data.current.id, transactionId: data.transaction.id, payee: 'Malformed Northwind',
+    }).then((observation) => db.$executeRaw`
+      UPDATE "HistoricalClassificationObservation"
+      SET "sourceQboType" = 'Transfer' WHERE "id" = ${observation.id}
+    `);
+    const repository = new PrismaClassificationSearchRepository(db);
+    await expect(searchClassificationMemory({
+      query: 'northwind', companyId: data.current.id, scope: 'current_company', mode: 'lexical',
+      accessibleCompanyIds: [data.current.id],
+    }, { repository, semantic: null })).resolves.toMatchObject({ status: 'no_match', hits: [] });
+  });
+
   it('finds live aliases, rules, candidates, and case evidence while excluding inactive rows', async () => {
     const data = await fixtures();
     expect(await db.historicalClassificationObservation.count({

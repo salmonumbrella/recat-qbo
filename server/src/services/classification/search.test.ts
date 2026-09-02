@@ -288,8 +288,10 @@ describe('classification memory search', () => {
       status: 'matched',
       total: 2,
     });
-    expect(result.hits[0]?.matchedIn).toEqual(expect.arrayContaining(['alias', 'lexical']));
-    expect(result.hits[1]?.matchedIn).toEqual(expect.arrayContaining(['rule', 'lexical']));
+    expect(result.hits.find((item) => item.kind === 'vendor_alias')?.matchedIn)
+      .toEqual(expect.arrayContaining(['alias', 'lexical']));
+    expect(result.hits.find((item) => item.kind === 'rule')?.matchedIn)
+      .toEqual(expect.arrayContaining(['rule', 'lexical']));
   });
 
   it('excludes the selected transaction before lexical ranking but keeps other compatible evidence', async () => {
@@ -312,6 +314,81 @@ describe('classification memory search', () => {
 
     expect(result.hits.map(({ id }) => id)).toEqual(['classification_case:prior']);
     expect(result.noMatch).toBe(false);
+  });
+
+  it('orders equal fused evidence by trust tier before score and recency', async () => {
+    const observation = record({
+      hit: {
+        id: 'historical_observation:observation-a', sourceId: 'observation-a',
+        kind: 'historical_observation', vendorIdentityId: null, vendorName: 'Northwind Supplies',
+        executable: false, advisory: true, action: null,
+        actionSummary: { categoryName: 'Inventory', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+        originIntent: null, evidenceCount: 0, verifiedAt: null,
+        provenance: { source: 'historical_observation', sourceId: 'observation-a', actorId: null, recordedAt: '2026-08-30T00:00:00.000Z' },
+        observation: {
+          sourceTransactionId: 'transaction-observation', sourceQboType: 'Purchase', sourceQboId: 'qbo-observation',
+          sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED',
+          sourceUpdatedAt: '2026-08-30T00:00:00.000Z', observedAt: '2026-08-30T00:00:00.000Z',
+        },
+      },
+      sourceTransactionId: 'transaction-observation', exactReasons: [], lexicalScore: 0.8,
+    });
+    const readyCandidate = record({
+      hit: {
+        id: 'rule_candidate:candidate-a', sourceId: 'candidate-a', kind: 'rule_candidate',
+        vendorIdentityId: null, vendorName: 'Northwind Supplies', originIntent: 'auto_candidate',
+        evidenceCount: 2, conflictingEvidenceCount: 0,
+        provenance: { source: 'candidate', sourceId: 'candidate-a', actorId: null, recordedAt: '2026-08-30T00:00:00.000Z' },
+      }, exactReasons: [], lexicalScore: 0.8,
+    });
+    const verifiedCase = record({
+      hit: {
+        id: 'classification_case:case-a', sourceId: 'case-a', kind: 'classification_case',
+        vendorIdentityId: null, vendorName: 'Northwind Supplies',
+        provenance: { source: 'qbo_verified', sourceId: 'case-a', actorId: null, recordedAt: '2026-08-30T00:00:00.000Z' },
+        verifiedAt: '2026-08-30T00:00:00.000Z', evidenceCount: 1,
+      }, exactReasons: [], lexicalScore: 0.8,
+    });
+    const enabledRule = record({
+      hit: {
+        id: 'rule:rule-a', sourceId: 'rule-a', kind: 'rule', vendorIdentityId: null,
+        vendorName: 'Northwind Supplies', originIntent: 'apply_once',
+        provenance: { source: 'rule', sourceId: 'rule-a', actorId: null, recordedAt: '2026-08-30T00:00:00.000Z' },
+      }, exactReasons: [], lexicalScore: 0.8,
+    });
+
+    const result = await searchClassificationMemory({
+      query: 'northwind supplies', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', limit: 20, accessibleCompanyIds: ['company-a'],
+    }, { repository: repository([observation, readyCandidate, verifiedCase, enabledRule]), semantic: null });
+
+    expect(result.hits.map((item) => item.kind)).toEqual([
+      'rule', 'classification_case', 'rule_candidate', 'historical_observation',
+    ]);
+  });
+
+  it('excludes an observation whose exact source transaction is the current transaction', async () => {
+    const observation = record({
+      hit: {
+        id: 'historical_observation:self', sourceId: 'self', kind: 'historical_observation',
+        vendorIdentityId: null, vendorName: 'Self evidence', executable: false, advisory: true, action: null,
+        actionSummary: { categoryName: 'Inventory', taxCalculation: 'NotApplicable', taxCodeName: null, tagNames: [] },
+        originIntent: null, evidenceCount: 0, verifiedAt: null,
+        provenance: { source: 'historical_observation', sourceId: 'self', actorId: null, recordedAt: '2026-08-30T00:00:00.000Z' },
+        observation: {
+          sourceTransactionId: 'transaction-self', sourceQboType: 'Purchase', sourceQboId: 'qbo-self',
+          sourceTransactionRevision: 1, sourceQboSyncToken: '1', sourceStatus: 'POSTED',
+          sourceUpdatedAt: '2026-08-30T00:00:00.000Z', observedAt: '2026-08-30T00:00:00.000Z',
+        },
+      }, sourceTransactionId: 'transaction-self', exactReasons: [], lexicalScore: 0.8,
+    });
+    const result = await searchClassificationMemory({
+      query: 'self evidence', companyId: 'company-a', scope: 'current_company',
+      mode: 'lexical', limit: 20, accessibleCompanyIds: ['company-a'],
+      excludeTransactionId: 'transaction-self',
+    }, { repository: repository([observation]), semantic: null });
+
+    expect(result.hits).toEqual([]);
   });
 
   it('reports completed no-match after exclusion instead of returning self evidence', async () => {
@@ -395,10 +472,10 @@ describe('classification memory search', () => {
     }, { repository: repository([mismatching, matching, explicitUnknown, nullJurisdiction, unknownRule]), semantic: null });
 
     expect(result.hits.map((candidate) => candidate.id)).toEqual([
+      'rule:unknown',
       'classification_case:matching',
       'classification_case:unknown-direction',
       'classification_case:null-jurisdiction',
-      'rule:unknown',
     ]);
 
     for (const context of [
@@ -410,9 +487,8 @@ describe('classification memory search', () => {
         limit: 10, accessibleCompanyIds: ['company-a'], context,
       }, { repository: repository([mismatching, matching, explicitUnknown, nullJurisdiction, unknownRule]), semantic: null });
       expect(unfiltered.hits.map((candidate) => candidate.id)).toEqual([
-        'classification_case:mismatch', 'classification_case:matching',
+        'rule:unknown', 'classification_case:mismatch', 'classification_case:matching',
         'classification_case:unknown-direction', 'classification_case:null-jurisdiction',
-        'rule:unknown',
       ]);
     }
   });

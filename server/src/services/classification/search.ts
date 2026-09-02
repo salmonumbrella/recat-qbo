@@ -90,17 +90,20 @@ export interface ClassificationSearchRepository {
     query: string,
     limit: number,
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]>;
   search(
     companyIds: readonly string[],
     query: string,
     limit: number,
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]>;
   rehydrate(
     companyIds: readonly string[],
     documentIds: readonly string[],
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]>;
   documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus>;
   revisions?(companyIds: readonly string[]): Promise<Readonly<Record<string, string>>>;
@@ -319,6 +322,14 @@ function relationSafeHit(
     source,
     ...raw.matchedIn,
   ])];
+  const observation = foreign && raw.observation !== null
+    ? {
+      ...raw.observation,
+      sourceTransactionId: 'redacted',
+      sourceQboId: 'redacted',
+      sourceQboSyncToken: 'redacted',
+    }
+    : raw.observation;
   return parseClassificationSearchHit({
     ...raw,
     companyRelation: foreign ? 'foreign' : 'current',
@@ -328,6 +339,7 @@ function relationSafeHit(
     conflicts: foreign
       ? raw.conflicts.map((conflict) => ({ ...conflict, action: null }))
       : raw.conflicts,
+    observation,
     matchedIn,
   });
 }
@@ -360,6 +372,54 @@ function exactLists(records: readonly ClassificationSearchRecord[]): RankedDocum
       .filter((record) => record.exactReasons.includes(reason))
       .map((record) => ({ id: record.hit.id, revisedAt: record.revisedAt }));
     return hits.length === 0 ? [] : [{ matchedIn: reason, hits }];
+  });
+}
+
+type SearchTrustTier =
+  | 'enabled_rule'
+  | 'verified_case'
+  | 'ready_candidate'
+  | 'historical_observation'
+  | 'conflicting_candidate'
+  | 'identity_discovery';
+
+const SEARCH_TRUST_TIER_RANK: Readonly<Record<SearchTrustTier, number>> = {
+  enabled_rule: 0,
+  verified_case: 1,
+  ready_candidate: 2,
+  historical_observation: 3,
+  conflicting_candidate: 4,
+  identity_discovery: 5,
+};
+
+function searchTrustTier(record: ClassificationSearchRecord): SearchTrustTier {
+  switch (record.hit.kind) {
+    case 'rule': return 'enabled_rule';
+    case 'classification_case': return 'verified_case';
+    case 'historical_observation': return 'historical_observation';
+    case 'rule_candidate': return record.hit.conflictingEvidenceCount === 0
+      ? 'ready_candidate'
+      : 'conflicting_candidate';
+    case 'vendor_identity':
+    case 'vendor_alias': return 'identity_discovery';
+  }
+}
+
+function rankClassificationRecords(
+  fused: readonly ReturnType<typeof reciprocalRankFuse>[number][],
+  records: ReadonlyMap<string, ClassificationSearchRecord>,
+): ReturnType<typeof reciprocalRankFuse> {
+  return [...fused].sort((left, right) => {
+    const leftRecord = records.get(left.id);
+    const rightRecord = records.get(right.id);
+    if (leftRecord === undefined || rightRecord === undefined) {
+      return left.id.localeCompare(right.id);
+    }
+    return SEARCH_TRUST_TIER_RANK[searchTrustTier(leftRecord)]
+      - SEARCH_TRUST_TIER_RANK[searchTrustTier(rightRecord)]
+      || right.score - left.score
+      || Date.parse(rightRecord.revisedAt) - Date.parse(leftRecord.revisedAt)
+      || left.id.localeCompare(right.id);
   });
 }
 
@@ -426,7 +486,10 @@ function finalResult(input: {
   limit: number;
 }): ClassificationSearchResult {
   const byId = new Map(input.records.map((record) => [record.hit.id, record]));
-  const fused = reciprocalRankFuse(input.lists, { limit: MAX_FETCH });
+  const fused = rankClassificationRecords(
+    reciprocalRankFuse(input.lists, { limit: MAX_FETCH }),
+    byId,
+  );
   const hits = fused.flatMap((ranked) => {
     const record = byId.get(ranked.id);
     if (record === undefined) return [];
@@ -474,7 +537,7 @@ export async function searchClassificationMemory(
 
   if (rawInput.mode === 'exact') {
     const loaded = await boundedRepositoryRead(() => (
-      repository.exact(companyIds, query, fetchLimit, context)
+      repository.exact(companyIds, query, fetchLimit, context, excludeTransactionId)
     ));
     const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
@@ -485,7 +548,7 @@ export async function searchClassificationMemory(
 
   if (rawInput.mode === 'lexical') {
     const loaded = await boundedRepositoryRead(() => (
-      repository.search(companyIds, query, fetchLimit, context)
+      repository.search(companyIds, query, fetchLimit, context, excludeTransactionId)
     ));
     const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
@@ -499,7 +562,7 @@ export async function searchClassificationMemory(
       throw new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'embedding_not_configured');
     }
     const loaded = await boundedRepositoryRead(() => (
-      repository.search(companyIds, query, fetchLimit, context)
+      repository.search(companyIds, query, fetchLimit, context, excludeTransactionId)
     ));
     const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     return finalResult({
@@ -518,7 +581,7 @@ export async function searchClassificationMemory(
       revisedAt: hit.revisedAt,
     })), { cosineFloor: COSINE_FLOOR, limit: fetchLimit });
     const loaded = await boundedRepositoryRead(() => (
-      repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
+      repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context, excludeTransactionId)
     ));
     const records = recordsMatchingContext(loaded, context, excludeTransactionId);
     const eligibleIds = new Set(records.map((record) => record.hit.id));
@@ -531,7 +594,7 @@ export async function searchClassificationMemory(
   }
 
   const lexicalPromise = boundedRepositoryRead(() => (
-    repository.search(companyIds, query, fetchLimit, context)
+    repository.search(companyIds, query, fetchLimit, context, excludeTransactionId)
   ));
   const semanticPromise = semanticLeg(
     companyIds, query, fetchLimit, dependencies.semantic,
@@ -560,7 +623,7 @@ export async function searchClassificationMemory(
     revisedAt: hit.revisedAt,
   })), { cosineFloor: COSINE_FLOOR, limit: fetchLimit });
   const loadedRehydrated = await boundedRepositoryRead(() => (
-    repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context)
+    repository.rehydrate(companyIds, rolled.map((hit) => hit.id), context, excludeTransactionId)
   ));
   const rehydrated = recordsMatchingContext(loadedRehydrated, context, excludeTransactionId);
   const eligibleSemanticIds = new Set(rehydrated.map((record) => record.hit.id));
@@ -694,6 +757,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string,
     limit: number,
     _context?: ClassificationSearchContextFilter,
+    _excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     const checkedQuery = checkedText(query, CLASSIFICATION_CONTRACT_LIMITS.query);
@@ -726,11 +790,13 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     query: string,
     limit: number,
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     const checkedQuery = checkedText(query, CLASSIFICATION_CONTRACT_LIMITS.query);
     return this.load(
       checkedCompanyIds, checkedQuery, null, boundedFetchLimit(limit), checkedContext(context),
+      checkedOptionalIdentifier(excludeTransactionId),
     );
   }
 
@@ -738,6 +804,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     companyIds: readonly string[],
     documentIds: readonly string[],
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]> {
     const checkedCompanyIds = checkedCompanyList(companyIds);
     if (!Array.isArray(documentIds) || documentIds.length > MAX_FETCH) {
@@ -745,7 +812,10 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     }
     const checkedIds = [...new Set(documentIds.map((id) => checkedText(id, 260)))];
     if (checkedIds.length === 0) return [];
-    return this.load(checkedCompanyIds, null, checkedIds, checkedIds.length, checkedContext(context));
+    return this.load(
+      checkedCompanyIds, null, checkedIds, checkedIds.length, checkedContext(context),
+      checkedOptionalIdentifier(excludeTransactionId),
+    );
   }
 
   async documents(companyId: string, expectedRevision?: string): Promise<ClassificationSearchCorpus> {
@@ -836,6 +906,10 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
         FROM "AutopilotRuleCandidate" candidate
         WHERE candidate."companyId" = ${companyId}
           AND candidate."state" IN ('ready', 'conflict')
+        UNION ALL
+        SELECT 'historical_observation'::text, observation."id"::text
+        FROM "HistoricalClassificationObservation" observation
+        WHERE observation."companyId" = ${companyId}
       )
       SELECT concat(document_kind, ':', source_id) AS "documentId"
       FROM canonical_documents
@@ -852,14 +926,18 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     documentIds: readonly string[] | null,
     limit: number,
     context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
   ): Promise<ClassificationSearchRecord[]> {
     const idsByKind = splitDocumentIds(documentIds);
-    const [identities, aliases, cases, rules, candidates] = await Promise.all([
+    const [identities, aliases, cases, rules, candidates, observations] = await Promise.all([
       this.identityRows(companyIds, query, idsByKind.vendor_identity, limit),
       this.aliasRows(companyIds, query, idsByKind.vendor_alias, limit),
       this.caseRows(companyIds, query, idsByKind.classification_case, limit, context),
       this.ruleRows(companyIds, query, idsByKind.rule, limit),
       this.candidateRows(companyIds, query, idsByKind.rule_candidate, limit),
+      this.observationRows(
+        companyIds, query, idsByKind.historical_observation, limit, context, excludeTransactionId,
+      ),
     ]);
     const records = [
       ...identities.map(identityRecord),
@@ -867,6 +945,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       ...cases.map(caseRecord),
       ...rules.map(ruleRecord),
       ...candidates.map(candidateRecord),
+      ...observations.map(observationRecord),
     ].flatMap((record) => {
       try {
         const mapped = record();
@@ -1289,6 +1368,59 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       LIMIT ${limit}
     `);
   }
+
+  private observationRows(
+    companyIds: readonly string[],
+    query: string | null,
+    ids: readonly string[] | null,
+    limit: number,
+    context?: ClassificationSearchContextFilter,
+    excludeTransactionId?: string,
+  ) {
+    if (ids !== null && ids.length === 0) {
+      return Promise.resolve([] as HistoricalObservationSearchRow[]);
+    }
+    const idFilter = ids === null
+      ? Prisma.empty
+      : Prisma.sql`AND observation."id" IN (${Prisma.join(ids)})`;
+    const tagText = Prisma.sql`COALESCE((
+      SELECT string_agg(tag_name, ' ' ORDER BY ordinal ASC)
+      FROM jsonb_array_elements_text(
+        CASE WHEN jsonb_typeof(observation."tagNames") = 'array'
+          THEN observation."tagNames" ELSE '[]'::jsonb END
+      ) WITH ORDINALITY tags(tag_name, ordinal)
+    ), '')`;
+    const text = Prisma.sql`concat_ws(' ', 'historical advisory observation', observation."payee",
+      observation."memo", observation."sourceQboType", to_char(observation."transactionDate", 'YYYY-MM-DD'),
+      observation."currency", observation."sourceAccountName", observation."categoryName",
+      observation."taxCalculation", observation."taxCodeName", ${tagText})`;
+    const queryFilter = query === null ? Prisma.empty : Prisma.sql`
+      AND to_tsvector('simple', ${text}) @@ plainto_tsquery('simple', ${query})
+    `;
+    const score = query === null ? Prisma.sql`0::double precision` : Prisma.sql`
+      ts_rank_cd(to_tsvector('simple', ${text}), plainto_tsquery('simple', ${query}))::double precision
+    `;
+    const sourceFilter = excludeTransactionId === undefined ? Prisma.empty : Prisma.sql`
+      AND observation."sourceTransactionId" <> ${excludeTransactionId}
+    `;
+    const contextFilter = historicalObservationSqlFilter(context);
+    return this.db.$queryRaw<HistoricalObservationSearchRow[]>(Prisma.sql`
+      SELECT observation."id", observation."companyId", company."nickname" AS "companyName",
+             observation."sourceTransactionId", observation."sourceQboType", observation."sourceQboId",
+             observation."sourceTransactionRevision", observation."sourceQboSyncToken", observation."sourceStatus",
+             observation."sourceUpdatedAt", observation."observedAt", observation."observedAt" AS "revisedAt",
+             observation."transactionDate", observation."payee", observation."memo", observation."amountCents",
+             observation."currency", observation."sourceAccountName", observation."categoryName",
+             observation."taxCalculation", observation."taxCodeName", observation."tagNames",
+             ${text} AS "searchText", ${score} AS "lexicalScore"
+      FROM "HistoricalClassificationObservation" observation
+      JOIN "Company" company ON company."id" = observation."companyId"
+      WHERE observation."companyId" IN (${Prisma.join(companyIds)})
+        ${idFilter} ${sourceFilter} ${queryFilter} ${contextFilter}
+      ORDER BY "lexicalScore" DESC, observation."observedAt" DESC, observation."id" ASC
+      LIMIT ${limit}
+    `);
+  }
 }
 
 type BaseSearchRow = {
@@ -1380,6 +1512,28 @@ type CandidateSearchRow = BaseSearchRow & {
   searchText: string;
 };
 
+type HistoricalObservationSearchRow = BaseSearchRow & {
+  sourceTransactionId: string;
+  sourceQboType: string;
+  sourceQboId: string;
+  sourceTransactionRevision: number;
+  sourceQboSyncToken: string;
+  sourceStatus: string;
+  sourceUpdatedAt: Date;
+  observedAt: Date;
+  transactionDate: Date;
+  payee: string;
+  memo: string | null;
+  amountCents: bigint;
+  currency: string;
+  sourceAccountName: string;
+  categoryName: string;
+  taxCalculation: string;
+  taxCodeName: string | null;
+  tagNames: Prisma.JsonValue;
+  searchText: string;
+};
+
 function boundedFetchLimit(limit: number): number {
   if (!Number.isFinite(limit)) throw new ClassificationSearchError('INVALID_INPUT');
   return Math.max(1, Math.min(MAX_FETCH, Math.trunc(limit)));
@@ -1434,6 +1588,34 @@ function classificationCaseSqlFilter(
       OR jsonb_typeof(memory."action"->'taxCalculation') <> 'string'
       OR memory."action"->>'taxCalculation' = ${context.taxCalculation}
     )
+  `);
+  return clauses.length === 0 ? Prisma.empty : Prisma.join(clauses, ' ');
+}
+
+function historicalObservationSqlFilter(
+  context: ClassificationSearchContextFilter | undefined,
+): Prisma.Sql {
+  if (context === undefined) return Prisma.empty;
+  const clauses: Prisma.Sql[] = [];
+  if (context.transactionDirection !== undefined) clauses.push(Prisma.sql`
+    AND (CASE WHEN observation."amountCents" < 0 THEN 'out'
+              WHEN observation."amountCents" > 0 THEN 'in' ELSE 'unknown' END)
+      IN (${context.transactionDirection}, 'unknown')
+  `);
+  if (context.qboType !== undefined) clauses.push(Prisma.sql`
+    AND observation."sourceQboType" = ${context.qboType}
+  `);
+  if (context.sourceAccountName !== undefined) clauses.push(Prisma.sql`
+    AND lower(trim(observation."sourceAccountName")) = lower(trim(${context.sourceAccountName}))
+  `);
+  if (context.currency !== undefined) clauses.push(Prisma.sql`
+    AND observation."currency" = ${context.currency}
+  `);
+  if (context.transactionPeriod !== undefined) clauses.push(Prisma.sql`
+    AND to_char(observation."transactionDate", 'YYYY-MM') = ${context.transactionPeriod}
+  `);
+  if (context.taxCalculation !== undefined) clauses.push(Prisma.sql`
+    AND observation."taxCalculation" = ${context.taxCalculation}
   `);
   return clauses.length === 0 ? Prisma.empty : Prisma.join(clauses, ' ');
 }
@@ -1526,11 +1708,11 @@ function resolvedVendorAliasCte(
 }
 
 function splitDocumentIds(documentIds: readonly string[] | null): Record<
-  'vendor_identity' | 'vendor_alias' | 'classification_case' | 'rule' | 'rule_candidate',
+  'vendor_identity' | 'vendor_alias' | 'classification_case' | 'rule' | 'rule_candidate' | 'historical_observation',
   string[] | null
 > {
   const result: Record<
-    'vendor_identity' | 'vendor_alias' | 'classification_case' | 'rule' | 'rule_candidate',
+    'vendor_identity' | 'vendor_alias' | 'classification_case' | 'rule' | 'rule_candidate' | 'historical_observation',
     string[] | null
   > = {
     vendor_identity: documentIds === null ? null : [],
@@ -1538,6 +1720,7 @@ function splitDocumentIds(documentIds: readonly string[] | null): Record<
     classification_case: documentIds === null ? null : [],
     rule: documentIds === null ? null : [],
     rule_candidate: documentIds === null ? null : [],
+    historical_observation: documentIds === null ? null : [],
   } satisfies Record<string, string[] | null>;
   if (documentIds === null) return result;
   for (const documentId of documentIds) {
@@ -1668,6 +1851,7 @@ function baseHit(input: {
   currency?: string | null;
   verifiedAt?: string | null;
   ruleRevision?: number | null;
+  observation?: ClassificationSearchHit['observation'];
 }): ClassificationSearchHit {
   const historicalRationale = input.action === null && input.summary === null
     && ['classification_case', 'rule', 'rule_candidate'].includes(input.kind)
@@ -1700,7 +1884,7 @@ function baseHit(input: {
     currency: input.currency ?? null,
     verifiedAt: input.verifiedAt ?? null,
     ruleRevision: input.ruleRevision ?? null,
-    observation: null,
+    observation: input.observation ?? null,
   });
 }
 
@@ -1876,6 +2060,58 @@ function candidateRecord(row: CandidateSearchRow): () => ClassificationSearchRec
     return {
       hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
       document: optionalDocumentFor(hit, revisedAt, row.searchText),
+    };
+  };
+}
+
+function observationRecord(row: HistoricalObservationSearchRow): () => ClassificationSearchRecord {
+  return () => {
+    const revisedAt = row.revisedAt.toISOString();
+    const calculation = taxCalculation(row.taxCalculation);
+    const tags = actionTagNames(row.tagNames);
+    if (calculation === null
+      || !Array.isArray(row.tagNames)
+      || row.tagNames.length > 50
+      || tags.length !== row.tagNames.length
+      || (calculation === 'NotApplicable') !== (row.taxCodeName === null)
+      || !Number.isSafeInteger(Number(row.amountCents))) {
+      throw new ClassificationSearchError('INVALID_INPUT');
+    }
+    const summary: ClassificationActionSummary = {
+      categoryName: row.categoryName,
+      taxCalculation: calculation,
+      taxCodeName: row.taxCodeName,
+      tagNames: tags,
+    };
+    const observation = {
+      sourceTransactionId: row.sourceTransactionId,
+      sourceQboType: row.sourceQboType as 'Purchase' | 'Deposit' | 'JournalEntry',
+      sourceQboId: row.sourceQboId,
+      sourceTransactionRevision: row.sourceTransactionRevision,
+      sourceQboSyncToken: row.sourceQboSyncToken,
+      sourceStatus: row.sourceStatus as 'POSTED',
+      sourceUpdatedAt: row.sourceUpdatedAt.toISOString(),
+      observedAt: row.observedAt.toISOString(),
+    } satisfies NonNullable<ClassificationSearchHit['observation']>;
+    const hit = baseHit({
+      row, kind: 'historical_observation', vendorIdentityId: null, vendorName: row.payee,
+      action: null, summary, executable: false, advisory: true, originIntent: null,
+      evidenceCount: 0, conflictingEvidenceCount: 0,
+      provenance: { source: 'historical_observation', sourceId: row.id, actorId: null, recordedAt: revisedAt },
+      currency: row.currency, observation,
+    });
+    return {
+      hit, revisedAt, lexicalScore: Number(row.lexicalScore), exactReasons: [],
+      document: optionalDocumentFor(hit, revisedAt, row.searchText),
+      sourceTransactionId: row.sourceTransactionId,
+      context: {
+        transactionDirection: row.amountCents < 0n ? 'out' : row.amountCents > 0n ? 'in' : 'unknown',
+        qboType: observation.sourceQboType,
+        sourceAccountName: row.sourceAccountName,
+        currency: row.currency,
+        transactionDate: row.transactionDate.toISOString().slice(0, 10),
+        taxCalculation: calculation,
+      },
     };
   };
 }
