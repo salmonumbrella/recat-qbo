@@ -328,7 +328,7 @@ function undoFixture(status: string | null = null) {
         ) ?? null
   ));
   value.transactionStatus.value = status === 'VERIFIED'
-    ? 'REVERTED'
+    ? 'PENDING'
     : status === 'UNCERTAIN'
       ? 'ERROR'
       : 'POSTED';
@@ -389,13 +389,13 @@ function undoFixture(status: string | null = null) {
       errorCode: null,
       errorMessage: null,
     });
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: target.id,
       ok: true,
-      status: 'REVERTED' as const,
+      status: 'PENDING' as const,
       outcome: 'VERIFIED' as const,
     };
   });
@@ -407,13 +407,13 @@ function undoFixture(status: string | null = null) {
       status: 'REVERTED',
       newSyncToken: '9',
     };
-    value.transactionStatus.value = 'REVERTED';
+    value.transactionStatus.value = 'PENDING';
     value.transactionSync.value = '9';
     return {
       transactionId: TRANSACTION_ID,
       requestId: value.operations[0]!.id,
       ok: true,
-      status: 'REVERTED',
+      status: 'PENDING',
       outcome: 'VERIFIED',
     };
   });
@@ -1143,7 +1143,7 @@ describe('MCP undo operation execution', () => {
         kind: 'undo',
         state: 'committed',
         phase: 'verified',
-        result: { outcome: 'VERIFIED', status: 'REVERTED' },
+        result: { outcome: 'VERIFIED', status: 'PENDING' },
       });
       expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
         requestId: 'operation-1',
@@ -1167,7 +1167,7 @@ describe('MCP undo operation execution', () => {
     },
   );
 
-  it('accepts only restore POSTED→REVERTED verified evidence for undo', async () => {
+  it('accepts only restore POSTED→REVERTED evidence with a PENDING queue state', async () => {
     const verified = undoFixture('VERIFIED');
     await expect(getMcpOperation(
       principal,
@@ -1176,7 +1176,7 @@ describe('MCP undo operation execution', () => {
     )).resolves.toMatchObject({
       kind: 'undo',
       state: 'committed',
-      result: { outcome: 'VERIFIED', status: 'REVERTED' },
+      result: { outcome: 'VERIFIED', status: 'PENDING' },
     });
 
     verified.attempts[0]!.operation = 'recategorize';

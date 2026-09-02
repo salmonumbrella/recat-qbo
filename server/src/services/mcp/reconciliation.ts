@@ -901,8 +901,9 @@ function validAttemptState(
       {
         const verification = attempt.verification as Record<string, unknown> | null;
         const newSyncToken = verification?.newSyncToken;
-        const verifiedStatus = operation.kind === 'undo' ? 'REVERTED' : 'POSTED';
-        return transaction.status === verifiedStatus
+        const verificationStatus = operation.kind === 'undo' ? 'REVERTED' : 'POSTED';
+        const transactionStatus = operation.kind === 'undo' ? 'PENDING' : 'POSTED';
+        return transaction.status === transactionStatus
         && typeof newSyncToken === 'string'
         && newSyncToken.length > 0
         && newSyncToken.length <= 128
@@ -910,7 +911,7 @@ function validAttemptState(
         && transaction.qboSyncToken === newSyncToken
         && exactVerification(verification, {
           outcome: 'VERIFIED',
-          status: verifiedStatus,
+          status: verificationStatus,
           newSyncToken,
         });
       }

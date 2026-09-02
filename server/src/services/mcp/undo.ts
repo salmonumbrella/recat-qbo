@@ -96,12 +96,17 @@ const previewSchema = z.object({
   lineCount: z.number().int().min(0).max(10_000),
   restorationDigest: z.string().regex(SHA256),
 }).strict();
+const storedPreviewSchema = previewSchema.extend({
+  // Pre-upgrade operations recorded the provider transition instead of the
+  // mutable Transaction projection's queue state. Accept and normalize them.
+  resultingStatus: z.enum(['PENDING', 'REVERTED']),
+});
 const storedUndoPayloadSchema = z.object({
   sourceOperationId: z.string().uuid(),
   sourcePreparedHash: z.string().regex(SHA256),
   currentPostHash: z.string().regex(SHA256),
   restoreHash: z.string().regex(SHA256),
-  preview: previewSchema,
+  preview: storedPreviewSchema,
   warnings: z.array(z.string().max(MAX_WARNING_LENGTH)).max(MAX_WARNINGS),
 }).strict();
 
@@ -117,7 +122,13 @@ export interface StoredMcpUndoPayload {
 export function parseStoredMcpUndoPayload(payload: unknown): StoredMcpUndoPayload {
   const parsed = storedUndoPayloadSchema.safeParse(payload);
   if (!parsed.success) throw new McpUndoError('OPERATION_CORRUPT');
-  return parsed.data;
+  return {
+    ...parsed.data,
+    preview: {
+      ...parsed.data.preview,
+      resultingStatus: 'PENDING',
+    },
+  };
 }
 
 export async function prepareMcpUndo(
