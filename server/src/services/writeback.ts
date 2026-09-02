@@ -2813,6 +2813,7 @@ async function finalizeVerified(
   status: 'POSTED' | 'REVERTED',
   auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
+  const transactionStatus = status === 'REVERTED' ? 'PENDING' : status;
   let transitioned = false;
   await d.db.$transaction(async (tx) => {
     await lockCompanyMutationScope(tx, txn.companyId);
@@ -2840,7 +2841,7 @@ async function finalizeVerified(
       attempt,
       txn,
       {
-        status: status === 'REVERTED' ? 'PENDING' : status,
+        status: transactionStatus,
         qboSyncToken: newSyncToken,
         postedAt: status === 'POSTED' ? d.now() : null,
         postedByUserId: status === 'POSTED' ? actor.id : null,
@@ -2891,7 +2892,7 @@ async function finalizeVerified(
     transactionId: txn.id,
     requestId: attempt.requestId,
     ok: true,
-    status: status === 'REVERTED' ? 'PENDING' : status,
+    status: transactionStatus,
     outcome: 'VERIFIED',
   };
 }
@@ -3164,7 +3165,7 @@ function leaseKey(txn: DurableTransaction): EntityLeaseKey {
 
 function allowedStatusesForAttempt(attempt: DurableAttempt): string[] {
   if (attempt.status === 'VERIFIED') {
-    return [attempt.operation === 'restore' ? 'REVERTED' : 'POSTED'];
+    return [attempt.operation === 'restore' ? 'PENDING' : 'POSTED'];
   }
   if (attempt.status === 'DRY_RUN') return ['DRY_RUN'];
   if (attempt.status === 'UNCHANGED') {
