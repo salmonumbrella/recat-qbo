@@ -964,6 +964,7 @@ export default function Queue() {
       t: TransactionDto,
       error: unknown,
       mutation: TaxMutationState,
+      preservePrepared = false,
     ) => {
       if (
         error instanceof ApiError &&
@@ -982,6 +983,16 @@ export default function Queue() {
           removeRow(t.id);
           updateTaxState(t, (state) => ({ ...state, mutation: null }));
           notifyQboMutation();
+          toast(error.message);
+          return;
+        }
+        if (preservePrepared) {
+          updateTaxState(t, (state) => ({
+            ...state,
+            mutation: state.mutation?.requestId === mutation.requestId
+              ? { ...state.mutation, busy: false, phase: 'idle' }
+              : state.mutation,
+          }));
           toast(error.message);
           return;
         }
@@ -1101,7 +1112,7 @@ export default function Queue() {
               error.mutationResult.requestId === mutation.requestId
             )
           ) {
-            recordTaxMutationFailure(t, error, resumed);
+            recordTaxMutationFailure(t, error, resumed, true);
             return;
           }
           if (

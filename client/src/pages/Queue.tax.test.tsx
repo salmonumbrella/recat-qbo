@@ -1568,6 +1568,44 @@ describe('tax-aware manual queue', () => {
   });
 
   it.each([
+    ['recategorize', 'PENDING', 'Resume post'],
+    ['restore', 'POSTED', 'Resume undo'],
+  ] as const)(
+    'keeps a PREPARED %s resumable after transient write-safety unavailability',
+    async (operation, status, buttonName) => {
+      const requestId = operation === 'restore'
+        ? '00000000-0000-4000-8000-000000000605'
+        : '00000000-0000-4000-8000-000000000604';
+      const endpoint = operation === 'restore'
+        ? mocks.undoCategorization
+        : mocks.commit;
+      endpoint.mockRejectedValue(new ApiError(
+        503,
+        'QuickBooks write safety is temporarily unavailable.',
+        'QBO_WRITE_SAFETY_UNAVAILABLE',
+      ));
+      const user = userEvent.setup();
+      await renderQueue(transaction({
+        status,
+        activeCategorizationAttempt: {
+          requestId,
+          operation,
+          status: 'PREPARED',
+        },
+      }));
+
+      await user.click(screen.getByRole('button', { name: buttonName }));
+
+      expect(await screen.findByRole('button', { name: buttonName })).toBeEnabled();
+      expect(screen.getByText('Generic supplier')).toBeInTheDocument();
+      expect(mocks.toast).toHaveBeenCalledWith(
+        'QuickBooks write safety is temporarily unavailable.',
+      );
+      expect(endpoint).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
     ['recategorize', 'PENDING', 'Resume post', 'QBO_TRANSACTION_LOCKED'],
     ['restore', 'POSTED', 'Resume undo', 'QBO_PERIOD_CLOSED'],
   ] as const)(
