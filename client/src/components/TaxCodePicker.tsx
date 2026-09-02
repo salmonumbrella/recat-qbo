@@ -1,5 +1,6 @@
 import { isUsableSalesTaxCodeDto, isUsableTaxCodeDto } from '@recat/shared';
 import type { TaxReadinessDto } from '@recat/shared';
+import { Combobox } from './SelectCombobox';
 
 export type TaxDirection = 'purchase' | 'sales';
 
@@ -60,24 +61,19 @@ export default function TaxCodePicker({
 
   return (
     <span style={{ display: 'block' }}>
-      <label htmlFor={id} style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}>
-        {label}
-      </label>
-      <select
+      <Combobox
         id={id}
-        value={available ? value ?? '' : ''}
+        label={label}
+        value={available ? value : null}
         disabled={disabled || !available}
-        onChange={(event) => onChange(event.target.value || null)}
-        className="select"
-        style={{ width: '100%' }}
-      >
-        <option value="">No tax</option>
-        {usableCodes.map((code) => (
-          <option key={code.qboId} value={code.qboId}>
-            {code.name}
-          </option>
-        ))}
-      </select>
+        searchPlaceholder="Search tax codes…"
+        emptyText="No matching tax codes"
+        options={[
+          { value: '', label: 'No tax', searchText: 'no tax none' },
+          ...usableCodes.map((code) => ({ value: code.qboId, label: code.name, searchText: code.name })),
+        ]}
+        onValueChange={(next) => onChange(next || null)}
+      />
       {explanation && (
         <span style={{ display: 'block', color: 'var(--mut)', fontSize: 12, marginTop: 4 }}>
           {explanation}

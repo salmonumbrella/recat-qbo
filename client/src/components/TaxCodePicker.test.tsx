@@ -51,7 +51,8 @@ const READY: TaxReadinessDto = {
 describe('TaxCodePicker', () => {
   it('offers explicit no tax and only usable purchase tax codes', async () => {
     const onChange = vi.fn();
-    render(
+    const user = userEvent.setup();
+    const view = render(
       <TaxCodePicker
         id="tax-code"
         label="Purchase tax"
@@ -61,20 +62,34 @@ describe('TaxCodePicker', () => {
       />,
     );
 
-    const picker = screen.getByLabelText('Purchase tax');
-    expect(picker).toHaveTextContent('No tax');
-    expect(picker).toHaveTextContent('Standard purchase tax');
-    expect(picker).not.toHaveTextContent('Inactive purchase tax');
-    expect(picker).not.toHaveTextContent('Unsupported purchase tax');
-    expect(picker).not.toHaveTextContent('Explicit non-tax treatment');
+    await user.click(screen.getByRole('combobox', { name: 'Purchase tax' }));
+    const picker = screen.getByRole('textbox', { name: 'Purchase tax' });
+    expect(screen.getByRole('option', { name: 'No tax' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Standard purchase tax' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Inactive purchase tax' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Unsupported purchase tax' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Explicit non-tax treatment' })).not.toBeInTheDocument();
 
-    await userEvent.selectOptions(picker, 'TAX_CODE_STANDARD');
+    await user.type(picker, 'standard');
+    await user.keyboard('{ArrowDown}{Enter}');
     expect(onChange).toHaveBeenCalledWith('TAX_CODE_STANDARD');
-    await userEvent.selectOptions(picker, '');
+
+    view.unmount();
+    render(
+      <TaxCodePicker
+        id="tax-code"
+        label="Purchase tax"
+        readiness={READY}
+        value="TAX_CODE_STANDARD"
+        onChange={onChange}
+      />,
+    );
+    await user.click(screen.getByRole('combobox', { name: 'Purchase tax' }));
+    await user.keyboard('{ArrowDown}{Enter}');
     expect(onChange).toHaveBeenLastCalledWith(null);
   });
 
-  it('explains disabled purchase tax while keeping no tax explicit', () => {
+  it('explains disabled purchase tax and prevents selection', () => {
     render(
       <TaxCodePicker
         id="tax-disabled"
@@ -96,7 +111,6 @@ describe('TaxCodePicker', () => {
 
     expect(screen.getByLabelText('Purchase tax')).toBeDisabled();
     expect(screen.getByText(/purchase tax is disabled/i)).toBeInTheDocument();
-    expect(screen.getByRole('option', { name: 'No tax' })).toBeInTheDocument();
   });
 
   it('explains unavailable readiness without inventing tax choices', () => {
@@ -117,6 +131,7 @@ describe('TaxCodePicker', () => {
 
   it('uses sales readiness and sales tax codes when requested', async () => {
     const onChange = vi.fn();
+    const user = userEvent.setup();
     render(
       <TaxCodePicker
         id="sales-tax-code"
@@ -140,10 +155,12 @@ describe('TaxCodePicker', () => {
       />,
     );
 
-    const picker = screen.getByLabelText('Sales tax');
-    expect(picker).toHaveTextContent('Standard sales tax');
-    expect(picker).not.toHaveTextContent('Standard purchase tax');
-    await userEvent.selectOptions(picker, 'SALES_TAX_CODE');
+    await user.click(screen.getByRole('combobox', { name: 'Sales tax' }));
+    const picker = screen.getByRole('textbox', { name: 'Sales tax' });
+    expect(screen.getByRole('option', { name: 'Standard sales tax' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Standard purchase tax' })).not.toBeInTheDocument();
+    await user.type(picker, 'standard');
+    await user.keyboard('{ArrowDown}{Enter}');
     expect(onChange).toHaveBeenCalledWith('SALES_TAX_CODE');
   });
 });
