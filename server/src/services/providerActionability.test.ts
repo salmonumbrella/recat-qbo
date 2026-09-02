@@ -90,6 +90,34 @@ describe('provider actionability', () => {
     )).toBe(true);
   });
 
+  it('retains a same-binding provider lock after its writable TTL expires', () => {
+    const now = new Date('2026-08-30T18:15:00.000Z');
+    const stale = new Date('2026-08-30T17:59:59.000Z');
+
+    expect(effectiveProviderDisposition(
+      observation({ disposition: 'WRITABLE', checkedAt: stale }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('UNKNOWN');
+    expect(effectiveProviderDisposition(
+      observation({ disposition: 'BLOCKED_RECONCILED', checkedAt: stale }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('BLOCKED_RECONCILED');
+    expect(effectiveProviderDisposition(
+      observation({
+        disposition: 'BLOCKED_CLEARED',
+        checkedAt: stale,
+        qboSyncToken: 'different-binding',
+      }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('UNKNOWN');
+  });
+
   it('rejects known blocked or unknown prepare before any operation is created', () => {
     const now = new Date('2026-08-30T18:00:00.000Z');
     expect(() => assertProviderActionabilityAllowsPrepare(

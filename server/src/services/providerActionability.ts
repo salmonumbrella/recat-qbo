@@ -169,17 +169,22 @@ export function isFreshProviderActionability(
   return age >= 0 && age <= ttlMs;
 }
 
-/** Resolve a row for selection. Missing, malformed, mismatched, or stale
- * observations fail closed as UNKNOWN. */
+/** Resolve a row for selection. Missing, malformed, or mismatched observations
+ * fail closed as UNKNOWN. WRITABLE evidence expires because it must never
+ * authorize a later write. A same-binding provider lock remains a lock until
+ * new provider evidence or a changed transaction binding invalidates it: time
+ * passing alone cannot make a cleared, reconciled, or closed-period row safe. */
 export function effectiveProviderDisposition(
   row: ProviderActionabilityObservation | null | undefined,
   txn: ActionabilityTransactionIdentity,
   now = new Date(),
   ttlMs = PROVIDER_ACTIONABILITY_TTL_MS,
 ): ProviderActionabilityDisposition {
-  return isFreshProviderActionability(row, txn, now, ttlMs)
-    ? row!.disposition
-    : 'UNKNOWN';
+  if (!row || !validDisposition(row.disposition) || !sameBinding(row, txn)) {
+    return 'UNKNOWN';
+  }
+  if (providerDispositionIsBlocked(row.disposition)) return row.disposition;
+  return isFreshProviderActionability(row, txn, now, ttlMs) ? row.disposition : 'UNKNOWN';
 }
 
 function unknownData(txn: ActionabilityTransactionIdentity): Record<string, unknown> {

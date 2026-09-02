@@ -38,6 +38,7 @@ import {
   PROVIDER_ACTIONABILITY_DISPOSITIONS,
   assertTransactionProviderActionability,
   effectiveProviderActionabilityCounts,
+  providerDispositionIsBlocked,
 } from '../services/providerActionability.js';
 import {
   MAX_ACTIONABILITY_REFRESH_LIMIT,
@@ -153,8 +154,9 @@ companyTransactionsRouter.get(
       (prisma as unknown as { transactionActionability?: unknown }).transactionActionability,
     );
 
-    // Queue badge: every local PENDING or ERROR row belongs to the one queue.
-    // Provider observations remain additive metadata, not a visibility gate.
+    // Queue badge: pending local work belongs to the one queue unless QBO is
+    // already known to lock it. UNKNOWN remains visible and every actual write
+    // still performs a fresh provider check.
     const pendingWhere: Prisma.TransactionWhereInput = {
       companyId: company.id,
       status: { in: ['PENDING', 'ERROR'] as TxnStatus[] },
@@ -180,7 +182,9 @@ companyTransactionsRouter.get(
       ?? await prisma.transaction.count({ where: pendingWhere });
     const actionableCount = providerCounts?.actionable ?? totalPending;
     const blockedCount = providerCounts?.blocked ?? 0;
-    const pendingCount = totalPending;
+    const pendingCount = supportsActionability
+      ? Math.max(0, totalPending - blockedCount)
+      : totalPending;
     if (query.countOnly) {
       res.json({
         transactions: [],
@@ -197,11 +201,16 @@ companyTransactionsRouter.get(
       return;
     }
 
-    // The queue shows posted/dry-run/error rows too; only SUPERSEDED is hidden.
+    // Default reads power the interactive Queue and therefore return only
+    // pending/error work. Explicit status reads remain available to other
+    // surfaces and diagnostics, except SUPERSEDED which is never interactive.
     // Prototype order: date ascending as entered.
     const queueWhere: Record<string, unknown> = {
       companyId: company.id,
-      status: { not: 'SUPERSEDED' },
+      status:
+        query.status === 'SUPERSEDED'
+          ? { in: [] }
+          : query.status ?? { in: ['PENDING', 'ERROR'] },
     };
     const rows = await prisma.transaction.findMany({
       where: queueWhere,
@@ -219,6 +228,14 @@ companyTransactionsRouter.get(
       dtos = filterTransactionDtos(dtos, query, fullNameOf);
     } else {
       dtos = filterTransactionDtos(dtos, query);
+    }
+    if (query.status === undefined) {
+      dtos = dtos.filter((dto) => dto.status === 'PENDING' || dto.status === 'ERROR');
+    }
+    if (supportsActionability && query.providerDisposition === undefined) {
+      dtos = dtos.filter((dto) => !providerDispositionIsBlocked(
+        dto.providerActionability?.disposition ?? 'UNKNOWN',
+      ));
     }
     res.json({
       transactions: dtos,

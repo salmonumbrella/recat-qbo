@@ -261,7 +261,7 @@ beforeEach(() => {
 });
 
 describe('tax-aware categorization action routes', () => {
-  it('counts every pending and error transaction while retaining provider observation metadata', async () => {
+  it('counts only writable or unknown pending work while retaining blocked diagnostics', async () => {
     const checkedAt = new Date();
     const providerRow = (id: string, disposition: string, qboId = id) => ({
       ...transactionRow,
@@ -293,11 +293,53 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
-      pendingCount: 3,
+      pendingCount: 2,
       actionableCount: 1,
       blockedCount: 1,
       unknownCount: 1,
     });
+  });
+
+  it('keeps one Queue by omitting terminal and known provider-blocked rows', async () => {
+    const checkedAt = new Date();
+    const providerRow = (
+      id: string,
+      disposition: string,
+      status = 'PENDING',
+      qboId = id,
+    ) => ({
+      ...transactionRow,
+      id,
+      qboId,
+      status,
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 1,
+        qboSyncToken: '7',
+        qboType: 'Purchase',
+        qboId,
+        txnDate: transactionRow.date,
+      },
+    });
+    mocks.transactionFindMany.mockResolvedValue([
+      providerRow('WRITABLE_TXN', 'WRITABLE'),
+      providerRow('BLOCKED_TXN', 'BLOCKED_RECONCILED'),
+      providerRow('UNKNOWN_TXN', 'WRITABLE', 'PENDING', 'mismatched-binding'),
+      providerRow('POSTED_TXN', 'WRITABLE', 'POSTED'),
+    ]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
+      'UNKNOWN_TXN',
+      'WRITABLE_TXN',
+    ]);
   });
 
   it('keeps explicit SUPERSEDED queue reads empty', async () => {
@@ -310,7 +352,7 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(200);
     expect(response.body.transactions).toEqual([]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { companyId: COMPANY_ID, status: { not: 'SUPERSEDED' } },
+      where: { companyId: COMPANY_ID, status: { in: [] } },
     }));
   });
 
