@@ -1277,6 +1277,36 @@ describe('tax-aware manual queue', () => {
     );
   });
 
+  it('reloads a RETRYABLE recategorization for restaging with a new request ID', async () => {
+    const priorRequestId = '00000000-0000-4000-8000-000000000598';
+    const nextRequestId = '00000000-0000-4000-8000-000000000600';
+    mocks.requestId.mockReset().mockReturnValue(nextRequestId);
+    const user = userEvent.setup();
+    await renderQueue(transaction({
+      activeCategorizationAttempt: {
+        requestId: priorRequestId,
+        operation: 'recategorize',
+        status: 'RETRYABLE',
+      },
+    }));
+
+    expect(screen.getByText('Not posted — restage to retry')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await user.click(await screen.findByRole('button', { name: /^post$/i }));
+
+    await waitFor(() => expect(mocks.commit).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      5,
+      nextRequestId,
+    ));
+    expect(mocks.commit).not.toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      expect.any(Number),
+      priorRequestId,
+    );
+    expect(mocks.requestId).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['recategorize', 'PREPARED'],
     ['restore', 'PREPARED'],
