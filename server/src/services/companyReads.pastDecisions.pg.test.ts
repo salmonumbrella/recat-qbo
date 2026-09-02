@@ -148,6 +148,40 @@ describePostgres('past-decision PostgreSQL reads', () => {
       .rejects.toMatchObject({ status: 404, code: 'OBSERVATION_NOT_FOUND' });
   });
 
+  it('returns the latest non-invalidated verified case that supersedes an observation', async () => {
+    const current = await seedCompany('supersession');
+    const transaction = await seedTransaction(current.company.id, 'supersession');
+    const observation = await seedObservation({
+      companyId: current.company.id, transactionId: transaction.id,
+      observedAt: new Date('2026-09-01T09:00:00.000Z'), revision: 6,
+    });
+    await seedCase({
+      companyId: current.company.id, userId: current.viewer.id, transactionId: transaction.id,
+      accountQboId: current.account.qboId, verifiedAt: new Date('2026-09-01T10:00:00.000Z'),
+    });
+    const latestNonInvalidated = await seedCase({
+      companyId: current.company.id, userId: current.viewer.id, transactionId: transaction.id,
+      accountQboId: current.account.qboId, verifiedAt: new Date('2026-09-01T11:00:00.000Z'),
+    });
+    const laterInvalidated = await seedCase({
+      companyId: current.company.id, userId: current.viewer.id, transactionId: transaction.id,
+      accountQboId: current.account.qboId, verifiedAt: new Date('2026-09-01T12:00:00.000Z'),
+    });
+    await db.classificationCaseInvalidation.create({ data: {
+      companyId: current.company.id, classificationCaseId: laterInvalidated.id,
+      invalidatedAt: new Date('2026-09-01T13:00:00.000Z'), reason: 'Corrected after verification.',
+    } });
+    const reads = createCompanyReadService(db as unknown as CompanyReadDb, 'past-decisions-pg-supersession-secret');
+
+    await expect(reads.listPastDecisions(current.viewer.id, current.company.id, {
+      kind: 'historical_observation', limit: 10,
+    })).resolves.toMatchObject({
+      items: [expect.objectContaining({ id: observation.id, supersededByCaseId: latestNonInvalidated.id })],
+    });
+    await expect(reads.getHistoricalObservation(current.viewer.id, current.company.id, observation.id))
+      .resolves.toMatchObject({ id: observation.id, supersededByCaseId: latestNonInvalidated.id });
+  });
+
   it('binds cursors to actor, company, filter, and the current corpus revision', async () => {
     const current = await seedCompany('fence');
     const other = await db.user.create({ data: { email: `other-${randomUUID()}@example.test` } });
