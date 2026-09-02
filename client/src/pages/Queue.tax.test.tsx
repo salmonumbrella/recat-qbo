@@ -400,6 +400,23 @@ async function renderQueue(row: TransactionDto | TransactionDto[] = transaction(
   return view;
 }
 
+function QueueWithCompanyKey() {
+  // AppLayout keys its Outlet by active company, so this remounts Queue on a switch.
+  return <div key={mocks.activeCompanyId ?? 'no-company'}><Queue /></div>;
+}
+
+async function renderKeyedQueue(row: TransactionDto | TransactionDto[] = transaction()) {
+  const transactions = Array.isArray(row) ? row : [row];
+  mocks.list.mockResolvedValue({
+    transactions,
+    nextCursor: null,
+    pendingCount: transactions.filter((transaction) => transaction.status === 'PENDING').length,
+  });
+  const view = render(<QueueWithCompanyKey />);
+  await screen.findByText(transactions[0]!.payee);
+  return view;
+}
+
 async function expectInFlightChangeInvalidates(
   change: (user: ReturnType<typeof userEvent.setup>) => Promise<void>,
   restaged: StagedCategorization = STAGED,
@@ -1803,6 +1820,10 @@ describe('single interactive queue', () => {
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute('aria-busy', 'true');
     expect(button).toHaveTextContent('Syncing…');
+
+    await act(async () => pending.resolve({
+      ok: false, message: 'QuickBooks connection timed out.', lastSyncedAt: null,
+    }));
   });
 
   it('names the company and honours an ok:false manual-sync body as failure', async () => {
@@ -1870,6 +1891,56 @@ describe('single interactive queue', () => {
 
     expect(mocks.toast).not.toHaveBeenCalledWith(expect.stringContaining('Generic company'));
     expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+    expect(mocks.refreshCompanies).not.toHaveBeenCalled();
+  });
+
+  it('keeps an in-flight company sync locked across AppLayout-style remounts', async () => {
+    const pending = deferred<{ ok: boolean; message: string; lastSyncedAt: string | null }>();
+    mocks.sync.mockReturnValueOnce(pending.promise);
+    const user = userEvent.setup();
+    const view = await renderKeyedQueue();
+    await user.click(screen.getByRole('button', { name: /sync now/i }));
+
+    mocks.activeCompanyId = 'COMPANY_OTHER';
+    mocks.activeCompanyName = 'Other company';
+    mocks.list.mockResolvedValueOnce({
+      transactions: [transaction({
+        id: 'TRANSACTION_OTHER', companyId: 'COMPANY_OTHER', payee: 'Other company supplier',
+      })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+    view.rerender(<QueueWithCompanyKey />);
+    await screen.findByText('Other company supplier');
+    expect(screen.getByRole('button', { name: /sync now/i })).toBeEnabled();
+
+    mocks.activeCompanyId = 'COMPANY_GENERIC';
+    mocks.activeCompanyName = 'Generic company';
+    mocks.list.mockResolvedValueOnce({
+      transactions: [transaction()],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+    view.rerender(<QueueWithCompanyKey />);
+    await screen.findByText('Generic supplier');
+
+    const returningButton = screen.getByRole('button', { name: /syncing/i });
+    expect(returningButton).toBeDisabled();
+    expect(returningButton).toHaveAttribute('aria-busy', 'true');
+    await user.click(returningButton);
+    expect(mocks.sync).toHaveBeenCalledTimes(1);
+    expect(mocks.sync).toHaveBeenCalledWith('COMPANY_GENERIC');
+
+    await act(async () => pending.resolve({
+      ok: true, message: '1 new transaction', lastSyncedAt: '2026-09-01T17:00:00.000Z',
+    }));
+
+    await waitFor(() => {
+      expect(returningButton).toBeEnabled();
+      expect(returningButton).toHaveAttribute('aria-busy', 'false');
+      expect(returningButton).toHaveTextContent('Sync now');
+    });
+    expect(mocks.toast).not.toHaveBeenCalledWith(expect.stringContaining('Generic company'));
     expect(mocks.refreshCompanies).not.toHaveBeenCalled();
   });
 
