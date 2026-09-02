@@ -400,6 +400,17 @@ async function renderQueue(row: TransactionDto | TransactionDto[] = transaction(
   return view;
 }
 
+async function chooseControl(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+  optionName: string,
+) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  const search = screen.queryByRole('textbox', { name: label });
+  if (search) await user.type(search, optionName);
+  await user.click(screen.getByRole('option', { name: optionName }));
+}
+
 function QueueWithCompanyKey() {
   // AppLayout keys its Outlet by active company, so this remounts Queue on a switch.
   return <div key={mocks.activeCompanyId ?? 'no-company'}><Queue /></div>;
@@ -631,21 +642,21 @@ describe('tax-aware manual queue', () => {
     const user = userEvent.setup();
     await renderQueue();
 
-    await user.click(screen.getByRole('button', {
-      name: 'Expenses · Generic expense',
+    await user.click(screen.getByRole('combobox', {
+      name: 'Category for Generic supplier',
     }));
 
-    expect(screen.queryByRole('button', {
+    expect(screen.queryByRole('option', {
       name: /Uncategorised Expense/,
     })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', {
+    expect(screen.getByRole('option', {
       name: /Alternate expense/,
     })).toBeInTheDocument();
 
     // A user's own account that merely mentions the term is not QuickBooks'
     // holding account, and hiding it would remove a destination they created
     // on purpose with nothing to explain where it went.
-    expect(screen.getByRole('button', {
+    expect(screen.getByRole('option', {
       name: /Old Uncategorized Costs/,
     })).toBeInTheDocument();
   });
@@ -741,10 +752,7 @@ describe('tax-aware manual queue', () => {
     await user.click(screen.getByRole('button', { name: /preview tax/i }));
     await screen.findByText(/subtotal.*10\.00/i);
 
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
 
     expect(screen.queryByText(/subtotal.*10\.00/i)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^post$/i })).toBeDisabled();
@@ -762,10 +770,7 @@ describe('tax-aware manual queue', () => {
     await renderQueue();
 
     await user.click(screen.getByRole('button', { name: /preview tax/i }));
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
     expect(screen.getByRole('button', { name: /calculating/i })).toBeDisabled();
     await act(async () => first.resolve(STAGED));
 
@@ -790,8 +795,9 @@ describe('tax-aware manual queue', () => {
 
   it('invalidates an in-flight preview when the category changes', async () => {
     await expectInFlightChangeInvalidates(async (user) => {
-      await user.click(screen.getByRole('button', { name: 'Expenses · Generic expense' }));
-      await user.click(screen.getByRole('button', { name: /Alternate expense/ }));
+      await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
+      await user.type(screen.getByRole('textbox', { name: 'Category for Generic supplier' }), 'alternate');
+      await user.click(screen.getByRole('option', { name: /Alternate expense/ }));
     });
   });
 
@@ -810,10 +816,7 @@ describe('tax-aware manual queue', () => {
 
   it('invalidates an in-flight preview when the tax code changes', async () => {
     await expectInFlightChangeInvalidates(async (user) => {
-      await user.selectOptions(
-        screen.getByLabelText('Purchase tax for Generic supplier'),
-        '',
-      );
+      await chooseControl(user, 'Purchase tax for Generic supplier', 'No tax');
     });
   });
 
@@ -841,10 +844,7 @@ describe('tax-aware manual queue', () => {
     });
 
     await user.click(screen.getByRole('button', { name: /preview tax/i }));
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for Generic supplier'),
-      'TaxExcluded',
-    );
+    await chooseControl(user, 'Tax calculation for Generic supplier', 'Tax exclusive');
     await act(async () => pending.reject(new ApiError(
       409,
       'The transaction changed. Reload before continuing.',
@@ -898,7 +898,7 @@ describe('tax-aware manual queue', () => {
 
       expect(
         screen.getByLabelText('Tax calculation for Generic supplier'),
-      ).toHaveValue(expectedCalculation);
+      ).toHaveTextContent(expectedCalculation === 'TaxExcluded' ? 'Tax exclusive' : 'Tax inclusive');
       await user.click(screen.getByRole('button', { name: /preview tax/i }));
 
       await waitFor(() => expect(mocks.stage).toHaveBeenCalledWith(
@@ -1091,8 +1091,8 @@ describe('tax-aware manual queue', () => {
         },
       }));
 
-      expect(screen.getByRole('button', {
-        name: 'Expenses · Generic expense',
+      expect(screen.getByRole('combobox', {
+        name: 'Category for Generic supplier',
       })).toBeDisabled();
       expect(screen.getByRole('button', { name: 'Split' })).toBeDisabled();
       expect(screen.getByRole('button', { name: '+ tag' })).toBeDisabled();
@@ -1981,7 +1981,7 @@ describe('single interactive queue', () => {
     const user = userEvent.setup();
     await renderQueue(providerRow('TXN_REVIEW', 'Review supplier', disposition));
 
-    expect(screen.getByRole('button', { name: 'Expenses · Generic expense' })).toBeEnabled();
+    expect(screen.getByRole('combobox', { name: 'Category for Review supplier' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '+ tag' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Split' })).toBeEnabled();
     expect(screen.getByRole('button', { name: /preview tax/i })).toBeEnabled();

@@ -12,60 +12,6 @@ const MISSING_STABLE_CATEGORY_VALUE: CategoryOption = {
 void MISSING_STABLE_CATEGORY_VALUE;
 
 describe('CategoryPicker', () => {
-  it('temporarily renders Queue legacy props until Queue adopts stable values', () => {
-    render(
-      <div className="rr">
-        <CategoryPicker
-          query="office"
-          onQueryChange={vi.fn()}
-          options={[{ group: 'Expenses', name: 'Office expense', sug: true }]}
-          empty={false}
-          activeIdx={0}
-          onPick={vi.fn()}
-          showBadges
-          containerStyle={{ width: 300 }}
-        />
-      </div>,
-    );
-
-    expect(screen.getByRole('textbox')).toHaveValue('office');
-    expect(screen.getByRole('button', { name: /office expense/i })).toBeInTheDocument();
-  });
-
-  it('keeps Queue legacy keyboard-active categories in view', () => {
-    const previous = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
-    const scrollIntoView = vi.fn();
-    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
-      configurable: true,
-      value: scrollIntoView,
-    });
-
-    try {
-      render(
-        <div className="rr">
-          <CategoryPicker
-            query=""
-            onQueryChange={vi.fn()}
-            options={[
-              { group: 'Expenses', name: 'Office expense', sug: false },
-              { group: 'Expenses', name: 'Travel', sug: false },
-            ]}
-            empty={false}
-            activeIdx={1}
-            onPick={vi.fn()}
-            showBadges={false}
-            containerStyle={{ width: 300 }}
-          />
-        </div>,
-      );
-
-      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
-    } finally {
-      if (previous) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', previous);
-      else delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
-    }
-  });
-
   it('searches grouped categories, marks the suggested option, and selects its stable value', async () => {
     const onPick = vi.fn();
     const user = userEvent.setup();

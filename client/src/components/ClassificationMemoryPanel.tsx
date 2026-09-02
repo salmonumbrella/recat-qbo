@@ -6,6 +6,7 @@ import {
   type ClassificationSearchPageDto,
   type ClassificationSemanticHealthDto,
 } from '../lib/api';
+import { Select } from './SelectCombobox';
 
 interface ClassificationMemoryPanelProps {
   companyId: string;
@@ -216,23 +217,24 @@ export default function ClassificationMemoryPanel({
             style={{ width: '100%', boxSizing: 'border-box' }}
           />
         </label>
-        <label>
-          <select
-            aria-label="Search mode"
-            className="select"
+        <span>
+          <Select
+            label="Search mode"
             value={mode}
-            onChange={(event) => {
+            options={[
+              { value: 'auto', label: 'Auto' },
+              { value: 'exact', label: 'Exact' },
+              { value: 'lexical', label: 'Lexical' },
+              { value: 'hybrid', label: 'Hybrid' },
+              { value: 'semantic', label: 'Semantic' },
+            ]}
+            onValueChange={(next) => {
+              if (next === null) return;
               invalidatePendingRequest();
-              setMode(event.target.value as ClassificationSearchMode);
+              setMode(next as ClassificationSearchMode);
             }}
-          >
-            <option value="auto">Auto</option>
-            <option value="exact">Exact</option>
-            <option value="lexical">Lexical</option>
-            <option value="hybrid">Hybrid</option>
-            <option value="semantic">Semantic</option>
-          </select>
-        </label>
+          />
+        </span>
         <button className="btn-ghost" type="submit" disabled={busy || !query.trim()}>
           {busy ? 'Searching…' : 'Search knowledge'}
         </button>

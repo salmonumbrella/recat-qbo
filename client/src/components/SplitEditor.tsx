@@ -14,6 +14,7 @@ import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
 import TaxCodePicker, { usableTaxCodesForDirection } from './TaxCodePicker';
 import type { TaxDirection } from './TaxCodePicker';
+import { Combobox, Select } from './SelectCombobox';
 
 export interface SplitLineDraft {
   amt: string;
@@ -164,21 +165,18 @@ export default function SplitEditor({
         </div>
         {taxEnabled && (
           <span style={{ display: 'block', marginBottom: 12 }}>
-            <label
-              htmlFor={`split-tax-calculation-${txn.id}`}
-              style={{ display: 'block', fontSize: 12, color: 'var(--mut)', marginBottom: 4 }}
-            >
-              Tax calculation for split
-            </label>
-            <select
+            <Select
               id={`split-tax-calculation-${txn.id}`}
-              className="select"
+              label="Tax calculation for split"
               value={taxCalculation === 'TaxExcluded' ? 'TaxExcluded' : 'TaxInclusive'}
-              onChange={(event) => setTaxCalculation(event.target.value as TaxCalculation)}
-            >
-              <option value="TaxInclusive">Tax inclusive</option>
-              <option value="TaxExcluded">Tax exclusive</option>
-            </select>
+              options={[
+                { value: 'TaxInclusive', label: 'Tax inclusive' },
+                { value: 'TaxExcluded', label: 'Tax exclusive' },
+              ]}
+              onValueChange={(next) => {
+                if (next === 'TaxInclusive' || next === 'TaxExcluded') setTaxCalculation(next);
+              }}
+            />
           </span>
         )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -204,29 +202,21 @@ export default function SplitEditor({
                     fontVariantNumeric: 'tabular-nums',
                   }}
                 />
-                <select
-                  aria-label={`Category for split line ${i + 1}`}
+                <Combobox
+                  label={`Category for split line ${i + 1}`}
                   value={l.cat}
-                  onChange={(e) => upd(i, { cat: e.target.value })}
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    border: '1px solid var(--bd)',
-                    borderRadius: 7,
-                    padding: '8px 10px',
-                    fontSize: 13.5,
-                    background: 'var(--card)',
-                    color: 'var(--ink)',
-                    cursor: 'pointer',
+                  placeholder="Category…"
+                  searchPlaceholder="Search categories…"
+                  options={catOpts.map((option) => ({
+                    value: `${option.group}·${option.name}`,
+                    label: `${option.group} · ${option.name}`,
+                    searchText: `${option.group} ${option.name}`,
+                  }))}
+                  onValueChange={(next) => {
+                    const matched = catOpts.find((option) => `${option.group}·${option.name}` === next);
+                    if (matched) upd(i, { cat: matched.name });
                   }}
-                >
-                  <option value="">Category…</option>
-                  {catOpts.map((c) => (
-                    <option key={`${c.group}·${c.name}`} value={c.name}>
-                      {c.group} · {c.name}
-                    </option>
-                  ))}
-                </select>
+                />
                 <button
                   onClick={() =>
                     setDraft((d) => (d.length > 1 ? d.filter((_, j) => j !== i) : d))

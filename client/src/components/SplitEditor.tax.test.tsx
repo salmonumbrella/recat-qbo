@@ -4,6 +4,17 @@ import { describe, expect, it, vi } from 'vitest';
 import type { TaxReadinessDto, TransactionDto } from '@recat/shared';
 import SplitEditor from './SplitEditor';
 
+async function chooseControl(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+  optionName: string,
+) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  const search = screen.queryByRole('textbox', { name: label });
+  if (search) await user.type(search, optionName);
+  await user.click(screen.getByRole('option', { name: optionName }));
+}
+
 const toast = vi.fn();
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({ toast }),
@@ -108,17 +119,11 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Tax calculation for split'),
-      'TaxExcluded',
-    );
+    await chooseControl(user, 'Tax calculation for split', 'Tax exclusive');
     const firstMemo = screen.getByLabelText('Memo for split line 1');
     await user.clear(firstMemo);
     await user.type(firstMemo, 'Updated generic memo');
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      'TAX_CODE_STANDARD',
-    );
+    await chooseControl(user, 'Purchase tax for split line 2', 'Standard purchase tax');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(
@@ -214,10 +219,7 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    await user.selectOptions(
-      screen.getByLabelText('Purchase tax for split line 2'),
-      '',
-    );
+    await chooseControl(user, 'Purchase tax for split line 2', 'No tax');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).not.toHaveBeenCalled();
@@ -251,10 +253,10 @@ describe('SplitEditor tax fields', () => {
       />,
     );
 
-    expect(screen.getByLabelText('Sales tax for split line 1')).toHaveTextContent('Standard sales tax');
+    expect(screen.getByRole('combobox', { name: 'Sales tax for split line 1' })).toBeInTheDocument();
     expect(screen.queryByLabelText('Purchase tax for split line 1')).not.toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 1'), 'SALES_TAX_CODE');
-    await user.selectOptions(screen.getByLabelText('Sales tax for split line 2'), 'SALES_TAX_CODE');
+    await chooseControl(user, 'Sales tax for split line 1', 'Standard sales tax');
+    await chooseControl(user, 'Sales tax for split line 2', 'Standard sales tax');
     await user.click(screen.getByRole('button', { name: /save split/i }));
 
     expect(onSave).toHaveBeenCalledWith(

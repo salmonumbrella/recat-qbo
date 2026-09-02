@@ -17,6 +17,17 @@ vi.mock('../lib/api', () => ({
 
 import ClassificationMemoryPanel from './ClassificationMemoryPanel';
 
+async function chooseControl(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+  optionName: string,
+) {
+  await user.click(screen.getByRole('combobox', { name: label }));
+  const search = screen.queryByRole('textbox', { name: label });
+  if (search) await user.type(search, optionName);
+  await user.click(screen.getByRole('option', { name: optionName }));
+}
+
 function hit(overrides: Partial<ClassificationSearchHit> = {}): ClassificationSearchHit {
   return {
     id: 'hit-1',
@@ -121,11 +132,11 @@ beforeEach(() => {
 });
 
 describe('ClassificationMemoryPanel', () => {
-  it('keeps the search mode accessible without rendering a visible label', () => {
+  it('keeps the search mode accessible through the shared control label', () => {
     render(<ClassificationMemoryPanel companyId="company-1" initialQuery="Northwind Fuel" />);
 
     expect(screen.getByRole('combobox', { name: 'Search mode' })).toBeInTheDocument();
-    expect(screen.queryByText('Search mode')).not.toBeInTheDocument();
+    expect(screen.getByText('Search mode')).toBeInTheDocument();
   });
 
   it('searches with transaction context and renders bounded provenance with source navigation', async () => {
@@ -191,7 +202,7 @@ describe('ClassificationMemoryPanel', () => {
 
     mocks.search.mockRejectedValueOnce(new Error('Hybrid classification search is unavailable.'));
     view.rerender(<ClassificationMemoryPanel companyId="company-1" initialQuery="unknown" />);
-    await user.selectOptions(screen.getByLabelText('Search mode'), 'hybrid');
+    await chooseControl(user, 'Search mode', 'Hybrid');
     await user.click(screen.getByRole('button', { name: 'Search knowledge' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/hybrid classification search is unavailable/i);
     expect(screen.queryByText(/nothing matched/i)).not.toBeInTheDocument();
@@ -272,7 +283,7 @@ describe('ClassificationMemoryPanel', () => {
 
     await user.clear(screen.getByLabelText('Classification search'));
     await user.type(screen.getByLabelText('Classification search'), 'repairs');
-    await user.selectOptions(screen.getByLabelText('Search mode'), 'exact');
+    await chooseControl(user, 'Search mode', 'Exact');
     expect(screen.queryByRole('button', { name: /load more/i })).not.toBeInTheDocument();
     expect(screen.queryByText('Northwind Books')).not.toBeInTheDocument();
     resolvePage({
@@ -294,7 +305,7 @@ describe('ClassificationMemoryPanel', () => {
     });
     const user = userEvent.setup();
     render(<ClassificationMemoryPanel companyId="company-1" initialQuery="Northwind" />);
-    await user.selectOptions(screen.getByLabelText('Search mode'), 'exact');
+    await chooseControl(user, 'Search mode', 'Exact');
     await user.click(screen.getByRole('button', { name: 'Search knowledge' }));
 
     expect(await screen.findByText('Northwind Books')).toBeInTheDocument();
