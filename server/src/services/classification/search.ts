@@ -2071,7 +2071,7 @@ function observationRecord(row: HistoricalObservationSearchRow): () => Classific
     const tags = actionTagNames(row.tagNames);
     if (calculation === null
       || !Array.isArray(row.tagNames)
-      || row.tagNames.length > 50
+      || row.tagNames.length > CLASSIFICATION_CONTRACT_LIMITS.tags
       || tags.length !== row.tagNames.length
       || (calculation === 'NotApplicable') !== (row.taxCodeName === null)
       || !Number.isSafeInteger(Number(row.amountCents))) {
