@@ -1194,6 +1194,27 @@ describe('tax-aware manual queue', () => {
     },
   );
 
+  it('keeps a POSTED RETRYABLE restore reachable and offers a new-request retry', async () => {
+    const priorRequestId = '00000000-0000-4000-8000-000000000599';
+    const nextRequestId = '00000000-0000-4000-8000-000000000600';
+    mocks.requestId.mockReset().mockReturnValue(nextRequestId);
+    await renderQueue({
+      ...transaction({ status: 'POSTED' }),
+      activeCategorizationAttempt: {
+        requestId: priorRequestId,
+        operation: 'restore',
+        status: 'RETRYABLE',
+      },
+    } as unknown as TransactionDto);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry undo' }));
+
+    expect(mocks.undoCategorization).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      nextRequestId,
+    );
+  });
+
   it.each([
     ['recategorize', 'PREPARED'],
     ['restore', 'PREPARED'],

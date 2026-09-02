@@ -217,7 +217,7 @@ companyTransactionsRouter.get(
               qboMutationAttempts: {
                 some: {
                   operation: 'restore',
-                  status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] },
+                  status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] },
                 },
               },
             },

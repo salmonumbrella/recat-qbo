@@ -337,6 +337,14 @@ describe('tax-aware categorization action routes', () => {
           status: 'PREPARED',
         }],
       },
+      {
+        ...providerRow('POSTED_RETRYABLE_RESTORE_TXN', 'WRITABLE', 'POSTED'),
+        qboMutationAttempts: [{
+          requestId: '00000000-0000-4000-8000-000000000099',
+          operation: 'restore',
+          status: 'RETRYABLE',
+        }],
+      },
     ]);
 
     const response = await request(testApp())
@@ -347,6 +355,7 @@ describe('tax-aware categorization action routes', () => {
     expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
       'UNKNOWN_TXN',
       'POSTED_RESTORE_TXN',
+      'POSTED_RETRYABLE_RESTORE_TXN',
       'WRITABLE_TXN',
     ]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -359,7 +368,7 @@ describe('tax-aware categorization action routes', () => {
             qboMutationAttempts: {
               some: {
                 operation: 'restore',
-                status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] },
+                status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] },
               },
             },
           },
@@ -493,6 +502,35 @@ describe('tax-aware categorization action routes', () => {
     },
   );
 
+  it('exposes a bounded RETRYABLE restore summary for a new-request retry', async () => {
+    const [dto] = await transactionDtos(
+      COMPANY_ID,
+      [{
+        ...transactionRow,
+        status: 'POSTED',
+        qboMutationAttempts: [{
+          requestId: REQUEST_ID,
+          operation: 'restore',
+          status: 'RETRYABLE',
+          requestHash: 'INTERNAL_HASH',
+          requestPayload: { internal: 'payload' },
+          beforeSnapshot: { internal: 'before' },
+          errorMessage: 'internal error detail',
+        }],
+      } as never],
+      new Map(),
+    );
+
+    expect(dto?.activeCategorizationAttempt).toEqual({
+      requestId: REQUEST_ID,
+      operation: 'restore',
+      status: 'RETRYABLE',
+    });
+    expect(JSON.stringify(dto?.activeCategorizationAttempt)).not.toMatch(
+      /hash|payload|snapshot|error|internal/i,
+    );
+  });
+
   it.each([
     ['malformed', 'not-a-request-id'],
     ['oversized', `00000000-0000-4000-8000-${'0'.repeat(200)}`],
@@ -531,7 +569,7 @@ describe('tax-aware categorization action routes', () => {
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
       include: expect.objectContaining({
         qboMutationAttempts: {
-          where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+          where: { status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] } },
           orderBy: { createdAt: 'desc' },
           take: 1,
           select: {

@@ -214,7 +214,7 @@ export interface CategorizationMutationResult {
 export interface ActiveCategorizationAttemptDto {
   requestId: string;
   operation: 'recategorize' | 'restore';
-  status: 'PREPARED' | 'COMMITTING' | 'UNCERTAIN';
+  status: 'PREPARED' | 'RETRYABLE' | 'COMMITTING' | 'UNCERTAIN';
 }
 
 export type QboDiagnosticCode =

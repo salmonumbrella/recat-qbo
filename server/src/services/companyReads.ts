@@ -636,11 +636,16 @@ function transactionDto(
     typeof attempt.requestId === 'string' &&
     UUID_PATTERN.test(attempt.requestId) &&
     (operation === 'recategorize' || operation === 'restore') &&
-    (attemptStatus === 'PREPARED' || attemptStatus === 'COMMITTING' || attemptStatus === 'UNCERTAIN')
+    (
+      attemptStatus === 'PREPARED'
+      || attemptStatus === 'RETRYABLE'
+      || attemptStatus === 'COMMITTING'
+      || attemptStatus === 'UNCERTAIN'
+    )
       ? {
           requestId: attempt.requestId,
           operation: operation as 'recategorize' | 'restore',
-          status: attemptStatus as 'PREPARED' | 'COMMITTING' | 'UNCERTAIN',
+          status: attemptStatus as 'PREPARED' | 'RETRYABLE' | 'COMMITTING' | 'UNCERTAIN',
         }
       : null;
   const posterId = typeof row.postedByUserId === 'string' ? row.postedByUserId : null;
@@ -710,7 +715,7 @@ export const transactionReadInclude = {
     orderBy: { idx: 'asc' },
   },
   qboMutationAttempts: {
-    where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+    where: { status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] } },
     orderBy: { createdAt: 'desc' },
     take: 1,
     select: { requestId: true, operation: true, status: true },

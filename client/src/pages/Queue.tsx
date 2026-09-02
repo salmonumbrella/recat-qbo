@@ -231,7 +231,11 @@ function initialTaxState(t: TransactionDto): TaxRowState {
           kind: t.activeCategorizationAttempt.operation === 'restore' ? 'undo' : 'commit',
           requestId: t.activeCategorizationAttempt.requestId,
           attemptStatus: t.activeCategorizationAttempt.status,
-          outcome: t.activeCategorizationAttempt.status === 'UNCERTAIN' ? 'UNCERTAIN' : 'IN_PROGRESS',
+          outcome: t.activeCategorizationAttempt.status === 'UNCERTAIN'
+            ? 'UNCERTAIN'
+            : t.activeCategorizationAttempt.status === 'RETRYABLE'
+              ? 'RETRYABLE'
+              : 'IN_PROGRESS',
           busy: false,
           phase: 'idle',
           resolution: 'known',
@@ -1231,7 +1235,9 @@ export default function Queue() {
                   outcome:
                     activeAttempt.status === 'UNCERTAIN'
                       ? 'UNCERTAIN'
-                      : 'IN_PROGRESS',
+                      : activeAttempt.status === 'RETRYABLE'
+                        ? 'RETRYABLE'
+                        : 'IN_PROGRESS',
                   busy: false,
                   phase: 'idle',
                   resolution: 'known',
@@ -2151,6 +2157,22 @@ export default function Queue() {
             </button>
           )}
         </>
+      );
+    }
+    if (mutation?.kind === 'undo' && mutation.outcome === 'RETRYABLE') {
+      return (
+        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 5, alignItems: 'center' }}>
+          <span style={{ color: 'var(--amT)', fontSize: 12 }}>Undo not sent</span>
+          <button
+            className="btn-ghost"
+            onClick={(event) => {
+              event.stopPropagation();
+              undoTax(v.t);
+            }}
+          >
+            Retry undo
+          </button>
+        </span>
       );
     }
     if (v.t.status === 'POSTED') {

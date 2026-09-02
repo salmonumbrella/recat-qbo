@@ -458,7 +458,7 @@ const transaction = z.strictObject({
   activeCategorizationAttempt: z.strictObject({
     requestId: id,
     operation: z.enum(['recategorize', 'restore']),
-    status: z.enum(['PREPARED', 'COMMITTING', 'UNCERTAIN']),
+    status: z.enum(['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN']),
   }).nullable(),
   providerActionability: z.strictObject({
     disposition: z.enum([
