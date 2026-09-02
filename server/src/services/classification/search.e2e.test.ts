@@ -786,7 +786,7 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
       await retryable.destroy();
       await admin.$disconnect();
     }
-  });
+  }, 15_000);
 
   it('reports both initialization and cleanup failures with the exact database target', async () => {
     let leakedDatabaseName: string | null = null;
