@@ -151,6 +151,7 @@ async function persistBlockedProviderOutcome(
   error: QboWriteSafetyError,
   after: string,
   checkedAt: Date,
+  before = txn.bankAccount,
 ): Promise<void> {
   await persistProviderActionability({
     id: txn.id,
@@ -172,7 +173,7 @@ async function persistBlockedProviderOutcome(
     payee: txn.payee,
     amount: Number(txn.amount),
     action: 'blocked',
-    before: txn.bankAccount,
+    before,
     after,
     payload: {
       error: { code: error.code },
@@ -778,8 +779,9 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
             actor,
             safetyRead,
             error,
-            `${holdingName} (re-queued)`,
+            'Blocked — re-queue refused',
             new Date(),
+            beforeLabel,
           );
         });
       }

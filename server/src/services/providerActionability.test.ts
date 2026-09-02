@@ -90,7 +90,7 @@ describe('provider actionability', () => {
     )).toBe(true);
   });
 
-  it('retains a same-binding provider lock after its writable TTL expires', () => {
+  it('retains terminal provider locks but expires a period-close lock with the TTL', () => {
     const now = new Date('2026-08-30T18:15:00.000Z');
     const stale = new Date('2026-08-30T17:59:59.000Z');
 
@@ -106,6 +106,12 @@ describe('provider actionability', () => {
       now,
       15 * 60 * 1000,
     )).toBe('BLOCKED_RECONCILED');
+    expect(effectiveProviderDisposition(
+      observation({ disposition: 'BLOCKED_PERIOD_CLOSED', checkedAt: stale }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('UNKNOWN');
     expect(effectiveProviderDisposition(
       observation({
         disposition: 'BLOCKED_CLEARED',

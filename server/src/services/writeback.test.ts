@@ -486,6 +486,8 @@ describe('undoPost', () => {
       expect(audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         txnId: 'txn-1',
         action: 'blocked',
+        before: 'Software subscriptions',
+        after: 'Blocked — re-queue refused',
         payload: expect.objectContaining({
           error: { code: 'QBO_TRANSACTION_LOCKED' },
         }),
