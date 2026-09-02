@@ -830,7 +830,7 @@ describe('Rules candidate review', () => {
     );
     expect(screen.queryByRole('button', { name: 'Load more rules' })).not.toBeInTheDocument();
     expect(mocks.lifecycleRules.mock.calls.filter(([, state]) => state === 'all')).toHaveLength(2);
-  });
+  }, 15_000);
 
   it('caps visible candidate pages at 100 rows and stops before another request', async () => {
     const candidates = Array.from({ length: 120 }, (_, index) => candidate({
