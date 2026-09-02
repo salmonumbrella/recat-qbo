@@ -721,7 +721,7 @@ describe('tax-aware manual queue', () => {
       5,
       '00000000-0000-4000-8000-000000000101',
     ));
-    expect(await screen.findByText(/posted.*verified/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
   });
 
   it('renders positive server preview totals as an explicit refund direction', async () => {
@@ -745,19 +745,34 @@ describe('tax-aware manual queue', () => {
     expect(screen.getByText('Total +$10.50')).toBeInTheDocument();
   });
 
-  it('confirms the staged QuickBooks totals before allocating a commit UUID', async () => {
+  it('treats clicking Post as confirmation and allocates the commit UUID immediately', async () => {
     vi.mocked(window.confirm).mockReturnValue(false);
     const user = userEvent.setup();
     await renderQueue();
     await user.click(screen.getByRole('button', { name: /preview tax/i }));
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
 
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(
-      /post.*quickbooks[\s\S]*subtotal −\$10\.00[\s\S]*tax −\$0\.50[\s\S]*total −\$10\.50/i,
+    expect(window.confirm).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.commit).toHaveBeenCalledWith(
+      'TRANSACTION_GENERIC',
+      5,
+      '00000000-0000-4000-8000-000000000101',
     ));
-    expect(mocks.commit).not.toHaveBeenCalled();
-    expect(mocks.requestId).not.toHaveBeenCalled();
   });
+
+  it.each(['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED'])(
+    'removes a transaction when the fresh provider check returns %s',
+    async (code) => {
+      mocks.commit.mockRejectedValue(new ApiError(409, 'QuickBooks locked this transaction.', code));
+      const user = userEvent.setup();
+      await renderQueue();
+      await user.click(screen.getByRole('button', { name: /preview tax/i }));
+      await user.click(await screen.findByRole('button', { name: /^post$/i }));
+
+      await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+      expect(mocks.toast).toHaveBeenCalledWith('QuickBooks locked this transaction.');
+    },
+  );
 
   it('confirms the exact-restore QuickBooks operation before allocating an undo UUID', async () => {
     vi.mocked(window.confirm).mockReturnValue(false);
@@ -1241,7 +1256,6 @@ describe('tax-aware manual queue', () => {
           'TRANSACTION_GENERIC',
           requestId,
         );
-        expect(await screen.findByText(/reverted/i)).toBeInTheDocument();
       } else {
         expect(resumedEndpoint).toHaveBeenNthCalledWith(
           2,
@@ -1249,8 +1263,8 @@ describe('tax-aware manual queue', () => {
           4,
           requestId,
         );
-        expect(await screen.findByText(/posted.*verified/i)).toBeInTheDocument();
       }
+      await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
       expect(mocks.reconcile).not.toHaveBeenCalled();
       expect(mocks.requestId).not.toHaveBeenCalled();
     },
@@ -1332,9 +1346,7 @@ describe('tax-aware manual queue', () => {
         expect(await screen.findByText(/verify in quickbooks/i)).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /^reconcile$/i })).toBeEnabled();
       } else if (operation === 'restore') {
-        expect(await screen.findByText(/posted.*verified/i)).toBeInTheDocument();
-        expect(screen.getByRole('button', { name: /^undo$/i })).toBeEnabled();
-        expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
+        await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
       } else {
         expect(await screen.findByText(/not posted.*restage to retry/i)).toBeInTheDocument();
         expect(screen.queryByRole('button', { name: /^reconcile$/i })).not.toBeInTheDocument();
@@ -1556,7 +1568,7 @@ describe('tax-aware manual queue', () => {
     },
   );
 
-  it('labels a reconciled outcome as verified and uses a new ID for undo', async () => {
+  it('removes a reconciled verified post from the queue', async () => {
     mocks.commit.mockResolvedValue(mutation({
       ok: false,
       status: 'ERROR',
@@ -1568,13 +1580,8 @@ describe('tax-aware manual queue', () => {
     await user.click(await screen.findByRole('button', { name: /^post$/i }));
     await user.click(await screen.findByRole('button', { name: /reconcile/i }));
 
-    expect(await screen.findByText(/verified in quickbooks/i)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: /undo/i }));
-    await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalledWith(
-      'TRANSACTION_GENERIC',
-      '00000000-0000-4000-8000-000000000202',
-    ));
-    expect(await screen.findByText(/reverted/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
   });
 
   it('preserves the legacy category, tag, and post flow when tax is disabled', async () => {
@@ -1599,6 +1606,7 @@ describe('tax-aware manual queue', () => {
     expect(screen.queryByRole('button', { name: /preview tax/i })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /^post$/i }));
     await waitFor(() => expect(mocks.legacyPost).toHaveBeenCalledWith('TRANSACTION_GENERIC'));
+    await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
     expect(mocks.stage).not.toHaveBeenCalled();
   });
 
@@ -1618,7 +1626,7 @@ describe('tax-aware manual queue', () => {
     );
   });
 
-  it('runs a sales-ready Deposit through the tax lifecycle with positive cents and Deposit undo copy', async () => {
+  it('runs a sales-ready Deposit through the tax lifecycle and removes it after verification', async () => {
     mocks.taxReadiness = SALES_READY;
     mocks.commit.mockResolvedValue(mutation({
       ok: false,
@@ -1650,9 +1658,8 @@ describe('tax-aware manual queue', () => {
       'TRANSACTION_GENERIC',
       '00000000-0000-4000-8000-000000000101',
     ));
-    await user.click(screen.getByRole('button', { name: /^undo$/i }));
-    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringMatching(/original deposit/i));
-    await waitFor(() => expect(mocks.undoCategorization).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText('Generic customer receipt')).not.toBeInTheDocument());
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
   });
 
   it('keeps a sales-not-ready Deposit on the legacy workflow and leaves JournalEntry without tax controls', async () => {
@@ -1971,7 +1978,7 @@ describe('single interactive queue', () => {
     expect(mocks.refreshCompanies).not.toHaveBeenCalled();
   });
 
-  it('shows and counts every pending transaction without actionability tabs', async () => {
+  it('shows only eligible pending work without reintroducing actionability tabs', async () => {
     await renderQueue([
       providerRow('TXN_WRITABLE', 'Writable supplier', 'WRITABLE'),
       providerRow('TXN_UNKNOWN', 'Unknown supplier', undefined),
@@ -1979,30 +1986,29 @@ describe('single interactive queue', () => {
       providerRow('TXN_RECONCILED', 'Reconciled supplier', 'BLOCKED_RECONCILED'),
       providerRow('TXN_CLOSED', 'Closed supplier', 'BLOCKED_PERIOD_CLOSED'),
       providerRow('TXN_UNAVAILABLE', 'Unavailable supplier', 'UNAVAILABLE'),
-      providerRow('TXN_POSTED', 'Posted writable supplier', 'WRITABLE', undefined, { status: 'POSTED' }),
     ]);
 
     for (const payee of [
       'Writable supplier',
       'Unknown supplier',
-      'Cleared supplier',
-      'Reconciled supplier',
-      'Closed supplier',
       'Unavailable supplier',
-      'Posted writable supplier',
     ]) {
       expect(screen.getByText(payee)).toBeInTheDocument();
     }
+    for (const payee of [
+      'Cleared supplier',
+      'Reconciled supplier',
+      'Closed supplier',
+    ]) {
+      expect(screen.queryByText(payee)).not.toBeInTheDocument();
+    }
     expect(screen.queryByRole('tablist', { name: 'Transaction queue views' })).not.toBeInTheDocument();
     expect(screen.queryByText(/Needs safety check|Blocked in QuickBooks/i)).not.toBeInTheDocument();
-    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(6);
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(3);
   });
 
   it.each([
     ['unknown', undefined],
-    ['cleared', 'BLOCKED_CLEARED'],
-    ['reconciled', 'BLOCKED_RECONCILED'],
-    ['closed period', 'BLOCKED_PERIOD_CLOSED'],
     ['unavailable', 'UNAVAILABLE'],
   ])('keeps a %s observation interactive for local review and tax staging', async (_label, disposition) => {
     const user = userEvent.setup();
@@ -2019,5 +2025,24 @@ describe('single interactive queue', () => {
       'TXN_REVIEW',
       expect.objectContaining({ expectedRevision: 4 }),
     ));
+  });
+
+  it.each([
+    ['cleared', 'BLOCKED_CLEARED'],
+    ['reconciled', 'BLOCKED_RECONCILED'],
+    ['closed period', 'BLOCKED_PERIOD_CLOSED'],
+  ])('keeps a provider-%s transaction out of the interactive queue', async (_label, disposition) => {
+    mocks.list.mockResolvedValue({
+      transactions: [providerRow('TXN_REVIEW', 'Review supplier', disposition)],
+      nextCursor: null,
+      pendingCount: 0,
+    });
+
+    render(<Queue />);
+
+    await waitFor(() => expect(mocks.list).toHaveBeenCalled());
+    expect(screen.queryByText('Review supplier')).not.toBeInTheDocument();
+    expect(mocks.stage).not.toHaveBeenCalled();
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(0);
   });
 });

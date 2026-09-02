@@ -575,6 +575,7 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   },
   REQUEST_ID_CONFLICT: { status: 409, message: 'This request ID belongs to a different mutation.' },
   STALE_REVISION: { status: 409, message: 'The transaction changed. Reload before continuing.' },
+  SUPERSEDED: { status: 409, message: 'This transaction was already categorized in QuickBooks.' },
   TAX_AMOUNT_INVALID: { status: 400, message: 'The tax amount cannot be calculated safely.' },
   TAX_AMOUNT_SIGN_MISMATCH: { status: 400, message: 'Categorization lines do not match the transaction direction.' },
   TAX_AWARE_STAGING_REQUIRED: {

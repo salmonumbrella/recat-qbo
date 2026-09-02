@@ -199,7 +199,7 @@ describe('Queue shared controls', () => {
     expect(otherRow).toHaveStyle({ background: 'transparent' });
   });
 
-  it('keeps a posted split row inert', async () => {
+  it('keeps an explicitly loaded posted split row inert', async () => {
     const user = userEvent.setup();
     mocks.list.mockResolvedValue({
       transactions: [transaction({
@@ -223,7 +223,6 @@ describe('Queue shared controls', () => {
     const splitTrigger = screen.getByRole('button', { name: 'Split · 1 categories' });
     expect(splitTrigger).toBeDisabled();
     await user.click(splitTrigger);
-
     expect(screen.queryByText('Split transaction')).not.toBeInTheDocument();
     expect(mocks.categorize).not.toHaveBeenCalled();
   });

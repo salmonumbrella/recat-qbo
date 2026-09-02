@@ -63,6 +63,25 @@ const STATE_OF: Partial<Record<TxnStatus, UiState>> = {
   REVERTED: 'reverted',
 };
 
+const PROVIDER_BLOCKED = new Set([
+  'BLOCKED_CLEARED',
+  'BLOCKED_RECONCILED',
+  'BLOCKED_PERIOD_CLOSED',
+]);
+
+function belongsInQueue(transaction: TransactionDto): boolean {
+  if (
+    transaction.status !== 'PENDING'
+    && transaction.status !== 'ERROR'
+    && transaction.status !== 'POSTING'
+  ) return false;
+  return !PROVIDER_BLOCKED.has(transaction.providerActionability?.disposition ?? 'UNKNOWN');
+}
+
+function providerAllowsQueueDisplay(transaction: TransactionDto): boolean {
+  return !PROVIDER_BLOCKED.has(transaction.providerActionability?.disposition ?? 'UNKNOWN');
+}
+
 /** Search words per state — prototype's statusWords map. */
 const STATUS_WORDS: Record<UiState, string> = {
   pending: 'pending',
@@ -386,7 +405,7 @@ export default function Queue() {
       all.push(...res.transactions);
       cursor = res.nextCursor ?? undefined;
     } while (cursor);
-    return all;
+    return all.filter(providerAllowsQueueDisplay);
   }, []);
 
   useEffect(() => {
@@ -415,11 +434,25 @@ export default function Queue() {
 
   // ---- row helpers ----
   const updateRow = useCallback((dto: TransactionDto) => {
-    setRows((prev) => prev.map((r) => (r.id === dto.id ? dto : r)));
+    setRows((prev) => prev
+      .map((r) => (r.id === dto.id ? dto : r))
+      .filter(belongsInQueue));
   }, []);
 
   const patchRow = useCallback((id: string, patch: Partial<TransactionDto>) => {
-    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    setRows((prev) => prev
+      .map((r) => (r.id === id ? { ...r, ...patch } : r))
+      .filter(belongsInQueue));
+  }, []);
+
+  const removeRow = useCallback((id: string) => {
+    setRows((prev) => prev.filter((row) => row.id !== id));
+    setSel((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   }, []);
 
   const stateOf = (t: TransactionDto): UiState => STATE_OF[t.status] ?? 'pending';
@@ -520,6 +553,7 @@ export default function Queue() {
   const vis = useMemo(() => {
     const q = search.toLowerCase();
     const list = rows.filter((t) => {
+      if (!providerAllowsQueueDisplay(t)) return false;
       const state = STATE_OF[t.status];
       if (!state) return false; // SUPERSEDED rows never render
       if (acct !== 'all' && t.bankAccount !== acct) return false;
@@ -935,6 +969,16 @@ export default function Queue() {
         return;
       }
       if (error instanceof ApiError && error.code !== undefined) {
+        if (
+          error.code === 'QBO_TRANSACTION_LOCKED'
+          || error.code === 'QBO_PERIOD_CLOSED'
+          || error.code === 'SUPERSEDED'
+        ) {
+          removeRow(t.id);
+          updateTaxState(t, (state) => ({ ...state, mutation: null }));
+          toast(error.message);
+          return;
+        }
         patchRow(t.id, { status: t.status, error: t.error });
         updateTaxState(t, (state) => ({ ...state, mutation: null }));
         toast(error.message);
@@ -953,7 +997,7 @@ export default function Queue() {
         false,
       );
     },
-    [patchRow, updateTaxState, recordTaxMutation, toast],
+    [patchRow, removeRow, updateTaxState, recordTaxMutation, toast],
   );
 
   const commitTax = useCallback(
@@ -966,15 +1010,6 @@ export default function Queue() {
         current.stagedVersion !== current.version ||
         current.staging
       ) return;
-      const totals = current.staged.totals;
-      if (!window.confirm(
-        [
-          'Post this categorization to QuickBooks?',
-          `Subtotal ${centsLabel(totals.subtotalCents)}`,
-          `Tax ${centsLabel(totals.taxCents)}`,
-          `Total ${centsLabel(totals.totalCents)}`,
-        ].join('\n'),
-      )) return;
       const requestId = createCategorizationRequestId();
       const mutation: TaxMutationState = {
         kind: 'commit',
@@ -1274,6 +1309,18 @@ export default function Queue() {
         })
         .catch((e) => {
           if (!aliveRef.current) return;
+          if (
+            e instanceof ApiError
+            && (
+              e.code === 'QBO_TRANSACTION_LOCKED'
+              || e.code === 'QBO_PERIOD_CLOSED'
+              || e.code === 'SUPERSEDED'
+            )
+          ) {
+            removeRow(id);
+            toast(e.message);
+            return;
+          }
           patchRow(id, { status: 'PENDING' });
           toast(errText(e));
         });
@@ -1287,6 +1334,7 @@ export default function Queue() {
       tagsRequired,
       patchRow,
       updateRow,
+      removeRow,
       toast,
     ],
   );
