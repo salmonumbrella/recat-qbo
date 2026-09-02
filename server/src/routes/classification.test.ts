@@ -7,6 +7,7 @@ import { errorMiddleware, HttpError } from '../lib/http.js';
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(),
   search: vi.fn(), caseDetail: vi.fn(), currentCase: vi.fn(),
+  pastDecisions: vi.fn(), observation: vi.fn(),
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: {
@@ -17,6 +18,8 @@ vi.mock('../services/companyReads.js', () => ({
   searchClassificationKnowledge: mocks.search,
   getClassificationCase: mocks.caseDetail,
   getCurrentClassificationCase: mocks.currentCase,
+  listPastDecisions: mocks.pastDecisions,
+  getHistoricalObservation: mocks.observation,
 }));
 
 import { classificationRouter } from './classification.js';
@@ -39,6 +42,8 @@ beforeEach(() => {
   mocks.search.mockResolvedValue({ items: [], nextCursor: null, status: 'no_match' });
   mocks.caseDetail.mockResolvedValue({ id: 'case-a' });
   mocks.currentCase.mockResolvedValue({ id: 'case-current' });
+  mocks.pastDecisions.mockResolvedValue({ items: [], nextCursor: null });
+  mocks.observation.mockResolvedValue({ id: 'observation-a' });
 });
 
 describe('session classification reads', () => {
@@ -79,5 +84,33 @@ describe('session classification reads', () => {
     expect(current.status).toBe(200);
     expect(mocks.caseDetail).toHaveBeenCalledWith('user-a', 'company-a', 'case-a');
     expect(mocks.currentCase).toHaveBeenCalledWith('user-a', 'company-a', 'txn-a');
+  });
+
+  it('reads a bounded decision page and observation only after the viewer fence', async () => {
+    const page = await request(app())
+      .get('/api/companies/company-a/classification/past-decisions')
+      .query({ kind: 'all', limit: 20, cursor: 'signed-cursor' })
+      .set('Cookie', 'recat_session=test');
+    const detail = await request(app())
+      .get('/api/companies/company-a/classification/observations/observation-a')
+      .set('Cookie', 'recat_session=test');
+
+    expect(page.status).toBe(200);
+    expect(detail.status).toBe(200);
+    expect(mocks.pastDecisions).toHaveBeenCalledWith('user-a', 'company-a', {
+      kind: 'all', limit: 20, cursor: 'signed-cursor',
+    });
+    expect(mocks.observation).toHaveBeenCalledWith('user-a', 'company-a', 'observation-a');
+  });
+
+  it('rejects invalid decision query input and has no observation mutation surface', async () => {
+    await request(app()).get('/api/companies/company-a/classification/past-decisions')
+      .query({ kind: 'candidate' }).set('Cookie', 'recat_session=test').expect(400);
+    await request(app()).get('/api/companies/company-a/classification/past-decisions')
+      .query({ limit: 101 }).set('Cookie', 'recat_session=test').expect(400);
+    for (const method of ['post', 'patch', 'put', 'delete'] as const) {
+      await request(app())[method]('/api/companies/company-a/classification/observations/observation-a')
+        .set('Cookie', 'recat_session=test').send({}).expect(404);
+    }
   });
 });
