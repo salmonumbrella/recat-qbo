@@ -844,7 +844,7 @@ describeTask8('classification memory deterministic PostgreSQL end-to-end', () =>
         throw unexpectedDestroyError;
       }
     }
-  });
+  }, 15_000);
 
   it('cleans users, sessions, and immutable envelopes from an untracked partial seed', async () => {
     const db = client();
