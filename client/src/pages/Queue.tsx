@@ -601,7 +601,7 @@ export default function Queue() {
   const doOpenSplit = useCallback(
     (id: string) => {
       const row = rows.find((candidate) => candidate.id === id);
-      if (!row || !canMutate(row)) return;
+      if (!row || row.status !== 'PENDING' || !canMutate(row)) return;
       openSplit();
       setSplitEditId(id);
     },
@@ -641,12 +641,15 @@ export default function Queue() {
   );
 
   const rowCategoryOptions = useCallback(
-    (t: TransactionDto) => catAccounts.map((account) => ({
-      value: account.qboId,
-      group: account.classification,
-      name: account.name,
-      sug: t.suggestion?.category === account.name,
-    })),
+    (t: TransactionDto) => {
+      const options = catAccounts.map((account) => ({
+        value: account.qboId,
+        group: account.classification,
+        name: account.name,
+        sug: t.suggestion?.category === account.name,
+      }));
+      return [...options.filter((option) => option.sug), ...options.filter((option) => !option.sug)];
+    },
     [catAccounts],
   );
 
@@ -1745,7 +1748,7 @@ export default function Queue() {
           event.stopPropagation();
           doOpenSplit(v.t.id);
         }}
-        disabled={hasActiveMutation(v.t)}
+        disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
         className="hov-brd"
       >
         {v.pickLabel}

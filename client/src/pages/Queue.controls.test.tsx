@@ -183,4 +183,60 @@ describe('Queue shared controls', () => {
     expect(genericRow).toHaveStyle({ background: 'var(--hl)' });
     expect(otherRow).toHaveStyle({ background: 'transparent' });
   });
+
+  it('keeps a posted split row inert', async () => {
+    const user = userEvent.setup();
+    mocks.list.mockResolvedValue({
+      transactions: [transaction({
+        status: 'POSTED',
+        category: null,
+        categoryQboId: null,
+        splits: [{
+          amount: -10.5,
+          category: 'Generic expense',
+          categoryQboId: 'EXPENSE_GENERIC',
+          taxCode: null,
+          taxCodeQboId: null,
+          tagIds: [],
+        }],
+      })],
+      nextCursor: null,
+      pendingCount: 0,
+    });
+    await renderQueue();
+
+    const splitTrigger = screen.getByRole('button', { name: 'Split · 1 categories' });
+    expect(splitTrigger).toBeDisabled();
+    await user.click(splitTrigger);
+
+    expect(screen.queryByText('Split transaction')).not.toBeInTheDocument();
+    expect(mocks.categorize).not.toHaveBeenCalled();
+  });
+
+  it('selects an unselected row suggestion first with Enter', async () => {
+    const user = userEvent.setup();
+    mocks.list.mockResolvedValue({
+      transactions: [transaction({
+        category: null,
+        categoryQboId: null,
+        suggestion: {
+          category: 'Office expense',
+          categoryQboId: 'EXPENSE_OFFICE',
+          source: 'history',
+        },
+      })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+    mocks.categorize.mockImplementation(async (_id: string, request: { category: string; categoryQboId: string | null }) =>
+      transaction({ category: request.category, categoryQboId: request.categoryQboId }),
+    );
+    await renderQueue();
+
+    const category = screen.getByRole('combobox', { name: 'Category for Generic supplier' });
+    await user.click(category);
+    await user.keyboard('{Enter}');
+
+    expect(category).toHaveTextContent('Expenses · Office expense');
+  });
 });
