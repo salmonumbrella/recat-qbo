@@ -236,6 +236,30 @@ function isVerifiedCategorizationPayload(payload: unknown): boolean {
     && (references as Record<string, unknown>).operation === 'recategorize';
 }
 
+function auditUndoCandidateKind(
+  entry: AuditEntryDto,
+  txn: Pick<AuditUndoTransactionState, 'status' | 'postedAt'> | undefined,
+  latest: LatestUndoableAuditState | undefined,
+  now: Date,
+): 'categorization' | 'legacy' | null {
+  const postedAt = txn?.postedAt?.getTime();
+  const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
+  const postedWrite = txn?.status === 'POSTED'
+    && (entry.action === 'posted' || entry.action === 'auto-posted');
+  const dryRun = txn?.status === 'DRY_RUN' && entry.action === 'dry-run';
+  if (
+    (!postedWrite && !dryRun)
+    || latest?.id !== entry.id
+    || elapsed < 0
+    || elapsed > AUDIT_UNDO_WINDOW_MS
+  ) {
+    return null;
+  }
+  return postedWrite && isVerifiedCategorizationPayload(latest.payload)
+    ? 'categorization'
+    : 'legacy';
+}
+
 export function auditPageNeedsSalesTaxCodes(
   entries: AuditEntryDto[],
   transactions: AuditTaxCodeCandidateState[],
@@ -254,15 +278,9 @@ export function auditPageNeedsSalesTaxCodes(
     if (transactionId === undefined) return false;
     const txn = transactionById.get(transactionId);
     const latest = latestByTransactionId.get(transactionId);
-    const postedAt = txn?.postedAt?.getTime();
-    const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
     return txn?.qboType === 'Deposit'
       && txn.status === 'POSTED'
-      && (entry.action === 'posted' || entry.action === 'auto-posted')
-      && latest?.id === entry.id
-      && !isVerifiedCategorizationPayload(latest.payload)
-      && elapsed >= 0
-      && elapsed <= AUDIT_UNDO_WINDOW_MS;
+      && auditUndoCandidateKind(entry, txn, latest, now) === 'legacy';
   });
 }
 
@@ -285,30 +303,14 @@ export function decorateAuditEntriesWithUndo(
     const withTransaction = { ...entry, transactionId };
     const txn = transactionById.get(transactionId);
     const latest = latestByTransactionId.get(transactionId);
-    const postedAt = txn?.postedAt?.getTime();
-    const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
-    const postedWrite = txn?.status === 'POSTED'
-      && (entry.action === 'posted' || entry.action === 'auto-posted');
-    const dryRun = txn?.status === 'DRY_RUN' && entry.action === 'dry-run';
-    if (
-      (!postedWrite && !dryRun)
-      || latest?.id !== entry.id
-      || elapsed < 0
-      || elapsed > AUDIT_UNDO_WINDOW_MS
-    ) {
-      return withTransaction;
-    }
-    const durableCategorization = postedWrite && isVerifiedCategorizationPayload(latest.payload);
-    if (postedWrite && !durableCategorization && txn.legacyUndoAllowed !== true) {
+    const kind = auditUndoCandidateKind(entry, txn, latest, now);
+    if (kind === null) return withTransaction;
+    if (txn?.status === 'POSTED' && kind === 'legacy' && txn.legacyUndoAllowed !== true) {
       return withTransaction;
     }
     return {
       ...withTransaction,
-      undo: {
-        kind: durableCategorization
-          ? 'categorization'
-          : 'legacy',
-      },
+      undo: { kind },
     };
   });
 }

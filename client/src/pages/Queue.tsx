@@ -8,6 +8,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
+  AUDIT_UNDO_WINDOW_MS,
   isQboHoldingAccountName,
   type ActiveCategorizationAttemptDto,
   type CategorizationMutationOutcome,
@@ -143,13 +144,10 @@ function relTime(iso: string | null | undefined): string {
   return d === 1 ? '1 day ago' : `${d} days ago`;
 }
 
-/** Undo is server-rejected past 30 days — hide the button rather than error. */
-const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-
 /** Null postedAt (e.g. dry-run rows) stays undoable — let the server decide. */
 function canUndoPosted(postedAt: string | null | undefined): boolean {
   if (!postedAt) return true;
-  return Date.now() - new Date(postedAt).getTime() <= UNDO_WINDOW_MS;
+  return Date.now() - new Date(postedAt).getTime() <= AUDIT_UNDO_WINDOW_MS;
 }
 
 export function similarDecisionsQuery(
