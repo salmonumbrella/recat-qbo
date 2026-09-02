@@ -241,9 +241,11 @@ export default function Queue() {
   const [attachmentOpenId, setAttachmentOpenId] = useState<string | null>(null);
   const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({});
   const [taxRows, setTaxRows] = useState<Record<string, TaxRowState>>({});
+  const [syncingCompanyId, setSyncingCompanyId] = useState<string | null>(null);
   const taxVersionsRef = useRef<Record<string, number>>({});
   const stageRequestSequenceRef = useRef(0);
   const stageRequestTokensRef = useRef<Record<string, number>>({});
+  const syncingCompanyIdsRef = useRef(new Set<string>());
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia('(max-width: 640px)').matches,
   );
@@ -253,6 +255,7 @@ export default function Queue() {
     setAttachmentOpenId(null);
     setAttachmentCounts({});
     setRecurringPrompt(null);
+    setSyncingCompanyId((current) => current === activeCompanyId ? current : null);
   }, [activeCompanyId]);
 
   const taxState = useCallback(
@@ -1372,20 +1375,48 @@ export default function Queue() {
   );
 
   const syncNow = useCallback(async () => {
-    if (!activeCompanyId) return;
+    const companyId = activeCompanyId;
+    const companyName = activeCompany?.nickname ?? 'selected company';
+    if (!companyId || syncingCompanyIdsRef.current.has(companyId)) return;
+
+    syncingCompanyIdsRef.current.add(companyId);
+    setSyncingCompanyId(companyId);
+    const stillCurrent = () => (
+      aliveRef.current && activeCompanyIdRef.current === companyId
+    );
+
     try {
-      const res = (await companiesApi.sync(activeCompanyId)) as unknown as
-        | { message?: string }
-        | undefined;
-      const fresh = await fetchAllTxns(activeCompanyId);
-      if (!aliveRef.current) return;
+      const result = await companiesApi.sync(companyId);
+      if (!stillCurrent()) return;
+      if (!result.ok) {
+        toast(`Sync failed for ${companyName} — ${result.message}`);
+        return;
+      }
+
+      let fresh: TransactionDto[];
+      try {
+        fresh = await fetchAllTxns(companyId);
+      } catch (error) {
+        if (stillCurrent()) {
+          toast(`Synced ${companyName}, but Queue refresh failed — ${errText(error)}`);
+        }
+        return;
+      }
+      if (!stillCurrent()) return;
       setRows(fresh);
-      refreshCompanies().catch(() => {});
-      toast(res && typeof res.message === 'string' ? res.message : 'Synced — no new transactions');
-    } catch (e) {
-      toast(errText(e));
+      void refreshCompanies().catch(() => {});
+      toast(`Synced ${companyName} — ${result.message}`);
+    } catch (error) {
+      if (stillCurrent()) toast(`Sync failed for ${companyName} — ${errText(error)}`);
+    } finally {
+      syncingCompanyIdsRef.current.delete(companyId);
+      if (stillCurrent()) {
+        setSyncingCompanyId((current) => current === companyId ? null : current);
+      }
     }
-  }, [activeCompanyId, fetchAllTxns, refreshCompanies, toast]);
+  }, [activeCompany, activeCompanyId, fetchAllTxns, refreshCompanies, toast]);
+
+  const isSyncingActiveCompany = syncingCompanyId !== null && syncingCompanyId === activeCompanyId;
 
   const bulkPost = useCallback(async () => {
     if (!activeCompanyId) return;
@@ -2260,8 +2291,14 @@ export default function Queue() {
               </option>
             ))}
           </select>
-          <button className="btn-ghost" onClick={syncNow}>
-            ↻ Sync now
+          <button
+            className="btn-ghost"
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={isSyncingActiveCompany}
+            aria-busy={isSyncingActiveCompany}
+          >
+            {isSyncingActiveCompany ? <><Spinner size={11} /> Syncing…</> : '↻ Sync now'}
           </button>
         </div>
       </div>

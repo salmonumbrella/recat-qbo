@@ -13,6 +13,26 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it('returns the body that distinguishes a failed manual sync from an HTTP failure', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    ok: false,
+    message: 'QuickBooks connection timed out.',
+    lastSyncedAt: '2026-09-01T17:00:00.000Z',
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+
+  const result: {
+    ok: boolean;
+    message: string;
+    lastSyncedAt: string | null;
+  } = await companies.sync('company-1');
+
+  expect(result).toEqual({
+    ok: false,
+    message: 'QuickBooks connection timed out.',
+    lastSyncedAt: '2026-09-01T17:00:00.000Z',
+  });
+});
+
 it('keeps safe request reference but ignores provider fields', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
     error: 'QuickBooks could not provide this report right now.',
