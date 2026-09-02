@@ -766,6 +766,28 @@ describe('tax-aware categorization action routes', () => {
     expect(mocks.transactionUpdate).not.toHaveBeenCalled();
   });
 
+  it('does not return success when a legacy undo result is unverified', async () => {
+    mocks.undoPost.mockResolvedValue({
+      id: TRANSACTION_ID,
+      ok: false,
+      status: 'ERROR',
+      error: {
+        code: 'DB_COMMIT_FAILED',
+        message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/undo`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+      code: 'DB_COMMIT_FAILED',
+    });
+  });
+
   it.each(['categorizer', 'admin'] as const)(
     'lets a %s stage and passes the normalized proposal unchanged',
     async (allowedRole) => {

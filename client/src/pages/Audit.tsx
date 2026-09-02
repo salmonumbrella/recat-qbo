@@ -121,10 +121,23 @@ export default function Audit() {
     const request = entry.undo.kind === 'categorization'
       ? txnApi.undoCategorization(entry.transactionId, createCategorizationRequestId())
       : txnApi.undo(entry.transactionId);
-    request
-      .then(() => {
+    Promise.resolve(request)
+      .then((result) => {
         notifyQboMutation();
-        toast(isDryRun ? 'Dry run moved back to the queue.' : 'Reverted in QuickBooks.');
+        const durable = 'outcome' in result;
+        const completed = result.status === 'PENDING'
+          && (!durable || (result.ok && result.outcome === 'VERIFIED'));
+        if (completed) {
+          toast(isDryRun ? 'Dry run moved back to the queue.' : 'Reverted in QuickBooks.');
+        } else if (durable && result.outcome === 'IN_PROGRESS') {
+          toast('Undo is still in progress. Check Audit again before retrying.');
+        } else if (durable && result.outcome === 'UNCHANGED') {
+          toast('QuickBooks was unchanged; nothing was reverted.');
+        } else {
+          toast(durable
+            ? result.error?.message ?? 'The QuickBooks undo could not be verified.'
+            : 'The QuickBooks undo could not be verified.');
+        }
       })
       .catch((error: Error) => {
         // Safety failures are themselves append-only audit outcomes.

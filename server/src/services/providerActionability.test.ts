@@ -114,6 +114,15 @@ describe('provider actionability', () => {
     )).toBe('UNKNOWN');
     expect(effectiveProviderDisposition(
       observation({
+        disposition: 'BLOCKED_RECONCILED',
+        checkedAt: new Date('2026-08-28T18:14:59.999Z'),
+      }),
+      TXN,
+      now,
+      15 * 60 * 1000,
+    )).toBe('UNKNOWN');
+    expect(effectiveProviderDisposition(
+      observation({
         disposition: 'BLOCKED_CLEARED',
         checkedAt: stale,
         qboSyncToken: 'different-binding',

@@ -6,6 +6,10 @@ import { prisma } from '../lib/prisma.js';
  * transaction SyncToken changing.  The cache only guides reads; it never
  * grants QBO write authority. */
 export const PROVIDER_ACTIONABILITY_TTL_MS = 15 * 60 * 1000;
+/** Provider locks are observations, not permanent transaction state. Keep them
+ * longer than writable evidence to avoid hammering QBO, but eventually force a
+ * fresh check in case a user clears the reconciliation in QuickBooks. */
+export const PROVIDER_BLOCKED_ACTIONABILITY_TTL_MS = 48 * 60 * 60 * 1000;
 
 export const PROVIDER_ACTIONABILITY_DISPOSITIONS: readonly ProviderActionabilityDisposition[] = [
   'UNKNOWN',
@@ -171,9 +175,10 @@ export function isFreshProviderActionability(
 
 /** Resolve a row for selection. Missing, malformed, or mismatched observations
  * fail closed as UNKNOWN. WRITABLE evidence expires because it must never
- * authorize a later write. Same-binding cleared/reconciled locks remain locked
- * until new provider evidence or a changed transaction binding invalidates
- * them. Period-close evidence expires because the company can reopen its books. */
+ * authorize a later write. Same-binding cleared/reconciled locks use a longer
+ * bounded TTL because QBO can change that bank-feed state without changing the
+ * transaction SyncToken. Period-close evidence expires because the company can
+ * reopen its books. */
 export function effectiveProviderDisposition(
   row: ProviderActionabilityObservation | null | undefined,
   txn: ActionabilityTransactionIdentity,
@@ -186,7 +191,14 @@ export function effectiveProviderDisposition(
   if (
     row.disposition === 'BLOCKED_CLEARED'
     || row.disposition === 'BLOCKED_RECONCILED'
-  ) return row.disposition;
+  ) {
+    return isFreshProviderActionability(
+      row,
+      txn,
+      now,
+      PROVIDER_BLOCKED_ACTIONABILITY_TTL_MS,
+    ) ? row.disposition : 'UNKNOWN';
+  }
   return isFreshProviderActionability(row, txn, now, ttlMs) ? row.disposition : 'UNKNOWN';
 }
 

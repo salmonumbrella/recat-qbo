@@ -444,6 +444,34 @@ describe('legacy write safety', () => {
     );
   });
 
+  it('returns the original provider lock when blocked-outcome persistence fails', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: null,
+        cleared: true,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.$transaction.mockRejectedValueOnce(new Error('temporary database failure'));
+
+    const result = await postTransaction(
+      'txn-1',
+      { id: 'u-1', label: 'Generic User' },
+      {},
+      deps,
+    );
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      status: 'PENDING',
+      error: { code: 'QBO_TRANSACTION_LOCKED' },
+    });
+  });
+
   it('rechecks safety after a SyncToken conflict before retrying', async () => {
     const row = makeTxnRow();
     const recategorize = vi.fn().mockRejectedValueOnce(new QboSyncTokenConflict());

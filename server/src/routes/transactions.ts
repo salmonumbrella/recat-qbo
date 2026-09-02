@@ -564,6 +564,10 @@ const SAFE_SERVICE_ERRORS: Record<string, { status: number; message: string }> =
   ATTEMPT_CORRUPT: { status: 500, message: 'Mutation state could not be verified.' },
   ATTEMPT_NOT_FOUND: { status: 404, message: 'Mutation attempt not found.' },
   COMPANY_DISCONNECTED: { status: 409, message: 'This company is disconnected from QuickBooks.' },
+  DB_COMMIT_FAILED: {
+    status: 409,
+    message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
+  },
   ENTITY_BUSY: { status: 409, message: 'Another write is already in progress.' },
   FORBIDDEN: { status: 403, message: 'You do not have permission to do that.' },
   INVALID_ACCOUNT: { status: 400, message: 'One or more category accounts are unavailable for this company.' },
@@ -1023,12 +1027,18 @@ transactionActionsRouter.post(
     const user = requestUser(req);
     const txn = await loadTxn(id);
     await assertCategorizerFor(user, txn.companyId);
+    let result;
     try {
-      await undoPost(id, actorFor(user));
+      result = await undoPost(id, actorFor(user));
     } catch (err) {
       const mapped = mappedServiceHttpError(err);
       if (mapped) throw mapped;
       throw new HttpError(400, err instanceof Error ? err.message : String(err), 'UNDO_FAILED');
+    }
+    if (!result.ok) {
+      const mapped = mappedServiceHttpError(result.error);
+      if (mapped) throw mapped;
+      throw new HttpError(409, 'The QuickBooks undo could not be verified.', 'UNDO_FAILED');
     }
     res.json(await dtoById(id));
   }),

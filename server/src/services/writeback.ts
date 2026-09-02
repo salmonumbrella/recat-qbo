@@ -217,20 +217,27 @@ async function assertWriteSafetyAndPersistBlocked(
       error instanceof QboWriteSafetyError
       && error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE'
     ) {
-      await d.db.$transaction(async (tx) => {
-        await lockCompanyMutationScope(tx, txn.companyId);
-        await persistBlockedProviderOutcome(
-          tx,
-          d.audit,
-          { ...txn, ...observed },
-          actor,
-          safety,
-          error,
-          after,
-          d.now(),
-          auditLabels(txn).before,
+      try {
+        await d.db.$transaction(async (tx) => {
+          await lockCompanyMutationScope(tx, txn.companyId);
+          await persistBlockedProviderOutcome(
+            tx,
+            d.audit,
+            { ...txn, ...observed },
+            actor,
+            safety,
+            error,
+            after,
+            d.now(),
+            auditLabels(txn).before,
+          );
+        });
+      } catch (persistenceError) {
+        console.error(
+          `[writeback] Failed to persist blocked outcome for txn ${txn.id}:`,
+          persistenceError,
         );
-      });
+      }
     }
     throw error;
   }
@@ -600,25 +607,32 @@ export async function postTransaction(
     } catch (err) {
       const info = errorInfo(err);
       if (err instanceof QboWriteSafetyError) {
-        await d.db.$transaction(async (tx) => {
-          await tx.transaction.update({
-            where: { id: txnId },
-            data: { status: 'PENDING', errorCode: null, errorMessage: null },
+        try {
+          await d.db.$transaction(async (tx) => {
+            await tx.transaction.update({
+              where: { id: txnId },
+              data: { status: 'PENDING', errorCode: null, errorMessage: null },
+            });
+            if (safetyRead && err.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE') {
+              await persistBlockedProviderOutcome(
+                tx,
+                d.audit,
+                { ...txn, amount },
+                actor,
+                safetyRead,
+                err,
+                afterLabel,
+                now,
+                before,
+              );
+            }
           });
-          if (safetyRead && err.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE') {
-            await persistBlockedProviderOutcome(
-              tx,
-              d.audit,
-              { ...txn, amount },
-              actor,
-              safetyRead,
-              err,
-              afterLabel,
-              now,
-              before,
-            );
-          }
-        });
+        } catch (persistenceError) {
+          console.error(
+            `[writeback] Failed to persist blocked outcome for txn ${txnId}:`,
+            persistenceError,
+          );
+        }
         return { id: txnId, ok: false, status: 'PENDING', error: info };
       }
       await d.db.$transaction(async (tx) => {
@@ -786,19 +800,26 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
         && error instanceof QboWriteSafetyError
         && error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE'
       ) {
-        await d.db.$transaction(async (tx) => {
-          await persistBlockedProviderOutcome(
-            tx,
-            d.audit,
-            { ...txn, amount },
-            actor,
-            safetyRead,
-            error,
-            'Blocked — re-queue refused',
-            new Date(),
-            beforeLabel,
+        try {
+          await d.db.$transaction(async (tx) => {
+            await persistBlockedProviderOutcome(
+              tx,
+              d.audit,
+              { ...txn, amount },
+              actor,
+              safetyRead,
+              error,
+              'Blocked — re-queue refused',
+              new Date(),
+              beforeLabel,
+            );
+          });
+        } catch (persistenceError) {
+          console.error(
+            `[writeback] Failed to persist blocked outcome for txn ${txnId}:`,
+            persistenceError,
           );
-        });
+        }
       }
       throw error;
     }

@@ -56,8 +56,8 @@ describe('Audit', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     mocks.qboMutationRevision = 0;
     mocks.requestId.mockReturnValue('undo-request-generic');
-    mocks.undoCategorization.mockResolvedValue({ ok: true, outcome: 'VERIFIED' });
-    mocks.legacyUndo.mockResolvedValue({ status: 'REVERTED' });
+    mocks.undoCategorization.mockResolvedValue({ ok: true, outcome: 'VERIFIED', status: 'PENDING' });
+    mocks.legacyUndo.mockResolvedValue({ status: 'PENDING' });
     mocks.list.mockResolvedValue({ entries: [blockedEntry], nextCursor: null });
   });
 
@@ -103,6 +103,32 @@ describe('Audit', () => {
     expect(mocks.legacyUndo).not.toHaveBeenCalled();
     expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
     expect(mocks.toast).toHaveBeenCalledWith('Reverted in QuickBooks.');
+  });
+
+  it('does not claim QuickBooks was reverted while durable Undo is still in progress', async () => {
+    mocks.list.mockResolvedValue({
+      entries: [{
+        ...blockedEntry,
+        id: 'audit-posted',
+        action: 'posted',
+        transactionId: 'transaction-generic',
+        undo: { kind: 'categorization' },
+      }],
+      nextCursor: null,
+    });
+    mocks.undoCategorization.mockResolvedValue({
+      ok: false,
+      outcome: 'IN_PROGRESS',
+      status: 'POSTED',
+    });
+    const user = userEvent.setup();
+    render(<Audit />);
+
+    await user.click(await screen.findByRole('button', { name: /undo locked supplier/i }));
+
+    expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
+    expect(mocks.toast).toHaveBeenCalledWith('Undo is still in progress. Check Audit again before retrying.');
+    expect(mocks.toast).not.toHaveBeenCalledWith('Reverted in QuickBooks.');
   });
 
   it('runs a legacy Undo without allocating a durable operation ID', async () => {
