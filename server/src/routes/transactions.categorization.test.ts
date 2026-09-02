@@ -329,6 +329,14 @@ describe('tax-aware categorization action routes', () => {
       providerRow('BLOCKED_TXN', 'BLOCKED_RECONCILED'),
       providerRow('UNKNOWN_TXN', 'WRITABLE', 'PENDING', 'mismatched-binding'),
       providerRow('POSTED_TXN', 'WRITABLE', 'POSTED'),
+      {
+        ...providerRow('POSTED_RESTORE_TXN', 'WRITABLE', 'POSTED'),
+        qboMutationAttempts: [{
+          requestId: REQUEST_ID,
+          operation: 'restore',
+          status: 'PREPARED',
+        }],
+      },
     ]);
 
     const response = await request(testApp())
@@ -338,10 +346,25 @@ describe('tax-aware categorization action routes', () => {
     expect(response.status).toBe(200);
     expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
       'UNKNOWN_TXN',
+      'POSTED_RESTORE_TXN',
       'WRITABLE_TXN',
     ]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { companyId: COMPANY_ID, status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+      where: {
+        companyId: COMPANY_ID,
+        OR: [
+          { status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+          {
+            status: 'POSTED',
+            qboMutationAttempts: {
+              some: {
+                operation: 'restore',
+                status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] },
+              },
+            },
+          },
+        ],
+      },
     }));
   });
 

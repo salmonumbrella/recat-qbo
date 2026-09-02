@@ -127,6 +127,28 @@ describe('Audit', () => {
     expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
   });
 
+  it('describes a dry-run requeue without claiming QuickBooks was changed', async () => {
+    mocks.list.mockResolvedValue({
+      entries: [{
+        ...blockedEntry,
+        id: 'audit-dry-run',
+        action: 'dry-run',
+        transactionId: 'transaction-dry-run',
+        undo: { kind: 'legacy' },
+      }],
+      nextCursor: null,
+    });
+    const user = userEvent.setup();
+    render(<Audit />);
+
+    await user.click(await screen.findByRole('button', { name: /undo locked supplier/i }));
+
+    expect(mocks.legacyUndo).toHaveBeenCalledWith('transaction-dry-run');
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/move this dry run back to the queue/i));
+    expect(mocks.toast).toHaveBeenCalledWith('Dry run moved back to the queue.');
+    expect(mocks.toast).not.toHaveBeenCalledWith('Reverted in QuickBooks.');
+  });
+
   it('refreshes the log when a blocked Undo returns an error', async () => {
     mocks.list.mockResolvedValue({
       entries: [{

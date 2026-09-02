@@ -207,13 +207,26 @@ companyTransactionsRouter.get(
     // available to other surfaces and diagnostics, except SUPERSEDED which is
     // never interactive.
     // Prototype order: date ascending as entered.
-    const queueWhere: Record<string, unknown> = {
-      companyId: company.id,
-      status:
-        query.status === 'SUPERSEDED'
-          ? { in: [] }
-          : query.status ?? { in: ['PENDING', 'ERROR', 'POSTING'] },
-    };
+    const queueWhere: Prisma.TransactionWhereInput = query.status === undefined
+      ? {
+          companyId: company.id,
+          OR: [
+            { status: { in: ['PENDING', 'ERROR', 'POSTING'] } },
+            {
+              status: 'POSTED',
+              qboMutationAttempts: {
+                some: {
+                  operation: 'restore',
+                  status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] },
+                },
+              },
+            },
+          ],
+        }
+      : {
+          companyId: company.id,
+          status: query.status === 'SUPERSEDED' ? { in: [] } : query.status,
+        };
     const rows = await prisma.transaction.findMany({
       where: queueWhere,
       include: transactionReadInclude,
@@ -232,7 +245,12 @@ companyTransactionsRouter.get(
       dtos = filterTransactionDtos(dtos, query);
     }
     if (query.status === undefined) {
-      dtos = dtos.filter((dto) => dto.status === 'PENDING' || dto.status === 'ERROR');
+      dtos = dtos.filter((dto) =>
+        dto.status === 'PENDING'
+        || dto.status === 'ERROR'
+        || dto.status === 'POSTING'
+        || (dto.status === 'POSTED' && dto.activeCategorizationAttempt?.operation === 'restore'),
+      );
     }
     if (supportsActionability && query.providerDisposition === undefined) {
       dtos = dtos.filter((dto) => !providerDispositionIsBlocked(

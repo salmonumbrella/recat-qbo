@@ -112,9 +112,11 @@ export default function Audit() {
 
   const undoWrite = useCallback((entry: AuditEntryDto) => {
     if (!entry.transactionId || !entry.undo || undoingEntryId !== null) return;
-    if (!window.confirm(
-      `Undo this QuickBooks categorization for ${entry.payee}? This restores the prior transaction exactly.`,
-    )) return;
+    const isDryRun = entry.action === 'dry-run';
+    const confirmation = isDryRun
+      ? `Move this dry run back to the queue for ${entry.payee}?`
+      : `Undo this QuickBooks categorization for ${entry.payee}? This restores the prior transaction exactly.`;
+    if (!window.confirm(confirmation)) return;
     setUndoingEntryId(entry.id);
     const request = entry.undo.kind === 'categorization'
       ? txnApi.undoCategorization(entry.transactionId, createCategorizationRequestId())
@@ -122,7 +124,7 @@ export default function Audit() {
     request
       .then(() => {
         notifyQboMutation();
-        toast('Reverted in QuickBooks.');
+        toast(isDryRun ? 'Dry run moved back to the queue.' : 'Reverted in QuickBooks.');
       })
       .catch((error: Error) => {
         // Safety failures are themselves append-only audit outcomes.
