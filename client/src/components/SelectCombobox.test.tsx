@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { Combobox, Select, type ControlOption } from './SelectCombobox';
@@ -104,6 +104,30 @@ describe('Combobox', () => {
     expect(screen.getByRole('listbox', { name: 'Category' })).toBeInTheDocument();
     await user.click(document.body);
     expect(screen.queryByRole('listbox', { name: 'Category' })).not.toBeInTheDocument();
+  });
+
+  it('dismisses after an inside search interaction and keeps focus on an outside field', async () => {
+    const user = userEvent.setup();
+    let insidePointerDowns = 0;
+    render(
+      <div className="rr" onPointerDown={() => { insidePointerDowns += 1; }}>
+        <Combobox label="Category" value="all" options={OPTIONS} onValueChange={vi.fn()} />
+        <input aria-label="Outside field" />
+      </div>,
+    );
+
+    await user.click(screen.getByRole('combobox', { name: 'Category' }));
+    insidePointerDowns = 0;
+    await user.click(screen.getByRole('textbox', { name: 'Category' }));
+    expect(insidePointerDowns).toBeGreaterThan(0);
+    const outsideField = screen.getByRole('textbox', { name: 'Outside field' });
+    fireEvent.pointerDown(outsideField);
+    outsideField.focus();
+    fireEvent.pointerUp(outsideField);
+    fireEvent.click(outsideField);
+
+    expect(screen.queryByRole('listbox', { name: 'Category' })).not.toBeInTheDocument();
+    expect(outsideField).toHaveFocus();
   });
 
   it('keeps the active listbox option programmatically associated with its focused search input', async () => {

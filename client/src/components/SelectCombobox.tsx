@@ -273,7 +273,6 @@ function ControlBase({
                 className="control-popover"
                 style={floatingStyles}
                 {...getFloatingProps()}
-                onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => event.stopPropagation()}
               >
                 {combobox && (
