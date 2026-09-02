@@ -1600,8 +1600,8 @@ export default function Queue() {
       await txnApi.bulkPost(ids);
       notifyQboMutation();
     } catch (e) {
-      if (!aliveRef.current) return;
       notifyQboMutation();
+      if (!aliveRef.current) return;
       toast(errText(e));
     }
     // Refetch and keep polling briefly while the server finishes posting.

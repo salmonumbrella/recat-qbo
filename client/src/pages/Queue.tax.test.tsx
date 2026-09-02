@@ -1807,7 +1807,7 @@ describe('tax-aware manual queue', () => {
     expect(mocks.toast).not.toHaveBeenCalled();
   });
 
-  it('does not refresh Audit or toast when bulk post fails after Queue unmounts', async () => {
+  it('refreshes Audit without a stale toast when bulk post fails after Queue unmounts', async () => {
     const pending = deferred<unknown>();
     mocks.taxReadiness = null;
     mocks.bulkPost.mockReturnValue(pending.promise);
@@ -1823,7 +1823,7 @@ describe('tax-aware manual queue', () => {
     view.unmount();
     await act(async () => pending.reject(new Error('late bulk failure')));
 
-    expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+    expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
     expect(mocks.toast).not.toHaveBeenCalled();
   });
 
