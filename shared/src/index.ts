@@ -363,6 +363,9 @@ export type AuditAction =
   | 'attachment_deleted_everywhere'
   | 'attachment_error';
 
+/** Server-enforced age limit for both Audit undo offers and legacy undo. */
+export const AUDIT_UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
 export interface MembershipDto {
   companyId: string;
   role: Role;

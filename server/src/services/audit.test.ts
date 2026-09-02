@@ -76,6 +76,7 @@ describe('decorateAuditEntriesWithUndo', () => {
   it('offers durable undo only on the latest current verified categorization write', () => {
     const current = entry({
       id: 'audit-current',
+      transactionId: 'transaction-generic',
       at: '2026-07-28T11:59:59.000Z',
       payload: {
         requestId: 'request-current',
@@ -87,7 +88,12 @@ describe('decorateAuditEntriesWithUndo', () => {
 
     const decorated = decorateAuditEntriesWithUndo(
       [current, older],
-      [{ id: 'transaction-generic', status: 'POSTED', postedAt: new Date('2026-07-28T12:00:00.000Z') }],
+      [{
+        id: 'transaction-generic',
+        status: 'POSTED',
+        postedAt: new Date('2026-07-28T12:00:00.000Z'),
+        legacyUndoAllowed: true,
+      }],
       [{ id: 'audit-current', txnId: 'transaction-generic', payload: current.payload }],
       new Date('2026-07-29T12:00:00.000Z'),
     );
@@ -103,19 +109,46 @@ describe('decorateAuditEntriesWithUndo', () => {
     const legacy = entry({ id: 'audit-legacy', transactionId: 'transaction-legacy' });
     const available = decorateAuditEntriesWithUndo(
       [legacy],
-      [{ id: 'transaction-legacy', status: 'POSTED', postedAt: new Date('2026-07-15T12:00:00.000Z') }],
+      [{
+        id: 'transaction-legacy',
+        status: 'POSTED',
+        postedAt: new Date('2026-07-15T12:00:00.000Z'),
+        legacyUndoAllowed: true,
+      }],
       [{ id: 'audit-legacy', txnId: 'transaction-legacy', payload: null }],
       new Date('2026-07-16T12:00:00.000Z'),
     );
     const expired = decorateAuditEntriesWithUndo(
       [legacy],
-      [{ id: 'transaction-legacy', status: 'POSTED', postedAt: new Date('2026-06-01T12:00:00.000Z') }],
+      [{
+        id: 'transaction-legacy',
+        status: 'POSTED',
+        postedAt: new Date('2026-06-01T12:00:00.000Z'),
+        legacyUndoAllowed: true,
+      }],
       [{ id: 'audit-legacy', txnId: 'transaction-legacy', payload: null }],
       new Date('2026-07-16T12:00:00.000Z'),
     );
 
     expect(available[0]?.undo).toEqual({ kind: 'legacy' });
     expect(expired[0]?.undo).toBeUndefined();
+  });
+
+  it('does not offer legacy undo when the transaction now requires staged restore', () => {
+    const legacy = entry({ id: 'audit-legacy', transactionId: 'transaction-legacy' });
+    const [decorated] = decorateAuditEntriesWithUndo(
+      [legacy],
+      [{
+        id: 'transaction-legacy',
+        status: 'POSTED',
+        postedAt: new Date('2026-07-15T12:00:00.000Z'),
+        legacyUndoAllowed: false,
+      }],
+      [{ id: 'audit-legacy', txnId: 'transaction-legacy', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+
+    expect(decorated?.undo).toBeUndefined();
   });
 
   it('offers legacy requeue for the latest dry-run outcome', () => {
@@ -130,6 +163,7 @@ describe('decorateAuditEntriesWithUndo', () => {
         id: 'transaction-dry-run',
         status: 'DRY_RUN',
         postedAt: new Date('2026-07-15T12:00:00.000Z'),
+        legacyUndoAllowed: false,
       }],
       [{ id: 'audit-dry-run', txnId: 'transaction-dry-run', payload: null }],
       new Date('2026-07-16T12:00:00.000Z'),
@@ -142,7 +176,12 @@ describe('decorateAuditEntriesWithUndo', () => {
     const posted = entry({ id: 'audit-post', transactionId: 'transaction-generic' });
     const [decorated] = decorateAuditEntriesWithUndo(
       [posted],
-      [{ id: 'transaction-generic', status: 'REVERTED', postedAt: new Date('2026-07-15T12:00:00.000Z') }],
+      [{
+        id: 'transaction-generic',
+        status: 'REVERTED',
+        postedAt: new Date('2026-07-15T12:00:00.000Z'),
+        legacyUndoAllowed: true,
+      }],
       [{ id: 'audit-post', txnId: 'transaction-generic', payload: null }],
       new Date('2026-07-16T12:00:00.000Z'),
     );

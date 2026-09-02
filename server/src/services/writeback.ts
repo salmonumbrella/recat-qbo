@@ -14,6 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { PrismaClient, Prisma } from '@prisma/client';
 import {
+  AUDIT_UNDO_WINDOW_MS,
   QBO_NOT_APPLICABLE_TAX_CODE,
   type AuditAction,
   type SplitDto,
@@ -41,6 +42,7 @@ import {
 import { verifyPreparedResult } from './tax/verify.js';
 import { cachedSalesTaxReadiness } from './tax/reference.js';
 import { lockCompanyMutationScope } from './companyMutationScope.js';
+import { legacyStagingRequired } from './legacyWriteLifecycle.js';
 import {
   acquireEntityLease,
   renewEntityLease,
@@ -405,36 +407,39 @@ async function legacyNeedsStaging(
     };
   },
 ): Promise<boolean> {
-  if (
-    txn.taxCalculation !== null ||
-    txn.taxCodeQboId !== null ||
-    txn.splitLines.some((line) => line.taxCodeQboId != null)
-  ) {
-    return true;
-  }
+  const baseState = {
+    qboType: txn.qboType,
+    taxCalculation: txn.taxCalculation,
+    taxCodeQboId: txn.taxCodeQboId,
+    splitTaxCodeQboIds: txn.splitLines.map((line) => line.taxCodeQboId),
+    company: txn.company,
+  };
+  if (legacyStagingRequired({
+    ...baseState,
+    hasDurableAttempt: false,
+    cachedSalesTaxCodes: [],
+  })) return true;
   const durableAttempt = await db.qboMutationAttempt.findFirst({
     where: { transactionId: txn.id },
     select: { id: true },
   });
-  if (durableAttempt) return true;
-  if (txn.qboType === 'Purchase') {
-    return txn.company.taxSupportStatus === 'ready';
-  }
-  if (txn.qboType !== 'Deposit') return false;
-  const cachedCodes = await db.qboTaxCode.findMany({
-    where: { companyId: txn.companyId },
-    select: {
-      active: true,
-      taxable: true,
-      salesTaxRateList: true,
-      combinedSalesRate: true,
-    },
+  if (durableAttempt !== null) return true;
+  const cachedCodes = txn.qboType === 'Deposit'
+    ? await db.qboTaxCode.findMany({
+        where: { companyId: txn.companyId },
+        select: {
+          active: true,
+          taxable: true,
+          salesTaxRateList: true,
+          combinedSalesRate: true,
+        },
+      })
+    : [];
+  return legacyStagingRequired({
+    ...baseState,
+    hasDurableAttempt: false,
+    cachedSalesTaxCodes: cachedCodes,
   });
-  return cachedSalesTaxReadiness(
-    txn.company.taxUsingSalesTax,
-    cachedCodes,
-    txn.company.taxSupportReason,
-  ).status === 'ready';
 }
 
 export async function postTransaction(
@@ -694,8 +699,6 @@ export async function postTransaction(
 // undoPost — POSTED/DRY_RUN → (REVERTED) → PENDING, within 30 days
 // ---------------------------------------------------------------------------
 
-const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-
 export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps): Promise<PostResult> {
   const d = deps ?? (await defaultDeps());
 
@@ -716,7 +719,7 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
   if (txn.status !== 'POSTED' && txn.status !== 'DRY_RUN') {
     throw new Error(`Only posted transactions can be undone (status is ${txn.status})`);
   }
-  if (!txn.postedAt || Date.now() - txn.postedAt.getTime() > UNDO_WINDOW_MS) {
+  if (!txn.postedAt || Date.now() - txn.postedAt.getTime() > AUDIT_UNDO_WINDOW_MS) {
     throw new Error('The 30-day undo window for this transaction has passed.');
   }
 
@@ -3467,11 +3470,6 @@ async function readTxnWriteSafety(
   if (!target) return null;
   const evidence = await client.fetchWriteSafety(target);
   return { target, evidence };
-}
-
-async function assertTxnWriteSafety(client: QboClient, txn: QboTxn): Promise<void> {
-  const safety = await readTxnWriteSafety(client, txn);
-  if (safety) assertQboWriteAllowed(safety.target, safety.evidence);
 }
 
 async function readSnapshotWriteSafety(

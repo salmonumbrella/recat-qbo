@@ -4,8 +4,13 @@
 // There is intentionally no update or delete API for this table.
 
 import type { AuditEntry, Prisma, PrismaClient } from '@prisma/client';
-import type { AuditAction, AuditEntryDto } from '@recat/shared';
+import {
+  AUDIT_UNDO_WINDOW_MS,
+  type AuditAction,
+  type AuditEntryDto,
+} from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
+import { legacyStagingRequired } from './legacyWriteLifecycle.js';
 
 /** Either the root client or an interactive-transaction client. */
 export type PrismaTransactionClientOrPrisma = PrismaClient | Prisma.TransactionClient;
@@ -205,6 +210,7 @@ interface AuditUndoTransactionState {
   id: string;
   status: string;
   postedAt: Date | null;
+  legacyUndoAllowed: boolean;
 }
 
 interface LatestUndoableAuditState {
@@ -212,8 +218,6 @@ interface LatestUndoableAuditState {
   txnId: string | null;
   payload: unknown;
 }
-
-const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 function isVerifiedCategorizationPayload(payload: unknown): boolean {
   if (typeof payload !== 'object' || payload === null) return false;
@@ -233,15 +237,13 @@ export function decorateAuditEntriesWithUndo(
 ): AuditEntryDto[] {
   const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
   const latestByTransactionId = new Map<string, LatestUndoableAuditState>();
-  const transactionIdByLatestEntryId = new Map<string, string>();
   for (const row of latestUndoableEntries) {
     if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
     latestByTransactionId.set(row.txnId, row);
-    transactionIdByLatestEntryId.set(row.id, row.txnId);
   }
 
   return entries.map((entry) => {
-    const transactionId = entry.transactionId ?? transactionIdByLatestEntryId.get(entry.id);
+    const transactionId = entry.transactionId;
     if (transactionId === undefined) return entry;
     const withTransaction = { ...entry, transactionId };
     const txn = transactionById.get(transactionId);
@@ -255,14 +257,18 @@ export function decorateAuditEntriesWithUndo(
       (!postedWrite && !dryRun)
       || latest?.id !== entry.id
       || elapsed < 0
-      || elapsed > UNDO_WINDOW_MS
+      || elapsed > AUDIT_UNDO_WINDOW_MS
     ) {
+      return withTransaction;
+    }
+    const durableCategorization = postedWrite && isVerifiedCategorizationPayload(latest.payload);
+    if (postedWrite && !durableCategorization && txn.legacyUndoAllowed !== true) {
       return withTransaction;
     }
     return {
       ...withTransaction,
       undo: {
-        kind: postedWrite && isVerifiedCategorizationPayload(latest.payload)
+        kind: durableCategorization
           ? 'categorization'
           : 'legacy',
       },
@@ -278,10 +284,26 @@ async function decoratePageWithUndo(
     entries.flatMap((entry) => entry.transactionId === undefined ? [] : [entry.transactionId]),
   )];
   if (transactionIds.length === 0) return entries;
-  const [transactions, postedEntries] = await Promise.all([
+  const [transactions, postedEntries, cachedSalesTaxCodes] = await Promise.all([
     prisma.transaction.findMany({
       where: { companyId, id: { in: transactionIds } },
-      select: { id: true, status: true, postedAt: true },
+      select: {
+        id: true,
+        status: true,
+        postedAt: true,
+        qboType: true,
+        taxCalculation: true,
+        taxCodeQboId: true,
+        splitLines: { select: { taxCodeQboId: true } },
+        qboMutationAttempts: { select: { id: true }, take: 1 },
+        company: {
+          select: {
+            taxSupportStatus: true,
+            taxUsingSalesTax: true,
+            taxSupportReason: true,
+          },
+        },
+      },
     }),
     prisma.auditEntry.findMany({
       where: {
@@ -292,8 +314,34 @@ async function decoratePageWithUndo(
       select: { id: true, txnId: true, payload: true },
       orderBy: [{ at: 'desc' }, { id: 'desc' }],
     }),
+    prisma.qboTaxCode.findMany({
+      where: { companyId },
+      select: {
+        active: true,
+        taxable: true,
+        salesTaxRateList: true,
+        combinedSalesRate: true,
+      },
+    }),
   ]);
-  return decorateAuditEntriesWithUndo(entries, transactions, postedEntries);
+  return decorateAuditEntriesWithUndo(
+    entries,
+    transactions.map((txn) => ({
+      id: txn.id,
+      status: txn.status,
+      postedAt: txn.postedAt,
+      legacyUndoAllowed: !legacyStagingRequired({
+        qboType: txn.qboType,
+        taxCalculation: txn.taxCalculation,
+        taxCodeQboId: txn.taxCodeQboId,
+        splitTaxCodeQboIds: txn.splitLines.map((line) => line.taxCodeQboId),
+        hasDurableAttempt: txn.qboMutationAttempts.length > 0,
+        company: txn.company,
+        cachedSalesTaxCodes,
+      }),
+    })),
+    postedEntries,
+  );
 }
 
 /** Does the entry match the free-text search across when/who/payee/amount/action/before/after? */
