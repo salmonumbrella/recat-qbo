@@ -316,7 +316,7 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     expect(await fence(company.id)).toBe(-1n);
   });
 
-  it('acquires Rule lifecycle fences in sorted order under reversed source order without deadlock', async () => {
+  it('acquires Rule lifecycle fences in sorted order across concurrent multi-company writes without deadlock', async () => {
     const suffix = randomUUID();
     const companies = await Promise.all(['a', 'b'].map((label) => db.company.create({ data: {
       realmId: `lifecycle-concurrency-${label}-${suffix}`,
@@ -454,10 +454,12 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
       await db.$executeRawUnsafe('DROP TABLE IF EXISTS "RuleLifecycleOrderAudit"');
     }
 
+    // PostgreSQL does not promise row-trigger order for a multi-row UPDATE;
+    // assert the source set, then assert the lifecycle fence order separately.
     expect(audit.filter((row) => row.writer === 'writer-a' && row.surface === 'source')
-      .map((row) => row.companyId)).toEqual([companyA!.id, companyB!.id]);
+      .map((row) => row.companyId).sort()).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-b' && row.surface === 'source')
-      .map((row) => row.companyId)).toEqual([companyB!.id, companyA!.id]);
+      .map((row) => row.companyId).sort()).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-a' && row.surface === 'fence')
       .map((row) => row.companyId)).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-b' && row.surface === 'fence')
@@ -467,7 +469,7 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
     expect(await generationLast()).toBe(sequenceBefore + 4n);
   });
 
-  it('acquires RuleRevision lifecycle fences in sorted order under reversed source order without deadlock', async () => {
+  it('acquires RuleRevision lifecycle fences in sorted order across concurrent multi-company writes without deadlock', async () => {
     const suffix = randomUUID();
     const companies = await Promise.all(['a', 'b'].map((label) => db.company.create({ data: {
       realmId: `lifecycle-revision-concurrency-${label}-${suffix}`,
@@ -613,10 +615,12 @@ describePostgres('rule lifecycle revision PostgreSQL fence', () => {
       await db.$executeRawUnsafe('ALTER TABLE "RuleRevision" ENABLE TRIGGER "RuleRevision_append_only"');
     }
 
+    // Transition-table and row-trigger iteration order is deliberately not a
+    // PostgreSQL contract; only the sorted fence acquisition order is one.
     expect(audit.filter((row) => row.writer === 'writer-a' && row.surface === 'source')
-      .map((row) => row.companyId)).toEqual([companyA!.id, companyB!.id]);
+      .map((row) => row.companyId).sort()).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-b' && row.surface === 'source')
-      .map((row) => row.companyId)).toEqual([companyB!.id, companyA!.id]);
+      .map((row) => row.companyId).sort()).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-a' && row.surface === 'fence')
       .map((row) => row.companyId)).toEqual([companyA!.id, companyB!.id].sort());
     expect(audit.filter((row) => row.writer === 'writer-b' && row.surface === 'fence')
