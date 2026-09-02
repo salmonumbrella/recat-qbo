@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   setPendingCount: vi.fn(),
   refreshCompanies: vi.fn(),
   navigate: vi.fn(),
+  tags: [] as Array<{ id: string; companyId: string; name: string; color: string }>,
 }));
 
 vi.mock('react-router-dom', async () => {
@@ -31,7 +32,7 @@ vi.mock('../state/AppContext', () => ({
       { id: 'ACCOUNT_OFFICE', qboId: 'EXPENSE_OFFICE', name: 'Office expense', fullName: 'Expenses · Office expense', classification: 'Expenses', active: true },
       { id: 'ACCOUNT_HOLDING', qboId: 'HOLDING', name: 'Uncategorised Expense', fullName: 'Expenses · Uncategorised Expense', classification: 'Expenses', active: true },
     ],
-    tags: [], setPendingCount: mocks.setPendingCount, refreshCompanies: mocks.refreshCompanies,
+    tags: mocks.tags, setPendingCount: mocks.setPendingCount, refreshCompanies: mocks.refreshCompanies,
     dryRun: false, tagsRequired: false, taxReadiness: null, toast: mocks.toast,
   }),
 }));
@@ -76,6 +77,7 @@ beforeEach(() => {
     pendingCount: 2,
   });
   mocks.categorize.mockResolvedValue(transaction({ category: 'Office expense', categoryQboId: 'EXPENSE_OFFICE' }));
+  mocks.tags = [];
   mocks.classificationSearch.mockResolvedValue({
     query: 'Generic supplier', companyId: 'COMPANY_GENERIC', scope: 'current_company', mode: 'hybrid', requestedMode: 'auto',
     degraded: false, degradedReason: null, status: 'no_match', noMatch: true, total: 0, items: [], nextCursor: null,
@@ -107,5 +109,57 @@ describe('Queue shared controls', () => {
     await renderQueue();
 
     expect(document.querySelectorAll('select')).toHaveLength(0);
+  });
+
+  it('keeps an unselected rule suggestion visible on the category trigger', async () => {
+    mocks.list.mockResolvedValue({
+      transactions: [transaction({
+        category: null,
+        categoryQboId: null,
+        suggestion: {
+          category: 'Office expense',
+          categoryQboId: 'EXPENSE_OFFICE',
+          source: 'rule',
+          matchedRules: 2,
+          winnerMatchText: 'office supply',
+        },
+      })],
+      nextCursor: null,
+      pendingCount: 1,
+    });
+    await renderQueue();
+
+    expect(screen.getByRole('combobox', { name: 'Category for Generic supplier' }))
+      .toHaveTextContent('Office expense');
+    expect(screen.getByText('rule')).toHaveAttribute(
+      'data-tip',
+      'Matched 2 rules — “office supply” won (topmost). Reorder in Rules.',
+    );
+  });
+
+  it('does not let shared-control type-ahead activate Queue shortcuts', async () => {
+    const user = userEvent.setup();
+    mocks.tags = [{ id: 'TAG_GENERIC', companyId: 'COMPANY_GENERIC', name: 'Generic tag', color: '#667788' }];
+    await renderQueue();
+
+    await user.click(screen.getByRole('combobox', { name: 'Account filter' }));
+    await user.keyboard('txjk');
+
+    expect(screen.queryByRole('button', { name: 'Generic tag' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('checkbox').every((checkbox) => !(checkbox as HTMLInputElement).checked)).toBe(true);
+  });
+
+  it('keeps tag interactions open but dismisses the tag picker on an outside click', async () => {
+    const user = userEvent.setup();
+    mocks.tags = [{ id: 'TAG_GENERIC', companyId: 'COMPANY_GENERIC', name: 'Generic tag', color: '#667788' }];
+    mocks.categorize.mockResolvedValue(transaction({ tagIds: ['TAG_GENERIC'] }));
+    await renderQueue();
+
+    await user.click(screen.getAllByRole('button', { name: '+ tag' })[0]!);
+    await user.click(screen.getByRole('button', { name: 'Generic tag' }));
+    expect(screen.getByRole('button', { name: 'Generic tag' })).toBeInTheDocument();
+
+    await user.click(document.body);
+    expect(screen.queryByRole('button', { name: 'Generic tag' })).not.toBeInTheDocument();
   });
 });

@@ -116,6 +116,10 @@ export default function SplitEditor({
 
   const upd = (i: number, patch: Partial<SplitLineDraft>) =>
     setDraft((d) => d.map((l, j) => (j === i ? { ...l, ...patch } : l)));
+  const categoryValueFor = (name: string): string => {
+    const match = catOpts.find((option) => option.name === name);
+    return match ? `${match.group}·${match.name}` : '';
+  };
 
   const remainLabel =
     Math.abs(remain) < 0.005
@@ -204,8 +208,8 @@ export default function SplitEditor({
                 />
                 <Combobox
                   label={`Category for split line ${i + 1}`}
-                  value={l.cat}
-                  placeholder="Category…"
+                  value={categoryValueFor(l.cat)}
+                  placeholder={l.cat || 'Category…'}
                   searchPlaceholder="Search categories…"
                   options={catOpts.map((option) => ({
                     value: `${option.group}·${option.name}`,

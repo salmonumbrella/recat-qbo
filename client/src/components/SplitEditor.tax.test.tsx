@@ -105,6 +105,25 @@ const SALES_READY: TaxReadinessDto = {
 };
 
 describe('SplitEditor tax fields', () => {
+  it('keeps a name-only draft category visibly selected and selected on reopen', async () => {
+    const user = userEvent.setup();
+    render(
+      <SplitEditor
+        txn={TXN}
+        tags={[]}
+        catOpts={[{ group: 'Expenses', name: 'Generic expense' }]}
+        taxReadiness={READY}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+
+    const category = screen.getByRole('combobox', { name: 'Category for split line 1' });
+    expect(category).toHaveTextContent('Expenses · Generic expense');
+    await user.click(category);
+    expect(screen.getByRole('option', { name: /Generic expense/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
   it('saves the calculation, memo, and purchase tax selection on every line', async () => {
     const onSave = vi.fn();
     const user = userEvent.setup();

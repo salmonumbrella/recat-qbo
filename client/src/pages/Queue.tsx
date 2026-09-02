@@ -258,6 +258,7 @@ export default function Queue() {
   const taxVersionsRef = useRef<Record<string, number>>({});
   const stageRequestSequenceRef = useRef(0);
   const stageRequestTokensRef = useRef<Record<string, number>>({});
+  const tagPickerRootRef = useRef<HTMLSpanElement | null>(null);
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia('(max-width: 640px)').matches,
   );
@@ -585,6 +586,17 @@ export default function Queue() {
     // Draft seeding lives in <SplitEditor/> (mounts fresh).
     setTagPicker(null);
   }, []);
+
+  useEffect(() => {
+    if (tagPicker === null) return;
+    const dismissTagPicker = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Node && tagPickerRootRef.current?.contains(target)) return;
+      setTagPicker(null);
+    };
+    document.addEventListener('mousedown', dismissTagPicker);
+    return () => document.removeEventListener('mousedown', dismissTagPicker);
+  }, [tagPicker]);
 
   const doOpenSplit = useCallback(
     (id: string) => {
@@ -1581,8 +1593,7 @@ export default function Queue() {
       return;
     }
     const target = e.target as HTMLElement | null;
-    const tag = (target?.tagName || '').toUpperCase();
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (target?.closest('input, select, textarea, button, a, summary, [role="button"], [role="combobox"], [role="listbox"], [contenteditable="true"]')) return;
     if (!vis.length) return;
     const i = Math.min(activeIdx, vis.length - 1);
     const cur = vis[i];
@@ -1748,6 +1759,14 @@ export default function Queue() {
         onSplitFooter={() => doOpenSplit(v.t.id)}
         showBadges={!mobile}
         disabled={v.t.status !== 'PENDING' || hasActiveMutation(v.t)}
+        triggerText={v.pickLabel}
+        triggerTone={v.suggested ? 'suggested' : undefined}
+        triggerBadge={v.suggested ? v.isRule ? 'rule' : 'suggested' : undefined}
+        triggerBadgeTooltip={
+          v.isRule && v.t.suggestion && (v.t.suggestion.matchedRules ?? 0) > 1
+            ? `Matched ${v.t.suggestion.matchedRules} rules — “${v.t.suggestion.winnerMatchText ?? ''}” won (topmost). Reorder in Rules.`
+            : undefined
+        }
       />
     );
 
@@ -2400,6 +2419,7 @@ export default function Queue() {
                       </span>
                     )}
                     <span
+                      ref={tagPicker === t.id ? tagPickerRootRef : undefined}
                       style={{
                         display: 'flex',
                         flexWrap: 'wrap',
@@ -2631,6 +2651,7 @@ export default function Queue() {
                   </span>
                 </div>
                 <span
+                  ref={tagPicker === t.id ? tagPickerRootRef : undefined}
                   style={{
                     display: 'flex',
                     flexWrap: 'wrap',
