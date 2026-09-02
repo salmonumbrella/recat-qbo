@@ -271,4 +271,68 @@ describePostgres('classification company reads on PostgreSQL', () => {
       revision: { action: null, valid: false },
     });
   });
+
+  it('reads advisory observations without mutation and excludes the selected observation source', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({
+      data: { realmId: `company-read-observation-${suffix}`, legalName: 'Observation Read Legal', nickname: 'Observation Read' },
+    });
+    companyIds.add(company.id);
+    const user = await db.user.create({ data: { email: `observation-read-${suffix}@example.test` } });
+    userIds.add(user.id);
+    await db.membership.create({ data: { userId: user.id, companyId: company.id, role: 'viewer' } });
+    const transaction = await db.transaction.create({
+      data: {
+        companyId: company.id, qboId: `northwind-${suffix}`, qboType: 'Purchase', qboSyncToken: '1',
+        date: new Date('2026-08-30T00:00:00.000Z'), payee: 'Northwind Fixture Supplies',
+        memo: 'Advisory historical fixture', amount: '-113.00', bankAccount: 'Synthetic operating',
+        status: 'POSTED', revision: 1, rawData: { CurrencyRef: { value: 'CAD' } },
+      },
+    });
+    const observation = await db.historicalClassificationObservation.create({
+      data: {
+        companyId: company.id, sourceTransactionId: transaction.id, sourceQboType: 'Purchase',
+        sourceQboId: transaction.qboId, sourceTransactionRevision: 1, sourceQboSyncToken: '1',
+        sourceStatus: 'POSTED', sourceUpdatedAt: new Date('2026-08-30T00:00:00.000Z'),
+        transactionDate: transaction.date, payee: 'Northwind Fixture Supplies',
+        memo: 'Advisory historical fixture', amountCents: -11300n, currency: 'CAD',
+        sourceAccountName: 'Synthetic operating', categoryName: 'Inventory',
+        categoryQboId: 'inventory-fixture', taxCalculation: 'NotApplicable',
+        taxCodeName: null, taxCodeQboId: null, tagNames: [],
+      },
+    });
+    const repository = new PrismaClassificationSearchRepository(db);
+    const service = createCompanyReadService(
+      db as unknown as CompanyReadDb,
+      'company-read-observation-cursor-secret',
+      { classificationSearch: (input) => searchClassificationMemorySnapshot(input, { repository, semantic: null }) },
+    );
+    const counts = async () => Promise.all([
+      db.transaction.count({ where: { companyId: company.id } }),
+      db.historicalClassificationObservation.count({ where: { companyId: company.id } }),
+      db.classificationCase.count({ where: { companyId: company.id } }),
+      db.autopilotRuleCandidate.count({ where: { companyId: company.id } }),
+      db.autopilotRuleCandidateEvidence.count({ where: { companyId: company.id } }),
+      db.autopilotRuleCandidateFold.count({ where: { companyId: company.id } }),
+      db.rule.count({ where: { companyId: company.id } }),
+      db.ruleRevision.count({ where: { companyId: company.id } }),
+      db.qboMutationAttempt.count({ where: { transactionId: transaction.id } }),
+    ]);
+    const before = await counts();
+
+    const page = await service.searchClassificationKnowledge(user.id, company.id, {
+      query: 'northwind', mode: 'lexical', limit: 20,
+    });
+    expect(page.items).toContainEqual(expect.objectContaining({
+      sourceId: observation.id, kind: 'historical_observation', advisory: true,
+      executable: false, action: null,
+    }));
+    await expect(counts()).resolves.toEqual(before);
+
+    const selfExcluded = await service.searchClassificationKnowledge(user.id, company.id, {
+      query: 'northwind', mode: 'lexical', limit: 20, transactionId: transaction.id,
+    });
+    expect(selfExcluded.items.map(({ sourceId }) => sourceId)).not.toContain(observation.id);
+    await expect(counts()).resolves.toEqual(before);
+  });
 });

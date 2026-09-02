@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AgentDecision } from './decision.js';
+import { agentDecisionSchema, type AgentDecision } from './decision.js';
 import { buildAgentSnapshot, type AgentSnapshotSource } from './snapshot.js';
 import { verifyAgentDecision } from './verifier.js';
 
@@ -291,6 +291,15 @@ describe('verifyAgentDecision', () => {
       proposal({ evidence: [evidence] as never }),
       code,
     );
+  });
+
+  it('rejects historical observations as proposal evidence before verification', () => {
+    const observationEvidence = {
+      ...proposal(),
+      evidence: [{ kind: 'historical_observation', id: HISTORY_ID }],
+    };
+
+    expect(agentDecisionSchema.safeParse({ decision: observationEvidence }).success).toBe(false);
   });
 
   it.each([

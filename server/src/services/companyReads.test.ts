@@ -100,6 +100,26 @@ function classificationHit(id: string) {
   };
 }
 
+function historicalObservationHit(id: string) {
+  return {
+    id: `historical_observation:${id}`, sourceId: id, kind: 'historical_observation' as const,
+    companyId: COMPANY_ID, companyName: 'Acme', companyRelation: 'current' as const,
+    executable: false, advisory: true, matchedIn: ['observation'] as const, score: 1,
+    vendorIdentityId: null, vendorName: 'Northwind', action: null,
+    actionSummary: { categoryName: 'Meals', taxCalculation: 'NotApplicable' as const, taxCodeName: null, tagNames: [] },
+    originIntent: null, evidenceCount: 0, conflictingEvidenceCount: 0, conflicts: [],
+    provenance: { source: 'historical_observation' as const, sourceId: id, actorId: null, recordedAt: '2026-08-31T00:00:00.000Z' },
+    rationale: null, examples: [], counterexamples: [], jurisdiction: null,
+    currency: 'CAD', verifiedAt: null, ruleRevision: null,
+    observation: {
+      sourceTransactionId: 'transaction-history', sourceQboType: 'Purchase' as const,
+      sourceQboId: 'purchase-history', sourceTransactionRevision: 1,
+      sourceQboSyncToken: '1', sourceStatus: 'POSTED' as const,
+      sourceUpdatedAt: '2026-08-31T00:00:00.000Z', observedAt: '2026-08-31T00:00:00.000Z',
+    },
+  };
+}
+
 function makeDb() {
   const db = {
     user: {
@@ -237,6 +257,38 @@ describe('company read services', () => {
       }),
     ]);
     expect(JSON.stringify(result)).not.toMatch(/categoryQboId|taxCodeQboId|tagIds/);
+  });
+
+  it('returns an advisory observation through the existing company read page', async () => {
+    const db = makeDb();
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      query: input.query,
+      companyId: COMPANY_ID,
+      scope: 'current_company' as const,
+      mode: 'lexical' as const,
+      requestedMode: 'lexical' as const,
+      degraded: false,
+      degradedReason: null,
+      status: 'matched' as const,
+      noMatch: false,
+      total: 1,
+      hits: [historicalObservationHit('observation-a')],
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    const page = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'northwind', mode: 'lexical', scope: 'current_company',
+    });
+
+    expect(page.items).toEqual([expect.objectContaining({
+      kind: 'historical_observation', advisory: true, executable: false, action: null,
+      originIntent: null, verifiedAt: null, evidenceCount: 0,
+    })]);
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID, scope: 'current_company',
+    }));
   });
 
   it('keeps concurrent principals isolated with one hundred refreshed memberships', async () => {

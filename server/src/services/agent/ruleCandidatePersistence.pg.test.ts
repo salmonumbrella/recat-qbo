@@ -211,6 +211,65 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
     }
   });
 
+  it('rejects an observation without a verified write and leaves candidate state untouched', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({
+      data: {
+        realmId: `observation-no-promotion-${suffix}`,
+        legalName: 'Observation no promotion fixture',
+        nickname: `observation-${suffix.slice(0, 8)}`,
+      },
+    });
+    try {
+      const transaction = await db.transaction.create({
+        data: {
+          companyId: company.id, qboId: `observation-purchase-${suffix}`, qboType: 'Purchase',
+          qboSyncToken: '1', date: NOW, payee: 'Observation-only vendor',
+          amount: '-10.00', bankAccount: 'Fixture bank', status: 'POSTED', revision: 1,
+        },
+      });
+      await db.historicalClassificationObservation.create({
+        data: {
+          companyId: company.id, sourceTransactionId: transaction.id, sourceQboType: 'Purchase',
+          sourceQboId: transaction.qboId, sourceTransactionRevision: 1, sourceQboSyncToken: '1',
+          sourceStatus: 'POSTED', sourceUpdatedAt: NOW, transactionDate: NOW,
+          payee: 'Observation-only vendor', memo: null, amountCents: -1000n, currency: 'CAD',
+          sourceAccountName: 'Fixture bank', categoryName: 'Fixture category',
+          categoryQboId: 'fixture-category', taxCalculation: 'NotApplicable',
+          taxCodeName: null, taxCodeQboId: null, tagNames: [],
+        },
+      });
+      const counts = async () => Promise.all([
+        db.classificationCase.count({ where: { companyId: company.id } }),
+        db.autopilotRuleCandidate.count({ where: { companyId: company.id } }),
+        db.autopilotRuleCandidateEvidence.count({ where: { companyId: company.id } }),
+        db.autopilotRuleCandidateFold.count({ where: { companyId: company.id } }),
+        db.rule.count({ where: { companyId: company.id } }),
+        db.ruleRevision.count({ where: { companyId: company.id } }),
+        db.qboMutationAttempt.count({ where: { transactionId: transaction.id } }),
+        db.historicalClassificationObservation.count({ where: { companyId: company.id } }),
+      ]);
+      const before = await counts();
+      const sourceBefore = await db.transaction.findUniqueOrThrow({
+        where: { id: transaction.id },
+        select: { revision: true, status: true, qboSyncToken: true, payee: true },
+      });
+
+      await expect(recordVerifiedRuleCandidateOutcome({
+        companyId: company.id, transactionId: transaction.id, inputRevision: 1,
+        requestId: randomUUID(), operation: 'posted', proposal: null, candidateContext: null,
+      }, { db, now: () => NOW })).rejects.toThrow('not backed by one durable attempt');
+
+      await expect(counts()).resolves.toEqual(before);
+      await expect(db.transaction.findUniqueOrThrow({
+        where: { id: transaction.id },
+        select: { revision: true, status: true, qboSyncToken: true, payee: true },
+      })).resolves.toEqual(sourceBefore);
+    } finally {
+      await db.company.delete({ where: { id: company.id } });
+    }
+  });
+
   it('terminally rejects a durable but semantically mismatched no-decision attempt before activation', async () => {
     const suffix = randomUUID();
     const company = await db.company.create({

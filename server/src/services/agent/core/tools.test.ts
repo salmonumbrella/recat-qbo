@@ -260,6 +260,9 @@ describe('createSnapshotTools', () => {
     const accepted = createSnapshotTools(buildAgentSnapshot(sourceWithManyItems()), {
       classificationSearch: async () => result(observation),
     });
+    await expect(accepted.call('find_similar_transactions', {
+      query: 'merchant', limit: 5,
+    })).resolves.toMatchObject({ items: [{ kind: 'historical_observation', executable: false, action: null }] });
     await expect(accepted.call('search_classification_knowledge', {
       query: 'merchant', mode: 'lexical', limit: 5,
     })).resolves.toMatchObject({ items: [{ kind: 'historical_observation', executable: false, action: null }] });
