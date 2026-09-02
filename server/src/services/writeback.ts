@@ -1268,7 +1268,7 @@ export class WritebackLifecycleError extends Error {
   }
 }
 
-const ACTIVE_ATTEMPT_STATUSES = ['PREPARED', 'COMMITTING', 'UNCERTAIN'];
+export const ACTIVE_ATTEMPT_STATUSES = ['PREPARED', 'COMMITTING', 'UNCERTAIN'];
 const POSSIBLE_WRITE_GUIDANCE =
   'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.';
 const LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE =

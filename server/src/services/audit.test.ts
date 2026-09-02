@@ -1,11 +1,21 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuditEntryDto } from '@recat/shared';
+
+const prismaMock = vi.hoisted(() => ({
+  transaction: { findMany: vi.fn() },
+  auditEntry: { findMany: vi.fn() },
+  qboTaxCode: { findMany: vi.fn() },
+}));
+
+vi.mock('../lib/prisma.js', () => ({ prisma: prismaMock }));
+
 import {
   AUDIT_CSV_HEADER,
   buildAuditCsv,
   csvEscape,
   decorateAuditEntriesWithUndo,
   auditPageNeedsSalesTaxCodes,
+  listAudit,
   writeAudit,
 } from './audit.js';
 
@@ -74,6 +84,12 @@ describe('buildAuditCsv', () => {
 });
 
 describe('decorateAuditEntriesWithUndo', () => {
+  beforeEach(() => {
+    prismaMock.transaction.findMany.mockReset();
+    prismaMock.auditEntry.findMany.mockReset();
+    prismaMock.qboTaxCode.findMany.mockReset();
+  });
+
   it('offers durable undo only on the latest current verified categorization write', () => {
     const current = entry({
       id: 'audit-current',
@@ -227,6 +243,55 @@ describe('decorateAuditEntriesWithUndo', () => {
     );
 
     expect(decorated?.undo).toBeUndefined();
+  });
+
+  it('does not offer a competing undo through the production audit-page projection', async () => {
+    const payload = {
+      requestId: 'request-current',
+      outcome: 'VERIFIED',
+      references: { operation: 'recategorize' },
+    };
+    prismaMock.auditEntry.findMany
+      .mockResolvedValueOnce([{
+        id: 'audit-post',
+        companyId: 'c1',
+        at: new Date('2026-07-15T12:00:00.000Z'),
+        actorId: null,
+        actorLabel: 'Josh',
+        txnId: 'transaction-generic',
+        payee: 'Staples',
+        amount: -42.5,
+        action: 'posted',
+        before: 'Uncategorized Expense',
+        after: 'Office Supplies',
+        payload,
+      }])
+      .mockResolvedValueOnce([{
+        id: 'audit-post',
+        txnId: 'transaction-generic',
+        payload,
+      }]);
+    prismaMock.transaction.findMany.mockResolvedValueOnce([{
+      id: 'transaction-generic',
+      status: 'POSTED',
+      postedAt: new Date(),
+      qboType: 'Purchase',
+      taxCalculation: null,
+      taxCodeQboId: null,
+      splitLines: [],
+      qboMutationAttempts: [{ id: 'attempt-prepared' }],
+      _count: { qboMutationAttempts: 1 },
+      company: {
+        taxSupportStatus: 'needs_setup',
+        taxUsingSalesTax: false,
+        taxSupportReason: null,
+      },
+    }]);
+
+    const page = await listAudit('c1');
+
+    expect(page.entries[0]?.undo).toBeUndefined();
+    expect(prismaMock.qboTaxCode.findMany).not.toHaveBeenCalled();
   });
 });
 

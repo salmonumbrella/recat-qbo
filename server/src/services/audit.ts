@@ -11,6 +11,7 @@ import {
 } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { legacyStagingRequired } from './legacyWriteLifecycle.js';
+import { ACTIVE_ATTEMPT_STATUSES } from './writeback.js';
 
 /** Either the root client or an interactive-transaction client. */
 export type PrismaTransactionClientOrPrisma = PrismaClient | Prisma.TransactionClient;
@@ -342,7 +343,7 @@ async function decoratePageWithUndo(
         taxCodeQboId: true,
         splitLines: { select: { taxCodeQboId: true } },
         qboMutationAttempts: {
-          where: { status: { in: ['PREPARED', 'COMMITTING', 'UNCERTAIN'] } },
+          where: { status: { in: ACTIVE_ATTEMPT_STATUSES } },
           select: { id: true },
           take: 1,
         },
@@ -391,6 +392,7 @@ async function decoratePageWithUndo(
       id: txn.id,
       status: txn.status,
       postedAt: txn.postedAt,
+      hasActiveAttempt: txn.hasActiveAttempt,
       legacyUndoAllowed: !legacyStagingRequired({
         qboType: txn.qboType,
         taxCalculation: txn.taxCalculation,
