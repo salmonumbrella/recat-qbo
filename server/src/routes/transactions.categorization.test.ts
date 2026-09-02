@@ -555,10 +555,15 @@ describe('tax-aware categorization action routes', () => {
     },
   );
 
-  it('loads at most the latest reconcilable attempt with an allowlisted relation select', async () => {
+  it('loads only the latest attempt so a terminal retry successor suppresses stale RETRYABLE state', async () => {
     mocks.transactionFindMany.mockResolvedValue([{
       ...transactionRow,
-      qboMutationAttempts: [],
+      status: 'POSTED',
+      qboMutationAttempts: [{
+        requestId: '00000000-0000-4000-8000-000000000098',
+        operation: 'restore',
+        status: 'VERIFIED',
+      }],
     }]);
 
     const response = await request(testApp())
@@ -566,11 +571,11 @@ describe('tax-aware categorization action routes', () => {
       .set(sessionHeaders);
 
     expect(response.status).toBe(200);
+    expect(response.body.transactions).toEqual([]);
     expect(mocks.transactionFindMany).toHaveBeenCalledWith(expect.objectContaining({
       include: expect.objectContaining({
         qboMutationAttempts: {
-          where: { status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] } },
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           take: 1,
           select: {
             requestId: true,

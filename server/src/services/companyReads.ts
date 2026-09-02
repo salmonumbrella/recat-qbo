@@ -715,8 +715,10 @@ export const transactionReadInclude = {
     orderBy: { idx: 'asc' },
   },
   qboMutationAttempts: {
-    where: { status: { in: ['PREPARED', 'RETRYABLE', 'COMMITTING', 'UNCERTAIN'] } },
-    orderBy: { createdAt: 'desc' },
+    // Project the newest attempt first, including terminal successors. Filtering
+    // before ordering would let an older RETRYABLE attempt resurface forever
+    // after a later retry completed successfully.
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: 1,
     select: { requestId: true, operation: true, status: true },
   },

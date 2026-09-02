@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   createCompanyReadService,
+  transactionReadInclude,
   type CompanyReadDb,
 } from './companyReads.js';
 import {
@@ -35,6 +36,71 @@ describePostgres('classification company reads on PostgreSQL', () => {
 
   afterAll(async () => {
     await db?.$disconnect();
+  });
+
+  it('projects a terminal retry successor instead of an older RETRYABLE attempt', async () => {
+    const suffix = randomUUID();
+    const company = await db.company.create({
+      data: {
+        realmId: `company-read-retry-${suffix}`,
+        legalName: 'Retry Read Legal',
+        nickname: 'Retry Read',
+      },
+    });
+    companyIds.add(company.id);
+    const transaction = await db.transaction.create({
+      data: {
+        companyId: company.id,
+        qboId: `retry-${suffix}`,
+        qboType: 'Purchase',
+        qboSyncToken: '2',
+        date: new Date('2026-09-02T00:00:00.000Z'),
+        payee: 'Retry fixture',
+        amount: '-10.00',
+        bankAccount: 'Synthetic operating',
+        status: 'PENDING',
+        revision: 2,
+      },
+    });
+    await db.qboMutationAttempt.createMany({
+      data: [
+        {
+          transactionId: transaction.id,
+          requestId: `retry-old-${suffix}`,
+          operation: 'restore',
+          status: 'RETRYABLE',
+          expectedRevision: 1,
+          expectedSyncToken: '1',
+          requestHash: 'a'.repeat(64),
+          requestPayload: {},
+          beforeSnapshot: {},
+          createdAt: new Date('2026-09-02T01:00:00.000Z'),
+        },
+        {
+          transactionId: transaction.id,
+          requestId: `retry-new-${suffix}`,
+          operation: 'restore',
+          status: 'VERIFIED',
+          expectedRevision: 1,
+          expectedSyncToken: '1',
+          requestHash: 'b'.repeat(64),
+          requestPayload: {},
+          beforeSnapshot: {},
+          createdAt: new Date('2026-09-02T02:00:00.000Z'),
+        },
+      ],
+    });
+
+    const row = await db.transaction.findUnique({
+      where: { id: transaction.id },
+      include: transactionReadInclude,
+    });
+
+    expect(row?.qboMutationAttempts).toEqual([expect.objectContaining({
+      requestId: `retry-new-${suffix}`,
+      operation: 'restore',
+      status: 'VERIFIED',
+    })]);
   });
 
   it('reads canonical rule, candidate, case, test, and search state through company fences', async () => {
