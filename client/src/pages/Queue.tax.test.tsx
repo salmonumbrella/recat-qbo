@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   legacyPost: vi.fn(),
   legacyUndo: vi.fn(),
   retry: vi.fn(),
+  transfer: vi.fn(),
   bulkPost: vi.fn(),
   sync: vi.fn(),
   rulesCreate: vi.fn(),
@@ -153,7 +154,7 @@ vi.mock('../lib/api', () => {
       post: mocks.legacyPost,
       undo: mocks.legacyUndo,
       retry: mocks.retry,
-      transfer: vi.fn(),
+      transfer: mocks.transfer,
       bulkPost: mocks.bulkPost,
     },
   };
@@ -494,6 +495,7 @@ beforeEach(() => {
   mocks.categorize.mockResolvedValue(transaction());
   mocks.legacyPost.mockResolvedValue(transaction({ status: 'POSTED' }));
   mocks.legacyUndo.mockResolvedValue(transaction());
+  mocks.transfer.mockResolvedValue([]);
   mocks.requestId
     .mockReset()
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000101')
@@ -1718,6 +1720,74 @@ describe('tax-aware manual queue', () => {
     await waitFor(() => expect(mocks.legacyPost).toHaveBeenCalledWith('TRANSACTION_GENERIC'));
     await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
     expect(mocks.stage).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh Audit or toast when legacy undo fails after Queue unmounts', async () => {
+    const pending = deferred<TransactionDto>();
+    mocks.legacyUndo.mockReturnValue(pending.promise);
+    const user = userEvent.setup();
+    mocks.taxReadiness = null;
+    const view = await renderQueue(transaction({
+      status: 'POSTED',
+      postedAt: new Date().toISOString(),
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    }));
+
+    await user.click(document.querySelector<HTMLButtonElement>('[data-tip^="Undo"]')!);
+    view.unmount();
+    await act(async () => pending.reject(new Error('late undo failure')));
+
+    expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh Audit or toast when transfer fails after Queue unmounts', async () => {
+    const pending = deferred<TransactionDto[]>();
+    mocks.transfer.mockReturnValue(pending.promise);
+    const user = userEvent.setup();
+    const source = transaction({
+      category: null,
+      categoryQboId: null,
+      transferCandidateId: 'TRANSACTION_MATE',
+    });
+    const mate = transaction({
+      id: 'TRANSACTION_MATE',
+      qboId: 'PURCHASE_MATE',
+      payee: 'Transfer mate',
+      category: null,
+      categoryQboId: null,
+      transferCandidateId: source.id,
+    });
+    const view = await renderQueue([source, mate]);
+
+    await user.click(screen.getAllByRole('link', { name: 'record as transfer' })[0]!);
+    view.unmount();
+    await act(async () => pending.reject(new Error('late transfer failure')));
+
+    expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh Audit or toast when bulk post fails after Queue unmounts', async () => {
+    const pending = deferred<unknown>();
+    mocks.taxReadiness = null;
+    mocks.bulkPost.mockReturnValue(pending.promise);
+    const user = userEvent.setup();
+    const view = await renderQueue(transaction({
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    }));
+
+    await user.click(screen.getAllByRole('checkbox')[1]!);
+    await user.click(screen.getByRole('button', { name: /post 1 transaction/i }));
+    view.unmount();
+    await act(async () => pending.reject(new Error('late bulk failure')));
+
+    expect(mocks.notifyQboMutation).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
   });
 
   it('does not send an unstaged tax-ready purchase through legacy bulk post', async () => {

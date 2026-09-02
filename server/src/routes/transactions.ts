@@ -252,7 +252,11 @@ companyTransactionsRouter.get(
         || (dto.status === 'POSTED' && dto.activeCategorizationAttempt?.operation === 'restore'),
       );
     }
-    if (supportsActionability && query.providerDisposition === undefined) {
+    if (
+      supportsActionability
+      && query.status === undefined
+      && query.providerDisposition === undefined
+    ) {
       dtos = dtos.filter((dto) => !providerDispositionIsBlocked(
         dto.providerActionability?.disposition ?? 'UNKNOWN',
       ));

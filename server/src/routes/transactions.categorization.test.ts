@@ -382,6 +382,34 @@ describe('tax-aware categorization action routes', () => {
     }));
   });
 
+  it('keeps provider-blocked rows available to explicit diagnostic status reads', async () => {
+    const checkedAt = new Date();
+    mocks.transactionFindMany.mockResolvedValue([{
+      ...transactionRow,
+      status: 'ERROR',
+      providerActionability: {
+        companyId: COMPANY_ID,
+        transactionId: TRANSACTION_ID,
+        disposition: 'BLOCKED_RECONCILED',
+        checkedAt,
+        revision: 1,
+        qboSyncToken: transactionRow.qboSyncToken,
+        qboType: transactionRow.qboType,
+        qboId: transactionRow.qboId,
+        txnDate: transactionRow.date,
+      },
+    }]);
+
+    const response = await request(testApp())
+      .get(`/api/companies/${COMPANY_ID}/transactions?status=ERROR`)
+      .set(sessionHeaders);
+
+    expect(response.status).toBe(200);
+    expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
+      TRANSACTION_ID,
+    ]);
+  });
+
   it('exposes the current revision and staged transaction tax identity for reloads', async () => {
     mocks.splitLineDtos.mockReturnValue(null);
 

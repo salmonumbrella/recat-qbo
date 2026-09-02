@@ -1392,6 +1392,7 @@ export default function Queue() {
           toast('Reverted — moved back to the queue');
         })
         .catch((e) => {
+          if (!aliveRef.current) return;
           notifyQboMutation();
           toast(errText(e));
         });
@@ -1433,6 +1434,7 @@ export default function Queue() {
           toast(dryRun ? 'Dry run — transfer payload logged' : 'Recorded as a transfer in QuickBooks');
         })
         .catch((e) => {
+          if (!aliveRef.current) return;
           notifyQboMutation();
           toast(errText(e));
         });
@@ -1592,6 +1594,7 @@ export default function Queue() {
       await txnApi.bulkPost(ids);
       notifyQboMutation();
     } catch (e) {
+      if (!aliveRef.current) return;
       notifyQboMutation();
       toast(errText(e));
     }
