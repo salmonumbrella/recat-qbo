@@ -1539,6 +1539,42 @@ describe('tax-aware manual queue', () => {
   );
 
   it.each([
+    ['recategorize', 'PENDING', 'Resume post', 'QBO_TRANSACTION_LOCKED'],
+    ['restore', 'POSTED', 'Resume undo', 'QBO_PERIOD_CLOSED'],
+  ] as const)(
+    'removes a provider-blocked PREPARED %s resume from the queue',
+    async (operation, transactionStatus, buttonName, code) => {
+      const requestId = operation === 'restore'
+        ? '00000000-0000-4000-8000-000000000812'
+        : '00000000-0000-4000-8000-000000000811';
+      const endpoint = operation === 'restore'
+        ? mocks.undoCategorization
+        : mocks.commit;
+      endpoint.mockRejectedValue(new ApiError(
+        409,
+        'QuickBooks locked this transaction.',
+        code,
+      ));
+      const user = userEvent.setup();
+      await renderQueue(transaction({
+        status: transactionStatus,
+        activeCategorizationAttempt: {
+          requestId,
+          operation,
+          status: 'PREPARED',
+        },
+      }));
+
+      await user.click(screen.getByRole('button', { name: buttonName }));
+
+      await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+      expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
+      expect(mocks.toast).toHaveBeenCalledWith('QuickBooks locked this transaction.');
+      expect(mocks.requestId).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
     ['recategorize', 'Posting…'],
     ['restore', 'Undoing…'],
   ] as const)(

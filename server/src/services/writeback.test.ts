@@ -2926,6 +2926,44 @@ describe('commitStagedCategorization durable lifecycle', () => {
       status: 'RETRYABLE',
       errorCode: 'QBO_PERIOD_CLOSED',
     });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(restarted.audit).toHaveBeenCalledWith(db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_PERIOD_CLOSED' },
+      }),
+    }));
+  });
+
+  it('records a provider lock discovered after fresh preparation before sending', async () => {
+    const fixture = durableDeps();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: true,
+        reconciled: false,
+      });
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+
+    expect(fixture.preparePurchaseRecategorization).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_TRANSACTION_LOCKED' },
+      }),
+    }));
   });
 
   it('resumes a persisted PREPARED request when current account and tax references are unavailable', async () => {
@@ -4289,6 +4327,47 @@ describe('undoCategorization', () => {
     expect(fixture.db.attempts).toHaveLength(1);
     expect(fixture.prepareRestore).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_TRANSACTION_LOCKED' },
+      }),
+    }));
+  });
+
+  it('records a provider lock discovered after fresh restore preparation before sending', async () => {
+    const fixture = postedFixture();
+    fixture.fetchWriteSafety
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: false,
+      })
+      .mockResolvedValueOnce({
+        bookCloseDate: null,
+        cleared: false,
+        reconciled: true,
+      });
+
+    await expect(undoCategorization({
+      transactionId: DURABLE_TRANSACTION_ID,
+      companyId: DURABLE_COMPANY_ID,
+      requestId: 'request-undo-final-lock',
+      actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+    }, fixture.deps)).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_TRANSACTION_LOCKED' },
+      }),
+    }));
   });
 
   it('prepares and verifies undo from persisted proof when current references are unavailable', async () => {
@@ -4424,6 +4503,40 @@ describe('undoCategorization', () => {
     expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
     expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
     expect(fixture.db.attempts.at(-1)?.status).toBe('RETRYABLE');
+  });
+
+  it('records a provider lock when resuming a persisted PREPARED restore', async () => {
+    const fixture = postedFixture();
+    seedAttempt(fixture.db, 'PREPARED', 'request-undo', 'restore');
+    fixture.fetchWriteSafety.mockResolvedValueOnce({
+      bookCloseDate: null,
+      cleared: true,
+      reconciled: false,
+    });
+
+    await expect(
+      undoCategorization({
+        transactionId: DURABLE_TRANSACTION_ID,
+        companyId: DURABLE_COMPANY_ID,
+        requestId: 'request-undo',
+        actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
+      }, fixture.deps),
+    ).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+    expect(fixture.db.attempts.at(-1)).toMatchObject({
+      status: 'RETRYABLE',
+      errorCode: 'QBO_TRANSACTION_LOCKED',
+    });
+    expect(fixture.db.transactionActionability.updateMany).toHaveBeenCalledTimes(1);
+    expect(fixture.audit).toHaveBeenCalledWith(fixture.db, expect.objectContaining({
+      txnId: DURABLE_TRANSACTION_ID,
+      action: 'blocked',
+      payload: expect.objectContaining({
+        error: { code: 'QBO_TRANSACTION_LOCKED' },
+      }),
+    }));
   });
 
   it('allows exactly one COMMITTING winner and one send for concurrent same-request PREPARED undo resumes', async () => {

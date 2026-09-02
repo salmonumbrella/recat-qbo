@@ -1098,14 +1098,7 @@ export default function Queue() {
               error.mutationResult.requestId === mutation.requestId
             )
           ) {
-            updateTaxState(t, (state) => ({
-              ...state,
-              mutation:
-                state.mutation?.requestId === mutation.requestId
-                  ? { ...state.mutation, busy: false, phase: 'idle' }
-                  : state.mutation,
-            }));
-            toast(error.message);
+            recordTaxMutationFailure(t, error, resumed);
             return;
           }
           if (
@@ -1238,6 +1231,7 @@ export default function Queue() {
       taxState,
       updateTaxState,
       recordTaxMutation,
+      recordTaxMutationFailure,
       activeCompanyId,
       fetchAllTxns,
       toast,

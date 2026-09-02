@@ -180,6 +180,49 @@ async function persistBlockedProviderOutcome(
   });
 }
 
+function proposedCategorizationLabel(
+  txn: Pick<DurableTransaction, 'splitLines'>,
+  operation: QboPreparedWrite['operation'],
+): string {
+  if (operation === 'restore') return 'Restore original categorization';
+  return txn.splitLines.length > 1
+    ? `Split · ${txn.splitLines.map((line) => line.category).join(' / ')}`
+    : txn.splitLines[0]?.category ?? 'Prepared categorization';
+}
+
+async function assertWriteSafetyAndPersistBlocked(
+  d: DurableWritebackDeps,
+  txn: DurableTransaction,
+  actor: Actor,
+  safety: WriteSafetyRead,
+  observed: { date: Date | string; bankAccount: string },
+  after: string,
+): Promise<void> {
+  try {
+    assertQboWriteAllowed(safety.target, safety.evidence);
+  } catch (error) {
+    if (
+      error instanceof QboWriteSafetyError
+      && error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE'
+    ) {
+      await d.db.$transaction(async (tx) => {
+        await lockCompanyMutationScope(tx, txn.companyId);
+        await persistBlockedProviderOutcome(
+          tx,
+          d.audit,
+          { ...txn, ...observed },
+          actor,
+          safety,
+          error,
+          after,
+          d.now(),
+        );
+      });
+    }
+    throw error;
+  }
+}
+
 async function defaultDeps(): Promise<WritebackDeps> {
   const [{ prisma }, { qboFactory }, { writeAudit }, { env }] = await Promise.all([
     import('../lib/prisma.js'),
@@ -3348,13 +3391,24 @@ function preparedWriteSafetyTarget(
   };
 }
 
-async function assertPreparedWriteSafety(
+async function assertPreparedWriteSafetyAndPersistBlocked(
+  d: DurableWritebackDeps,
   client: QboClient,
   prepared: QboPreparedWrite,
+  txn: DurableTransaction,
+  actor: Actor,
+  observed: { date: Date | string; bankAccount: string },
 ): Promise<void> {
   const target = preparedWriteSafetyTarget(prepared);
   const evidence = await client.fetchWriteSafety(target);
-  assertQboWriteAllowed(target, evidence);
+  await assertWriteSafetyAndPersistBlocked(
+    d,
+    txn,
+    actor,
+    { target, evidence },
+    observed,
+    proposedCategorizationLabel(txn, prepared.operation),
+  );
 }
 
 function txnWriteSafetyTarget(txn: QboTxn): QboWriteSafetyTarget | null {
@@ -3415,16 +3469,6 @@ async function readSnapshotWriteSafety(
   };
   const evidence = await client.fetchWriteSafety(target);
   return { target, evidence };
-}
-
-async function assertSnapshotWriteSafety(
-  client: QboClient,
-  qboType: 'Purchase' | 'Deposit',
-  qboId: string,
-  snapshot: QboPurchaseSnapshot | QboDepositSnapshot,
-): Promise<void> {
-  const safety = await readSnapshotWriteSafety(client, qboType, qboId, snapshot);
-  assertQboWriteAllowed(safety.target, safety.evidence);
 }
 
 async function sendAndVerifyPrepared(
@@ -3796,7 +3840,14 @@ async function commitStagedCategorizationInternal(
               `${prepared.qboType} changed before the prepared write could resume.`,
             );
           }
-          await assertPreparedWriteSafety(client, prepared);
+          await assertPreparedWriteSafetyAndPersistBlocked(
+            d,
+            client,
+            prepared,
+            currentTxn,
+            input.actor,
+            { date: current.date, bankAccount: freshTxn.bankAccount },
+          );
         },
         autopilot === undefined
           ? undefined
@@ -3868,36 +3919,14 @@ async function commitStagedCategorizationInternal(
     }
 
     const safetyRead = await readSnapshotWriteSafety(client, qboType, txn.qboId, before);
-    try {
-      assertQboWriteAllowed(safetyRead.target, safetyRead.evidence);
-    } catch (error) {
-      if (
-        error instanceof QboWriteSafetyError
-        && error.code !== 'QBO_WRITE_SAFETY_UNAVAILABLE'
-      ) {
-        const after = txn.splitLines.length > 1
-          ? `Split · ${txn.splitLines.map((line) => line.category).join(' / ')}`
-          : txn.splitLines[0]?.category ?? 'Prepared categorization';
-        await d.db.$transaction(async (tx) => {
-          await lockCompanyMutationScope(tx, txn.companyId);
-          await persistBlockedProviderOutcome(
-            tx,
-            d.audit,
-            {
-              ...txn,
-              date: before.date,
-              bankAccount: freshTxn.bankAccount,
-            },
-            input.actor,
-            safetyRead,
-            error,
-            after,
-            d.now(),
-          );
-        });
-      }
-      throw error;
-    }
+    await assertWriteSafetyAndPersistBlocked(
+      d,
+      txn,
+      input.actor,
+      safetyRead,
+      { date: before.date, bankAccount: freshTxn.bankAccount },
+      proposedCategorizationLabel(txn, 'recategorize'),
+    );
 
     const prepared = validateFreshPrepared(
       await client.prepareRecategorization(
@@ -3988,7 +4017,14 @@ async function commitStagedCategorizationInternal(
               input.expectedTaxDisposition,
             );
         }
-        await assertPreparedWriteSafety(client, prepared);
+        await assertPreparedWriteSafetyAndPersistBlocked(
+          d,
+          client,
+          prepared,
+          currentTxn,
+          input.actor,
+          { date: before.date, bankAccount: freshTxn.bankAccount },
+        );
       },
       autopilot === undefined
         ? undefined
@@ -5024,7 +5060,14 @@ export async function undoCategorization(
             );
           }
           assertCurrentProof(txn, current);
-          await assertPreparedWriteSafety(client, restore);
+          await assertPreparedWriteSafetyAndPersistBlocked(
+            d,
+            client,
+            restore,
+            currentTxn,
+            input.actor,
+            { date: current.date, bankAccount: freshTxn.bankAccount },
+          );
         },
       );
       if (!entered.won) {
@@ -5090,11 +5133,19 @@ export async function undoCategorization(
       lifecycleError('QBO_STATE_DRIFT', currentVerification.message);
     }
     assertCurrentProof(txn, current);
-    await assertSnapshotWriteSafety(
+    const restoreSafety = await readSnapshotWriteSafety(
       client,
       originalPrepared.qboType,
       txn.qboId,
       current,
+    );
+    await assertWriteSafetyAndPersistBlocked(
+      d,
+      txn,
+      input.actor,
+      restoreSafety,
+      { date: current.date, bankAccount: freshTxn.bankAccount },
+      proposedCategorizationLabel(txn, 'restore'),
     );
 
     const restore = validateFreshPrepared(
@@ -5171,7 +5222,14 @@ export async function undoCategorization(
           );
         }
         assertCurrentProof(txn, lastSnapshot);
-        await assertPreparedWriteSafety(client, restore);
+        await assertPreparedWriteSafetyAndPersistBlocked(
+          d,
+          client,
+          restore,
+          currentTxn,
+          input.actor,
+          { date: lastSnapshot.date, bankAccount: lastTxn.bankAccount },
+        );
       },
     );
     if (!entered.won) {
