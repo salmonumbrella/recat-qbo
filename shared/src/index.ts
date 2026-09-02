@@ -1439,6 +1439,10 @@ export interface AuditEntryDto {
   before: string;
   after: string;
   payload?: unknown;
+  transactionId?: string;
+  undo?: {
+    kind: 'categorization' | 'legacy';
+  };
 }
 
 export interface QboAccountDto {

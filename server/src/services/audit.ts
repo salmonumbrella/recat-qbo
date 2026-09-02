@@ -196,8 +196,102 @@ function toAuditDto(row: AuditEntry): AuditEntryDto {
     before: row.before,
     after: row.after,
   };
+  if (row.txnId !== null) dto.transactionId = row.txnId;
   if (row.payload !== null) dto.payload = row.payload;
   return dto;
+}
+
+interface AuditUndoTransactionState {
+  id: string;
+  status: string;
+  postedAt: Date | null;
+}
+
+interface LatestPostedAuditState {
+  id: string;
+  txnId: string | null;
+  payload: unknown;
+}
+
+const UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+function isVerifiedCategorizationPayload(payload: unknown): boolean {
+  if (typeof payload !== 'object' || payload === null) return false;
+  const record = payload as Record<string, unknown>;
+  if (record.outcome !== 'VERIFIED') return false;
+  const references = record.references;
+  return typeof references === 'object'
+    && references !== null
+    && (references as Record<string, unknown>).operation === 'recategorize';
+}
+
+export function decorateAuditEntriesWithUndo(
+  entries: AuditEntryDto[],
+  transactions: AuditUndoTransactionState[],
+  latestPostedEntries: LatestPostedAuditState[],
+  now = new Date(),
+): AuditEntryDto[] {
+  const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
+  const latestByTransactionId = new Map<string, LatestPostedAuditState>();
+  const transactionIdByLatestEntryId = new Map<string, string>();
+  for (const row of latestPostedEntries) {
+    if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
+    latestByTransactionId.set(row.txnId, row);
+    transactionIdByLatestEntryId.set(row.id, row.txnId);
+  }
+
+  return entries.map((entry) => {
+    const transactionId = entry.transactionId ?? transactionIdByLatestEntryId.get(entry.id);
+    if (transactionId === undefined) return entry;
+    const withTransaction = { ...entry, transactionId };
+    const txn = transactionById.get(transactionId);
+    const latest = latestByTransactionId.get(transactionId);
+    const postedAt = txn?.postedAt?.getTime();
+    const elapsed = postedAt === undefined ? Number.POSITIVE_INFINITY : now.getTime() - postedAt;
+    if (
+      txn?.status !== 'POSTED'
+      || latest?.id !== entry.id
+      || (entry.action !== 'posted' && entry.action !== 'auto-posted')
+      || elapsed < 0
+      || elapsed > UNDO_WINDOW_MS
+    ) {
+      return withTransaction;
+    }
+    return {
+      ...withTransaction,
+      undo: {
+        kind: isVerifiedCategorizationPayload(latest.payload)
+          ? 'categorization'
+          : 'legacy',
+      },
+    };
+  });
+}
+
+async function decoratePageWithUndo(
+  companyId: string,
+  entries: AuditEntryDto[],
+): Promise<AuditEntryDto[]> {
+  const transactionIds = [...new Set(
+    entries.flatMap((entry) => entry.transactionId === undefined ? [] : [entry.transactionId]),
+  )];
+  if (transactionIds.length === 0) return entries;
+  const [transactions, postedEntries] = await Promise.all([
+    prisma.transaction.findMany({
+      where: { companyId, id: { in: transactionIds } },
+      select: { id: true, status: true, postedAt: true },
+    }),
+    prisma.auditEntry.findMany({
+      where: {
+        companyId,
+        txnId: { in: transactionIds },
+        action: { in: ['posted', 'auto-posted'] },
+      },
+      select: { id: true, txnId: true, payload: true },
+      orderBy: [{ at: 'desc' }, { id: 'desc' }],
+    }),
+  ]);
+  return decorateAuditEntriesWithUndo(entries, transactions, postedEntries);
 }
 
 /** Does the entry match the free-text search across when/who/payee/amount/action/before/after? */
@@ -236,7 +330,7 @@ export async function listAudit(companyId: string, opts: ListAuditOptions = {}):
       const idx = matched.findIndex((d) => d.id === opts.cursor);
       start = idx >= 0 ? idx + 1 : 0;
     }
-    const entries = matched.slice(start, start + limit);
+    const entries = await decoratePageWithUndo(companyId, matched.slice(start, start + limit));
     const last = entries[entries.length - 1];
     const nextCursor = last !== undefined && matched.length > start + limit ? last.id : null;
     return { entries, nextCursor };
@@ -249,7 +343,7 @@ export async function listAudit(companyId: string, opts: ListAuditOptions = {}):
     ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
   });
   const hasMore = rows.length > limit;
-  const entries = rows.slice(0, limit).map(toAuditDto);
+  const entries = await decoratePageWithUndo(companyId, rows.slice(0, limit).map(toAuditDto));
   const last = entries[entries.length - 1];
   const nextCursor = hasMore && last !== undefined ? last.id : null;
   return { entries, nextCursor };

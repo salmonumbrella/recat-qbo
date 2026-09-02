@@ -1,10 +1,15 @@
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Audit from './Audit';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   toast: vi.fn(),
+  notifyQboMutation: vi.fn(),
+  undoCategorization: vi.fn(),
+  legacyUndo: vi.fn(),
+  requestId: vi.fn(),
   qboMutationRevision: 0,
 }));
 
@@ -13,12 +18,18 @@ vi.mock('../lib/api', () => ({
     list: mocks.list,
     exportUrl: (companyId: string) => `/api/companies/${companyId}/audit/export.csv`,
   },
+  createCategorizationRequestId: mocks.requestId,
+  transactions: {
+    undoCategorization: mocks.undoCategorization,
+    undo: mocks.legacyUndo,
+  },
 }));
 
 vi.mock('../state/AppContext', () => ({
   useApp: () => ({
     activeCompanyId: 'company-1',
     toast: mocks.toast,
+    notifyQboMutation: mocks.notifyQboMutation,
     qboMutationRevision: mocks.qboMutationRevision,
   }),
 }));
@@ -42,7 +53,11 @@ const blockedEntry = {
 describe('Audit', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     mocks.qboMutationRevision = 0;
+    mocks.requestId.mockReturnValue('undo-request-generic');
+    mocks.undoCategorization.mockResolvedValue({ ok: true, outcome: 'VERIFIED' });
+    mocks.legacyUndo.mockResolvedValue({ status: 'REVERTED' });
     mocks.list.mockResolvedValue({ entries: [blockedEntry], nextCursor: null });
   });
 
@@ -63,5 +78,52 @@ describe('Audit', () => {
     view.rerender(<Audit />);
 
     await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+  });
+
+  it('runs a durable Undo from the audit entry and refreshes the log', async () => {
+    mocks.list.mockResolvedValue({
+      entries: [{
+        ...blockedEntry,
+        id: 'audit-posted',
+        action: 'posted',
+        transactionId: 'transaction-generic',
+        undo: { kind: 'categorization' },
+      }],
+      nextCursor: null,
+    });
+    const user = userEvent.setup();
+    render(<Audit />);
+
+    await user.click(await screen.findByRole('button', { name: /undo locked supplier/i }));
+
+    expect(mocks.undoCategorization).toHaveBeenCalledWith(
+      'transaction-generic',
+      'undo-request-generic',
+    );
+    expect(mocks.legacyUndo).not.toHaveBeenCalled();
+    expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
+    expect(mocks.toast).toHaveBeenCalledWith('Reverted in QuickBooks.');
+  });
+
+  it('runs a legacy Undo without allocating a durable operation ID', async () => {
+    mocks.list.mockResolvedValue({
+      entries: [{
+        ...blockedEntry,
+        id: 'audit-legacy-post',
+        action: 'posted',
+        transactionId: 'transaction-legacy',
+        undo: { kind: 'legacy' },
+      }],
+      nextCursor: null,
+    });
+    const user = userEvent.setup();
+    render(<Audit />);
+
+    await user.click(await screen.findByRole('button', { name: /undo locked supplier/i }));
+
+    expect(mocks.legacyUndo).toHaveBeenCalledWith('transaction-legacy');
+    expect(mocks.undoCategorization).not.toHaveBeenCalled();
+    expect(mocks.requestId).not.toHaveBeenCalled();
+    expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
   });
 });

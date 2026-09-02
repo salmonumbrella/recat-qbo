@@ -4,6 +4,7 @@ import {
   AUDIT_CSV_HEADER,
   buildAuditCsv,
   csvEscape,
+  decorateAuditEntriesWithUndo,
   writeAudit,
 } from './audit.js';
 
@@ -68,6 +69,65 @@ describe('buildAuditCsv', () => {
     // Quoted newline stays inside the quoted field; naive line count is header + 2
     // but a CSV parser sees exactly one record. Assert the quoting is present.
     expect(csv).toContain('"Split:\nOffice / Meals"');
+  });
+});
+
+describe('decorateAuditEntriesWithUndo', () => {
+  it('offers durable undo only on the latest current verified categorization write', () => {
+    const current = entry({
+      id: 'audit-current',
+      at: '2026-07-28T11:59:59.000Z',
+      payload: {
+        requestId: 'request-current',
+        outcome: 'VERIFIED',
+        references: { operation: 'recategorize' },
+      },
+    });
+    const older = entry({ id: 'audit-older', at: '2026-07-20T12:00:00.000Z' });
+
+    const decorated = decorateAuditEntriesWithUndo(
+      [current, older],
+      [{ id: 'transaction-generic', status: 'POSTED', postedAt: new Date('2026-07-28T12:00:00.000Z') }],
+      [{ id: 'audit-current', txnId: 'transaction-generic', payload: current.payload }],
+      new Date('2026-07-29T12:00:00.000Z'),
+    );
+
+    expect(decorated[0]).toMatchObject({
+      transactionId: 'transaction-generic',
+      undo: { kind: 'categorization' },
+    });
+    expect(decorated[1]?.undo).toBeUndefined();
+  });
+
+  it('offers legacy undo for a current legacy post and none after the window', () => {
+    const legacy = entry({ id: 'audit-legacy', transactionId: 'transaction-legacy' });
+    const available = decorateAuditEntriesWithUndo(
+      [legacy],
+      [{ id: 'transaction-legacy', status: 'POSTED', postedAt: new Date('2026-07-15T12:00:00.000Z') }],
+      [{ id: 'audit-legacy', txnId: 'transaction-legacy', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+    const expired = decorateAuditEntriesWithUndo(
+      [legacy],
+      [{ id: 'transaction-legacy', status: 'POSTED', postedAt: new Date('2026-06-01T12:00:00.000Z') }],
+      [{ id: 'audit-legacy', txnId: 'transaction-legacy', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+
+    expect(available[0]?.undo).toEqual({ kind: 'legacy' });
+    expect(expired[0]?.undo).toBeUndefined();
+  });
+
+  it('does not offer undo when QuickBooks is no longer in the posted state', () => {
+    const posted = entry({ id: 'audit-post', transactionId: 'transaction-generic' });
+    const [decorated] = decorateAuditEntriesWithUndo(
+      [posted],
+      [{ id: 'transaction-generic', status: 'REVERTED', postedAt: new Date('2026-07-15T12:00:00.000Z') }],
+      [{ id: 'audit-post', txnId: 'transaction-generic', payload: null }],
+      new Date('2026-07-16T12:00:00.000Z'),
+    );
+
+    expect(decorated?.undo).toBeUndefined();
   });
 });
 

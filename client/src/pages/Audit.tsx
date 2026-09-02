@@ -6,7 +6,11 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AuditAction, AuditEntryDto } from '@recat/shared';
-import { audit as auditApi } from '../lib/api';
+import {
+  audit as auditApi,
+  createCategorizationRequestId,
+  transactions as txnApi,
+} from '../lib/api';
 import { useApp } from '../state/AppContext';
 import { fmtMoney } from '../lib/format';
 import { AutopilotQueueStatus } from './settings/AutopilotCard';
@@ -46,13 +50,14 @@ function fmtWhen(iso: string): string {
 const SEARCH_DEBOUNCE_MS = 300;
 
 export default function Audit() {
-  const { activeCompanyId, toast, qboMutationRevision } = useApp();
+  const { activeCompanyId, toast, qboMutationRevision, notifyQboMutation } = useApp();
 
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [entries, setEntries] = useState<AuditEntryDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [undoingEntryId, setUndoingEntryId] = useState<string | null>(null);
 
   // Ignore out-of-order responses (fast typing / company switch / load more).
   const seq = useRef(0);
@@ -104,6 +109,24 @@ export default function Audit() {
     if (!activeCompanyId) return;
     window.open(auditApi.exportUrl(activeCompanyId));
   }, [activeCompanyId]);
+
+  const undoWrite = useCallback((entry: AuditEntryDto) => {
+    if (!entry.transactionId || !entry.undo || undoingEntryId !== null) return;
+    if (!window.confirm(
+      `Undo this QuickBooks categorization for ${entry.payee}? This restores the prior transaction exactly.`,
+    )) return;
+    setUndoingEntryId(entry.id);
+    const request = entry.undo.kind === 'categorization'
+      ? txnApi.undoCategorization(entry.transactionId, createCategorizationRequestId())
+      : txnApi.undo(entry.transactionId);
+    request
+      .then(() => {
+        notifyQboMutation();
+        toast('Reverted in QuickBooks.');
+      })
+      .catch((error: Error) => toast(error.message))
+      .finally(() => setUndoingEntryId(null));
+  }, [notifyQboMutation, toast, undoingEntryId]);
 
   const showEmpty = loaded && q.trim() !== '' && entries.length === 0;
 
@@ -188,8 +211,22 @@ export default function Audit() {
                 </span>
               </span>
               <span style={{ fontSize: 13, color: 'var(--mut)' }}>
-                {e.before} <span style={{ color: 'var(--fnt)' }}>→</span>{' '}
-                <b style={{ color: 'var(--ink)', fontWeight: 600 }}>{e.after}</b>
+                <span>
+                  {e.before} <span style={{ color: 'var(--fnt)' }}>→</span>{' '}
+                  <b style={{ color: 'var(--ink)', fontWeight: 600 }}>{e.after}</b>
+                </span>
+                {e.undo && (
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    aria-label={`Undo ${e.payee}`}
+                    disabled={undoingEntryId !== null}
+                    onClick={() => undoWrite(e)}
+                    style={{ marginLeft: 10, padding: '4px 9px' }}
+                  >
+                    {undoingEntryId === e.id ? 'Undoing…' : 'Undo'}
+                  </button>
+                )}
               </span>
             </div>
           );
