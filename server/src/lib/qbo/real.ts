@@ -142,16 +142,16 @@ const REVOKE_TIMEOUT_MS = 5_000;
 /** QBO query hard cap per page. */
 const QUERY_PAGE_SIZE = 1000;
 
-class QboHttpNotFoundError extends Error {
+class QboHttpNotFoundError extends QboHttpError {
   constructor() {
-    super('QuickBooks resource was not found.');
+    super(404, 'QuickBooks resource was not found.');
     this.name = 'QboHttpNotFoundError';
   }
 }
 
-class QboObjectNotFoundError extends Error {
+class QboObjectNotFoundError extends QboHttpError {
   constructor(message = 'QuickBooks object was not found.') {
-    super(message);
+    super(400, message);
     this.name = 'QboObjectNotFoundError';
   }
 }
