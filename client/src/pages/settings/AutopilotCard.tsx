@@ -967,7 +967,7 @@ export function AutopilotQueueStatus({
   const [runs, setRuns] = useState<AutopilotRunDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [expanded, setExpanded] = useState(surface === 'audit');
+  const [expanded, setExpanded] = useState(false);
   const [capNonce, setCapNonce] = useState(0);
   const detailsId = useId();
   const generationRef = useRef(0);
@@ -1021,7 +1021,7 @@ export function AutopilotQueueStatus({
       setRuns([]);
       setNextCursor(null);
       setLoadingOlder(false);
-      setExpanded(surface === 'audit');
+      setExpanded(false);
     }
     Promise.all([
       autopilot.get(companyId),

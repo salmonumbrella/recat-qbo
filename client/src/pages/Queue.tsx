@@ -265,6 +265,7 @@ export default function Queue() {
     tagsRequired,
     taxReadiness,
     toast,
+    notifyQboMutation,
   } = useApp();
   const navigate = useNavigate();
 
@@ -946,12 +947,13 @@ export default function Queue() {
           reconciled,
         },
       }));
+      notifyQboMutation();
       if (result.ok && result.outcome === 'VERIFIED' && mutation.kind === 'commit') {
         const companyId = activeCompanyIdRef.current;
         if (companyId) offerRecurring(companyId, t.id, t.payee);
       }
     },
-    [offerRecurring, patchRow, updateTaxState],
+    [notifyQboMutation, offerRecurring, patchRow, updateTaxState],
   );
 
   const recordTaxMutationFailure = useCallback(
@@ -976,6 +978,7 @@ export default function Queue() {
         ) {
           removeRow(t.id);
           updateTaxState(t, (state) => ({ ...state, mutation: null }));
+          notifyQboMutation();
           toast(error.message);
           return;
         }
@@ -997,7 +1000,7 @@ export default function Queue() {
         false,
       );
     },
-    [patchRow, removeRow, updateTaxState, recordTaxMutation, toast],
+    [notifyQboMutation, patchRow, removeRow, updateTaxState, recordTaxMutation, toast],
   );
 
   const commitTax = useCallback(
@@ -1300,6 +1303,7 @@ export default function Queue() {
         .then((res) => {
           if (!aliveRef.current) return;
           const dto = res;
+          notifyQboMutation();
           updateRow(dto);
           setSel((s) => ({ ...s, [id]: false }));
           if (dto.status === 'POSTED' || dto.status === 'DRY_RUN') {
@@ -1309,6 +1313,7 @@ export default function Queue() {
         })
         .catch((e) => {
           if (!aliveRef.current) return;
+          notifyQboMutation();
           if (
             e instanceof ApiError
             && (
@@ -1335,6 +1340,7 @@ export default function Queue() {
       patchRow,
       updateRow,
       removeRow,
+      notifyQboMutation,
       toast,
     ],
   );
@@ -1347,12 +1353,16 @@ export default function Queue() {
         .undo(id)
         .then((dto) => {
           if (!aliveRef.current) return;
+          notifyQboMutation();
           updateRow(dto);
           toast('Reverted — moved back to the queue');
         })
-        .catch((e) => toast(errText(e)));
+        .catch((e) => {
+          notifyQboMutation();
+          toast(errText(e));
+        });
     },
-    [rows, canMutate, updateRow, toast],
+    [rows, canMutate, notifyQboMutation, updateRow, toast],
   );
 
   const doRetry = useCallback(
@@ -1380,14 +1390,20 @@ export default function Queue() {
         .transfer(t.id, mate.id)
         .then((dtos) => {
           if (!aliveRef.current) return;
+          notifyQboMutation();
           setRows((prev) =>
-            prev.map((r) => dtos.find((d) => d.id === r.id) ?? r),
+            prev
+              .map((r) => dtos.find((d) => d.id === r.id) ?? r)
+              .filter(belongsInQueue),
           );
           toast(dryRun ? 'Dry run — transfer payload logged' : 'Recorded as a transfer in QuickBooks');
         })
-        .catch((e) => toast(errText(e)));
+        .catch((e) => {
+          notifyQboMutation();
+          toast(errText(e));
+        });
     },
-    [xferMateOf, canMutate, dryRun, toast],
+    [xferMateOf, canMutate, dryRun, notifyQboMutation, toast],
   );
 
   const toggleTag = useCallback(
@@ -1540,7 +1556,9 @@ export default function Queue() {
     setBulkCat(null);
     try {
       await txnApi.bulkPost(ids);
+      notifyQboMutation();
     } catch (e) {
+      notifyQboMutation();
       toast(errText(e));
     }
     // Refetch and keep polling briefly while the server finishes posting.
@@ -1573,6 +1591,7 @@ export default function Queue() {
     usesTaxLifecycleFor,
     tagsRequired,
     fetchAllTxns,
+    notifyQboMutation,
     toast,
   ]);
 

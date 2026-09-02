@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   classificationHealth: vi.fn(),
   categorize: vi.fn(),
   toast: vi.fn(),
+  notifyQboMutation: vi.fn(),
   setPendingCount: vi.fn(),
   refreshCompanies: vi.fn(),
   navigate: vi.fn(),
@@ -34,6 +35,7 @@ vi.mock('../state/AppContext', () => ({
     ],
     tags: mocks.tags, setPendingCount: mocks.setPendingCount, refreshCompanies: mocks.refreshCompanies,
     dryRun: false, tagsRequired: false, taxReadiness: null, toast: mocks.toast,
+    notifyQboMutation: mocks.notifyQboMutation,
   }),
 }));
 

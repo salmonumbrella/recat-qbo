@@ -1038,12 +1038,12 @@ describe('AutopilotQueueStatus', () => {
     expect(screen.getByText(/1 line proposal/i)).not.toBeVisible();
   });
 
-  it('keeps the audit surface expanded by default', async () => {
+  it('keeps the audit surface collapsed by default', async () => {
     render(<AutopilotQueueStatus companyId="company-1" surface="audit" />);
 
-    expect(await screen.findByRole('button', { name: 'Hide Autopilot details' }))
-      .toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByText(/1 line proposal/i)).toBeVisible();
+    expect(await screen.findByRole('button', { name: 'Show Autopilot details' }))
+      .toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText(/1 line proposal/i)).not.toBeVisible();
   });
 
   it('loads older run summaries through the opaque cursor without adding mutation controls', async () => {

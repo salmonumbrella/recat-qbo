@@ -27,7 +27,9 @@ function chipColors(action: AuditAction): [string, string, string] {
     return ['var(--okT)', 'var(--okB)', 'var(--okD)'];
   }
   if (action === 'error') return ['var(--erT)', 'var(--erB)', 'var(--erD)'];
-  if (action === 'dry-run') return ['var(--amT)', 'var(--amB)', 'var(--amD)'];
+  if (action === 'dry-run' || action === 'blocked') {
+    return ['var(--amT)', 'var(--amB)', 'var(--amD)'];
+  }
   return ['var(--fnt)', 'var(--hl)', 'var(--bd2)'];
 }
 
@@ -44,7 +46,7 @@ function fmtWhen(iso: string): string {
 const SEARCH_DEBOUNCE_MS = 300;
 
 export default function Audit() {
-  const { activeCompanyId, toast } = useApp();
+  const { activeCompanyId, toast, qboMutationRevision } = useApp();
 
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
@@ -80,7 +82,7 @@ export default function Audit() {
       .catch((err: Error) => {
         if (seq.current === mySeq) toast(err.message);
       });
-  }, [activeCompanyId, debouncedQ, toast]);
+  }, [activeCompanyId, debouncedQ, qboMutationRevision, toast]);
 
   const loadMore = useCallback(() => {
     if (!activeCompanyId || !nextCursor) return;
@@ -128,8 +130,8 @@ export default function Audit() {
         <div>
           <div className="page-title">Audit log</div>
           <div className="page-sub">
-            Every write to QuickBooks, recorded before it happens. Append-only — nothing here can be
-            edited or deleted.
+            Every attempt to change QuickBooks and its verified outcome. Append-only — nothing here
+            can be edited or deleted.
           </div>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>

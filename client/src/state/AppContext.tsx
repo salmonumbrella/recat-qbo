@@ -77,6 +77,10 @@ export interface AppContextValue {
   setPendingCount: (n: number) => void;
   refreshPendingCount: () => Promise<void>;
 
+  /** Monotonic signal for views that read append-only QuickBooks mutation history. */
+  qboMutationRevision: number;
+  notifyQboMutation: () => void;
+
   theme: Theme;
   toggleTheme: () => void;
 
@@ -112,6 +116,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [taxReadiness, setTaxReadiness] = useState<TaxReadinessDto | null>(null);
   const [taxReadinessLoading, setTaxReadinessLoading] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
+  const [qboMutationRevision, setQboMutationRevision] = useState(0);
 
   const [theme, setTheme] = useState<Theme>(() =>
     readPreference(THEME_KEY) === 'dark' ? 'dark' : 'light',
@@ -220,6 +225,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (refDataCompanyRef.current === cid) setPendingCount(res.pendingCount);
   }, [activeCompanyId]);
 
+  const notifyQboMutation = useCallback(() => {
+    setQboMutationRevision((revision) => revision + 1);
+  }, []);
+
   const refreshTaxReadiness = useCallback(async () => {
     const cid = activeCompanyId;
     if (!cid) return;
@@ -318,6 +327,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setTaxReadiness(null);
     setTaxReadinessLoading(false);
     setPendingCount(0);
+    setQboMutationRevision(0);
   }, []);
 
   const value = useMemo<AppContextValue>(
@@ -346,6 +356,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       pendingCount,
       setPendingCount,
       refreshPendingCount,
+      qboMutationRevision,
+      notifyQboMutation,
       theme,
       toggleTheme,
       density,
@@ -374,6 +386,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshTaxReferences,
       pendingCount,
       refreshPendingCount,
+      qboMutationRevision,
+      notifyQboMutation,
       theme,
       toggleTheme,
       density,

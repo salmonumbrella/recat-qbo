@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   commitRuleOperation: vi.fn(),
   navigate: vi.fn(),
   toast: vi.fn(),
+  notifyQboMutation: vi.fn(),
   setPendingCount: vi.fn(),
   refreshCompanies: vi.fn(),
   requestId: vi.fn(),
@@ -105,6 +106,7 @@ vi.mock('../state/AppContext', () => ({
     tagsRequired: false,
     taxReadiness: mocks.taxReadiness,
     toast: mocks.toast,
+    notifyQboMutation: mocks.notifyQboMutation,
   }),
 }));
 
@@ -722,6 +724,7 @@ describe('tax-aware manual queue', () => {
       '00000000-0000-4000-8000-000000000101',
     ));
     await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
+    expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
   });
 
   it('renders positive server preview totals as an explicit refund direction', async () => {
@@ -771,6 +774,7 @@ describe('tax-aware manual queue', () => {
 
       await waitFor(() => expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument());
       expect(mocks.toast).toHaveBeenCalledWith('QuickBooks locked this transaction.');
+      expect(mocks.notifyQboMutation).toHaveBeenCalledTimes(1);
     },
   );
 
