@@ -137,7 +137,7 @@ function preparedUndo() {
     restoreHash: 'c'.repeat(64),
     preview: {
       action: 'restore_purchase_categorization' as const,
-      resultingStatus: 'REVERTED' as const,
+      resultingStatus: 'PENDING' as const,
       direction: 'purchase' as const,
       totalCents: -1234,
       totalTaxCents: null,

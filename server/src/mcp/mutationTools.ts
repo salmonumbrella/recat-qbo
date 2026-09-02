@@ -576,7 +576,7 @@ const preparedUndoOutput = z.strictObject({
   expiresAt: z.iso.datetime(),
   preview: z.strictObject({
     action: z.literal('restore_purchase_categorization'),
-    resultingStatus: z.literal('REVERTED'),
+    resultingStatus: z.literal('PENDING'),
     direction: z.enum(['purchase', 'refund']),
     totalCents: safeInteger,
     totalTaxCents: safeInteger.nullable(),

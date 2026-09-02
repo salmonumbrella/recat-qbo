@@ -79,7 +79,7 @@ const preparedUndo = {
   expiresAt: '2026-07-29T20:15:00.000Z',
   preview: {
     action: 'restore_purchase_categorization' as const,
-    resultingStatus: 'REVERTED' as const,
+    resultingStatus: 'PENDING' as const,
     direction: 'purchase' as const,
     totalCents: -1_050,
     totalTaxCents: -50,

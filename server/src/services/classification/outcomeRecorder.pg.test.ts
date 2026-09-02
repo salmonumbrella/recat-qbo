@@ -1131,7 +1131,7 @@ describePostgres('verified classification outcome recorder on PostgreSQL', () =>
     const undoPreparedHash = hashClassificationPreparedWrite(undoPrepared);
     await db.transaction.update({
       where: { id: first.transaction.id },
-      data: { revision: 3, qboSyncToken: '3', status: 'REVERTED' },
+      data: { revision: 3, qboSyncToken: '3', status: 'PENDING' },
     });
     const undoAttempt = await db.qboMutationAttempt.create({
       data: {

@@ -858,7 +858,7 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
 
       await db.transaction.update({
         where: { id: transactions[3]!.id },
-        data: { status: 'REVERTED' },
+        data: { status: 'PENDING' },
       });
       const reverted = {
         ...conflicting,

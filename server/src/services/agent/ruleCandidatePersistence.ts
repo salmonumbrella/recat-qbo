@@ -247,7 +247,7 @@ async function foldOutcome(
     return false;
   }
 
-  const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'REVERTED';
+  const expectedStatus = outcome.operation === 'posted' ? 'POSTED' : 'PENDING';
   const current =
     transaction.id === outcome.transactionId
     && transaction.companyId === outcome.companyId

@@ -260,6 +260,17 @@ function auditUndoCandidateKind(
     : 'legacy';
 }
 
+function latestUndoableByTransactionId(
+  rows: LatestUndoableAuditState[],
+): Map<string, LatestUndoableAuditState> {
+  const latest = new Map<string, LatestUndoableAuditState>();
+  for (const row of rows) {
+    if (row.txnId === null || latest.has(row.txnId)) continue;
+    latest.set(row.txnId, row);
+  }
+  return latest;
+}
+
 export function auditPageNeedsSalesTaxCodes(
   entries: AuditEntryDto[],
   transactions: AuditTaxCodeCandidateState[],
@@ -267,11 +278,7 @@ export function auditPageNeedsSalesTaxCodes(
   now = new Date(),
 ): boolean {
   const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
-  const latestByTransactionId = new Map<string, LatestUndoableAuditState>();
-  for (const row of latestUndoableEntries) {
-    if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
-    latestByTransactionId.set(row.txnId, row);
-  }
+  const latestByTransactionId = latestUndoableByTransactionId(latestUndoableEntries);
 
   return entries.some((entry) => {
     const transactionId = entry.transactionId;
@@ -291,11 +298,7 @@ export function decorateAuditEntriesWithUndo(
   now = new Date(),
 ): AuditEntryDto[] {
   const transactionById = new Map(transactions.map((txn) => [txn.id, txn]));
-  const latestByTransactionId = new Map<string, LatestUndoableAuditState>();
-  for (const row of latestUndoableEntries) {
-    if (row.txnId === null || latestByTransactionId.has(row.txnId)) continue;
-    latestByTransactionId.set(row.txnId, row);
-  }
+  const latestByTransactionId = latestUndoableByTransactionId(latestUndoableEntries);
 
   return entries.map((entry) => {
     const transactionId = entry.transactionId;

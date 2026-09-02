@@ -33,7 +33,7 @@ export interface PrepareMcpUndoInput {
 
 export interface McpUndoPreview {
   action: 'restore_purchase_categorization';
-  resultingStatus: 'REVERTED';
+  resultingStatus: 'PENDING';
   direction: 'purchase' | 'refund';
   totalCents: number;
   totalTaxCents: number | null;
@@ -89,7 +89,7 @@ export class McpUndoError extends Error {
 const safeCents = z.number().refine(Number.isSafeInteger);
 const previewSchema = z.object({
   action: z.literal('restore_purchase_categorization'),
-  resultingStatus: z.literal('REVERTED'),
+  resultingStatus: z.literal('PENDING'),
   direction: z.enum(['purchase', 'refund']),
   totalCents: safeCents,
   totalTaxCents: safeCents.nullable(),

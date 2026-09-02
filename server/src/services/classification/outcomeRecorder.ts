@@ -337,7 +337,7 @@ async function recordInTransaction(
   );
   if (repairedExistingFold !== null) return repairedExistingFold;
 
-  const durableStatus = operation === 'posted' ? 'POSTED' : 'REVERTED';
+  const durableStatus = operation === 'posted' ? 'POSTED' : 'PENDING';
   const response = runtimeRecord(attempt.responseSnapshot);
   if (
     attempt.transaction.revision !== attempt.expectedRevision

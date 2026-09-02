@@ -977,12 +977,15 @@ export default function Queue() {
         },
       }));
       notifyQboMutation();
+      if (result.outcome === 'DRY_RUN') {
+        toast('Dry run — payload logged, nothing sent to QuickBooks.');
+      }
       if (result.ok && result.outcome === 'VERIFIED' && mutation.kind === 'commit') {
         const companyId = activeCompanyIdRef.current;
         if (companyId) offerRecurring(companyId, t.id, t.payee);
       }
     },
-    [notifyQboMutation, offerRecurring, patchRow, updateTaxState],
+    [notifyQboMutation, offerRecurring, patchRow, toast, updateTaxState],
   );
 
   const recordTaxMutationFailure = useCallback(
@@ -1343,6 +1346,9 @@ export default function Queue() {
           if (dto.status === 'POSTED' || dto.status === 'DRY_RUN') {
             const companyId = activeCompanyIdRef.current;
             if (companyId) offerRecurring(companyId, dto.id, dto.payee);
+          }
+          if (dto.status === 'DRY_RUN') {
+            toast('Dry run — payload logged, nothing sent to QuickBooks.');
           }
         })
         .catch((e) => {

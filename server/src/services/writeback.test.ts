@@ -3863,7 +3863,7 @@ describe('prepareCategorizationUndo', () => {
       qboSyncToken: '8',
       preview: {
         action: 'restore_purchase_categorization',
-        resultingStatus: 'REVERTED',
+        resultingStatus: 'PENDING',
         direction: 'purchase',
         totalCents: -1050,
         totalTaxCents: 0,
@@ -4295,14 +4295,17 @@ describe('undoCategorization', () => {
         syncToken: '9',
       });
 
-    const result = await undoCategorization({
+    const input = {
       transactionId: DURABLE_TRANSACTION_ID,
       companyId: DURABLE_COMPANY_ID,
       requestId: 'request-undo',
       actor: { id: DURABLE_ACTOR_ID, label: 'Generic User' },
-    }, fixture.deps);
+    };
+    const result = await undoCategorization(input, fixture.deps);
+    const replay = await undoCategorization(input, fixture.deps);
 
     expect(result).toMatchObject({ ok: true, status: 'PENDING', outcome: 'VERIFIED' });
+    expect(replay).toEqual(result);
     expect(fixture.preparePurchaseRestore).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
     expect(fixture.sendPreparedWrite.mock.calls[0]?.[0]).toMatchObject({
@@ -4316,6 +4319,8 @@ describe('undoCategorization', () => {
     expect(fixture.db.transactionRow.status).toBe('PENDING');
     expect(fixture.db.transactionRow.postedAt).toBeNull();
     expect(fixture.db.transactionRow.postedByUserId).toBeNull();
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
+    expect(fixture.onVerifiedCategorizationOutcome).toHaveBeenCalledTimes(2);
   });
 
   it('blocks a reconciled transaction before a prepared undo can enter COMMITTING', async () => {

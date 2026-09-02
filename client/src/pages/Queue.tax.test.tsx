@@ -768,6 +768,39 @@ describe('tax-aware manual queue', () => {
     ));
   });
 
+  it('confirms a completed dry run without claiming QuickBooks was changed', async () => {
+    mocks.commit.mockResolvedValue(mutation({
+      status: 'DRY_RUN',
+      outcome: 'DRY_RUN',
+    }));
+    const user = userEvent.setup();
+    await renderQueue();
+    await user.click(screen.getByRole('button', { name: /preview tax/i }));
+    await user.click(await screen.findByRole('button', { name: /^post$/i }));
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(
+      'Dry run — payload logged, nothing sent to QuickBooks.',
+    ));
+    expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+  });
+
+  it('confirms a completed legacy dry run without claiming QuickBooks was changed', async () => {
+    mocks.taxReadiness = null;
+    mocks.legacyPost.mockResolvedValue(transaction({ status: 'DRY_RUN' }));
+    const user = userEvent.setup();
+    await renderQueue(transaction({
+      taxCalculation: null,
+      taxCode: null,
+      taxCodeQboId: null,
+    }));
+    await user.click(screen.getByRole('button', { name: /^post$/i }));
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(
+      'Dry run — payload logged, nothing sent to QuickBooks.',
+    ));
+    expect(screen.queryByText('Generic supplier')).not.toBeInTheDocument();
+  });
+
   it.each(['QBO_TRANSACTION_LOCKED', 'QBO_PERIOD_CLOSED'])(
     'removes a transaction when the fresh provider check returns %s',
     async (code) => {

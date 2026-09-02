@@ -342,7 +342,7 @@ describe('shadow evidence evaluation', () => {
   it('invalidates prior evidence on a verified revert or corrected post', async () => {
     const db = new FakeEvaluationDb();
     await evaluateShadowRunAgainstOutcome(validOutcome(), { db });
-    db.transactionRows[0]!.status = 'REVERTED';
+    db.transactionRows[0]!.status = 'PENDING';
     await evaluateShadowRunAgainstOutcome(validOutcome('reverted'), { db });
 
     expect((await getShadowEvidenceSummary(COMPANY_ID, { db })).eligibleRuns).toBe(0);

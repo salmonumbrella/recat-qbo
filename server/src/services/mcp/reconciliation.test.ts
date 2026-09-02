@@ -104,7 +104,7 @@ function undoOperation(
       restoreHash: 'c'.repeat(64),
       preview: {
         action: 'restore_purchase_categorization',
-        resultingStatus: 'REVERTED',
+        resultingStatus: 'PENDING',
         direction: 'purchase',
         totalCents: -1000,
         totalTaxCents: null,

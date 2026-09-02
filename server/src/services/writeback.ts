@@ -1228,7 +1228,7 @@ export interface PreparedCategorizationUndo {
   restoreHash: string;
   preview: {
     action: 'restore_purchase_categorization';
-    resultingStatus: 'REVERTED';
+    resultingStatus: 'PENDING';
     direction: 'purchase' | 'refund';
     totalCents: number;
     totalTaxCents: number | null;
@@ -2535,7 +2535,12 @@ async function recordedAttemptResultWithOutcome(
   txn: DurableTransaction,
 ): Promise<DurableMutationResult> {
   validateRecordedAttemptBinding(attempt, txn);
-  await emitVerifiedCategorizationOutcome(d, attempt, txn);
+  await emitVerifiedCategorizationOutcome(
+    d,
+    attempt,
+    txn,
+    attempt.operation === 'restore' ? 'REVERTED' : 'POSTED',
+  );
   return recordedAttemptResult(attempt, txn.status);
 }
 
@@ -4600,7 +4605,7 @@ export async function prepareCategorizationUndo(
       restoreHash,
       preview: {
         action: 'restore_purchase_categorization',
-        resultingStatus: 'REVERTED',
+        resultingStatus: 'PENDING',
         direction: restore.expected.direction,
         totalCents: restore.expected.totalCents,
         totalTaxCents: restore.expected.totalTaxCents,
