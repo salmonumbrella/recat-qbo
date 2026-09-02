@@ -76,7 +76,7 @@ function boundedConflictCard() {
     }],
     provenance: { source: 'candidate', sourceId: 'candidate-1', actorId: null, recordedAt: '2026-08-31T00:00:00.000Z' },
     rationale: null, examples: [], counterexamples: [], jurisdiction: null, currency: null,
-    verifiedAt: null, ruleRevision: null,
+    verifiedAt: null, ruleRevision: null, observation: null,
   };
 }
 
