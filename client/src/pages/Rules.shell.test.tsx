@@ -21,7 +21,10 @@ vi.mock('../state/AppContext', () => ({
   useApp: () => ({
     activeCompanyId: 'COMPANY_GENERIC',
     activeCompany: { id: 'COMPANY_GENERIC', holdingAccountIds: [] },
-    accounts: [{ qboId: 'ACCOUNT_GENERIC', name: 'Office expense', classification: 'Expenses' }],
+    accounts: [
+      { qboId: 'ACCOUNT_GENERIC', name: 'Office expense', classification: 'Expenses' },
+      { qboId: 'ACCOUNT_TRAVEL', name: 'Travel expense', classification: 'Expenses' },
+    ],
     tags: [],
     taxReadiness: { status: 'ready', reason: null, usingSalesTax: true, refreshedAt: '2026-07-30T00:00:00.000Z', taxCodes: [] },
     toast: mocks.toast,
@@ -97,6 +100,17 @@ it('renders the standard responsive Rules shell and an intentional zero-rules st
   expect(screen.getByRole('link', { name: 'Create rule from Queue' })).toHaveAttribute('href', '/');
 });
 
+it('does not prepare an update when the current rule category is reselected', async () => {
+  mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
+  const user = userEvent.setup();
+  renderRules();
+
+  await user.click(await screen.findByRole('combobox', { name: 'Category for Generic supplier' }));
+  await user.click(screen.getByRole('option', { name: 'Expenses · Office expense' }));
+
+  expect(mocks.prepare).not.toHaveBeenCalled();
+});
+
 it('changes lifecycle through the shared Select and prepares a category update through the shared Combobox', async () => {
   mocks.lifecycleRules.mockResolvedValue({ items: [ruleDetail()], nextCursor: null });
   mocks.prepare.mockResolvedValue(prepared());
@@ -108,10 +122,10 @@ it('changes lifecycle through the shared Select and prepares a category update t
   await waitFor(() => expect(mocks.lifecycleRules).toHaveBeenCalledWith('COMPANY_GENERIC', 'enabled', undefined, 100));
 
   await user.click(screen.getByRole('combobox', { name: 'Category for Generic supplier' }));
-  await user.type(screen.getByRole('textbox', { name: 'Category for Generic supplier' }), 'office');
+  await user.type(screen.getByRole('textbox', { name: 'Category for Generic supplier' }), 'travel');
   await user.keyboard('{ArrowDown}{Enter}');
   await waitFor(() => expect(mocks.prepare).toHaveBeenCalledWith('COMPANY_GENERIC', expect.objectContaining({
-    mutation: 'update', ruleId: 'rule-1', proposal: { categoryQboId: 'ACCOUNT_GENERIC' },
+    mutation: 'update', ruleId: 'rule-1', proposal: { categoryQboId: 'ACCOUNT_TRAVEL' },
   })));
 });
 

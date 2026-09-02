@@ -681,7 +681,9 @@ export default function Rules() {
                           ...categoryOptions.map((option) => ({ value: option.qboId, label: option.label, searchText: option.label })),
                         ]}
                         onValueChange={(next) => {
-                          if (next !== null) startRuleOperation(rule, 'update', { categoryQboId: next });
+                          if (next !== null && next !== revision.action?.categoryQboId) {
+                            startRuleOperation(rule, 'update', { categoryQboId: next });
+                          }
                         }}
                         searchPlaceholder="Search categories…"
                         emptyText="No matching categories"
