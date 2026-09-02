@@ -660,6 +660,23 @@ describe('undoPost', () => {
     expect(result).toMatchObject({ ok: true, status: 'PENDING' });
   });
 
+  it('requeues a DRY_RUN older than the QBO undo window without QBO work', async () => {
+    const row = makeTxnRow({
+      status: 'DRY_RUN',
+      postedAt: new Date('2026-01-01T00:00:00.000Z'),
+      company: postedCompany,
+    });
+    const moveToAccount = vi.fn();
+    const fetchTxn = vi.fn();
+    const { deps } = makeDeps(row, { fetchTxn, moveToAccount });
+
+    const result = await undoPost('txn-1', { id: 'u-1', label: 'Maria K.' }, deps);
+
+    expect(moveToAccount).not.toHaveBeenCalled();
+    expect(fetchTxn).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: true, status: 'PENDING' });
+  });
+
   it('throws (instead of silently re-queuing) when a POSTED txn no longer exists in QuickBooks', async () => {
     const row = makeTxnRow({ status: 'POSTED', postedAt: new Date() });
     const moveToAccount = vi.fn();

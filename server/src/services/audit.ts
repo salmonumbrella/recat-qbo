@@ -250,11 +250,12 @@ function auditUndoCandidateKind(
   const postedWrite = txn?.status === 'POSTED'
     && (entry.action === 'posted' || entry.action === 'auto-posted');
   const dryRun = txn?.status === 'DRY_RUN' && entry.action === 'dry-run';
+  const postedWriteOutsideUndoWindow = postedWrite
+    && (elapsed < 0 || elapsed > AUDIT_UNDO_WINDOW_MS);
   if (
     (!postedWrite && !dryRun)
     || latest?.id !== entry.id
-    || elapsed < 0
-    || elapsed > AUDIT_UNDO_WINDOW_MS
+    || postedWriteOutsideUndoWindow
   ) {
     return null;
   }

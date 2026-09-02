@@ -699,7 +699,8 @@ export async function postTransaction(
 }
 
 // ---------------------------------------------------------------------------
-// undoPost — POSTED/DRY_RUN → (REVERTED) → PENDING, within 30 days
+// undoPost — POSTED → (REVERTED) → PENDING within 30 days;
+// DRY_RUN → PENDING at any time because no QBO write occurred.
 // ---------------------------------------------------------------------------
 
 export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps): Promise<PostResult> {
@@ -722,7 +723,10 @@ export async function undoPost(txnId: string, actor: Actor, deps?: WritebackDeps
   if (txn.status !== 'POSTED' && txn.status !== 'DRY_RUN') {
     throw new Error(`Only posted transactions can be undone (status is ${txn.status})`);
   }
-  if (!txn.postedAt || Date.now() - txn.postedAt.getTime() > AUDIT_UNDO_WINDOW_MS) {
+  if (
+    txn.status === 'POSTED'
+    && (!txn.postedAt || Date.now() - txn.postedAt.getTime() > AUDIT_UNDO_WINDOW_MS)
+  ) {
     throw new Error('The 30-day undo window for this transaction has passed.');
   }
 
