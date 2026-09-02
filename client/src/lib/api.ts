@@ -20,6 +20,7 @@ import type {
   CompanyDto,
   CategorizationMutationResult,
   ClassificationCase,
+  ClassificationPastDecisionPageDto,
   ClassificationSearchHit,
   ClassificationSearchMode,
   ClassificationSearchScope,
@@ -35,6 +36,7 @@ import type {
   CreateMcpTokenResponse,
   McpTokenListResponse,
   PollInterval,
+  PastDecisionFilter,
   QboAccountDto,
   QboConnectionTestDto,
   QboEnv,
@@ -57,6 +59,8 @@ import type {
   ReconcileCategorizationBody,
   RuleCandidateDto,
   RuleDetailDto,
+  RuleAffectedTransactionFilter,
+  RuleAffectedTransactionPageDto,
   RuleLifecycleFilter,
   RuleLifecyclePageDto,
   RuleMutationKind,
@@ -81,6 +85,7 @@ import type {
   TxnStatus,
   UndoCategorizationBody,
   UserDto,
+  HistoricalObservationPastDecision,
   ApiError as ApiErrorBody,
 } from '@recat/shared';
 
@@ -946,6 +951,15 @@ export const classificationMemory = {
     ),
   getCase: (companyId: string, caseId: string) =>
     api.get<ClassificationCase>(`/api/companies/${companyId}/classification/cases/${caseId}`),
+  pastDecisions: (companyId: string, params: {
+    kind?: PastDecisionFilter; limit?: number; cursor?: string;
+  }) => api.get<ClassificationPastDecisionPageDto>(
+    `/api/companies/${companyId}/classification/past-decisions${qs(params)}`,
+  ),
+  getObservation: (companyId: string, observationId: string) =>
+    api.get<HistoricalObservationPastDecision>(
+      `/api/companies/${companyId}/classification/observations/${observationId}`,
+    ),
   currentCase: (companyId: string, transactionId: string) =>
     api.get<ClassificationCase | null>(
       `/api/companies/${companyId}/classification/cases/current${qs({ transactionId })}`,
@@ -1008,6 +1022,11 @@ export const rules = {
     api.get<RuleRevisionPageDto>(
       `/api/companies/${companyId}/rules/${ruleId}/revisions${qs({ cursor, limit })}`,
     ),
+  affectedTransactions: (companyId: string, ruleId: string, params: {
+    status?: RuleAffectedTransactionFilter; limit?: number; cursor?: string;
+  }) => api.get<RuleAffectedTransactionPageDto>(
+    `/api/companies/${companyId}/rules/${ruleId}/affected-transactions${qs(params)}`,
+  ),
   /** Dry-run a draft rule (placed at top priority) against recent transactions. */
   test: (companyId: string, matchText: string) =>
     api.post<RuleTestResult>(`/api/companies/${companyId}/rules/test`, { matchText }),

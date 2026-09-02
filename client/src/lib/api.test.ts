@@ -3,14 +3,48 @@ import {
   ApiError,
   attachments,
   autopilot,
+  classificationMemory,
   companies,
   createCategorizationRequestId,
   receipts,
+  rules,
   transactions,
 } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+it('requests only the bounded company-scoped browser reads', async () => {
+  const fetchMock = vi.fn(async () => new Response('{}', {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+
+  await classificationMemory.pastDecisions('company-a', {
+    kind: 'historical_observation', limit: 20, cursor: 'decision-cursor',
+  });
+  await classificationMemory.getObservation('company-a', 'observation-a');
+  await rules.affectedTransactions('company-a', 'rule-a', {
+    status: 'posted', limit: 20, cursor: 'affected-cursor',
+  });
+
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    1,
+    '/api/companies/company-a/classification/past-decisions?kind=historical_observation&limit=20&cursor=decision-cursor',
+    expect.objectContaining({ method: 'GET' }),
+  );
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    2,
+    '/api/companies/company-a/classification/observations/observation-a',
+    expect.objectContaining({ method: 'GET' }),
+  );
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    3,
+    '/api/companies/company-a/rules/rule-a/affected-transactions?status=posted&limit=20&cursor=affected-cursor',
+    expect.objectContaining({ method: 'GET' }),
+  );
 });
 
 it('returns the body that distinguishes a failed manual sync from an HTTP failure', async () => {

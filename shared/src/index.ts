@@ -1194,6 +1194,76 @@ export interface ClassificationCase {
   invalidationReason: string | null;
 }
 
+export type PastDecisionKind = 'classification_case' | 'historical_observation';
+export type PastDecisionFilter = PastDecisionKind | 'all';
+
+export interface ClassificationCasePastDecision {
+  kind: 'classification_case';
+  id: string;
+  companyId: string;
+  transactionId: string;
+  payee: string;
+  memo: string | null;
+  actionSummary: ClassificationActionSummary;
+  rationale: string;
+  verifiedAt: string;
+  invalidatedAt: string | null;
+  invalidationReason: string | null;
+  advisory: false;
+  executable: false;
+}
+
+export interface HistoricalObservationPastDecision {
+  kind: 'historical_observation';
+  id: string;
+  companyId: string;
+  transactionId: string;
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  qboId: string;
+  payee: string;
+  memo: string | null;
+  actionSummary: ClassificationActionSummary;
+  sourceStatus: string | null;
+  observedRecatRevision: number;
+  observedQboRevision: string;
+  observedAt: string;
+  supersededByCaseId: string | null;
+  advisory: true;
+  executable: false;
+}
+
+export type ClassificationPastDecisionItem =
+  | ClassificationCasePastDecision
+  | HistoricalObservationPastDecision;
+
+export interface ClassificationPastDecisionPageDto {
+  items: ClassificationPastDecisionItem[];
+  nextCursor: string | null;
+}
+
+export type RuleAffectedTransactionFilter = 'all' | 'pending' | 'posted';
+
+export interface RuleAffectedTransactionDto {
+  transactionId: string;
+  qboType: 'Purchase' | 'Deposit' | 'JournalEntry';
+  qboId: string;
+  date: string;
+  payee: string;
+  memo: string | null;
+  amountCents: number;
+  status: 'PENDING' | 'POSTED' | 'DRY_RUN';
+  ruleWins: boolean;
+  winningRuleId: string | null;
+}
+
+export interface RuleAffectedTransactionPageDto {
+  items: RuleAffectedTransactionDto[];
+  nextCursor: string | null;
+  matchedCount: number;
+  pendingCount: number;
+  postedCount: number;
+}
+
 export interface ClassificationSearchHit {
   /** Stable canonical hit ID and source ID are both returned for rehydration. */
   id: string;
