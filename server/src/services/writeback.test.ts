@@ -244,7 +244,10 @@ function makeFakeDb(row: FakeTxnRow) {
       findFirst: vi.fn(async () => null),
     },
     transactionActionability: {
+      findUnique: vi.fn(async () => null),
       updateMany: vi.fn(async () => ({ count: 1 })),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+      upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => create),
     },
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
@@ -407,6 +410,39 @@ describe('legacy write safety', () => {
       }));
     },
   );
+
+  it('creates a missing actionability row before caching a provider lock', async () => {
+    const row = makeTxnRow();
+    const recategorize = vi.fn();
+    const { deps, db } = makeDeps(row, {
+      fetchTxn: async () => freshQboTxn(),
+      fetchWriteSafety: async () => ({
+        bookCloseDate: null,
+        cleared: true,
+        reconciled: false,
+      }),
+      recategorize,
+    });
+    db.transactionActionability.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+
+    await postTransaction('txn-1', { id: 'u-1', label: 'Generic User' }, {}, deps);
+
+    expect(recategorize).not.toHaveBeenCalled();
+    expect(db.transactionActionability.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        transactionId: 'txn-1',
+        disposition: 'UNKNOWN',
+      }),
+    });
+    expect(db.transactionActionability.updateMany).toHaveBeenCalledTimes(2);
+    expect(db.transactionActionability.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ disposition: 'BLOCKED_CLEARED' }),
+      }),
+    );
+  });
 
   it('rechecks safety after a SyncToken conflict before retrying', async () => {
     const row = makeTxnRow();

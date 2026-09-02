@@ -262,6 +262,24 @@ export async function ensureUnknownProviderActionability(
   }
 }
 
+/** Seed only a missing index row. Unlike sync-time invalidation, this helper
+ * never overwrites an existing observation because the caller's transaction
+ * binding may have become stale after a provider safety read. */
+export async function createUnknownProviderActionabilityIfMissing(
+  txn: ActionabilityTransactionIdentity,
+  db: ProviderActionabilityDb = defaultDb,
+): Promise<boolean> {
+  if (!db.transactionActionability?.create) return false;
+  try {
+    await db.transactionActionability.create({ data: unknownData(txn) });
+    return true;
+  } catch {
+    // An existing row or a concurrent insert wins. The caller can retry its
+    // binding-checked update without disturbing the winner.
+    return false;
+  }
+}
+
 export interface PersistProviderActionabilityInput extends ActionabilityTransactionIdentity {
   checkedAt?: Date;
   evidence?: QboWriteSafetyEvidence;

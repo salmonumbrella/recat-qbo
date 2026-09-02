@@ -85,6 +85,7 @@ import {
   type QboWriteSafetyTarget,
 } from '../lib/qbo/writeSafety.js';
 import {
+  createUnknownProviderActionabilityIfMissing,
   persistProviderActionability,
   type ProviderActionabilityDb,
 } from './providerActionability.js';
@@ -153,7 +154,7 @@ async function persistBlockedProviderOutcome(
   checkedAt: Date,
   before = txn.bankAccount,
 ): Promise<void> {
-  await persistProviderActionability({
+  const actionability = {
     id: txn.id,
     companyId: txn.companyId,
     revision: txn.revision,
@@ -164,7 +165,15 @@ async function persistBlockedProviderOutcome(
     checkedAt,
     evidence: safety.evidence,
     bankAccountQboId: safety.target.bankAccountQboId,
-  }, tx as unknown as ProviderActionabilityDb);
+  };
+  const actionabilityDb = tx as unknown as ProviderActionabilityDb;
+  if (!await persistProviderActionability(actionability, actionabilityDb)) {
+    // Older mirrors may predate the actionability index. Seed a binding-safe
+    // UNKNOWN row, then retry the evidence update. A concurrent parent change
+    // still makes the updateMany CAS fail closed.
+    await createUnknownProviderActionabilityIfMissing(actionability, actionabilityDb);
+    await persistProviderActionability(actionability, actionabilityDb);
+  }
   await audit(tx as Prisma.TransactionClient, {
     companyId: txn.companyId,
     actorId: actor.id,
