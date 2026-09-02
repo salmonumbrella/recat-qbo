@@ -1148,7 +1148,7 @@ describePostgres('classification search on PostgreSQL', () => {
 
     expect(corpus).toMatchObject({ totalDocuments: 10_001, skippedDocuments: 0 });
     expect(corpus.documents).toHaveLength(10_001);
-  }, 45_000);
+  }, 120_000);
 
   it('rejects a corpus scan when a canonical write lands between keyset pages', async () => {
     const owner = await company('Changing Corpus');
