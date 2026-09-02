@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
@@ -10,6 +11,22 @@ const MISSING_STABLE_CATEGORY_VALUE: CategoryOption = {
   sug: false,
 };
 void MISSING_STABLE_CATEGORY_VALUE;
+
+function SplitFooterHarness() {
+  const [splitOpen, setSplitOpen] = useState(false);
+
+  return <div className="rr">
+    <CategoryPicker
+      label="Category"
+      value={null}
+      onPick={vi.fn()}
+      onSplitFooter={() => setSplitOpen(true)}
+      showBadges={false}
+      options={[]}
+    />
+    {splitOpen && <div role="dialog" aria-label="Split transaction">Split editor</div>}
+  </div>;
+}
 
 describe('CategoryPicker', () => {
   it('searches grouped categories, marks the suggested option, and selects its stable value', async () => {
@@ -33,6 +50,22 @@ describe('CategoryPicker', () => {
     await user.click(screen.getByRole('combobox', { name: 'Category' }));
     await user.click(screen.getByRole('button', { name: /split into multiple categories/i }));
     expect(onSplitFooter).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes its portalled menu before opening the split editor', async () => {
+    const user = userEvent.setup();
+    render(<SplitFooterHarness />);
+
+    await user.click(screen.getByRole('combobox', { name: 'Category' }));
+    const search = screen.getByRole('textbox', { name: 'Category' });
+    expect(search).toHaveFocus();
+
+    await user.click(screen.getByRole('button', { name: /split into multiple categories/i }));
+
+    expect(screen.getByRole('dialog', { name: 'Split transaction' })).toBeInTheDocument();
+    expect(screen.queryByRole('listbox', { name: 'Category' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Category' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(search);
   });
 
   it('connects each non-selected trigger description through a unique id', () => {

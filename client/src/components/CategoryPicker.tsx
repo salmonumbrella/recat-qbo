@@ -67,7 +67,18 @@ export default function CategoryPicker(props: CategoryPickerProps) {
           const source = options.find((entry) => entry.value === option.value)!;
           return <><span><span className="control-option-group">{source.group} · </span>{source.name}</span>{showBadges && source.sug && <span className="control-option-suggestion">suggested</span>}</>;
         }}
-        footer={onSplitFooter ? <button type="button" className="control-footer" onClick={onSplitFooter}>Split into multiple categories →</button> : undefined}
+        footer={onSplitFooter ? (dismissMenu) => (
+          <button
+            type="button"
+            className="control-footer"
+            onClick={() => {
+              dismissMenu();
+              onSplitFooter();
+            }}
+          >
+            Split into multiple categories →
+          </button>
+        ) : undefined}
       />
       {triggerBadge && (
         <span

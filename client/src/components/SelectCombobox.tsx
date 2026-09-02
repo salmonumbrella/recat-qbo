@@ -40,7 +40,7 @@ export type ComboboxProps = ControlCommonProps & {
   searchPlaceholder?: string;
   emptyText?: string;
   renderOption?: (option: ControlOption, selected: boolean) => ReactNode;
-  footer?: ReactNode;
+  footer?: ReactNode | ((dismissMenu: () => void) => ReactNode);
 };
 
 type InternalOption = ControlOption & { clear?: boolean };
@@ -62,7 +62,7 @@ function ControlBase({
   searchPlaceholder?: string;
   emptyText?: string;
   renderOption?: (option: ControlOption, selected: boolean) => ReactNode;
-  footer?: ReactNode;
+  footer?: ReactNode | ((dismissMenu: () => void) => ReactNode);
 }): JSX.Element {
   const {
     id,
@@ -322,7 +322,9 @@ function ControlBase({
                     <div className="control-empty" role="status">{emptyText ?? 'No matching options'}</div>
                   )}
                 </div>
-                {footer && <div className="control-footer">{footer}</div>}
+                {footer && <div className="control-footer">{
+                  typeof footer === 'function' ? footer(dismissMenu) : footer
+                }</div>}
               </div>
             </FloatingFocusManager>
           </div>
