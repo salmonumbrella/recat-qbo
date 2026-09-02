@@ -12,6 +12,7 @@ vi.mock('../lib/prisma.js', () => ({
   prisma: {
     appConfig: { findUnique: mocks.appConfigFindUnique },
     qboAccount: { findMany: mocks.qboAccountFindMany },
+    transactionActionability: {},
     transaction: { findMany: mocks.transactionFindMany },
   },
 }));
@@ -59,6 +60,43 @@ function monthlyStatement(): QboStatement {
 }
 
 describe('dashboardData provenance', () => {
+  it('reports only transactions that belong in the interactive queue', async () => {
+    const checkedAt = new Date();
+    const date = new Date('2026-04-02T00:00:00.000Z');
+    const row = (id: string, amount: number, disposition: string) => ({
+      id,
+      companyId: 'company-1',
+      revision: 2,
+      qboSyncToken: '0',
+      qboType: 'Purchase',
+      qboId: id,
+      date,
+      amount,
+      providerActionability: {
+        companyId: 'company-1',
+        transactionId: id,
+        disposition,
+        checkedAt,
+        revision: 2,
+        qboSyncToken: '0',
+        qboType: 'Purchase',
+        qboId: id,
+        txnDate: date,
+      },
+    });
+    mocks.transactionFindMany.mockResolvedValue([
+      row('writable', -125, 'WRITABLE'),
+      row('unknown', 75, 'UNKNOWN'),
+      row('cleared', -5000, 'BLOCKED_CLEARED'),
+    ]);
+    mocks.qboGetStatement.mockResolvedValue(monthlyStatement());
+
+    const result = await dashboardData('company-1');
+
+    expect(result.pendingCount).toBe(2);
+    expect(result.pendingTotal).toBe(200);
+  });
+
   it('labels complete QBO dashboard data', async () => {
     mocks.appConfigFindUnique.mockResolvedValue(null);
     mocks.transactionFindMany.mockResolvedValue([]);
