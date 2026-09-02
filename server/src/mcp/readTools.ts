@@ -154,6 +154,7 @@ export interface CompanyReadOperations {
       mode: 'auto' | 'exact' | 'lexical' | 'hybrid' | 'semantic';
       limit?: number;
       cursor?: string;
+      transactionId?: string;
     },
   ): Promise<ClassificationSearchPage>;
   listTransferCandidates(
@@ -295,6 +296,7 @@ const searchClassificationInput = z.strictObject({
   query: z.string().min(1).max(256),
   scope: z.enum(['current_company', 'accessible_companies']).default('current_company').optional(),
   mode: z.enum(['auto', 'exact', 'lexical', 'hybrid', 'semantic']),
+  transactionId: id.optional(),
   ...pageInput,
 });
 
@@ -1000,7 +1002,7 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   );
   register(
     'search_classification_knowledge',
-    'Search bounded classification evidence cards. Defaults to the current company; accessible-companies includes only actual memberships and foreign hits are advisory with QBO action IDs removed. Auto may label lexical degradation; explicit semantic or hybrid fails when unavailable; empty evidence returns no_match.',
+    'Search bounded classification evidence cards. An optional current-company transactionId derives canonical context and excludes that transaction from its own evidence. Defaults to the current company; accessible-companies includes only actual memberships and foreign hits are advisory with QBO action IDs removed. Auto may label lexical degradation; explicit semantic or hybrid fails safely when unavailable; empty evidence returns no_match.',
     searchClassificationInput,
     searchClassificationOutput,
     (input) => reads.searchClassificationKnowledge(

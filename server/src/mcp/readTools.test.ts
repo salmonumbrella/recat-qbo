@@ -6,7 +6,6 @@ import {
 } from '@opentelemetry/api';
 import { describe, expect, it, vi } from 'vitest';
 import { HttpError } from '../lib/http.js';
-import { ClassificationSearchError } from '../services/classification/search.js';
 import {
   READ_TOOL_NAMES,
   createRecatMcpServer,
@@ -518,7 +517,8 @@ describe('Recat MCP read tools', () => {
       ['get_rule_candidate', { companyId: 'company-a', candidateId: 'candidate-a' }],
       ['get_classification_case', { companyId: 'company-a', caseId: 'case-a' }],
       ['search_classification_knowledge', {
-        companyId: 'company-a', query: 'Coffee', scope: 'current_company', mode: 'lexical', limit: 5,
+        companyId: 'company-a', query: 'Coffee', scope: 'current_company', mode: 'lexical',
+        transactionId: 'transaction-selected', limit: 5,
       }],
     ] as const;
     for (const [name, arguments_] of calls) {
@@ -531,7 +531,10 @@ describe('Recat MCP read tools', () => {
     });
     expect(operations.searchClassificationKnowledge).toHaveBeenCalledWith(
       'user-a', 'company-a',
-      { query: 'Coffee', scope: 'current_company', mode: 'lexical', limit: 5 },
+      {
+        query: 'Coffee', scope: 'current_company', mode: 'lexical',
+        transactionId: 'transaction-selected', limit: 5,
+      },
     );
   });
 
@@ -671,7 +674,7 @@ describe('Recat MCP read tools', () => {
   it('fails explicit semantic unavailability closed with a small safe error', async () => {
     const operations = reads();
     vi.mocked(operations.searchClassificationKnowledge).mockRejectedValueOnce(
-      new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'embedding_not_configured'),
+      new HttpError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE'),
     );
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: operations }),
@@ -685,9 +688,10 @@ describe('Recat MCP read tools', () => {
 
     expect(response.result).toMatchObject({
       isError: true,
-      structuredContent: { error: { code: 'COMPANY_UNAVAILABLE' } },
+      structuredContent: { error: { code: 'SEMANTIC_UNAVAILABLE' } },
     });
     expect(JSON.stringify(response)).not.toContain('embedding_not_configured');
+    expect(JSON.stringify(response)).not.toContain('semantic_error');
   });
 
   it('keeps concurrent search principals and company scopes isolated', async () => {

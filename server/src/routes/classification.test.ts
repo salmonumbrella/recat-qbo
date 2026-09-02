@@ -2,7 +2,7 @@ import cookieParser from 'cookie-parser';
 import express from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { errorMiddleware } from '../lib/http.js';
+import { errorMiddleware, HttpError } from '../lib/http.js';
 
 const mocks = vi.hoisted(() => ({
   session: vi.fn(), company: vi.fn(), membership: vi.fn(),
@@ -50,6 +50,22 @@ describe('session classification reads', () => {
     expect(response.status).toBe(200);
     expect(mocks.search).toHaveBeenCalledWith('user-a', 'company-a', {
       query: 'fuel', mode: 'hybrid', scope: 'current_company', transactionId: 'txn-a',
+    });
+  });
+
+  it('returns the safe semantic-unavailable search error', async () => {
+    mocks.search.mockRejectedValueOnce(
+      new HttpError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE'),
+    );
+    const response = await request(app())
+      .get('/api/companies/company-a/classification/search')
+      .query({ query: 'fuel', mode: 'semantic' })
+      .set('Cookie', 'recat_session=test');
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      error: 'Semantic classification search is unavailable.',
+      code: 'SEMANTIC_UNAVAILABLE',
     });
   });
 

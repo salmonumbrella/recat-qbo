@@ -48,6 +48,7 @@ import {
   parseRuleRevision,
 } from './classification/contracts.js';
 import {
+  ClassificationSearchError,
   searchClassificationMemoryWithRuntimeSnapshot,
   type ClassificationSearchContextFilter,
   type ClassificationSearchInput,
@@ -1154,6 +1155,24 @@ export function createCompanyReadService(
     return [...new Set(rows.map((row) => String(row.companyId)))].sort();
   }
 
+  async function runClassificationSearch<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof ClassificationSearchError)) throw error;
+      if (error.code === 'SEMANTIC_UNAVAILABLE') {
+        throw new HttpError(503, 'Semantic classification search is unavailable.', 'SEMANTIC_UNAVAILABLE');
+      }
+      if (error.code === 'COMPANY_UNAVAILABLE') {
+        throw new HttpError(503, 'Classification search is temporarily unavailable.', 'COMPANY_UNAVAILABLE');
+      }
+      if (error.code === 'FORBIDDEN') {
+        throw new HttpError(403, 'Classification company access is forbidden.', 'FORBIDDEN');
+      }
+      throw new HttpError(400, 'Classification search input is invalid.', 'VALIDATION');
+    }
+  }
+
   async function searchClassificationKnowledgeForUser(
     userId: string,
     companyId: string,
@@ -1229,7 +1248,7 @@ export function createCompanyReadService(
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100) {
       badRequest('Invalid cursor', 'INVALID_CURSOR');
     }
-    const searched = await deps.classificationSearch({
+    const searched = await runClassificationSearch(() => deps.classificationSearch({
       query,
       companyId,
       scope,
@@ -1237,7 +1256,8 @@ export function createCompanyReadService(
       limit: MAX_READ_LIMIT,
       accessibleCompanyIds: membershipIds,
       context,
-    });
+      ...(input.transactionId === undefined ? {} : { excludeTransactionId: input.transactionId }),
+    }));
     const canonical = 'result' in searched ? searched.result : searched;
     const fingerprint = 'result' in searched
       ? searched.fingerprint

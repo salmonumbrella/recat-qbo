@@ -24,6 +24,7 @@ export type SafeToolErrorCode =
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
   | 'COMPANY_UNAVAILABLE'
+  | 'SEMANTIC_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
   | 'QBO_PERIOD_CLOSED'
   | 'QBO_TRANSACTION_LOCKED'
@@ -43,6 +44,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
+  SEMANTIC_UNAVAILABLE: 'Semantic classification search is unavailable.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
   QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
   QBO_TRANSACTION_LOCKED: 'QuickBooks reports this transaction as cleared or reconciled.',
@@ -239,6 +241,7 @@ function safeCode(error: unknown): SafeToolErrorCode {
   const mutationCode = safeMutationCode(error);
   if (mutationCode !== null) return mutationCode;
   if (!(error instanceof HttpError)) return 'COMPANY_UNAVAILABLE';
+  if (error.code === 'SEMANTIC_UNAVAILABLE') return 'SEMANTIC_UNAVAILABLE';
   if (error.code === 'COMPANY_UNAVAILABLE') return 'COMPANY_UNAVAILABLE';
   if (error.code === 'QBO_DISCONNECTED') return 'QBO_DISCONNECTED';
   switch (error.status) {

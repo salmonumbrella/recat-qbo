@@ -25,6 +25,7 @@ import {
 import {
   MAX_TRANSFER_DISCOVERY_TRANSACTIONS,
 } from './transferCandidates.js';
+import { ClassificationSearchError } from './classification/search.js';
 
 const SECRET = 'test-cursor-secret-at-least-16-characters';
 const USER_ID = 'user-1';
@@ -343,6 +344,111 @@ describe('company read services', () => {
       query: 'Different', mode: 'auto', cursor: first.nextCursor ?? undefined,
     })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
     expect(classificationSearch).toHaveBeenCalledTimes(2);
+  });
+
+  it('derives owned transaction context and excludes the selected transaction from canonical search', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      id: 'transaction-selected',
+      amount: -12.34,
+      bankAccount: 'Synthetic operating card',
+      rawData: { CurrencyRef: { value: 'CAD' } },
+      date: new Date('2026-08-30T00:00:00.000Z'),
+      revision: 7,
+    }));
+    const classificationSearch = vi.fn(async (input: Record<string, unknown>) => ({
+      query: input.query,
+      companyId: COMPANY_ID,
+      scope: 'current_company' as const,
+      mode: 'lexical' as const,
+      requestedMode: 'auto' as const,
+      degraded: false,
+      degradedReason: null,
+      status: 'no_match' as const,
+      noMatch: true,
+      total: 0,
+      hits: [],
+    }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'synthetic fuel', mode: 'auto', transactionId: 'transaction-selected', limit: 20,
+    });
+
+    expect(classificationSearch).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID,
+      scope: 'current_company',
+      mode: 'auto',
+      excludeTransactionId: 'transaction-selected',
+      context: {
+        transactionDirection: 'out',
+        qboType: 'Purchase',
+        sourceAccountName: 'Synthetic operating card',
+        currency: 'CAD',
+        transactionPeriod: '2026-08',
+      },
+    }));
+  });
+
+  it('does not search when the selected transaction belongs to another company', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({
+      id: 'transaction-selected',
+      companyId: 'company-other',
+    }));
+    const classificationSearch = vi.fn();
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'synthetic fuel', mode: 'auto', transactionId: 'transaction-selected', limit: 20,
+    })).rejects.toMatchObject({ code: 'TRANSACTION_NOT_FOUND' });
+    expect(classificationSearch).not.toHaveBeenCalled();
+  });
+
+  it('translates explicit semantic unavailability without exposing its private reason', async () => {
+    const db = makeDb();
+    const classificationSearch = vi.fn().mockRejectedValue(
+      new ClassificationSearchError('SEMANTIC_UNAVAILABLE', 'semantic_error'),
+    );
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'synthetic fuel', mode: 'semantic', limit: 20,
+    })).rejects.toMatchObject({
+      status: 503,
+      code: 'SEMANTIC_UNAVAILABLE',
+      message: 'Semantic classification search is unavailable.',
+    });
+  });
+
+  it('rejects a search cursor reused with a different selected transaction', async () => {
+    const db = makeDb();
+    db.transaction.findUnique.mockResolvedValue(transaction({ revision: 7 }));
+    const canonical = {
+      query: 'Coffee', companyId: COMPANY_ID, scope: 'current_company' as const,
+      mode: 'lexical' as const, requestedMode: 'lexical' as const,
+      degraded: false, degradedReason: null, status: 'matched' as const, noMatch: false,
+      total: 2, hits: [classificationHit('case-2'), classificationHit('case-1')],
+    };
+    const classificationSearch = vi.fn(async () => ({ result: canonical, fingerprint: 'a'.repeat(64) }));
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      classificationSearch: classificationSearch as never,
+    });
+    const first = await service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'lexical', transactionId: 'transaction-selected', limit: 1,
+    });
+
+    await expect(service.searchClassificationKnowledge(USER_ID, COMPANY_ID, {
+      query: 'Coffee', mode: 'lexical', transactionId: 'transaction-other', limit: 1,
+      cursor: first.nextCursor ?? undefined,
+    })).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
+    expect(classificationSearch).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a search cursor when the authoritative corpus fingerprint changes between pages', async () => {
