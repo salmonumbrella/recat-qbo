@@ -116,9 +116,27 @@ function toSafeCents(value: bigint): number {
 }
 
 interface ResolvedTaxLine {
-  rateQboId: string | null;
-  rate: { numerator: bigint; denominator: bigint } | null;
+  components: {
+    rateQboId: string;
+    rate: { numerator: bigint; denominator: bigint };
+  }[];
   treatment: PurchaseTaxTreatment;
+}
+
+function sumRateRatios(
+  rates: readonly { numerator: bigint; denominator: bigint }[],
+): { numerator: bigint; denominator: bigint } {
+  const denominator = rates.reduce(
+    (largest, rate) => rate.denominator > largest ? rate.denominator : largest,
+    1n,
+  );
+  return {
+    numerator: rates.reduce(
+      (sum, rate) => sum + rate.numerator * (denominator / rate.denominator),
+      0n,
+    ),
+    denominator,
+  };
 }
 
 type TaxDirection = 'purchase' | 'sales';
@@ -196,7 +214,7 @@ function resolveTaxLine(
   if (code.taxable === false) {
     if (components.length !== 0) return 'TAX_CODE_MALFORMED';
     if (input.nonTaxTreatment === undefined) return 'TAX_TREATMENT_AMBIGUOUS';
-    return { rateQboId: null, rate: null, treatment: input.nonTaxTreatment };
+    return { components: [], treatment: input.nonTaxTreatment };
   }
 
   if (taxCalculation === 'NotApplicable') return 'TAX_CODE_MALFORMED';
@@ -204,29 +222,38 @@ function resolveTaxLine(
   if (components.length === 0) {
     return direction === 'purchase' ? 'TAX_CODE_SALES_ONLY' : 'TAX_CODE_PURCHASE_ONLY';
   }
-  if (components.length !== 1) return 'TAX_RATE_UNSUPPORTED';
-  const component = components[0];
-  if (
-    !isRuntimeRecord(component) ||
-    !isNonEmptyIdentity(component.taxRateQboId) ||
-    !isNonEmptyIdentity(component.taxTypeApplicable)
-  ) {
-    return 'TAX_RATE_MALFORMED';
-  }
-  if (component.taxTypeApplicable !== 'TaxOnAmount') return 'TAX_RATE_UNSUPPORTED';
+  const resolvedComponents: ResolvedTaxLine['components'] = [];
+  const seenRateIds = new Set<string>();
+  for (const component of components) {
+    if (
+      !isRuntimeRecord(component) ||
+      !isNonEmptyIdentity(component.taxRateQboId) ||
+      !isNonEmptyIdentity(component.taxTypeApplicable)
+    ) {
+      return 'TAX_RATE_MALFORMED';
+    }
+    if (component.taxTypeApplicable !== 'TaxOnAmount') return 'TAX_RATE_UNSUPPORTED';
+    if (seenRateIds.has(component.taxRateQboId)) return 'TAX_CODE_MALFORMED';
+    seenRateIds.add(component.taxRateQboId);
 
-  const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
-  if (!taxRate) return 'TAX_RATE_UNAVAILABLE';
-  if (!isNonEmptyIdentity(taxRate.qboId) || typeof taxRate.active !== 'boolean') {
-    return 'TAX_RATE_MALFORMED';
+    const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
+    if (!taxRate) return 'TAX_RATE_UNAVAILABLE';
+    if (!isNonEmptyIdentity(taxRate.qboId) || typeof taxRate.active !== 'boolean') {
+      return 'TAX_RATE_MALFORMED';
+    }
+    if (!taxRate.active) return 'TAX_RATE_INACTIVE';
+    if (!isSupportedTaxRateValue(taxRate.rateValue)) return 'TAX_RATE_MALFORMED';
+    resolvedComponents.push({
+      rateQboId: taxRate.qboId,
+      rate: rateValueToRatio(taxRate.rateValue),
+    });
   }
-  if (!taxRate.active) return 'TAX_RATE_INACTIVE';
-  if (!isSupportedTaxRateValue(taxRate.rateValue)) return 'TAX_RATE_MALFORMED';
 
   return {
-    rateQboId: taxRate.qboId,
-    rate: rateValueToRatio(taxRate.rateValue),
-    treatment: taxRate.rateValue === 0 ? 'zero_rated' : 'standard',
+    components: resolvedComponents,
+    treatment: resolvedComponents.some((component) => component.rate.numerator !== 0n)
+      ? 'standard'
+      : 'zero_rated',
   };
 }
 
@@ -280,7 +307,7 @@ function allocateExcludedTax(
     centsToAllocate -= 1n;
   }
   for (const share of shares) {
-    lines.lines[share.index]!.taxCents = toSafeCents(BigInt(sign) * share.taxCents);
+    lines.lines[share.index]!.taxCents += toSafeCents(BigInt(sign) * share.taxCents);
   }
   return null;
 }
@@ -468,7 +495,7 @@ function reconstructTaxExcludedTransaction(
     if (typeof resolution === 'string') {
       return { eligible: false, reason: resolution };
     }
-    if (!resolution.rateQboId || !resolution.rate) return null;
+    if (resolution.components.length !== 1) return null;
     resolved.push(resolution);
   }
 
@@ -489,12 +516,13 @@ function reconstructTaxExcludedTransaction(
     { indexes: number[]; rate: { numerator: bigint; denominator: bigint } }
   >();
   for (const [index, resolution] of resolved.entries()) {
-    const group = groups.get(resolution.rateQboId!);
+    const component = resolution.components[0]!;
+    const group = groups.get(component.rateQboId);
     if (group) group.indexes.push(index);
     else {
-      groups.set(resolution.rateQboId!, {
+      groups.set(component.rateQboId, {
         indexes: [index],
-        rate: resolution.rate!,
+        rate: component.rate,
       });
     }
   }
@@ -608,12 +636,13 @@ function calculateTaxTransaction(
 
   if (input.taxCalculation === 'TaxInclusive') {
     for (const [index, resolution] of resolved.entries()) {
-      if (!resolution.rate) continue;
+      if (resolution.components.length === 0) continue;
+      const rate = sumRateRatios(resolution.components.map((component) => component.rate));
       const gross = BigInt(result.lines[index]!.grossCents);
-      const denominator = resolution.rate.denominator * 100n;
+      const denominator = rate.denominator * 100n;
       try {
         const net = toSafeCents(
-          roundRatio(gross * denominator, denominator + resolution.rate.numerator),
+          roundRatio(gross * denominator, denominator + rate.numerator),
         );
         result.lines[index]!.netCents = net;
         result.lines[index]!.taxCents = result.lines[index]!.grossCents - net;
@@ -622,15 +651,19 @@ function calculateTaxTransaction(
       }
     }
   } else if (input.taxCalculation === 'TaxExcluded') {
-    const componentGroups = new Map<string, { indexes: number[]; rate: ResolvedTaxLine['rate'] }>();
+    const componentGroups = new Map<string, {
+      indexes: number[];
+      rate: { numerator: bigint; denominator: bigint };
+    }>();
     for (const [index, resolution] of resolved.entries()) {
-      if (!resolution.rateQboId || !resolution.rate) continue;
-      const group = componentGroups.get(resolution.rateQboId);
-      if (group) group.indexes.push(index);
-      else componentGroups.set(resolution.rateQboId, { indexes: [index], rate: resolution.rate });
+      for (const component of resolution.components) {
+        const group = componentGroups.get(component.rateQboId);
+        if (group) group.indexes.push(index);
+        else componentGroups.set(component.rateQboId, { indexes: [index], rate: component.rate });
+      }
     }
     for (const group of componentGroups.values()) {
-      const failure = allocateExcludedTax(result, group.indexes, group.rate!);
+      const failure = allocateExcludedTax(result, group.indexes, group.rate);
       if (failure) return { eligible: false, reason: failure };
     }
   }
@@ -685,14 +718,21 @@ export function calculatePurchaseLine(
     if (code.taxable !== false) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
     return { grossCents: input.grossCents, netCents: input.grossCents, taxCents: 0 };
   }
-  if (code.purchaseRates.length !== 1 || code.purchaseRates[0]?.taxTypeApplicable !== 'TaxOnAmount') {
+  if (code.purchaseRates.length === 0 || code.purchaseRates.some(
+    (component) => component.taxTypeApplicable !== 'TaxOnAmount',
+  )) {
     throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
   }
-
-  const taxRate = reference.rates.find((candidate) => candidate.qboId === code.purchaseRates[0]?.taxRateQboId);
-  if (!taxRate || !taxRate.active) throw new PurchaseTaxError('TAX_RATE_UNAVAILABLE');
-  if (!isSupportedTaxRateValue(taxRate.rateValue)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
-  const rate = rateValueToRatio(taxRate.rateValue);
+  const rateIds = new Set<string>();
+  const rates = code.purchaseRates.map((component) => {
+    if (rateIds.has(component.taxRateQboId)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
+    rateIds.add(component.taxRateQboId);
+    const taxRate = reference.rates.find((candidate) => candidate.qboId === component.taxRateQboId);
+    if (!taxRate || !taxRate.active) throw new PurchaseTaxError('TAX_RATE_UNAVAILABLE');
+    if (!isSupportedTaxRateValue(taxRate.rateValue)) throw new PurchaseTaxError('TAX_RATE_UNSUPPORTED');
+    return rateValueToRatio(taxRate.rateValue);
+  });
+  const rate = sumRateRatios(rates);
 
   const grossCents = BigInt(input.grossCents);
   const taxDenominator = rate.denominator * 100n;

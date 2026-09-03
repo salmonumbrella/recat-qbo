@@ -180,6 +180,13 @@ describe('MCP tool results', () => {
     ],
     [
       new CategorizationError(
+        'TAX_RATE_UNSUPPORTED',
+        'PRIVATE_TAX_INPUT_SENTINEL',
+      ),
+      'INVALID_INPUT',
+    ],
+    [
+      new CategorizationError(
         'MUTATION_BLOCKED',
         'PRIVATE_CATEGORY_BUSY_SENTINEL',
       ),

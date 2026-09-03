@@ -210,9 +210,20 @@ describe('calculatePurchaseLine', () => {
   });
 
   it.each([
+    ['TaxExcluded', -2_800, -2_800, -336],
+    ['TaxInclusive', -3_136, -2_800, -336],
+  ] as const)('supports an active composite purchase code for %s', (taxCalculation, grossCents, netCents, taxCents) => {
+    expect(
+      calculatePurchaseLine(
+        { grossCents, taxCalculation, taxCodeQboId: 'COMPOUND' },
+        reference,
+      ),
+    ).toEqual({ grossCents, netCents, taxCents });
+  });
+
+  it.each([
     ['missing code', 'MISSING', 'TaxExcluded', 'TAX_CODE_UNAVAILABLE'],
     ['inactive code', 'OLD', 'TaxExcluded', 'TAX_CODE_UNAVAILABLE'],
-    ['compound rate', 'COMPOUND', 'TaxExcluded', 'TAX_RATE_UNSUPPORTED'],
     ['sales-only code', 'SALES_ONLY', 'TaxExcluded', 'TAX_RATE_UNSUPPORTED'],
     ['sales-only code marked not applicable', 'SALES_ONLY', 'NotApplicable', 'TAX_RATE_UNSUPPORTED'],
   ] as const)('fails closed for %s', (_name, taxCodeQboId, taxCalculation, code) => {
@@ -307,6 +318,45 @@ describe('calculatePurchaseTransaction', () => {
     });
   });
 
+  it('applies every component of a composite purchase code', () => {
+    expect(
+      calculatePurchaseTransaction(
+        {
+          taxCalculation: 'TaxExcluded',
+          lines: [
+            { grossCents: -1_000, taxCodeQboId: 'COMPOUND' },
+            { grossCents: -1_000, taxCodeQboId: 'COMPOUND' },
+          ],
+        },
+        reference,
+      ),
+    ).toMatchObject({
+      eligible: true,
+      grossCents: -2_000,
+      netCents: -2_000,
+      taxCents: -240,
+      lines: [{ taxCents: -120 }, { taxCents: -120 }],
+    });
+  });
+
+  it('back-calculates the exact net for a composite inclusive purchase', () => {
+    expect(
+      calculatePurchaseTransaction(
+        {
+          taxCalculation: 'TaxInclusive',
+          lines: [{ grossCents: -3_136, taxCodeQboId: 'COMPOUND' }],
+        },
+        reference,
+      ),
+    ).toMatchObject({
+      eligible: true,
+      grossCents: -3_136,
+      netCents: -2_800,
+      taxCents: -336,
+      lines: [{ grossCents: -3_136, netCents: -2_800, taxCents: -336 }],
+    });
+  });
+
   it('back-calculates and balances inclusive tax per line', () => {
     const result = calculatePurchaseTransaction(
       {
@@ -391,7 +441,6 @@ describe('calculatePurchaseTransaction', () => {
     ['unknown code', 'MISSING', 'TaxExcluded', undefined, 'TAX_CODE_UNAVAILABLE'],
     ['inactive code', 'OLD', 'TaxExcluded', undefined, 'TAX_CODE_INACTIVE'],
     ['sales-only code', 'SALES_ONLY', 'TaxExcluded', undefined, 'TAX_CODE_SALES_ONLY'],
-    ['compound code', 'COMPOUND', 'TaxExcluded', undefined, 'TAX_RATE_UNSUPPORTED'],
     ['unknown taxable semantics', 'UNKNOWN_TAXABLE', 'TaxExcluded', undefined, 'TAX_CODE_MALFORMED'],
     ['contradictory semantics', 'CONTRADICTORY', 'TaxExcluded', undefined, 'TAX_CODE_MALFORMED'],
     ['unsupported component', 'WRONG_COMPONENT', 'TaxExcluded', undefined, 'TAX_RATE_UNSUPPORTED'],

@@ -1020,16 +1020,64 @@ describe('stageCategorization', () => {
 
   it.each([
     ['inactive', () => { db.state.taxCodes[0]!.active = false; }, 'TAX_CODE_INACTIVE'],
-    ['unsupported', () => {
-      db.state.taxCodes[0]!.purchaseTaxRateList = [
-        { taxRateQboId: 'TAX_RATE_STANDARD', taxTypeApplicable: 'TaxOnAmount' },
-        { taxRateQboId: 'TAX_RATE_SECONDARY', taxTypeApplicable: 'TaxOnAmount' },
-      ];
-    }, 'TAX_RATE_UNSUPPORTED'],
   ] as const)('rejects an %s tax code', async (_kind, mutate, code) => {
     mutate();
     await expectCode(stageCategorization(input(), testDeps(db)), code);
     expect(db.transactionCalls).toBe(1);
+  });
+
+  it('stages a receipt-proven tax-inclusive composite purchase code', async () => {
+    db.state.transactions[0]!.amount = -31.36;
+    db.state.taxCodes[0]!.qboId = '7';
+    db.state.taxCodes[0]!.name = 'GST/PST BC';
+    db.state.taxCodes[0]!.purchaseTaxRateList = [
+      { taxRateQboId: '3', taxTypeApplicable: 'TaxOnAmount' },
+      { taxRateQboId: '15', taxTypeApplicable: 'TaxOnAmount' },
+    ];
+    db.state.taxRates = [{
+      companyId: COMPANY_ID,
+      qboId: '3',
+      name: 'GST (ITC)',
+      active: true,
+      rateValue: 5,
+    }, {
+      companyId: COMPANY_ID,
+      qboId: '15',
+      name: 'PST (BC) Purchase',
+      active: true,
+      rateValue: 7,
+    }];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -3_136,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -2_800, taxCents: -336, totalCents: -3_136 },
+      lines: [{
+        subtotalCents: -2_800,
+        taxCents: -336,
+        totalCents: -3_136,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: '7',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      revision: 1,
+      taxCalculation: 'TaxInclusive',
+      taxCode: 'GST/PST BC',
+      taxCodeQboId: '7',
+    });
   });
 
   it('rejects an explicit non-tax code in taxed mode without inventing its treatment', async () => {

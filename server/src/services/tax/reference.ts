@@ -122,15 +122,21 @@ function codeSupport(
     return { supported: true, combinedRate: null };
   }
   if (code.taxable !== true) return { supported: false, combinedRate: null };
-  if (rates.length !== 1) return { supported: false, combinedRate: null };
+  if (rates.length === 0) return { supported: false, combinedRate: null };
 
-  const [component] = rates;
-  if (!component) return { supported: false, combinedRate: null };
-  const rate = ratesById.get(component.taxRateQboId);
-  if (!rate || !rate.active || component.taxTypeApplicable !== 'TaxOnAmount' || !isSupportedTaxRateValue(rate.rateValue)) {
-    return { supported: false, combinedRate: null };
+  const seenRateIds = new Set<string>();
+  let combinedRate = 0;
+  for (const component of rates) {
+    if (seenRateIds.has(component.taxRateQboId)) return { supported: false, combinedRate: null };
+    seenRateIds.add(component.taxRateQboId);
+    const rate = ratesById.get(component.taxRateQboId);
+    if (!rate || !rate.active || component.taxTypeApplicable !== 'TaxOnAmount' || !isSupportedTaxRateValue(rate.rateValue)) {
+      return { supported: false, combinedRate: null };
+    }
+    combinedRate = Number((combinedRate + rate.rateValue).toFixed(6));
+    if (!isSupportedTaxRateValue(combinedRate)) return { supported: false, combinedRate: null };
   }
-  return { supported: true, combinedRate: rate.rateValue };
+  return { supported: true, combinedRate };
 }
 
 function readinessStatus(
@@ -253,7 +259,7 @@ function isSupportedCachedSalesTaxCode(row: CachedSalesTaxCode): boolean {
   }
   if (
     row.taxable !== true ||
-    row.salesTaxRateList.length !== 1 ||
+    row.salesTaxRateList.length === 0 ||
     row.combinedSalesRate === null
   ) {
     return false;
@@ -276,7 +282,7 @@ function taxCodesForReadiness(rows: TaxCodeRow[], direction: TaxDirection): TaxR
     }
     return (
       row.taxable === true &&
-      rateList.length === 1 &&
+      rateList.length > 0 &&
       combinedRate !== null &&
       isSupportedTaxRateValue(Number(combinedRate))
     );
