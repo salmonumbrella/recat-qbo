@@ -557,7 +557,7 @@ function isUsableTaxRow(row: TaxRow): boolean {
   if (row.taxable === false) {
     return row.purchaseTaxRateList.length === 0 && row.combinedPurchaseRate === null;
   }
-  if (row.taxable !== true || row.purchaseTaxRateList.length !== 1) return false;
+  if (row.taxable !== true || row.purchaseTaxRateList.length === 0) return false;
   const rate = Number(row.combinedPurchaseRate);
   return Number.isFinite(rate) && rate >= 0 && rate <= 999.999999;
 }

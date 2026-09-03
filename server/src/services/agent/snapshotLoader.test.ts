@@ -42,6 +42,7 @@ describe('agent snapshot loader', () => {
       if (sql.includes('agent-snapshot:tax')) {
         return [
           { qboId: 'tax-a', name: 'Tax A', active: true, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
+          { qboId: 'tax-composite', name: 'GST/PST BC', active: true, taxable: true, purchaseTaxRateList: [{}, {}], combinedPurchaseRate: '12.000000' },
           { qboId: 'tax-stale', name: 'Tax stale', active: false, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
         ];
       }
@@ -96,7 +97,10 @@ describe('agent snapshot loader', () => {
       tax: {
         status: 'ready',
         supportedCalculationModes: ['TaxInclusive', 'TaxExcluded'],
-        eligibleReferences: [{ qboId: 'tax-a', label: 'Tax A' }],
+        eligibleReferences: [
+          { qboId: 'tax-composite', label: 'GST/PST BC' },
+          { qboId: 'tax-a', label: 'Tax A' },
+        ],
       },
       tags: [{ id: TAG_ID, name: 'Generic tag' }],
       rules: [{

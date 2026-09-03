@@ -182,6 +182,27 @@ describe('refreshTaxReference', () => {
     ]);
   });
 
+  it('does not publish a composite code that repeats the same rate component', async () => {
+    const duplicate = {
+      ...code('DUPLICATE'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+
+    const result = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [duplicate]),
+    );
+
+    expect(cache.taxCode('company-1', 'DUPLICATE')).toMatchObject({
+      combinedPurchaseRate: null,
+    });
+    expect(result.readiness).toMatchObject({ status: 'needs_setup', taxCodes: [] });
+  });
+
   it.each([
     ['inactive sales rate', { ...code('SALES'), purchaseRates: [], salesRates: [{ taxRateQboId: 'OLD', taxTypeApplicable: 'TaxOnAmount' }] }, [
       ...rates,

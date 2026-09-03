@@ -51,6 +51,17 @@ const reference = {
       ],
     },
     {
+      qboId: 'DUPLICATE_COMPONENT',
+      name: 'Duplicate GST component',
+      description: null,
+      active: true,
+      taxable: true,
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    },
+    {
       qboId: 'SALES_ONLY',
       name: 'Sales only',
       description: null,
@@ -225,6 +236,7 @@ describe('calculatePurchaseLine', () => {
     ['missing code', 'MISSING', 'TaxExcluded', 'TAX_CODE_UNAVAILABLE'],
     ['inactive code', 'OLD', 'TaxExcluded', 'TAX_CODE_UNAVAILABLE'],
     ['sales-only code', 'SALES_ONLY', 'TaxExcluded', 'TAX_RATE_UNSUPPORTED'],
+    ['duplicate component', 'DUPLICATE_COMPONENT', 'TaxExcluded', 'TAX_RATE_UNSUPPORTED'],
     ['sales-only code marked not applicable', 'SALES_ONLY', 'NotApplicable', 'TAX_RATE_UNSUPPORTED'],
   ] as const)('fails closed for %s', (_name, taxCodeQboId, taxCalculation, code) => {
     expect(() =>
@@ -441,6 +453,7 @@ describe('calculatePurchaseTransaction', () => {
     ['unknown code', 'MISSING', 'TaxExcluded', undefined, 'TAX_CODE_UNAVAILABLE'],
     ['inactive code', 'OLD', 'TaxExcluded', undefined, 'TAX_CODE_INACTIVE'],
     ['sales-only code', 'SALES_ONLY', 'TaxExcluded', undefined, 'TAX_CODE_SALES_ONLY'],
+    ['duplicate component', 'DUPLICATE_COMPONENT', 'TaxExcluded', undefined, 'TAX_CODE_MALFORMED'],
     ['unknown taxable semantics', 'UNKNOWN_TAXABLE', 'TaxExcluded', undefined, 'TAX_CODE_MALFORMED'],
     ['contradictory semantics', 'CONTRADICTORY', 'TaxExcluded', undefined, 'TAX_CODE_MALFORMED'],
     ['unsupported component', 'WRONG_COMPONENT', 'TaxExcluded', undefined, 'TAX_RATE_UNSUPPORTED'],
