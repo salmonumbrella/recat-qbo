@@ -1369,9 +1369,7 @@ export function preparePurchaseRecategorization(args: {
       || sourceSnapshotLine.taxInclusiveCents === stagedLine.totalCents
     );
   const canPreserveOneToOneMetadata =
-    hasOneToOneSource
-    && stagedLine.memo === null
-    && (stagedLine.tagIds?.length ?? 0) === 0;
+    hasOneToOneSource;
   const newRawLines = canPreserveOneToOneSourceExactly
     ? [(() => {
         const cloned = normalizedClone(sourceRawLine);
@@ -1389,7 +1387,9 @@ export function preparePurchaseRecategorization(args: {
           const sourceDetail = sourceRawLine.AccountBasedExpenseLineDetail!;
           const stagedDetail = stagedRaw.AccountBasedExpenseLineDetail!;
           if (sourceRawLine.Id !== undefined) stagedRaw.Id = sourceRawLine.Id;
-          if (sourceRawLine.Description !== undefined) {
+          if (stagedLine.memo !== null) {
+            stagedRaw.Description = stagedLine.memo;
+          } else if (sourceRawLine.Description !== undefined) {
             stagedRaw.Description = sourceRawLine.Description;
           }
           if (sourceRawLine.CustomField !== undefined) {

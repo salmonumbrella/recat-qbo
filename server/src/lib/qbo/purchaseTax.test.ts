@@ -1244,8 +1244,8 @@ describe('preparePurchaseRecategorization', () => {
         totalCents: -3_136,
         categoryQboId: '99',
         taxCodeQboId: '7',
-        memo: null,
-        tagIds: [],
+        memo: 'Reviewed software subscription',
+        tagIds: ['reviewed-tag'],
       }],
       tagIds: [],
     };
@@ -1260,7 +1260,7 @@ describe('preparePurchaseRecategorization', () => {
 
     expect(prepared.body.Line![0]).toMatchObject({
       Id: '1',
-      Description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      Description: 'Reviewed software subscription',
       Amount: 28,
       CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
       AccountBasedExpenseLineDetail: {
@@ -1275,7 +1275,7 @@ describe('preparePurchaseRecategorization', () => {
     });
     expect(prepared.expected.targetLines[0]).toMatchObject({
       id: '1',
-      description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      description: 'Reviewed software subscription',
       amountCents: -2_800,
       accountQboId: '99',
       taxCodeQboId: '7',
@@ -1376,12 +1376,12 @@ describe('preparePurchaseRecategorization', () => {
         globalTaxCalculation: 'TaxInclusive',
         totalTaxCents: -73,
         targetLines: [{
-          id: null,
+          id: 'LINE_HOLDING',
           amountCents: -952,
           description: 'generic memo',
           accountQboId: 'ACCOUNT_CATEGORY',
-          customerQboId: null,
-          classQboId: null,
+          customerQboId: 'CUSTOMER_OLD',
+          classQboId: 'CLASS_OLD',
           taxCodeQboId: TAX_CODE_STANDARD,
           taxAmountCents: -48,
           taxInclusiveCents: -1_000,
@@ -1395,11 +1395,14 @@ describe('preparePurchaseRecategorization', () => {
       Line: [
         raw.Line![1],
         {
+          Id: 'LINE_HOLDING',
           Amount: 9.52,
           DetailType: 'AccountBasedExpenseLineDetail',
           Description: 'generic memo',
           AccountBasedExpenseLineDetail: {
             AccountRef: { value: 'ACCOUNT_CATEGORY' },
+            CustomerRef: { value: 'CUSTOMER_OLD', name: 'Generic Customer' },
+            ClassRef: { value: 'CLASS_OLD', name: 'Generic Class' },
             TaxCodeRef: { value: TAX_CODE_STANDARD },
             TaxAmount: 0.48,
             TaxInclusiveAmt: 10,
@@ -1464,6 +1467,8 @@ describe('preparePurchaseRecategorization', () => {
     const detail = prepared.body.Line![1]!.AccountBasedExpenseLineDetail;
     expect(detail).toEqual({
       AccountRef: { value: 'ACCOUNT_CATEGORY' },
+      CustomerRef: { value: 'CUSTOMER_OLD', name: 'Generic Customer' },
+      ClassRef: { value: 'CLASS_OLD', name: 'Generic Class' },
       TaxCodeRef: { value: TAX_CODE_STANDARD },
       TaxAmount: 0.48,
       ...(inclusiveAmount === undefined ? {} : { TaxInclusiveAmt: inclusiveAmount }),
@@ -1869,7 +1874,7 @@ describe('preparePurchaseRestore', () => {
         totalTaxCents: -73,
         lines: [
           original.before.lines[1],
-          { ...original.expected.targetLines[0], id: 'LINE_QBO_ASSIGNED' },
+          original.expected.targetLines[0],
         ],
       },
       expected: {

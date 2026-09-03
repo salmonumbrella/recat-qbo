@@ -1191,6 +1191,11 @@ describe('MockQboClient prepared Purchase writes', () => {
       ok: true,
       newSyncToken: '8',
     });
+    const {
+      rawHash: _rawHash,
+      categoryOnlyHash: _categoryOnlyHash,
+      ...readbackTarget
+    } = prepared.expected.targetLines[0]!;
     await expect(c.fetchPurchaseSnapshot('PURCHASE_GENERIC')).resolves.toEqual({
       qboId: prepared.expected.qboId,
       syncToken: '8',
@@ -1202,7 +1207,7 @@ describe('MockQboClient prepared Purchase writes', () => {
       totalTaxCents: prepared.expected.totalTaxCents,
       lines: [
         before.lines[1],
-        { ...prepared.expected.targetLines[0], id: '1001' },
+        readbackTarget,
       ],
     });
 
@@ -1213,7 +1218,7 @@ describe('MockQboClient prepared Purchase writes', () => {
       SyncToken: '8',
       Line: [
         prepared.body.Line![0]!,
-        { ...prepared.body.Line![1]!, Id: '1001' },
+        prepared.body.Line![1]!,
       ],
     };
     expect(posted.raw).toEqual(expectedPostedRaw);

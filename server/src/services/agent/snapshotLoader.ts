@@ -51,7 +51,6 @@ interface TaxRow {
   active: unknown;
   taxable: unknown;
   purchaseTaxRateList: unknown;
-  combinedPurchaseRate: unknown;
 }
 
 type UsableTaxRow = TaxRow & {
@@ -205,8 +204,7 @@ export async function loadAgentSnapshotSourceInTransaction(
     ),
     tx.$queryRawUnsafe<TaxRow[]>(
       `/* agent-snapshot:tax */
-       SELECT "qboId", "name", "active", "taxable", "purchaseTaxRateList",
-         "combinedPurchaseRate"::text AS "combinedPurchaseRate"
+       SELECT "qboId", "name", "active", "taxable", "purchaseTaxRateList"
        FROM "QboTaxCode"
        WHERE "companyId" = $1
          AND "active" = TRUE

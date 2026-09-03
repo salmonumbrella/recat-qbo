@@ -88,7 +88,6 @@ async function readiness(
             name: true,
             active: true,
             taxable: true,
-            combinedPurchaseRate: true,
             purchaseTaxRateList: true,
           },
         }),

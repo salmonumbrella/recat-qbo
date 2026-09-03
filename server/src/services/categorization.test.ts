@@ -1475,18 +1475,30 @@ describe('stageCategorization', () => {
     }), testDeps(db)), 'TAX_NOT_READY');
   });
 
-  it.each([
-    ['missing', null],
-    ['malformed', 'not-a-rate'],
-  ] as const)('rejects a Deposit when cached combined sales rate is %s', async (_case, combinedSalesRate) => {
+  it('derives Deposit readiness when a legacy cached combined sales rate is missing', async () => {
     db.state.transactions[0]!.qboType = 'Deposit';
     db.state.transactions[0]!.amount = 107;
-    db.state.taxCodes[0]!.combinedSalesRate = combinedSalesRate;
+    db.state.taxCodes[0]!.combinedSalesRate = null;
 
-    await expectCode(stageCategorization(input({
+    await expect(stageCategorization(input({
       ...standardProposal,
       lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
-    }), testDeps(db)), 'TAX_NOT_READY');
+    }), testDeps(db))).resolves.toMatchObject({
+      totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
+    });
+  });
+
+  it('ignores a malformed denormalized sales rate when valid component rows can be derived', async () => {
+    db.state.transactions[0]!.qboType = 'Deposit';
+    db.state.transactions[0]!.amount = 107;
+    db.state.taxCodes[0]!.combinedSalesRate = 'not-a-rate';
+
+    await expect(stageCategorization(input({
+      ...standardProposal,
+      lines: [{ ...standardProposal.lines[0]!, grossCents: 10_700 }],
+    }), testDeps(db))).resolves.toMatchObject({
+      totals: { subtotalCents: 10_000, taxCents: 700, totalCents: 10_700 },
+    });
   });
 
   it('rejects cached Deposit tax references after a recorded refresh failure', async () => {

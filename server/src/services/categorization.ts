@@ -16,6 +16,7 @@ import {
   reconstructSalesTaxExcludedTransaction,
 } from '../lib/qbo/purchaseTax.js';
 import { cachedSalesTaxReadiness } from './tax/reference.js';
+import { cachedTaxCodeSupport, cachedTaxRates } from './tax/cache.js';
 import {
   EntityLeaseError,
   fenceEntityLeaseOwnership,
@@ -700,10 +701,15 @@ async function validateStage(
     if (!company) {
       throw new CategorizationError('TRANSACTION_NOT_FOUND', 'Transaction company was not found.');
     }
+    const cachedRates = cachedTaxRates(taxRates);
+    const derivedTaxCodes = taxCodes.map((code) => ({
+      ...code,
+      combinedSalesRate: cachedTaxCodeSupport(code, cachedRates, 'sales').combinedRate,
+    }));
     const ready = transaction.qboType === 'Deposit'
       ? cachedSalesTaxReadiness(
           company.taxUsingSalesTax,
-          taxCodes,
+          derivedTaxCodes,
           company.taxSupportReason,
         ).status === 'ready'
       : taxReadiness(company, taxCodes).status === 'ready' && company.taxUsingSalesTax === true;
@@ -732,14 +738,7 @@ async function validateStage(
         }[],
         sourceUpdatedAt: null,
       })),
-      rates: taxRates.filter((rate) => rate.rateValue !== null).map((rate) => ({
-        qboId: rate.qboId,
-        name: rate.name,
-        description: null,
-        active: rate.active,
-        rateValue: Number(rate.rateValue),
-        sourceUpdatedAt: null,
-      })),
+      rates: cachedRates,
     };
     const taxLines = proposal.lines.map((line) => ({
       grossCents: line.grossCents,
