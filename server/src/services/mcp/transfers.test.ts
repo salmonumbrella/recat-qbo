@@ -145,7 +145,7 @@ function harness() {
 }
 
 describe('MCP transfer preparation', () => {
-  it('rejects a fresh blocked leg before creating a transfer operation', async () => {
+  it('allows a legacy cleared leg when creating a transfer operation', async () => {
     const h = harness();
     const identity = (id: string) => ({
       id,
@@ -182,8 +182,11 @@ describe('MCP transfer preparation', () => {
       prepare: h.prepare,
       createOperation: createPreparedOperation,
       now: () => NOW,
-    })).rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
-    expect(h.operations).toHaveLength(0);
+    })).resolves.toMatchObject({
+      operationId: expect.any(String),
+      preview: { action: 'record_transfer', legCount: 2 },
+    });
+    expect(h.operations).toHaveLength(1);
   });
 
   it('stores the complete private pair binding in the shared final transaction and returns only a bounded preview', async () => {

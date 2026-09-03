@@ -261,7 +261,7 @@ beforeEach(() => {
 });
 
 describe('tax-aware categorization action routes', () => {
-  it('counts only writable or unknown pending work while retaining blocked diagnostics', async () => {
+  it('counts legacy cleared rows as actionable while retaining stale-binding diagnostics', async () => {
     const checkedAt = new Date();
     const providerRow = (id: string, disposition: string, qboId = id) => ({
       ...transactionRow,
@@ -293,14 +293,14 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
-      pendingCount: 2,
-      actionableCount: 1,
-      blockedCount: 1,
+      pendingCount: 3,
+      actionableCount: 2,
+      blockedCount: 0,
       unknownCount: 1,
     });
   });
 
-  it('keeps one Queue by omitting terminal and known provider-blocked rows', async () => {
+  it('keeps one Queue with legacy cleared/reconciled rows and omits terminal rows', async () => {
     const checkedAt = new Date();
     const providerRow = (
       id: string,
@@ -353,6 +353,7 @@ describe('tax-aware categorization action routes', () => {
 
     expect(response.status).toBe(200);
     expect(response.body.transactions.map((row: { id: string }) => row.id)).toEqual([
+      'BLOCKED_TXN',
       'UNKNOWN_TXN',
       'POSTED_RESTORE_TXN',
       'POSTED_RETRYABLE_RESTORE_TXN',

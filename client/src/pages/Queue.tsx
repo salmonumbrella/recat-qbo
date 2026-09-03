@@ -66,8 +66,6 @@ const STATE_OF: Partial<Record<TxnStatus, UiState>> = {
 };
 
 const PROVIDER_BLOCKED = new Set([
-  'BLOCKED_CLEARED',
-  'BLOCKED_RECONCILED',
   'BLOCKED_PERIOD_CLOSED',
 ]);
 

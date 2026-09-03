@@ -240,7 +240,7 @@ describe('AI suggestion model', () => {
 });
 
 describe('refreshSuggestions provider eligibility', () => {
-  it('clears a blocked snapshot and never sends it to the AI provider', async () => {
+  it('treats a legacy cleared snapshot as eligible for a suggestion', async () => {
     const now = new Date();
     mocks.transaction.findMany
       .mockResolvedValueOnce([])
@@ -271,10 +271,6 @@ describe('refreshSuggestions provider eligibility', () => {
 
     await refreshSuggestions('company-1');
 
-    expect(mocks.fetch).not.toHaveBeenCalled();
-    expect(mocks.transaction.update).toHaveBeenCalledWith({
-      where: { id: 'txn-blocked' },
-      data: { suggestion: expect.anything() },
-    });
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
   });
 });

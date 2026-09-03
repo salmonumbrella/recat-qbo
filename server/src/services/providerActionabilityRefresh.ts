@@ -112,9 +112,9 @@ function normalizedRateLimitError(error: unknown): QboRateLimitError {
 
 function dispositionFromSafety(result: WriteSafetyReadResult): ProviderActionabilityRefreshItem['disposition'] {
   if (result.blockCode === 'QBO_PERIOD_CLOSED') return 'BLOCKED_PERIOD_CLOSED';
-  if (result.blockCode === 'QBO_TRANSACTION_LOCKED') {
-    return result.reconciled ? 'BLOCKED_RECONCILED' : 'BLOCKED_CLEARED';
-  }
+  // Compatibility with pre-policy-change read results: cleared/reconciled
+  // observations remain useful evidence but do not make a transaction unsafe.
+  if (result.blockCode === 'QBO_TRANSACTION_LOCKED') return 'WRITABLE';
   return result.writable ? 'WRITABLE' : 'UNAVAILABLE';
 }
 

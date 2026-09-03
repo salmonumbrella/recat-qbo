@@ -51,9 +51,6 @@ export function assertQboWriteAllowed(
       `QuickBooks has closed books through ${evidence.bookCloseDate}.`,
     );
   }
-  if (evidence.cleared || evidence.reconciled) {
-    throw new QboWriteSafetyError('QBO_TRANSACTION_LOCKED');
-  }
 }
 
 function dateOnly(value: string): boolean {

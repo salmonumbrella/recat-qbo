@@ -60,9 +60,9 @@ describe('provider actionability', () => {
   it('maps safety evidence by specificity and never changes local TxnStatus', () => {
     expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence())).toBe('WRITABLE');
     expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence({ cleared: true })))
-      .toBe('BLOCKED_CLEARED');
+      .toBe('WRITABLE');
     expect(dispositionFromWriteSafety({ txnDate: '2026-08-01' }, evidence({ reconciled: true })))
-      .toBe('BLOCKED_RECONCILED');
+      .toBe('WRITABLE');
     expect(dispositionFromWriteSafety(
       { txnDate: '2026-08-01' },
       evidence({ bookCloseDate: '2026-08-15', cleared: true, reconciled: true }),
@@ -90,7 +90,7 @@ describe('provider actionability', () => {
     )).toBe(true);
   });
 
-  it('retains terminal provider locks but expires a period-close lock with the TTL', () => {
+  it('reinterprets legacy cleared/reconciled locks as writable while retaining binding checks', () => {
     const now = new Date('2026-08-30T18:15:00.000Z');
     const stale = new Date('2026-08-30T17:59:59.000Z');
 
@@ -105,7 +105,7 @@ describe('provider actionability', () => {
       TXN,
       now,
       15 * 60 * 1000,
-    )).toBe('BLOCKED_RECONCILED');
+    )).toBe('WRITABLE');
     expect(effectiveProviderDisposition(
       observation({ disposition: 'BLOCKED_PERIOD_CLOSED', checkedAt: stale }),
       TXN,
@@ -120,7 +120,7 @@ describe('provider actionability', () => {
       TXN,
       now,
       15 * 60 * 1000,
-    )).toBe('UNKNOWN');
+    )).toBe('WRITABLE');
     expect(effectiveProviderDisposition(
       observation({
         disposition: 'BLOCKED_CLEARED',
@@ -133,7 +133,7 @@ describe('provider actionability', () => {
     )).toBe('UNKNOWN');
   });
 
-  it('rejects known blocked or unknown prepare before any operation is created', () => {
+  it('allows legacy cleared/reconciled observations but rejects closed or unknown prepares', () => {
     const now = new Date('2026-08-30T18:00:00.000Z');
     expect(() => assertProviderActionabilityAllowsPrepare(
       observation({ disposition: 'BLOCKED_PERIOD_CLOSED' }),
@@ -144,7 +144,12 @@ describe('provider actionability', () => {
       observation({ disposition: 'BLOCKED_CLEARED' }),
       TXN,
       now,
-    )).toThrowError(new QboWriteSafetyError('QBO_TRANSACTION_LOCKED'));
+    )).not.toThrow();
+    expect(() => assertProviderActionabilityAllowsPrepare(
+      observation({ disposition: 'BLOCKED_RECONCILED' }),
+      TXN,
+      now,
+    )).not.toThrow();
     expect(() => assertProviderActionabilityAllowsPrepare(null, TXN, now))
       .toThrowError(new QboWriteSafetyError('QBO_WRITE_SAFETY_UNAVAILABLE'));
   });
@@ -178,8 +183,8 @@ describe('provider actionability', () => {
     ];
     expect(effectiveProviderActionabilityCounts(rows, now)).toEqual({
       total: 3,
-      actionable: 1,
-      blocked: 1,
+      actionable: 2,
+      blocked: 0,
       unknown: 1,
     });
   });
@@ -197,7 +202,7 @@ describe('provider actionability', () => {
       TXN.id,
       db,
       now,
-    )).rejects.toThrowError(new QboWriteSafetyError('QBO_TRANSACTION_LOCKED'));
+    )).resolves.toBeUndefined();
   });
 
   it('persists only when the transaction and actionability bindings still match (bounded CAS)', async () => {
@@ -257,7 +262,7 @@ describe('provider actionability', () => {
         },
       },
     });
-    expect(actionability?.disposition).toBe('BLOCKED_CLEARED');
+    expect(actionability?.disposition).toBe('WRITABLE');
 
     actionability = observation({ revision: TXN.revision + 1, qboSyncToken: '18' });
     await expect(persistProviderActionability({ ...TXN, evidence: evidence() }, db)).resolves.toBe(false);

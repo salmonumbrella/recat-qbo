@@ -130,14 +130,21 @@ describe('write-safety reads', () => {
   });
 
   it.each([
-    [{ bookCloseDate: null, cleared: true, reconciled: false }, 'QBO_TRANSACTION_LOCKED'],
-    [{ bookCloseDate: null, cleared: false, reconciled: true }, 'QBO_TRANSACTION_LOCKED'],
-    [{ bookCloseDate: '2026-01-02', cleared: false, reconciled: false }, 'QBO_PERIOD_CLOSED'],
-  ] as const)('returns a non-writable result instead of throwing for a known block', async (evidence, code) => {
+    { bookCloseDate: null, cleared: true, reconciled: false },
+    { bookCloseDate: null, cleared: false, reconciled: true },
+  ] as const)('reports bank status without using it as a write lock', async (evidence) => {
     const fixture = service(recat, qbo(), evidence);
 
     await expect(fixture.operations.getWriteSafety('user-a', 'company-a', 'transaction-a'))
-      .resolves.toMatchObject({ writable: false, blockCode: code, ...evidence });
+      .resolves.toMatchObject({ writable: true, blockCode: null, ...evidence });
+  });
+
+  it('returns a non-writable result for a closed accounting period', async () => {
+    const evidence = { bookCloseDate: '2026-01-02', cleared: false, reconciled: false } as const;
+    const fixture = service(recat, qbo(), evidence);
+
+    await expect(fixture.operations.getWriteSafety('user-a', 'company-a', 'transaction-a'))
+      .resolves.toMatchObject({ writable: false, blockCode: 'QBO_PERIOD_CLOSED', ...evidence });
   });
 
   it('extracts DepositToAccountRef for deposits', async () => {

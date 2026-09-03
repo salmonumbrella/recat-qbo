@@ -2321,20 +2321,20 @@ describe('single interactive queue', () => {
     for (const payee of [
       'Writable supplier',
       'Unknown supplier',
+      'Cleared supplier',
+      'Reconciled supplier',
       'Unavailable supplier',
     ]) {
       expect(screen.getByText(payee)).toBeInTheDocument();
     }
     for (const payee of [
-      'Cleared supplier',
-      'Reconciled supplier',
       'Closed supplier',
     ]) {
       expect(screen.queryByText(payee)).not.toBeInTheDocument();
     }
     expect(screen.queryByRole('tablist', { name: 'Transaction queue views' })).not.toBeInTheDocument();
     expect(screen.queryByText(/Needs safety check|Blocked in QuickBooks/i)).not.toBeInTheDocument();
-    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(3);
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(5);
   });
 
   it.each([
@@ -2360,10 +2360,17 @@ describe('single interactive queue', () => {
   it.each([
     ['cleared', 'BLOCKED_CLEARED'],
     ['reconciled', 'BLOCKED_RECONCILED'],
-    ['closed period', 'BLOCKED_PERIOD_CLOSED'],
-  ])('keeps a provider-%s transaction out of the interactive queue', async (_label, disposition) => {
+  ])('keeps a provider-%s transaction interactive despite its bank status', async (_label, disposition) => {
+    await renderQueue(providerRow('TXN_REVIEW', 'Review supplier', disposition));
+
+    expect(screen.getByText('Review supplier')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Category for Review supplier' })).toBeEnabled();
+    expect(mocks.setPendingCount).toHaveBeenLastCalledWith(1);
+  });
+
+  it('keeps a closed-period transaction out of the interactive queue', async () => {
     mocks.list.mockResolvedValue({
-      transactions: [providerRow('TXN_REVIEW', 'Review supplier', disposition)],
+      transactions: [providerRow('TXN_REVIEW', 'Review supplier', 'BLOCKED_PERIOD_CLOSED')],
       nextCursor: null,
       pendingCount: 0,
     });

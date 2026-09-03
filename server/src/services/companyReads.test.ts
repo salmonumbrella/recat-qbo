@@ -1158,8 +1158,8 @@ describe('company read services', () => {
     })).resolves.toMatchObject({
       items: [{ id: 'stale', providerActionability: { disposition: 'UNKNOWN' } }],
       pendingCount: 3,
-      actionableCount: 1,
-      blockedCount: 1,
+      actionableCount: 2,
+      blockedCount: 0,
       unknownCount: 1,
     });
   });

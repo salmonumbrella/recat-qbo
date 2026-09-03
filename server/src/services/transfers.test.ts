@@ -135,7 +135,7 @@ describe('pairTransfers', () => {
 });
 
 describe('transferCandidates', () => {
-  it('excludes provider-blocked rows before pairing transfers', async () => {
+  it('pairs legacy cleared rows because bank status is not a write lock', async () => {
     const now = new Date();
     const row = (id: string, amount: number, bankAccount: string, disposition: string) => ({
       id,
@@ -169,7 +169,10 @@ describe('transferCandidates', () => {
       },
     };
 
-    await expect(transferCandidates('company-1', db as never)).resolves.toEqual(new Map());
+    await expect(transferCandidates('company-1', db as never)).resolves.toEqual(new Map([
+      ['blocked', 'writable'],
+      ['writable', 'blocked'],
+    ]));
   });
 
   it('queries one row beyond the fixed discovery cap and fails closed on overflow', async () => {

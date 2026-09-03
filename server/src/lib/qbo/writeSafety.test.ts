@@ -39,11 +39,11 @@ describe('QuickBooks write safety', () => {
   it.each([
     [{ cleared: true, reconciled: false }, 'cleared'],
     [{ cleared: false, reconciled: true }, 'reconciled'],
-  ])('blocks a %s bank line', (status) => {
+  ])('allows category and tax writes on a %s bank line', (status) => {
     expect(() => assertQboWriteAllowed({ ...purchase, qboType: 'Deposit' }, {
       bookCloseDate: null,
       ...status,
-    })).toThrow(expect.objectContaining({ code: 'QBO_TRANSACTION_LOCKED' }));
+    })).not.toThrow();
   });
 
   it.each([

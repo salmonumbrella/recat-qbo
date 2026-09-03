@@ -93,8 +93,8 @@ describe('dashboardData provenance', () => {
 
     const result = await dashboardData('company-1');
 
-    expect(result.pendingCount).toBe(2);
-    expect(result.pendingTotal).toBe(200);
+    expect(result.pendingCount).toBe(3);
+    expect(result.pendingTotal).toBe(5200);
   });
 
   it('labels complete QBO dashboard data', async () => {

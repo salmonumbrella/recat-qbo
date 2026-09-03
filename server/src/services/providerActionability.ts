@@ -6,10 +6,6 @@ import { prisma } from '../lib/prisma.js';
  * transaction SyncToken changing.  The cache only guides reads; it never
  * grants QBO write authority. */
 export const PROVIDER_ACTIONABILITY_TTL_MS = 15 * 60 * 1000;
-/** Provider locks are observations, not permanent transaction state. Keep them
- * longer than writable evidence to avoid hammering QBO, but eventually force a
- * fresh check in case a user clears the reconciliation in QuickBooks. */
-export const PROVIDER_BLOCKED_ACTIONABILITY_TTL_MS = 48 * 60 * 60 * 1000;
 
 export const PROVIDER_ACTIONABILITY_DISPOSITIONS: readonly ProviderActionabilityDisposition[] = [
   'UNKNOWN',
@@ -112,8 +108,6 @@ export function dispositionFromWriteSafety(
     evidence.bookCloseDate !== null
     && target.txnDate <= evidence.bookCloseDate
   ) return 'BLOCKED_PERIOD_CLOSED';
-  if (evidence.reconciled) return 'BLOCKED_RECONCILED';
-  if (evidence.cleared) return 'BLOCKED_CLEARED';
   return 'WRITABLE';
 }
 
@@ -174,11 +168,10 @@ export function isFreshProviderActionability(
 }
 
 /** Resolve a row for selection. Missing, malformed, or mismatched observations
- * fail closed as UNKNOWN. WRITABLE evidence expires because it must never
- * authorize a later write. Same-binding cleared/reconciled locks use a longer
- * bounded TTL because QBO can change that bank-feed state without changing the
- * transaction SyncToken. Period-close evidence expires because the company can
- * reopen its books. */
+ * fail closed as UNKNOWN. Legacy cleared/reconciled dispositions are re-read as
+ * WRITABLE because bank reconciliation state is evidence, not a write lock;
+ * commit still performs a fresh exact safety read before touching QuickBooks.
+ * Other evidence expires because a company can close or reopen its books. */
 export function effectiveProviderDisposition(
   row: ProviderActionabilityObservation | null | undefined,
   txn: ActionabilityTransactionIdentity,
@@ -192,12 +185,7 @@ export function effectiveProviderDisposition(
     row.disposition === 'BLOCKED_CLEARED'
     || row.disposition === 'BLOCKED_RECONCILED'
   ) {
-    return isFreshProviderActionability(
-      row,
-      txn,
-      now,
-      PROVIDER_BLOCKED_ACTIONABILITY_TTL_MS,
-    ) ? row.disposition : 'UNKNOWN';
+    return 'WRITABLE';
   }
   return isFreshProviderActionability(row, txn, now, ttlMs) ? row.disposition : 'UNKNOWN';
 }
@@ -368,9 +356,7 @@ export async function persistProviderActionability(
 export function providerDispositionIsBlocked(
   disposition: ProviderActionabilityDisposition,
 ): boolean {
-  return disposition === 'BLOCKED_CLEARED'
-    || disposition === 'BLOCKED_RECONCILED'
-    || disposition === 'BLOCKED_PERIOD_CLOSED';
+  return disposition === 'BLOCKED_PERIOD_CLOSED';
 }
 
 /** Gate a new prepare using only a fresh cached observation.  This is an
@@ -384,12 +370,11 @@ export function assertProviderActionabilityAllowsPrepare(
   const disposition = effectiveProviderDisposition(row, txn, now);
   switch (disposition) {
     case 'WRITABLE':
+    case 'BLOCKED_CLEARED':
+    case 'BLOCKED_RECONCILED':
       return;
     case 'BLOCKED_PERIOD_CLOSED':
       throw new QboWriteSafetyError('QBO_PERIOD_CLOSED');
-    case 'BLOCKED_CLEARED':
-    case 'BLOCKED_RECONCILED':
-      throw new QboWriteSafetyError('QBO_TRANSACTION_LOCKED');
     case 'UNKNOWN':
     case 'UNAVAILABLE':
     default:

@@ -7,7 +7,6 @@ import {
   type McpCategorizationDeps,
   type PrepareMcpCategorizationInput,
 } from './categorization.js';
-import { QboWriteSafetyError } from '../../lib/qbo/writeSafety.js';
 
 const NOW = new Date('2026-08-30T18:00:00.000Z');
 const principal: McpPrincipal = {
@@ -26,7 +25,7 @@ const proposal: CategorizationProposal = {
 };
 
 describe('MCP prepare provider actionability gate', () => {
-  it('rejects a known blocked transaction before staging or new operation creation', async () => {
+  it('allows a legacy cleared transaction through the prepare gate', async () => {
     const operationLookup = vi.fn().mockResolvedValue(null);
     const createOperation = vi.fn();
     const current = {
@@ -88,10 +87,8 @@ describe('MCP prepare provider actionability gate', () => {
     };
 
     await expect(prepareMcpCategorization(principal, input, deps))
-      .rejects.toMatchObject({ code: 'QBO_TRANSACTION_LOCKED' });
+      .resolves.toEqual({ kind: 'continue' });
     expect(stage).toHaveBeenCalledTimes(1);
-    // A durable idempotent replay is checked first; no matching operation
-    // exists, so the provider gate then rejects the new prepare.
     expect(operationLookup).toHaveBeenCalledTimes(1);
     expect(createOperation).not.toHaveBeenCalled();
   });
