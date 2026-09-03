@@ -4280,6 +4280,53 @@ describe('prepareCategorizationUndo', () => {
     expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
   });
 
+  it('rejects a preserve-current undo whose recorded source tax mode is corrupt', async () => {
+    const fixture = postedFixture();
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.body.Line![0]!.AccountBasedExpenseLineDetail = {
+      AccountRef: { value: 'expense-generic' },
+      TaxCodeRef: { value: 'NON' },
+    };
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: null,
+      totalTaxCents: 0,
+      preservedHash: 'preserved-corrupt-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1050,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'NON',
+        taxAmountCents: null,
+        taxInclusiveCents: null,
+        rawHash: 'preserved-corrupt-target',
+        categoryOnlyHash: 'preserved-corrupt-category-only',
+      }],
+      untouchedLineHashes: [],
+    } as unknown as QboPurchasePreparedWrite['expected'];
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    fixture.source.responseSnapshot = {
+      ...verifiedPurchase,
+      globalTaxCalculation: null,
+      totalTaxCents: 0,
+      preservedHash: 'preserved-corrupt-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    } as unknown as QboPurchaseSnapshot;
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .rejects.toMatchObject({
+        code: 'ATTEMPT_CORRUPT',
+        message: 'Verified preserved Purchase source is incomplete.',
+      });
+    expect(fixture.preparePurchaseRestore).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedWrite).not.toHaveBeenCalled();
+  });
+
   it('hashes the complete source and restore bindings while excluding only the throwaway request ID', async () => {
     expect(hashPreparedWriteBinding(preparedWrite('request-a')))
       .toBe(hashPreparedWriteBinding(preparedWrite('request-b')));
