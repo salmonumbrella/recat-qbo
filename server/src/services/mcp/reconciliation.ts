@@ -256,6 +256,40 @@ async function getOwnedAttachmentOperation(
   ));
 }
 
+async function resolveRetryChild(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+  dependencies: McpOperationExecutionDeps,
+): Promise<McpOperationRecord> {
+  if (operation.retryOfId !== null) return operation;
+  const store = storeFrom(dependencies);
+  const candidate = await store.mcpOperation.findFirst({
+    where: { retryOfId: operation.id },
+  });
+  if (candidate === null) return operation;
+  const child = await loadOwnedOperation(candidate.id, principal, { store });
+  if (
+    child.retryOfId !== operation.id
+    || child.idempotencyKey !== null
+    || child.tokenId !== operation.tokenId
+    || child.tokenPrefix !== operation.tokenPrefix
+    || child.userId !== operation.userId
+    || child.companyId !== operation.companyId
+    || child.transactionId !== operation.transactionId
+    || child.toolName !== operation.toolName
+    || child.kind !== operation.kind
+    || child.payloadHash !== operation.payloadHash
+    || child.sourceRevision !== operation.sourceRevision
+    || child.preparedRevision !== operation.preparedRevision
+    || child.qboType !== operation.qboType
+    || child.qboId !== operation.qboId
+    || child.qboSyncToken !== operation.qboSyncToken
+  ) {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  return child;
+}
+
 export async function getMcpOperation(
   principal: McpPrincipal,
   input: GetMcpOperationInput,
@@ -287,7 +321,8 @@ export async function getMcpOperation(
       store: storeFrom(dependencies) as never,
     });
   }
-  const loaded = await loadExecution(principal, input.operationId, dependencies);
+  owned = await resolveRetryChild(principal, owned, dependencies);
+  const loaded = await loadExecution(principal, owned.id, dependencies);
   return project(loaded, nowFrom(dependencies));
 }
 
@@ -479,7 +514,8 @@ export async function retryMcpOperation(
       store: storeFrom(dependencies) as never,
     });
   }
-  const loaded = await loadExecution(principal, input.operationId, dependencies);
+  owned = await resolveRetryChild(principal, owned, dependencies);
+  const loaded = await loadExecution(principal, owned.id, dependencies);
   const current = project(loaded, nowFrom(dependencies));
   const commit = loaded.operation.kind === 'undo'
     ? commitMcpUndo
@@ -492,18 +528,16 @@ export async function retryMcpOperation(
       { operationId: loaded.operation.id },
       dependencies,
     );
-    if (
-      loaded.operation.retryOfId !== null
-      || resumed.phase !== 'write_unchanged'
-    ) {
+    if (loaded.operation.retryOfId !== null) {
       if (
-        loaded.operation.retryOfId !== null
-        && resumed.state === 'retryable'
+        resumed.state === 'retryable'
+        && resumed.phase !== 'write_unchanged'
       ) {
         throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
       }
       return resumed;
     }
+    if (resumed.phase !== 'write_unchanged') return resumed;
   } else if (current.state !== 'retryable') {
     throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }

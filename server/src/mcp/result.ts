@@ -24,6 +24,7 @@ export type SafeToolErrorCode =
   | 'NOT_FOUND'
   | 'INVALID_INPUT'
   | 'COMPANY_UNAVAILABLE'
+  | 'OPERATION_RECONCILIATION_REQUIRED'
   | 'SEMANTIC_UNAVAILABLE'
   | 'QBO_DISCONNECTED'
   | 'QBO_PERIOD_CLOSED'
@@ -44,6 +45,7 @@ const SAFE_MESSAGES: Record<SafeToolErrorCode, string> = {
   NOT_FOUND: 'The requested record was not found or is unavailable.',
   INVALID_INPUT: 'Check the tool arguments and try again.',
   COMPANY_UNAVAILABLE: 'The company data is temporarily unavailable. Try again later.',
+  OPERATION_RECONCILIATION_REQUIRED: 'This operation requires reconciliation before it can continue.',
   SEMANTIC_UNAVAILABLE: 'Semantic classification search is unavailable.',
   QBO_DISCONNECTED: 'QuickBooks is disconnected for this company. Reconnect it before retrying.',
   QBO_PERIOD_CLOSED: 'QuickBooks has closed this accounting period.',
@@ -130,6 +132,8 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
       case 'IDEMPOTENCY_CONFLICT':
       case 'RETRY_NOT_ALLOWED':
         return 'INVALID_INPUT';
+      case 'OPERATION_CORRUPT':
+        return 'OPERATION_RECONCILIATION_REQUIRED';
       default:
         return 'COMPANY_UNAVAILABLE';
     }
@@ -198,14 +202,18 @@ function safeMutationCode(error: unknown): SafeToolErrorCode | null {
       case 'IDEMPOTENCY_CONFLICT':
       case 'RETRY_NOT_ALLOWED':
         return 'INVALID_INPUT';
+      case 'OPERATION_CORRUPT':
+        return 'OPERATION_RECONCILIATION_REQUIRED';
       default:
         return 'COMPANY_UNAVAILABLE';
     }
   }
   if (error instanceof McpUndoError) {
-    return error.code === 'UNDO_NOT_ALLOWED'
-      ? 'INVALID_INPUT'
-      : 'COMPANY_UNAVAILABLE';
+    if (error.code === 'UNDO_NOT_ALLOWED') return 'INVALID_INPUT';
+    if (error.code === 'OPERATION_CORRUPT') {
+      return 'OPERATION_RECONCILIATION_REQUIRED';
+    }
+    return 'COMPANY_UNAVAILABLE';
   }
   if (error instanceof CategorizationError) {
     if (error.code === 'TRANSACTION_NOT_FOUND') return 'NOT_FOUND';

@@ -1030,6 +1030,132 @@ describe('MCP categorization operation execution', () => {
     },
   );
 
+  it('reads and resumes the existing retry child when called with the root id', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'VERIFIED';
+      value.attempts[1]!.responseSnapshot = {};
+      value.attempts[1]!.verification = {
+        outcome: 'VERIFIED',
+        status: 'POSTED',
+        newSyncToken: '8',
+      };
+      value.transactionStatus.value = 'POSTED';
+      value.transactionSync.value = '8';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'POSTED',
+        outcome: 'VERIFIED',
+      };
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'committed',
+      phase: 'verified',
+    });
+    expect(value.reconcile).toHaveBeenCalledOnce();
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
+  it('returns an unchanged retry child after reconciliation without creating another child', async () => {
+    const value = fixture('UNCHANGED');
+    value.attempts[0]!.verification = {
+      outcome: 'UNCHANGED',
+      status: 'PENDING',
+    };
+    value.operations.push(operation({
+      id: 'operation-2',
+      retryOfId: 'operation-1',
+      idempotencyKey: null,
+    }));
+    value.attempts.push({
+      id: 'attempt-2',
+      requestId: 'operation-2',
+      transactionId: TRANSACTION_ID,
+      operation: 'recategorize',
+      status: 'UNCERTAIN',
+      expectedRevision: 2,
+      expectedSyncToken: 'sync-private',
+      requestHash: 'request-hash',
+      requestPayload: {},
+      beforeSnapshot: {},
+      responseSnapshot: null,
+      verification: null,
+      errorCode: 'QBO_WRITE_UNCERTAIN',
+      errorMessage: 'private provider detail',
+    });
+    value.transactionStatus.value = 'ERROR';
+    value.reconcile.mockImplementationOnce(async () => {
+      value.attempts[1]!.status = 'UNCHANGED';
+      value.attempts[1]!.verification = {
+        outcome: 'UNCHANGED',
+        status: 'PENDING',
+      };
+      value.transactionStatus.value = 'PENDING';
+      return {
+        transactionId: TRANSACTION_ID,
+        requestId: 'operation-2',
+        ok: true,
+        status: 'PENDING',
+        outcome: 'UNCHANGED',
+      };
+    });
+
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      operationId: 'operation-2',
+      state: 'retryable',
+      phase: 'write_unchanged',
+      actions: { canRetry: false },
+    });
+    expect(value.createOperation).not.toHaveBeenCalled();
+  });
+
   it('retry returns a valid terminal root without mutation', async () => {
     const { deps, attempts, commit, reconcile, createOperation } = fixture('VERIFIED');
     attempts[0]!.verification = {
