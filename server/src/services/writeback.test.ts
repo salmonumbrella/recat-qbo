@@ -3452,6 +3452,36 @@ describe('commitStagedCategorization durable lifecycle', () => {
     });
   });
 
+  it('logs a bounded provider diagnostic before marking a prepared write uncertain', async () => {
+    const fixture = durableDeps();
+    const providerError = Object.assign(new Error('Provider rejected the prepared Deposit body.'), {
+      name: 'QboHttpError',
+      status: 400,
+    });
+    fixture.sendPreparedWrite.mockRejectedValueOnce(providerError);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await commitStagedCategorization(commitInput(), fixture.deps);
+
+      expect(logged).toHaveBeenCalledWith(
+        '[writeback] prepared QBO write or readback failed',
+        {
+          transactionId: DURABLE_TRANSACTION_ID,
+          qboType: 'Purchase',
+          qboId: 'purchase-generic',
+          operation: 'recategorize',
+          errorClass: 'QboHttpError',
+          errorCode: 'QBO_ERROR',
+          errorStatus: 400,
+          errorMessage: 'Provider rejected the prepared Deposit body.',
+        },
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('persists the live uncertainty hook in the same attempt and transaction transition', async () => {
     const onUncertainMutation = vi.fn(async () => undefined);
     const fixture = durableDeps(undefined, { onUncertainMutation });

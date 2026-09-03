@@ -3579,7 +3579,26 @@ async function sendAndVerifyPrepared(
       status,
       auditAttribution,
     );
-  } catch {
+  } catch (error) {
+    const info = errorInfo(error);
+    const errorClass = error instanceof Error && /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u.test(error.name)
+      ? error.name
+      : 'UnknownError';
+    const errorStatus = typeof error === 'object' && error !== null && 'status' in error
+      && typeof (error as { status?: unknown }).status === 'number'
+      && Number.isSafeInteger((error as { status: number }).status)
+      ? (error as { status: number }).status
+      : undefined;
+    console.error('[writeback] prepared QBO write or readback failed', {
+      transactionId: txn.id,
+      qboType: prepared.qboType,
+      qboId: prepared.qboId,
+      operation: prepared.operation,
+      errorClass,
+      errorCode: info.code,
+      ...(errorStatus === undefined ? {} : { errorStatus }),
+      errorMessage: info.message.replace(/[\r\n]+/gu, ' ').slice(0, 500),
+    });
     // A failed readback cannot prove whether QBO accepted the exact body.
     // Do not compound that uncertainty with an automatic restore write.
     return markUncertain(
