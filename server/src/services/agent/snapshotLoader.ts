@@ -53,6 +53,15 @@ interface TaxRow {
   combinedPurchaseRate: unknown;
 }
 
+type UsableTaxRow = TaxRow & {
+  qboId: string;
+  name: string;
+  active: true;
+  taxable: boolean;
+  purchaseTaxRateList: unknown[];
+  combinedPurchaseRate: string | null;
+};
+
 interface TagRow {
   id: unknown;
   name: unknown;
@@ -363,8 +372,8 @@ function mapSource(input: {
     .map((row) => ({ qboId: row.qboId, name: row.fullName }));
   const categoryIds = new Set(candidateCategories.map((entry) => entry.qboId));
 
-  const eligibleReferences = input.taxRows
-    .filter(isUsableTaxRow)
+  const usableTaxRows = input.taxRows.filter(isUsableTaxRow);
+  const eligibleReferences = usableTaxRows
     .map((row) => ({
       qboId: reference(row.qboId),
       label: text(row.name, 160),
@@ -381,7 +390,11 @@ function mapSource(input: {
   const tax: AgentSnapshotSource['tax'] = taxStatus === 'ready'
     ? {
         status: 'ready',
-        supportedCalculationModes: ['TaxInclusive', 'TaxExcluded'],
+        supportedCalculationModes: usableTaxRows.some(
+          (row) => row.purchaseTaxRateList.length > 1,
+        )
+          ? ['TaxInclusive']
+          : ['TaxInclusive', 'TaxExcluded'],
         eligibleReferences,
       }
     : { status: taxStatus, supportedCalculationModes: [], eligibleReferences: [] };
@@ -545,7 +558,7 @@ function mapSource(input: {
   };
 }
 
-function isUsableTaxRow(row: TaxRow): boolean {
+function isUsableTaxRow(row: TaxRow): row is UsableTaxRow {
   if (
     row.active !== true
     || !isReference(row.qboId)
@@ -558,6 +571,7 @@ function isUsableTaxRow(row: TaxRow): boolean {
     return row.purchaseTaxRateList.length === 0 && row.combinedPurchaseRate === null;
   }
   if (row.taxable !== true || row.purchaseTaxRateList.length === 0) return false;
+  if (row.combinedPurchaseRate === null) return false;
   const rate = Number(row.combinedPurchaseRate);
   return Number.isFinite(rate) && rate >= 0 && rate <= 999.999999;
 }

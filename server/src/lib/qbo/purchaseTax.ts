@@ -485,7 +485,7 @@ function reconstructTaxExcludedTransaction(
   if (!validation.eligible) return validation;
 
   const resolved: ResolvedTaxLine[] = [];
-  for (const line of input.lines) {
+  for (const [lineIndex, line] of input.lines.entries()) {
     const resolution = resolveTaxLine(
       line,
       'TaxExcluded',
@@ -495,7 +495,9 @@ function reconstructTaxExcludedTransaction(
     if (typeof resolution === 'string') {
       return { eligible: false, reason: resolution };
     }
-    if (resolution.components.length !== 1) return null;
+    if (resolution.components.length !== 1) {
+      return { eligible: false, reason: 'TAX_RATE_UNSUPPORTED', lineIndex };
+    }
     resolved.push(resolution);
   }
 

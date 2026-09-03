@@ -9,6 +9,7 @@ import {
   preparePurchaseRecategorization,
   preparePurchaseRestore,
   purchaseTargetLineMatches,
+  reconstructPurchaseTaxExcludedTransaction,
 } from './purchaseTax.js';
 import { QboSyncTokenConflict, type QboPurchaseSnapshot, type RawPurchase } from './types.js';
 import type { StagedCategorization } from '@recat/shared';
@@ -230,6 +231,22 @@ describe('calculatePurchaseLine', () => {
         reference,
       ),
     ).toEqual({ grossCents, netCents, taxCents });
+  });
+
+  it('rejects inverse reconstruction for a composite tax-excluded gross with an actionable reason', () => {
+    expect(
+      reconstructPurchaseTaxExcludedTransaction(
+        {
+          companyId: 'company-1',
+          lines: [{ grossCents: -3_136, taxCodeQboId: 'COMPOUND' }],
+        },
+        { ...reference, companyId: 'company-1' },
+      ),
+    ).toEqual({
+      eligible: false,
+      reason: 'TAX_RATE_UNSUPPORTED',
+      lineIndex: 0,
+    });
   });
 
   it.each([

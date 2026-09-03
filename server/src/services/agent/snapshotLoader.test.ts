@@ -43,6 +43,7 @@ describe('agent snapshot loader', () => {
         return [
           { qboId: 'tax-a', name: 'Tax A', active: true, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
           { qboId: 'tax-composite', name: 'GST/PST BC', active: true, taxable: true, purchaseTaxRateList: [{}, {}], combinedPurchaseRate: '12.000000' },
+          { qboId: 'tax-unsupported', name: 'Unsupported composite', active: true, taxable: true, purchaseTaxRateList: [{}, {}], combinedPurchaseRate: null },
           { qboId: 'tax-stale', name: 'Tax stale', active: false, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
         ];
       }
@@ -96,7 +97,7 @@ describe('agent snapshot loader', () => {
       candidateCategories: [{ qboId: 'expense-a', name: 'Expenses · Generic' }],
       tax: {
         status: 'ready',
-        supportedCalculationModes: ['TaxInclusive', 'TaxExcluded'],
+        supportedCalculationModes: ['TaxInclusive'],
         eligibleReferences: [
           { qboId: 'tax-composite', label: 'GST/PST BC' },
           { qboId: 'tax-a', label: 'Tax A' },
