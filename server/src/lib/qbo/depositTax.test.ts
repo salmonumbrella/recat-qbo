@@ -440,6 +440,8 @@ describe('prepareDepositRecategorization', () => {
   });
 
   it.each([
+    ['non-empty CustomExtensions', { CustomExtensions: [{ DefinitionId: 'generic-extension' }] }],
+    ['non-array CustomExtensions', { CustomExtensions: 'generic-extension' }],
     ['LinkedTxn', { LinkedTxn: [{ TxnId: 'payment-generic', TxnType: 'Payment' }] }],
     ['unknown top-level field', { GenericLineField: 'semantic data' }],
     ['CheckNum', { DepositLineDetail: { CheckNum: 'CHECK-GENERIC' } }],
