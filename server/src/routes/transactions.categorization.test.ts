@@ -1348,6 +1348,40 @@ describe('tax-aware categorization action routes', () => {
     expect(JSON.stringify(response.body)).not.toMatch(/payload|snapshot|token|stack|secret/i);
   });
 
+  it('returns a bounded 422 response for a provider-rejected write', async () => {
+    mocks.commitStagedCategorization.mockResolvedValue({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'REJECTED',
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'private provider validation detail',
+        rawPayload: { token: 'secret' },
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(422);
+    expect(response.body).toEqual({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'REJECTED',
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.',
+      },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/payload|token|secret|private provider/i);
+  });
+
   it('delegates an unresolved retry to reconciliation and never the legacy reset', async () => {
     mocks.reconcileMutationAttempt.mockResolvedValue({
       ...verifiedResult,

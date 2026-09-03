@@ -2874,42 +2874,63 @@ async function markProviderRejected(
     errorCode: 'QBO_WRITE_REJECTED',
     errorMessage: QBO_WRITE_REJECTED_MESSAGE,
   };
+  const safeRejectedResult = (): DurableMutationResult => recordedAttemptResult(
+    { ...attempt, ...attemptData },
+    transactionStatus,
+  );
+  const transition = async (): Promise<boolean> => {
+    let won = false;
+    await d.db.$transaction(async (tx) => {
+      await lockCompanyMutationScope(tx, txn.companyId);
+      await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+      await assertCurrentReconciliationState(tx, attempt, txn);
+      throwIfReconciliationAborted(d.reconciliationSignal);
+      const guarded = await tx.qboMutationAttempt.updateMany({
+        where: { id: attempt.id, status: 'COMMITTING' },
+        data: attemptData,
+      });
+      if (guarded.count !== 1) return;
+      won = true;
+      await updateCurrentReconciliationTransaction(tx, attempt, txn, {
+        status: transactionStatus,
+        errorCode: null,
+        errorMessage: null,
+      });
+      await writeMutationAudit(
+        d,
+        tx,
+        txn,
+        actor,
+        'blocked',
+        mutationMetadata(prepared, 'REJECTED', auditAttribution),
+      );
+    });
+    return won;
+  };
   let transitioned = false;
-  await d.db.$transaction(async (tx) => {
-    await lockCompanyMutationScope(tx, txn.companyId);
-    await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
-    await assertCurrentReconciliationState(tx, attempt, txn);
-    throwIfReconciliationAborted(d.reconciliationSignal);
-    const guarded = await tx.qboMutationAttempt.updateMany({
-      where: { id: attempt.id, status: 'COMMITTING' },
-      data: attemptData,
-    });
-    if (guarded.count !== 1) return;
-    transitioned = true;
-    await updateCurrentReconciliationTransaction(tx, attempt, txn, {
-      status: transactionStatus,
-      errorCode: null,
-      errorMessage: null,
-    });
-    await writeMutationAudit(
-      d,
-      tx,
-      txn,
-      actor,
-      'blocked',
-      mutationMetadata(prepared, 'REJECTED', auditAttribution),
-    );
-  });
-  if (!transitioned) {
-    const latest = await d.db.qboMutationAttempt.findUnique({
-      where: { requestId: attempt.requestId },
-    });
-    if (!latest) {
-      lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared after provider rejection.');
+  try {
+    transitioned = await transition();
+  } catch (error) {
+    rethrowReconciliationFence(error);
+    try {
+      transitioned = await transition();
+    } catch (retryError) {
+      rethrowReconciliationFence(retryError);
+      return safeRejectedResult();
     }
-    return recordedAttemptResultWithOutcome(d, latest, txn);
   }
-  return recordedAttemptResult({ ...attempt, ...attemptData }, transactionStatus);
+  if (!transitioned) {
+    try {
+      const latest = await d.db.qboMutationAttempt.findUnique({
+        where: { requestId: attempt.requestId },
+      });
+      if (!latest || latest.status === 'COMMITTING') return safeRejectedResult();
+      return recordedAttemptResultWithOutcome(d, latest, txn);
+    } catch {
+      return safeRejectedResult();
+    }
+  }
+  return safeRejectedResult();
 }
 
 async function finalizeVerified(
@@ -3636,8 +3657,10 @@ async function sendAndVerifyPrepared(
   auditAttribution?: McpMutationAuditAttribution,
 ): Promise<DurableMutationResult> {
   // Possible-write boundary: COMMITTING is durable before this function runs.
+  let writeAccepted = false;
   try {
     await client.sendPreparedWrite(prepared);
+    writeAccepted = true;
     const response = await client.fetchPreparedSnapshot(
       prepared.qboType,
       txn.qboId,
@@ -3678,7 +3701,7 @@ async function sendAndVerifyPrepared(
       ...(errorStatus === undefined ? {} : { errorStatus }),
       errorMessage: info.message.replace(/[\r\n]+/gu, ' ').slice(0, 500),
     });
-    if (error instanceof QboHttpError && error.status === 400) {
+    if (!writeAccepted && error instanceof QboHttpError && error.status === 400) {
       return markProviderRejected(
         d,
         attempt,

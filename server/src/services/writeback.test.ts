@@ -1411,6 +1411,7 @@ class FakeDurableDb {
   failUncertainFallbackAndReadOnce = false;
   failCommittingOnce = false;
   failRetryableOnce = false;
+  failTransactionsWhileCommitting = 0;
   raceAttemptOnCreate = false;
   raceDifferentActiveAttemptOnCreate = false;
   raceAttemptHashOverride: string | null = null;
@@ -1627,6 +1628,13 @@ class FakeDurableDb {
   };
 
   async $transaction<T>(callback: (tx: FakeDurableDb) => Promise<T>): Promise<T> {
+    if (
+      this.failTransactionsWhileCommitting > 0
+      && this.attempts.some((attempt) => attempt.status === 'COMMITTING')
+    ) {
+      this.failTransactionsWhileCommitting -= 1;
+      throw new Error('database unavailable during terminal persistence');
+    }
     if (
       this.failUncertainTransactionOnce &&
       this.attempts.some((attempt) => attempt.status === 'COMMITTING')
@@ -3564,6 +3572,66 @@ describe('commitStagedCategorization durable lifecycle', () => {
       logged.mockRestore();
     }
   });
+
+  it('records a readback HTTP 400 after an accepted write as uncertain', async () => {
+    const fixture = durableDeps();
+    fixture.fetchPreparedSnapshot.mockReset()
+      .mockResolvedValueOnce(structuredClone(beforePurchase))
+      .mockRejectedValueOnce(new QboHttpError(400, 'Provider readback quirk.'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await expect(commitStagedCategorization(
+        commitInput('request-readback-400'),
+        fixture.deps,
+      )).resolves.toMatchObject({
+        ok: false,
+        status: 'ERROR',
+        outcome: 'UNCERTAIN',
+      });
+      expect(fixture.sendPreparedWrite).toHaveBeenCalledOnce();
+      expect(fixture.db.attempts[0]).toMatchObject({
+        status: 'UNCERTAIN',
+        errorCode: 'QBO_WRITE_UNCERTAIN',
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([1, 2])(
+    'returns a bounded provider rejection when %s persistence attempt(s) fail',
+    async (failures) => {
+      const fixture = durableDeps();
+      fixture.sendPreparedWrite.mockRejectedValueOnce(
+        new QboHttpError(400, 'Private provider validation detail.'),
+      );
+      fixture.db.failTransactionsWhileCommitting = failures;
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      try {
+        await expect(commitStagedCategorization(
+          commitInput(`request-rejection-persistence-${failures}`),
+          fixture.deps,
+        )).resolves.toMatchObject({
+          ok: false,
+          status: 'PENDING',
+          outcome: 'REJECTED',
+          error: {
+            code: 'QBO_WRITE_REJECTED',
+            message: expect.not.stringContaining('Private'),
+          },
+        });
+        if (failures === 1) {
+          expect(fixture.db.attempts[0]?.status).toBe('REJECTED');
+        } else {
+          expect(fixture.db.attempts[0]?.status).toBe('COMMITTING');
+        }
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
 
   it('persists the live uncertainty hook in the same attempt and transaction transition', async () => {
     const onUncertainMutation = vi.fn(async () => undefined);
