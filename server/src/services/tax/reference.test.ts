@@ -182,6 +182,27 @@ describe('refreshTaxReference', () => {
     ]);
   });
 
+  it('re-derives a composite rate when an older cache left the denormalized rate null', async () => {
+    const composite = {
+      ...code('GST_PST'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const deps = depsWith(cache, [composite]);
+    await refreshTaxReference('company-1', { force: true }, deps);
+    Object.assign(cache.taxCode('company-1', 'GST_PST')!, {
+      combinedPurchaseRate: null,
+    });
+
+    const readiness = await getTaxReadiness('company-1', deps);
+
+    expect(readiness.taxCodes).toEqual([
+      expect.objectContaining({ qboId: 'GST_PST', combinedPurchaseRate: 12 }),
+    ]);
+  });
+
   it('does not publish a composite code that repeats the same rate component', async () => {
     const duplicate = {
       ...code('DUPLICATE'),

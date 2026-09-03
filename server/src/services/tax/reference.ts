@@ -47,6 +47,12 @@ export interface TaxReadinessQueryDb {
       orderBy: { qboId: 'asc' };
     }): Promise<TaxCodeRow[]>;
   };
+  qboTaxRate: {
+    findMany(args: {
+      where: { companyId: string };
+      orderBy: { qboId: 'asc' };
+    }): Promise<TaxRateRow[]>;
+  };
 }
 
 export type CachedSalesTaxCode = Pick<
@@ -328,10 +334,40 @@ export async function getTaxReadinessInTransaction(
   companyId: string,
   db: TaxReadinessQueryDb,
 ): Promise<TaxReadinessDto> {
-  const [company, codeRows] = await Promise.all([
+  const [company, storedCodeRows, rateRows] = await Promise.all([
     db.company.findUniqueOrThrow({ where: { id: companyId } }),
     db.qboTaxCode.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
+    db.qboTaxRate.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
   ]);
+  const ratesById = new Map(rateRows.map((rate) => [rate.qboId, {
+    qboId: rate.qboId,
+    name: rate.name,
+    description: rate.description,
+    active: rate.active,
+    rateValue: Number(rate.rateValue),
+    sourceUpdatedAt: rate.sourceUpdatedAt?.toISOString() ?? null,
+  }]));
+  const codeRows = storedCodeRows.map((row) => {
+    const code: QboTaxCodeInfo = {
+      qboId: row.qboId,
+      name: row.name,
+      description: row.description,
+      active: row.active,
+      taxable: row.taxable,
+      purchaseRates: Array.isArray(row.purchaseTaxRateList)
+        ? row.purchaseTaxRateList as QboTaxCodeInfo['purchaseRates']
+        : [],
+      salesRates: Array.isArray(row.salesTaxRateList)
+        ? row.salesTaxRateList as QboTaxCodeInfo['salesRates']
+        : [],
+      sourceUpdatedAt: row.sourceUpdatedAt?.toISOString() ?? null,
+    };
+    return {
+      ...row,
+      combinedPurchaseRate: codeSupport(code, ratesById, 'purchase').combinedRate,
+      combinedSalesRate: codeSupport(code, ratesById, 'sales').combinedRate,
+    };
+  });
   const refreshFailed = company.taxSupportReason === REFRESH_FAILURE_REASON;
   const salesTaxCodes = refreshFailed ? [] : taxCodesForReadiness(codeRows, 'sales');
   const salesReadiness = cachedSalesTaxReadiness(

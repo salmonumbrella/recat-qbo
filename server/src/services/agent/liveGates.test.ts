@@ -798,6 +798,9 @@ describe('guarded live autopilot gates', () => {
       qboTaxCode: {
         findMany: async () => [],
       },
+      qboTaxRate: {
+        findMany: async () => [],
+      },
     });
 
     expect(readiness).toMatchObject({ status: 'ready', refreshedAt: NOW.toISOString() });
