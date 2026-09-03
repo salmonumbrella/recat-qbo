@@ -1307,6 +1307,8 @@ const LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE =
   'The guarded live mutation exhausted its retry budget.';
 const QBO_WRITE_REJECTED_MESSAGE =
   'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.';
+const REJECTION_RECONCILIATION_REQUIRED_MESSAGE =
+  'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.';
 const AUTOPILOT_ACTOR: Actor = Object.freeze({
   id: null,
   label: 'Recat autopilot',
@@ -2878,6 +2880,17 @@ async function markProviderRejected(
     { ...attempt, ...attemptData },
     transactionStatus,
   );
+  const reconciliationRequiredResult = (): DurableMutationResult => ({
+    transactionId: attempt.transactionId,
+    requestId: attempt.requestId,
+    ok: false,
+    status: transactionStatus,
+    outcome: 'IN_PROGRESS',
+    error: {
+      code: 'OPERATION_RECONCILIATION_REQUIRED',
+      message: REJECTION_RECONCILIATION_REQUIRED_MESSAGE,
+    },
+  });
   const transition = async (): Promise<boolean> => {
     let won = false;
     await d.db.$transaction(async (tx) => {
@@ -2916,7 +2929,7 @@ async function markProviderRejected(
       transitioned = await transition();
     } catch (retryError) {
       rethrowReconciliationFence(retryError);
-      return safeRejectedResult();
+      return reconciliationRequiredResult();
     }
   }
   if (!transitioned) {
@@ -2924,10 +2937,12 @@ async function markProviderRejected(
       const latest = await d.db.qboMutationAttempt.findUnique({
         where: { requestId: attempt.requestId },
       });
-      if (!latest || latest.status === 'COMMITTING') return safeRejectedResult();
+      if (!latest || latest.status === 'COMMITTING') {
+        return reconciliationRequiredResult();
+      }
       return recordedAttemptResultWithOutcome(d, latest, txn);
     } catch {
-      return safeRejectedResult();
+      return reconciliationRequiredResult();
     }
   }
   return safeRejectedResult();
@@ -4642,11 +4657,17 @@ export async function prepareCategorizationUndo(
     let sourceStageHash: string | undefined;
     if (sourceTaxDisposition === 'preserve_current') {
       const target = sourcePrepared.expected.targetLines[0];
+      const sourceTaxCalculation = sourcePrepared.expected.globalTaxCalculation;
       if (
         sourcePrepared.expected.targetLines.length !== 1
         || target === undefined
         || target.accountQboId === null
         || target.taxCodeQboId === null
+        || (
+          sourceTaxCalculation !== 'TaxInclusive'
+          && sourceTaxCalculation !== 'TaxExcluded'
+          && sourceTaxCalculation !== 'NotApplicable'
+        )
       ) {
         lifecycleError('ATTEMPT_CORRUPT', 'Verified preserved Purchase source is incomplete.');
       }
@@ -4655,7 +4676,7 @@ export async function prepareCategorizationUndo(
         transactionId: input.transactionId,
         revision: input.expectedRevision,
         taxDisposition: 'preserve_current',
-        taxCalculation: 'NotApplicable',
+        taxCalculation: sourceTaxCalculation,
         totals: { subtotalCents: totalCents, taxCents: 0, totalCents },
         lines: [{
           idx: 0,

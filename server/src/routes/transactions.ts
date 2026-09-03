@@ -685,6 +685,11 @@ const SAFE_OUTCOME_ERRORS: Partial<Record<
   },
 };
 
+const OPERATION_RECONCILIATION_REQUIRED_ERROR = {
+  code: 'OPERATION_RECONCILIATION_REQUIRED',
+  message: 'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.',
+};
+
 function sendMutationResult(
   res: Response,
   result: DurableMutationResult,
@@ -703,9 +708,14 @@ function sendMutationResult(
     status: result.status,
     outcome: result.outcome,
   };
-  const safeError = SAFE_OUTCOME_ERRORS[result.outcome];
+  const reconciliationRequired = result.error?.code
+    === OPERATION_RECONCILIATION_REQUIRED_ERROR.code;
+  const safeError = reconciliationRequired
+    ? OPERATION_RECONCILIATION_REQUIRED_ERROR
+    : SAFE_OUTCOME_ERRORS[result.outcome];
   if (!result.ok && safeError) safe.error = safeError;
-  const status = result.outcome === 'IN_PROGRESS' ? 202
+  const status = reconciliationRequired ? 409
+    : result.outcome === 'IN_PROGRESS' ? 202
     : result.outcome === 'UNCERTAIN' || result.outcome === 'RETRYABLE' ? 409
       : result.outcome === 'REJECTED' ? 422
       : 200;

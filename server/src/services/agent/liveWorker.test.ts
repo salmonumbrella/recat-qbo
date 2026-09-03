@@ -583,6 +583,29 @@ describe('guarded live worker', () => {
     expect(d.completions[0]?.status).not.toBe('posted_verified');
   });
 
+  it('pauses instead of retrying a mutation that requires reconciliation', async () => {
+    const d = deps({
+      commit: vi.fn(async () => ({
+        transactionId: TRANSACTION_ID,
+        requestId: JOB_ID,
+        ok: false,
+        status: 'PENDING' as const,
+        outcome: 'IN_PROGRESS' as const,
+        error: {
+          code: 'OPERATION_RECONCILIATION_REQUIRED',
+          message: 'The durable operation state could not be confirmed.',
+        },
+      })),
+    });
+
+    await runClaimedLiveJob(job(), d);
+
+    expect(d.completions).toEqual([expect.objectContaining({
+      status: 'uncertain',
+      errorCode: 'OPERATION_RECONCILIATION_REQUIRED',
+    })]);
+  });
+
   it.each([
     ['Deposit', 1_000, 'ENTITY_UNSUPPORTED'],
     ['Purchase', 1_000, 'REFUND_REVIEW_REQUIRED'],

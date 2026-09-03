@@ -498,6 +498,7 @@ function mutationCompletion(
     : mutation.outcome === 'UNCHANGED'
       ? 'unchanged'
       : mutation.outcome === 'UNCERTAIN'
+          || mutation.error?.code === 'OPERATION_RECONCILIATION_REQUIRED'
         ? 'uncertain'
         : mutation.outcome === 'REJECTED'
           ? 'rejected'

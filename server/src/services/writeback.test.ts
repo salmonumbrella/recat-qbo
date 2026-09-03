@@ -3616,9 +3616,11 @@ describe('commitStagedCategorization durable lifecycle', () => {
         )).resolves.toMatchObject({
           ok: false,
           status: 'PENDING',
-          outcome: 'REJECTED',
+          outcome: failures === 1 ? 'REJECTED' : 'IN_PROGRESS',
           error: {
-            code: 'QBO_WRITE_REJECTED',
+            code: failures === 1
+              ? 'QBO_WRITE_REJECTED'
+              : 'OPERATION_RECONCILIATION_REQUIRED',
             message: expect.not.stringContaining('Private'),
           },
         });
@@ -4216,6 +4218,58 @@ describe('prepareCategorizationUndo', () => {
       globalTaxCalculation: 'NotApplicable',
       totalTaxCents: 0,
       preservedHash: 'preserved-source',
+      lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
+    };
+    fixture.source.responseSnapshot = structuredClone(preservedResponse);
+    fixture.fetchPurchaseSnapshot.mockResolvedValue(structuredClone(preservedResponse));
+
+    await expect(prepareCategorizationUndo(input(), fixture.deps))
+      .resolves.toMatchObject({ preview: { action: 'restore_purchase_categorization' } });
+    expect(fixture.preparePurchaseRestore).toHaveBeenCalledOnce();
+  });
+
+  it('prepares undo from an exact verified tax-inclusive preserve-current stage', async () => {
+    const fixture = postedFixture();
+    fixture.db.transactionRow.amount = -10;
+    fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10,
+      category: 'Prepared purchase',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Generic tax',
+      taxCodeQboId: 'tax-generic',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const sourcePrepared = fixture.source.requestPayload as QboPurchasePreparedWrite;
+    sourcePrepared.expected = {
+      ...sourcePrepared.expected,
+      taxDisposition: 'preserve_current',
+      globalTaxCalculation: 'TaxInclusive',
+      totalTaxCents: -50,
+      preservedHash: 'preserved-taxed-source',
+      targetLines: [{
+        id: 'line-holding',
+        amountCents: -1000,
+        description: null,
+        accountQboId: 'expense-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'tax-generic',
+        taxAmountCents: -50,
+        taxInclusiveCents: -1050,
+        rawHash: 'preserved-taxed-target',
+        categoryOnlyHash: 'preserved-taxed-category-only',
+      }],
+      untouchedLineHashes: [],
+    };
+    sourcePrepared.requestHash = hashPreparedWriteBody(sourcePrepared.body);
+    fixture.source.requestHash = sourcePrepared.requestHash;
+    const preservedResponse: QboPurchaseSnapshot = {
+      ...verifiedPurchase,
+      preservedHash: 'preserved-taxed-source',
       lines: [structuredClone(sourcePrepared.expected.targetLines[0]!)],
     };
     fixture.source.responseSnapshot = structuredClone(preservedResponse);

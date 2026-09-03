@@ -1382,6 +1382,39 @@ describe('tax-aware categorization action routes', () => {
     expect(JSON.stringify(response.body)).not.toMatch(/payload|token|secret|private provider/i);
   });
 
+  it('requires reconciliation when a provider rejection could not be persisted', async () => {
+    mocks.commitStagedCategorization.mockResolvedValue({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'IN_PROGRESS',
+      error: {
+        code: 'OPERATION_RECONCILIATION_REQUIRED',
+        message: 'private database detail',
+      },
+    });
+
+    const response = await request(testApp())
+      .post(`/api/transactions/${TRANSACTION_ID}/categorization/commit`)
+      .set(sessionHeaders)
+      .send({ expectedRevision: 1, requestId: REQUEST_ID });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      transactionId: TRANSACTION_ID,
+      requestId: REQUEST_ID,
+      ok: false,
+      status: 'PENDING',
+      outcome: 'IN_PROGRESS',
+      error: {
+        code: 'OPERATION_RECONCILIATION_REQUIRED',
+        message: 'QuickBooks rejected the write, but Recat could not persist that outcome. Reconcile this operation before continuing.',
+      },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/private|database detail/i);
+  });
+
   it('delegates an unresolved retry to reconciliation and never the legacy reset', async () => {
     mocks.reconcileMutationAttempt.mockResolvedValue({
       ...verifiedResult,
