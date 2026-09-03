@@ -10,6 +10,8 @@ const TRANSACTION_ID = '11111111-1111-4111-8111-111111111111';
 const TAG_ID = '22222222-2222-4222-8222-222222222222';
 const RULE_ID = '33333333-3333-4333-8333-333333333333';
 const HISTORY_ID = '44444444-4444-4444-8444-444444444444';
+const COMPATIBLE_RULE_ID = '66666666-6666-4666-8666-666666666666';
+const COMPATIBLE_HISTORY_ID = '77777777-7777-4777-8777-777777777777';
 
 describe('agent snapshot loader', () => {
   it('uses one repeatable-read snapshot and maps only bounded allowlisted source data', async () => {
@@ -54,27 +56,31 @@ describe('agent snapshot loader', () => {
       if (sql.includes('agent-snapshot:rules')) {
         return [
           { id: RULE_ID, priority: 1, matchField: 'payee', matchText: 'merchant', categoryQboId: 'expense-a', taxCalculation: 'TaxExcluded', taxCodeQboId: 'tax-a', tagIds: [TAG_ID] },
+          { id: COMPATIBLE_RULE_ID, priority: 2, matchField: 'payee', matchText: 'merchant', categoryQboId: 'expense-a', taxCalculation: 'TaxInclusive', taxCodeQboId: 'tax-composite', tagIds: [TAG_ID] },
           { id: '55555555-5555-4555-8555-555555555555', priority: 2, matchField: 'payee', matchText: 'merchant', categoryQboId: 'stale-expense', taxCalculation: 'NotApplicable', taxCodeQboId: null, tagIds: [] },
         ];
       }
       if (sql.includes('agent-snapshot:history-lines')) {
-        return [{ transactionId: HISTORY_ID, signedGrossAmount: '-123.45', categoryQboId: 'expense-a', taxCodeQboId: 'tax-a', memo: null, tagIds: [] }];
+        return [
+          { transactionId: HISTORY_ID, signedGrossAmount: '-123.45', categoryQboId: 'expense-a', taxCodeQboId: 'tax-a', memo: null, tagIds: [] },
+          { transactionId: COMPATIBLE_HISTORY_ID, signedGrossAmount: '-123.45', categoryQboId: 'expense-a', taxCodeQboId: 'tax-composite', memo: null, tagIds: [] },
+        ];
       }
       if (sql.includes('agent-snapshot:history')) {
-        return [{
-          transactionId: HISTORY_ID,
-          companyId: COMPANY_ID,
-          status: 'POSTED',
-          mutationStatus: 'VERIFIED',
-          date: new Date('2026-07-20T00:00:00.000Z'),
-          signedAmount: '-123.45',
-          currency: 'CAD',
-          payee: 'Earlier merchant',
-          memo: null,
-          taxCalculation: 'TaxExcluded',
-          tagIds: [TAG_ID],
-          verifiedAt: new Date('2026-07-21T00:00:00.000Z'),
-        }];
+        return [
+          {
+            transactionId: HISTORY_ID, companyId: COMPANY_ID, status: 'POSTED', mutationStatus: 'VERIFIED',
+            date: new Date('2026-07-20T00:00:00.000Z'), signedAmount: '-123.45', currency: 'CAD',
+            payee: 'Earlier merchant', memo: null, taxCalculation: 'TaxExcluded', tagIds: [TAG_ID],
+            verifiedAt: new Date('2026-07-21T00:00:00.000Z'),
+          },
+          {
+            transactionId: COMPATIBLE_HISTORY_ID, companyId: COMPANY_ID, status: 'POSTED', mutationStatus: 'VERIFIED',
+            date: new Date('2026-07-22T00:00:00.000Z'), signedAmount: '-123.45', currency: 'CAD',
+            payee: 'Compatible merchant', memo: null, taxCalculation: 'TaxInclusive', tagIds: [TAG_ID],
+            verifiedAt: new Date('2026-07-23T00:00:00.000Z'),
+          },
+        ];
       }
       return [];
     });
@@ -105,8 +111,32 @@ describe('agent snapshot loader', () => {
         ],
       },
       tags: [{ id: TAG_ID, name: 'Generic tag' }],
-      rules: [],
-      similarVerifiedTransactions: [],
+      rules: [{
+        id: COMPATIBLE_RULE_ID,
+        priority: 2,
+        matchField: 'payee',
+        matchText: 'merchant',
+        categoryQboId: 'expense-a',
+        taxCalculation: 'TaxInclusive',
+        taxCodeQboId: 'tax-composite',
+        tagIds: [TAG_ID],
+      }],
+      similarVerifiedTransactions: [{
+        transactionId: COMPATIBLE_HISTORY_ID,
+        date: '2026-07-22',
+        signedAmountCents: -12_345,
+        currency: 'CAD',
+        payee: 'Compatible merchant',
+        taxCalculation: 'TaxInclusive',
+        lines: [{
+          signedGrossCents: -12_345,
+          categoryQboId: 'expense-a',
+          taxCodeQboId: 'tax-composite',
+          tagIds: [],
+        }],
+        tagIds: [TAG_ID],
+        verifiedAt: '2026-07-23T00:00:00.000Z',
+      }],
       featureVersion: 'shadow-core.1',
       configurationVersion: 'config-v7',
     });

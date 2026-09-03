@@ -222,6 +222,24 @@ describe('MCP tool results', () => {
       ),
       'QBO_DISCONNECTED',
     ],
+    ...[
+      'TAX_AMOUNT_INVALID',
+      'TAX_AMOUNT_SIGN_MISMATCH',
+      'TAX_CODE_INACTIVE',
+      'TAX_CODE_MALFORMED',
+      'TAX_CODE_PURCHASE_ONLY',
+      'TAX_CODE_SALES_ONLY',
+      'TAX_CODE_UNAVAILABLE',
+      'TAX_COMPANY_MISMATCH',
+      'TAX_RATE_INACTIVE',
+      'TAX_RATE_MALFORMED',
+      'TAX_RATE_UNAVAILABLE',
+      'TAX_RATE_UNSUPPORTED',
+      'TAX_TREATMENT_AMBIGUOUS',
+    ].map((code) => [
+      new WritebackLifecycleError(code, 'PRIVATE_WRITE_TAX_SENTINEL'),
+      'INVALID_INPUT',
+    ]),
     [
       new WritebackLifecycleError(
         'STALE_REVISION',
