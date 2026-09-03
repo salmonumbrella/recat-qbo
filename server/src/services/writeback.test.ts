@@ -2303,6 +2303,60 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.sendPreparedWrite).toHaveBeenCalledTimes(1);
   });
 
+  it('reconstructs a tax-inclusive preserve-current stage without tax inventory', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Prepared purchase',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Preserved source code',
+      taxCodeQboId: 'tax-generic',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    fixture.db.qboTaxCode.findMany.mockResolvedValue([]);
+    fixture.db.qboTaxRate.findMany.mockResolvedValue([]);
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-inclusive-preserve'),
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: hashStagedCategorization(preserved),
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+
+    expect(fixture.db.qboTaxCode.findMany).not.toHaveBeenCalled();
+    expect(fixture.db.qboTaxRate.findMany).not.toHaveBeenCalled();
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      preserved,
+      expect.anything(),
+      'request-tax-inclusive-preserve',
+    );
+  });
+
   it('reconstructs an exact set NotApplicable Purchase stage with NON on every split', async () => {
     const fixture = durableDeps();
     fixture.db.qboAccount.findMany.mockResolvedValue([

@@ -1540,23 +1540,28 @@ async function loadAuthorizedStage(
     taxCents: number;
     totalCents: number;
   }[];
-  if (taxCalculation === 'NotApplicable') {
-    if (expectedTaxDisposition === 'preserve_current') {
-      if (
-        txn.qboType !== 'Purchase'
-        || txn.splitLines.length !== 1
-        || txn.splitLines[0]!.taxCodeQboId === null
-        || txn.splitLines[0]!.taxCodeQboId!.trim() === ''
-        || txn.splitLines[0]!.memo !== null
-        || (txn.splitLines[0]!.tags?.length ?? 0) !== 0
-        || txn.txnTags.length !== 0
-      ) {
-        lifecycleError(
-          'INVALID_STAGE',
-          'Preserved Purchase tax requires one untagged, memo-free line with an explicit tax code.',
-        );
-      }
-    } else if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
+  if (expectedTaxDisposition === 'preserve_current') {
+    if (
+      txn.qboType !== 'Purchase'
+      || txn.splitLines.length !== 1
+      || txn.splitLines[0]!.taxCodeQboId === null
+      || txn.splitLines[0]!.taxCodeQboId!.trim() === ''
+      || txn.splitLines[0]!.memo !== null
+      || (txn.splitLines[0]!.tags?.length ?? 0) !== 0
+      || txn.txnTags.length !== 0
+    ) {
+      lifecycleError(
+        'INVALID_STAGE',
+        'Preserved Purchase tax requires one untagged, memo-free line with an explicit tax code.',
+      );
+    }
+    calculatedLines = grossCents.map((totalCents) => ({
+      subtotalCents: totalCents,
+      taxCents: 0,
+      totalCents,
+    }));
+  } else if (taxCalculation === 'NotApplicable') {
+    if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
       const explicitNon = txn.splitLines.every(
         (line) => line.taxCodeQboId === QBO_NOT_APPLICABLE_TAX_CODE,
       );
