@@ -1139,9 +1139,21 @@ describePostgres('rule candidate PostgreSQL persistence', () => {
         name: 'Synthetic tax',
         active: true,
         taxable: true,
-        purchaseTaxRateList: [{ taxRateQboId: `rate-${suffix}` }],
+        purchaseTaxRateList: [{
+          taxRateQboId: `rate-${suffix}`,
+          taxTypeApplicable: 'TaxOnAmount',
+        }],
         salesTaxRateList: [],
-        combinedPurchaseRate: '5',
+        combinedPurchaseRate: null,
+      },
+    });
+    await db.qboTaxRate.create({
+      data: {
+        companyId: company.id,
+        qboId: `rate-${suffix}`,
+        name: 'Synthetic rate',
+        active: true,
+        rateValue: '5',
       },
     });
     await db.agentCompanyConfig.create({

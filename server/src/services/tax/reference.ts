@@ -2,6 +2,7 @@ import { isUsableSalesTaxCodeDto, isUsableTaxCodeDto, type TaxReadinessDto, type
 import type { QboClient, QboTaxCodeInfo, QboTaxProfile, QboTaxRateInfo } from '../../lib/qbo/types.js';
 import { isSupportedTaxRateValue } from '../../lib/qbo/purchaseTax.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
+import { cachedTaxCodeSupport, cachedTaxRates } from './cache.js';
 
 export const TAX_REFERENCE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -107,43 +108,7 @@ export interface RefreshedTaxReference {
 }
 
 type TaxDirection = 'purchase' | 'sales';
-type CodeSupport = { supported: boolean; combinedRate: number | null };
-
 const inFlightRefreshes = new Map<string, Promise<RefreshedTaxReference>>();
-
-function codeRates(code: QboTaxCodeInfo, direction: TaxDirection) {
-  return direction === 'purchase' ? code.purchaseRates : code.salesRates;
-}
-
-function codeSupport(
-  code: QboTaxCodeInfo,
-  ratesById: Map<string, QboTaxRateInfo>,
-  direction: TaxDirection,
-): CodeSupport {
-  const rates = codeRates(code, direction);
-  if (!code.active || !Array.isArray(rates)) {
-    return { supported: false, combinedRate: null };
-  }
-  if (code.taxable === false && rates.length === 0) {
-    return { supported: true, combinedRate: null };
-  }
-  if (code.taxable !== true) return { supported: false, combinedRate: null };
-  if (rates.length === 0) return { supported: false, combinedRate: null };
-
-  const seenRateIds = new Set<string>();
-  let combinedRate = 0;
-  for (const component of rates) {
-    if (seenRateIds.has(component.taxRateQboId)) return { supported: false, combinedRate: null };
-    seenRateIds.add(component.taxRateQboId);
-    const rate = ratesById.get(component.taxRateQboId);
-    if (!rate || !rate.active || component.taxTypeApplicable !== 'TaxOnAmount' || !isSupportedTaxRateValue(rate.rateValue)) {
-      return { supported: false, combinedRate: null };
-    }
-    combinedRate = Number((combinedRate + rate.rateValue).toFixed(6));
-    if (!isSupportedTaxRateValue(combinedRate)) return { supported: false, combinedRate: null };
-  }
-  return { supported: true, combinedRate };
-}
 
 function readinessStatus(
   profile: QboTaxProfile,
@@ -157,7 +122,7 @@ function readinessStatus(
   if (profile.usingSalesTax === false) {
     return { status: 'unsupported', reason: 'Sales tax is disabled in QuickBooks.' };
   }
-  if (!codes.some((code) => codeSupport(code, ratesById, direction).supported)) {
+  if (!codes.some((code) => cachedTaxCodeSupport(code, [...ratesById.values()], direction).supported)) {
     return { status: 'needs_setup', reason: `No supported active ${direction} tax codes were found in QuickBooks.` };
   }
   return { status: 'ready', reason: null };
@@ -222,8 +187,9 @@ async function replaceTaxCache(
     });
 
     for (const code of codes) {
-      const purchaseSupport = codeSupport(code, ratesById, 'purchase');
-      const salesSupport = codeSupport(code, ratesById, 'sales');
+      const cachedRates = [...ratesById.values()];
+      const purchaseSupport = cachedTaxCodeSupport(code, cachedRates, 'purchase');
+      const salesSupport = cachedTaxCodeSupport(code, cachedRates, 'sales');
       const data = {
         name: code.name,
         description: code.description,
@@ -339,16 +305,7 @@ export async function getTaxReadinessInTransaction(
     db.qboTaxCode.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
     db.qboTaxRate.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
   ]);
-  const ratesById = new Map(rateRows.flatMap((rate) => rate.rateValue === null
-    ? []
-    : [[rate.qboId, {
-        qboId: rate.qboId,
-        name: rate.name,
-        description: rate.description,
-        active: rate.active,
-        rateValue: Number(rate.rateValue),
-        sourceUpdatedAt: rate.sourceUpdatedAt?.toISOString() ?? null,
-      } satisfies QboTaxRateInfo] as const]));
+  const cachedRates = cachedTaxRates(rateRows);
   const codeRows = storedCodeRows.map((row) => {
     const code: QboTaxCodeInfo = {
       qboId: row.qboId,
@@ -366,8 +323,8 @@ export async function getTaxReadinessInTransaction(
     };
     return {
       ...row,
-      combinedPurchaseRate: codeSupport(code, ratesById, 'purchase').combinedRate,
-      combinedSalesRate: codeSupport(code, ratesById, 'sales').combinedRate,
+      combinedPurchaseRate: cachedTaxCodeSupport(code, cachedRates, 'purchase').combinedRate,
+      combinedSalesRate: cachedTaxCodeSupport(code, cachedRates, 'sales').combinedRate,
     };
   });
   const refreshFailed = company.taxSupportReason === REFRESH_FAILURE_REASON;

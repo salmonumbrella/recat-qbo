@@ -13,6 +13,7 @@ import {
 } from './agent/ruleCandidatePersistence.js';
 import { runCompanyMutationTransaction } from './companyMutationScope.js';
 import { appendRuleRevision } from './ruleRevisionHistory.js';
+import { cachedTaxCodeSupport, cachedTaxRates } from './tax/cache.js';
 
 type CandidateDb = PrismaClient | Prisma.TransactionClient;
 
@@ -63,7 +64,7 @@ async function readiness(
   },
 ): Promise<CandidateReadiness> {
   const tagIds = stringArray(candidate.tagIds);
-  const [account, taxCode, ownedTags, config, company, hasOverlap] = await Promise.all([
+  const [account, taxCode, taxRateRows, ownedTags, config, company, hasOverlap] = await Promise.all([
     candidate.categoryQboId === null
       ? null
       : db.qboAccount.findFirst({
@@ -91,6 +92,19 @@ async function readiness(
             purchaseTaxRateList: true,
           },
         }),
+    candidate.taxCodeQboId === null
+      ? []
+      : db.qboTaxRate.findMany({
+          where: { companyId: candidate.companyId },
+          select: {
+            qboId: true,
+            name: true,
+            description: true,
+            active: true,
+            rateValue: true,
+            sourceUpdatedAt: true,
+          },
+        }),
     db.tag.count({ where: { companyId: candidate.companyId, id: { in: tagIds } } }),
     db.agentCompanyConfig.findUnique({
       where: { companyId: candidate.companyId },
@@ -105,22 +119,7 @@ async function readiness(
   const reasons: string[] = [];
   if (account === null) reasons.push('The category reference is no longer active.');
   const purchaseTaxCodeUsable = taxCode !== null
-    && Array.isArray(taxCode.purchaseTaxRateList)
-    && (
-      (
-        taxCode.taxable === true
-        && taxCode.purchaseTaxRateList.length === 1
-        && taxCode.combinedPurchaseRate !== null
-        && Number.isFinite(Number(taxCode.combinedPurchaseRate))
-        && Number(taxCode.combinedPurchaseRate) >= 0
-        && Number(taxCode.combinedPurchaseRate) <= 999.999999
-      )
-      || (
-        taxCode.taxable === false
-        && taxCode.purchaseTaxRateList.length === 0
-        && taxCode.combinedPurchaseRate === null
-      )
-    );
+    && cachedTaxCodeSupport(taxCode, cachedTaxRates(taxRateRows), 'purchase').supported;
   if (
     candidate.taxCalculation !== 'TaxInclusive'
     && candidate.taxCalculation !== 'TaxExcluded'

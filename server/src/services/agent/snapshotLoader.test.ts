@@ -42,12 +42,18 @@ describe('agent snapshot loader', () => {
           { qboId: 'stale-expense', fullName: 'Stale', classification: 'Expenses', accountType: 'Expense', active: false },
         ];
       }
-      if (sql.includes('agent-snapshot:tax')) {
+      if (sql.includes('agent-snapshot:rates')) {
         return [
-          { qboId: 'tax-a', name: 'Tax A', active: true, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
-          { qboId: 'tax-composite', name: 'GST/PST BC', active: true, taxable: true, purchaseTaxRateList: [{}, {}], combinedPurchaseRate: '12.000000' },
-          { qboId: 'tax-unsupported', name: 'Unsupported composite', active: true, taxable: true, purchaseTaxRateList: [{}, {}], combinedPurchaseRate: null },
-          { qboId: 'tax-stale', name: 'Tax stale', active: false, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
+          { qboId: 'rate-5', name: 'GST', active: true, rateValue: '5.000000' },
+          { qboId: 'rate-7', name: 'PST', active: true, rateValue: '7.000000' },
+        ];
+      }
+      if (sql.includes('agent-snapshot:tax */')) {
+        return [
+          { qboId: 'tax-a', name: 'Tax A', active: true, taxable: true, purchaseTaxRateList: [{ taxRateQboId: 'rate-5', taxTypeApplicable: 'TaxOnAmount' }], combinedPurchaseRate: '5.000000' },
+          { qboId: 'tax-composite', name: 'GST/PST BC', active: true, taxable: true, purchaseTaxRateList: [{ taxRateQboId: 'rate-5', taxTypeApplicable: 'TaxOnAmount' }, { taxRateQboId: 'rate-7', taxTypeApplicable: 'TaxOnAmount' }], combinedPurchaseRate: null },
+          { qboId: 'tax-unsupported', name: 'Unsupported composite', active: true, taxable: true, purchaseTaxRateList: [{ taxRateQboId: 'rate-5', taxTypeApplicable: 'TaxOnAmount' }, null], combinedPurchaseRate: '5.000000' },
+          { qboId: 'tax-stale', name: 'Tax stale', active: false, taxable: true, purchaseTaxRateList: [{ taxRateQboId: 'rate-5', taxTypeApplicable: 'TaxOnAmount' }], combinedPurchaseRate: '5.000000' },
         ];
       }
       if (sql.includes('agent-snapshot:tags')) {
@@ -229,7 +235,10 @@ describe('agent snapshot loader', () => {
             { qboId: 'expense-a', fullName: 'Expenses · Generic', classification: 'Expenses', accountType: 'Expense', active: true },
           ];
           if (sql.includes('agent-snapshot:tax')) return [
-            { qboId: 'tax-a', name: 'GST', active: true, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
+            { qboId: 'tax-a', name: 'GST', active: true, taxable: true, purchaseTaxRateList: [{ taxRateQboId: 'rate-5', taxTypeApplicable: 'TaxOnAmount' }], combinedPurchaseRate: null },
+          ];
+          if (sql.includes('agent-snapshot:rates')) return [
+            { qboId: 'rate-5', name: 'GST', active: true, rateValue: '5.000000' },
           ];
           return [];
         },

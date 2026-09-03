@@ -1,4 +1,5 @@
 import { prisma } from '../../lib/prisma.js';
+import { cachedTaxCodeSupport, cachedTaxRates } from '../tax/cache.js';
 import type { AgentSnapshotSource } from './core/snapshot.js';
 
 const MAX_RETAINED_ITEMS = 20;
@@ -59,8 +60,14 @@ type UsableTaxRow = TaxRow & {
   active: true;
   taxable: boolean;
   purchaseTaxRateList: unknown[];
-  combinedPurchaseRate: string | null;
 };
+
+interface TaxRateRow {
+  qboId: unknown;
+  name: unknown;
+  active: unknown;
+  rateValue: unknown;
+}
 
 interface TagRow {
   id: unknown;
@@ -181,7 +188,7 @@ export async function loadAgentSnapshotSourceInTransaction(
   if (current === undefined) invalid();
   const currentSourceAccountId = reference(current.sourceAccountQboId);
 
-  const [accounts, taxRows, tagRows, ruleRows, historyRows] = await Promise.all([
+  const [accounts, taxRows, taxRateRows, tagRows, ruleRows, historyRows] = await Promise.all([
     tx.$queryRawUnsafe<AccountRow[]>(
       `/* agent-snapshot:accounts */
        SELECT "qboId", "fullName", "classification", "accountType", "active"
@@ -204,6 +211,16 @@ export async function loadAgentSnapshotSourceInTransaction(
        WHERE "companyId" = $1
          AND "active" = TRUE
        ORDER BY "name", "qboId"
+       LIMIT ${MAX_QUERY_ITEMS + 1}`,
+      companyId,
+    ),
+    tx.$queryRawUnsafe<TaxRateRow[]>(
+      `/* agent-snapshot:rates */
+       SELECT "qboId", "name", "active", "rateValue"::text AS "rateValue"
+       FROM "QboTaxRate"
+       WHERE "companyId" = $1
+         AND "active" = TRUE
+       ORDER BY "qboId"
        LIMIT ${MAX_QUERY_ITEMS + 1}`,
       companyId,
     ),
@@ -308,6 +325,7 @@ export async function loadAgentSnapshotSourceInTransaction(
     current,
     accounts,
     taxRows,
+    taxRateRows,
     tagRows,
     ruleRows,
     historyRows,
@@ -321,6 +339,7 @@ function mapSource(input: {
   current: CurrentRow;
   accounts: AccountRow[];
   taxRows: TaxRow[];
+  taxRateRows: TaxRateRow[];
   tagRows: TagRow[];
   ruleRows: RuleRow[];
   historyRows: HistoryRow[];
@@ -372,7 +391,9 @@ function mapSource(input: {
     .map((row) => ({ qboId: row.qboId, name: row.fullName }));
   const categoryIds = new Set(candidateCategories.map((entry) => entry.qboId));
 
-  const usableTaxRows = input.taxRows.filter(isUsableTaxRow);
+  const cachedRates = cachedTaxRates(input.taxRateRows);
+  const usableTaxRows = input.taxRows.filter((row): row is UsableTaxRow =>
+    isUsableTaxRow(row, cachedRates));
   const eligibleReferences = usableTaxRows
     .map((row) => ({
       qboId: reference(row.qboId),
@@ -558,7 +579,10 @@ function mapSource(input: {
   };
 }
 
-function isUsableTaxRow(row: TaxRow): row is UsableTaxRow {
+function isUsableTaxRow(
+  row: TaxRow,
+  rates: ReturnType<typeof cachedTaxRates>,
+): row is UsableTaxRow {
   if (
     row.active !== true
     || !isReference(row.qboId)
@@ -567,13 +591,7 @@ function isUsableTaxRow(row: TaxRow): row is UsableTaxRow {
     || row.name.length > 160
     || !Array.isArray(row.purchaseTaxRateList)
   ) return false;
-  if (row.taxable === false) {
-    return row.purchaseTaxRateList.length === 0 && row.combinedPurchaseRate === null;
-  }
-  if (row.taxable !== true || row.purchaseTaxRateList.length === 0) return false;
-  if (row.combinedPurchaseRate === null) return false;
-  const rate = Number(row.combinedPurchaseRate);
-  return Number.isFinite(rate) && rate >= 0 && rate <= 999.999999;
+  return cachedTaxCodeSupport(row, rates, 'purchase').supported;
 }
 
 function normalizedTaxStatus(

@@ -22,6 +22,7 @@ import {
   type EntityLeaseKey,
 } from '../entityLease.js';
 import { lockCompanyMutationScope } from '../companyMutationScope.js';
+import { cachedTaxRates } from '../tax/cache.js';
 import {
   stageGuardedLiveCategorization,
 } from '../categorization.js';
@@ -803,7 +804,7 @@ interface LocalTaxRateRow {
   readonly name: string;
   readonly description: string | null;
   readonly active: boolean;
-  readonly rateValue: string | number | { toString(): string };
+  readonly rateValue: string | number | { toString(): string } | null;
   readonly sourceUpdatedAt: Date | null;
 }
 
@@ -1509,14 +1510,7 @@ async function loadProductionFreshLocal(
             salesRates: purchaseRates(code.salesTaxRateList),
             sourceUpdatedAt: code.sourceUpdatedAt?.toISOString() ?? null,
           })),
-          rates: rates.map((rate) => ({
-            qboId: rate.qboId,
-            name: rate.name,
-            description: rate.description,
-            active: rate.active,
-            rateValue: Number(rate.rateValue),
-            sourceUpdatedAt: rate.sourceUpdatedAt?.toISOString() ?? null,
-          })),
+          rates: cachedTaxRates(rates),
         },
       },
     };
