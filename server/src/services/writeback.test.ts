@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import type { StagedCategorization } from '@recat/shared';
 import {
+  QboHttpError,
   QboRequestTimeout,
   QboSyncTokenConflict,
   type QboClient,
@@ -3452,17 +3453,45 @@ describe('commitStagedCategorization durable lifecycle', () => {
     });
   });
 
-  it('logs a bounded provider diagnostic before marking a prepared write uncertain', async () => {
+  it('records a deterministic provider validation rejection without claiming write uncertainty', async () => {
     const fixture = durableDeps();
-    const providerError = Object.assign(new Error('Provider rejected the prepared Deposit body.'), {
-      name: 'QboHttpError',
-      status: 400,
-    });
+    const providerError = new QboHttpError(
+      400,
+      'Provider rejected the prepared Deposit body.',
+    );
     fixture.sendPreparedWrite.mockRejectedValueOnce(providerError);
     const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     try {
-      await commitStagedCategorization(commitInput(), fixture.deps);
+      const result = await commitStagedCategorization(commitInput(), fixture.deps);
+
+      expect(result).toMatchObject({
+        ok: false,
+        status: 'PENDING',
+        outcome: 'REJECTED',
+        error: {
+          code: 'QBO_WRITE_REJECTED',
+          message: expect.stringMatching(/rejected/i),
+        },
+      });
+      expect(fixture.db.attempts[0]).toMatchObject({
+        status: 'REJECTED',
+        errorCode: 'QBO_WRITE_REJECTED',
+        verification: { outcome: 'REJECTED', status: 'PENDING' },
+      });
+      expect(fixture.db.transactionRow).toMatchObject({
+        status: 'PENDING',
+        errorCode: null,
+        errorMessage: null,
+      });
+      expect(fixture.audit).toHaveBeenCalledWith(
+        fixture.db,
+        expect.objectContaining({
+          action: 'blocked',
+          txnId: DURABLE_TRANSACTION_ID,
+          mutation: expect.objectContaining({ outcome: 'REJECTED' }),
+        }),
+      );
 
       expect(logged).toHaveBeenCalledWith(
         '[writeback] prepared QBO write or readback failed',

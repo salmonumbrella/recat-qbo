@@ -200,7 +200,8 @@ export type CategorizationMutationOutcome =
   | 'IN_PROGRESS'
   | 'UNCHANGED'
   | 'DRY_RUN'
-  | 'RETRYABLE';
+  | 'RETRYABLE'
+  | 'REJECTED';
 
 export interface CategorizationMutationResult {
   transactionId: string;
@@ -244,7 +245,8 @@ export type AgentRunStatus =
   | 'dry_run'
   | 'unchanged'
   | 'uncertain'
-  | 'retryable';
+  | 'retryable'
+  | 'rejected';
 
 export type AutopilotRunOutcome =
   | 'shadow_proposed'

@@ -2250,6 +2250,9 @@ export default function Queue() {
     if (mutation?.outcome === 'RETRYABLE' || mutation?.outcome === 'UNCHANGED') {
       return <span style={{ color: 'var(--amT)', fontSize: 12 }}>Not posted — restage to retry</span>;
     }
+    if (mutation?.outcome === 'REJECTED') {
+      return <span style={{ color: 'var(--erT)', fontSize: 12 }}>Rejected by QuickBooks — change categorization</span>;
+    }
     if (v.t.status === 'PENDING') {
       return (
         <button

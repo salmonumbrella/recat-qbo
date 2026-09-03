@@ -21,7 +21,8 @@ export type MutationAuditOutcome =
   | 'VERIFIED'
   | 'UNCERTAIN'
   | 'UNCHANGED'
-  | 'RETRYABLE';
+  | 'RETRYABLE'
+  | 'REJECTED';
 
 export interface MutationAuditInput {
   requestId: string;

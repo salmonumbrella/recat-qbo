@@ -487,7 +487,7 @@ const transaction = z.strictObject({
 const transactionRead = transaction.extend({
   verification: z.strictObject({
     status: z.enum(['verified', 'dry-run', 'failed', 'uncertain', 'unknown']),
-    outcome: z.enum(['VERIFIED', 'DRY_RUN', 'RETRYABLE', 'UNCERTAIN', 'UNCHANGED']).nullable(),
+    outcome: z.enum(['VERIFIED', 'DRY_RUN', 'RETRYABLE', 'UNCERTAIN', 'UNCHANGED', 'REJECTED']).nullable(),
     summary: text,
   }),
 });

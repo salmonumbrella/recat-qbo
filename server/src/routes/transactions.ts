@@ -679,6 +679,10 @@ const SAFE_OUTCOME_ERRORS: Partial<Record<
     code: 'QBO_WRITE_UNCERTAIN',
     message: 'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.',
   },
+  REJECTED: {
+    code: 'QBO_WRITE_REJECTED',
+    message: 'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.',
+  },
 };
 
 function sendMutationResult(
@@ -703,6 +707,7 @@ function sendMutationResult(
   if (!result.ok && safeError) safe.error = safeError;
   const status = result.outcome === 'IN_PROGRESS' ? 202
     : result.outcome === 'UNCERTAIN' || result.outcome === 'RETRYABLE' ? 409
+      : result.outcome === 'REJECTED' ? 422
       : 200;
   res.status(status).json(safe);
 }

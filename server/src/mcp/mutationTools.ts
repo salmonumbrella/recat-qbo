@@ -399,6 +399,7 @@ const operationResult = z.strictObject({
     'UNCHANGED',
     'DRY_RUN',
     'RETRYABLE',
+    'REJECTED',
   ]),
   status: z.enum([
     'PENDING',
@@ -427,6 +428,7 @@ const operationOutput = z.strictObject({
   state: z.enum([
     'prepared',
     'committed',
+    'rejected',
     'retryable',
     'reconciliation_required',
     'expired',
@@ -438,6 +440,7 @@ const operationOutput = z.strictObject({
     'write_committing',
     'write_uncertain',
     'write_retryable',
+    'write_rejected',
     'write_unchanged',
     'verified',
     'dry_run',

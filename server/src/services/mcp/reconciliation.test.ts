@@ -816,6 +816,52 @@ describe('MCP categorization operation execution', () => {
     },
   );
 
+  it('projects a deterministic provider rejection as terminal and non-retryable', async () => {
+    const value = fixture('REJECTED');
+    value.attempts[0]!.verification = {
+      outcome: 'REJECTED',
+      status: 'PENDING',
+    };
+    value.attempts[0]!.errorCode = 'QBO_WRITE_REJECTED';
+    value.attempts[0]!.errorMessage = 'private provider detail';
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      state: 'rejected',
+      phase: 'write_rejected',
+      result: { outcome: 'REJECTED', status: 'PENDING' },
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction.',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: false,
+      },
+    });
+    await expect(commitMcpCategorization(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({ state: 'rejected' });
+    expect(value.commit).not.toHaveBeenCalled();
+    expect(value.reconcile).not.toHaveBeenCalled();
+    expect(JSON.stringify(await getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    ))).not.toContain('private provider detail');
+  });
+
   it('creates at most one retry child for a retryable root', async () => {
     const {
       deps,

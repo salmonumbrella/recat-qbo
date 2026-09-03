@@ -141,7 +141,7 @@ export interface TransactionListInput extends PageInput {
 }
 
 export type VerificationReadStatus = 'verified' | 'dry-run' | 'failed' | 'uncertain' | 'unknown';
-export type VerificationReadOutcome = 'VERIFIED' | 'DRY_RUN' | 'RETRYABLE' | 'UNCERTAIN' | 'UNCHANGED';
+export type VerificationReadOutcome = 'VERIFIED' | 'DRY_RUN' | 'RETRYABLE' | 'UNCERTAIN' | 'UNCHANGED' | 'REJECTED';
 
 export interface VerificationReadSummary {
   status: VerificationReadStatus;
@@ -903,6 +903,8 @@ function verificationSummary(attempt: Row | undefined): VerificationReadSummary 
       return { status: 'dry-run', outcome: 'DRY_RUN', summary: 'Dry run only; nothing was sent.' };
     case 'RETRYABLE':
       return { status: 'failed', outcome: 'RETRYABLE', summary: 'Write did not complete.' };
+    case 'REJECTED':
+      return { status: 'failed', outcome: 'REJECTED', summary: 'QuickBooks rejected the prepared write.' };
     case 'UNCERTAIN':
       return { status: 'uncertain', outcome: 'UNCERTAIN', summary: 'QuickBooks write could not be verified.' };
     default:

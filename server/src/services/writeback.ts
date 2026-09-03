@@ -23,6 +23,7 @@ import {
   type TxnStatus,
 } from '@recat/shared';
 import {
+  QboHttpError,
   QboSyncTokenConflict,
   type QboClient,
   type QboDepositPreparedWrite,
@@ -1277,7 +1278,8 @@ export type DurableMutationOutcome =
   | 'IN_PROGRESS'
   | 'UNCHANGED'
   | 'DRY_RUN'
-  | 'RETRYABLE';
+  | 'RETRYABLE'
+  | 'REJECTED';
 
 export interface DurableMutationResult {
   transactionId: string;
@@ -1303,6 +1305,8 @@ const POSSIBLE_WRITE_GUIDANCE =
   'The QuickBooks write may have succeeded — verify in QuickBooks before retrying.';
 const LIVE_MUTATION_RETRY_EXHAUSTED_MESSAGE =
   'The guarded live mutation exhausted its retry budget.';
+const QBO_WRITE_REJECTED_MESSAGE =
+  'QuickBooks rejected the prepared transaction. Correct it and prepare a new operation.';
 const AUTOPILOT_ACTOR: Actor = Object.freeze({
   id: null,
   label: 'Recat autopilot',
@@ -2479,6 +2483,20 @@ function recordedAttemptResult(
       error: { code: 'RETRYABLE', message: 'The prepared write was not sent. Create a new request to retry.' },
     };
   }
+  if (attempt.status === 'REJECTED') {
+    const status = attempt.operation === 'restore' ? 'POSTED' : 'PENDING';
+    return {
+      transactionId: attempt.transactionId,
+      requestId: attempt.requestId,
+      ok: false,
+      status,
+      outcome: 'REJECTED',
+      error: {
+        code: 'QBO_WRITE_REJECTED',
+        message: QBO_WRITE_REJECTED_MESSAGE,
+      },
+    };
+  }
   if (attempt.status === 'FAILED') {
     lifecycleError(
       'LIVE_MUTATION_RETRY_EXHAUSTED',
@@ -2834,6 +2852,59 @@ async function markUncertain(
   } catch {
     return safeUncertainResult();
   }
+}
+
+async function markProviderRejected(
+  d: DurableWritebackDeps,
+  attempt: DurableAttempt,
+  txn: DurableTransaction,
+  actor: Actor,
+  prepared: QboPreparedWrite,
+  auditAttribution?: McpMutationAuditAttribution,
+): Promise<DurableMutationResult> {
+  const transactionStatus = prepared.operation === 'restore' ? 'POSTED' : 'PENDING';
+  const attemptData = {
+    status: 'REJECTED',
+    verification: { outcome: 'REJECTED', status: transactionStatus },
+    errorCode: 'QBO_WRITE_REJECTED',
+    errorMessage: QBO_WRITE_REJECTED_MESSAGE,
+  };
+  let transitioned = false;
+  await d.db.$transaction(async (tx) => {
+    await lockCompanyMutationScope(tx, txn.companyId);
+    await assertReconciliationAdminInTransaction(d, tx, actor, txn.companyId);
+    await assertCurrentReconciliationState(tx, attempt, txn);
+    throwIfReconciliationAborted(d.reconciliationSignal);
+    const guarded = await tx.qboMutationAttempt.updateMany({
+      where: { id: attempt.id, status: 'COMMITTING' },
+      data: attemptData,
+    });
+    if (guarded.count !== 1) return;
+    transitioned = true;
+    await updateCurrentReconciliationTransaction(tx, attempt, txn, {
+      status: transactionStatus,
+      errorCode: null,
+      errorMessage: null,
+    });
+    await writeMutationAudit(
+      d,
+      tx,
+      txn,
+      actor,
+      'blocked',
+      mutationMetadata(prepared, 'REJECTED', auditAttribution),
+    );
+  });
+  if (!transitioned) {
+    const latest = await d.db.qboMutationAttempt.findUnique({
+      where: { requestId: attempt.requestId },
+    });
+    if (!latest) {
+      lifecycleError('ATTEMPT_CORRUPT', 'Mutation attempt disappeared after provider rejection.');
+    }
+    return recordedAttemptResultWithOutcome(d, latest, txn);
+  }
+  return recordedAttemptResult({ ...attempt, ...attemptData }, transactionStatus);
 }
 
 async function finalizeVerified(
@@ -3203,6 +3274,9 @@ function allowedStatusesForAttempt(attempt: DurableAttempt): string[] {
   }
   if (attempt.status === 'DRY_RUN') return ['DRY_RUN'];
   if (attempt.status === 'UNCHANGED') {
+    return [attempt.operation === 'restore' ? 'POSTED' : 'PENDING'];
+  }
+  if (attempt.status === 'REJECTED') {
     return [attempt.operation === 'restore' ? 'POSTED' : 'PENDING'];
   }
   if (attempt.status === 'PREPARED' || attempt.status === 'RETRYABLE') {
@@ -3599,6 +3673,16 @@ async function sendAndVerifyPrepared(
       ...(errorStatus === undefined ? {} : { errorStatus }),
       errorMessage: info.message.replace(/[\r\n]+/gu, ' ').slice(0, 500),
     });
+    if (error instanceof QboHttpError && error.status === 400) {
+      return markProviderRejected(
+        d,
+        attempt,
+        txn,
+        actor,
+        prepared,
+        auditAttribution,
+      );
+    }
     // A failed readback cannot prove whether QBO accepted the exact body.
     // Do not compound that uncertainty with an automatic restore write.
     return markUncertain(
@@ -4383,7 +4467,7 @@ async function reconcileMutationAttemptInternal(
       where: { requestId: input.requestId },
     });
     if (!attempt) lifecycleError('ATTEMPT_NOT_FOUND', 'Mutation attempt was not found.');
-    if (attempt.status === 'DRY_RUN') {
+    if (attempt.status === 'DRY_RUN' || attempt.status === 'REJECTED') {
       const { txn } = await loadAuthorizedAttempt(
         d,
         attempt,

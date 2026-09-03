@@ -52,6 +52,7 @@ import {
 export type McpOperationState =
   | 'prepared'
   | 'committed'
+  | 'rejected'
   | 'retryable'
   | 'reconciliation_required'
   | 'expired'
@@ -63,6 +64,7 @@ export type McpOperationPhase =
   | 'write_committing'
   | 'write_uncertain'
   | 'write_retryable'
+  | 'write_rejected'
   | 'write_unchanged'
   | 'verified'
   | 'dry_run'
@@ -304,6 +306,7 @@ export async function commitMcpCategorization(
   if (current.state === 'expired') throw new McpOperationExecutionError('OPERATION_EXPIRED');
   if (current.state === 'cancelled') throw new McpOperationExecutionError('OPERATION_CANCELLED');
   if (current.state === 'retryable') throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
+  if (current.state === 'rejected') return current;
   if (current.state === 'committed') return current;
 
   const actor = await actorFor(loaded.operation, dependencies);
@@ -373,6 +376,7 @@ export async function commitMcpUndo(
   if (current.state === 'retryable') {
     throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }
+  if (current.state === 'rejected') return current;
   if (current.state === 'committed') return current;
 
   const operation = loaded.operation;
@@ -481,6 +485,7 @@ export async function retryMcpOperation(
     ? commitMcpUndo
     : commitMcpCategorization;
   if (current.state === 'committed') return current;
+  if (current.state === 'rejected') return current;
   if (current.state === 'prepared' || current.state === 'reconciliation_required') {
     const resumed = await commit(
       principal,
@@ -730,6 +735,19 @@ function project(
     case 'DRY_RUN': return base(operation, 'committed', 'dry_run', false, false, false, result);
     case 'RETRYABLE': return base(operation, 'retryable', 'write_retryable', false, operation.retryOfId === null, false, result);
     case 'UNCHANGED': return base(operation, 'retryable', 'write_unchanged', false, operation.retryOfId === null, false, result);
+    case 'REJECTED': return base(
+      operation,
+      'rejected',
+      'write_rejected',
+      false,
+      false,
+      false,
+      result,
+      {
+        code: 'QBO_WRITE_REJECTED',
+        message: 'QuickBooks rejected the prepared transaction.',
+      },
+    );
     default:
       return base(operation, 'reconciliation_required', 'corrupt', false, false, true, null, {
         code: 'OPERATION_CORRUPT',
@@ -765,7 +783,7 @@ function base(
 }
 
 function attemptOutcome(status: string): DurableMutationOutcome {
-  if (status === 'VERIFIED' || status === 'DRY_RUN' || status === 'UNCHANGED' || status === 'RETRYABLE') {
+  if (status === 'VERIFIED' || status === 'DRY_RUN' || status === 'UNCHANGED' || status === 'RETRYABLE' || status === 'REJECTED') {
     return status;
   }
   return status === 'UNCERTAIN' ? 'UNCERTAIN' : 'IN_PROGRESS';
@@ -932,6 +950,15 @@ function validAttemptState(
           status: preparedStatus,
         });
       }
+    case 'REJECTED':
+      return transaction.status === preparedStatus
+        && retainsPreparedSync
+        && attempt.responseSnapshot === null
+        && attempt.errorCode === 'QBO_WRITE_REJECTED'
+        && exactVerification(attempt.verification, {
+          outcome: 'REJECTED',
+          status: preparedStatus,
+        });
     default:
       return false;
   }
