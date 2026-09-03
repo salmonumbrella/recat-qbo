@@ -185,6 +185,15 @@ describe('MCP tool results', () => {
       ),
       'INVALID_INPUT',
     ],
+    ...[
+      'TAX_AMOUNT_SIGN_MISMATCH',
+      'TAX_CODE_MALFORMED',
+      'TAX_COMPANY_MISMATCH',
+      'TAX_RATE_MALFORMED',
+    ].map((code) => [
+      new CategorizationError(code, 'PRIVATE_TAX_INPUT_SENTINEL'),
+      'INVALID_INPUT',
+    ]),
     [
       new CategorizationError(
         'MUTATION_BLOCKED',
