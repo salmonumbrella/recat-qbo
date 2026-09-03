@@ -20,7 +20,7 @@ type TaxRateRow = {
   name: string;
   description: string | null;
   active: boolean;
-  rateValue: number | string | { toString(): string };
+  rateValue: number | string | { toString(): string } | null;
   sourceUpdatedAt: Date | null;
 };
 
@@ -339,14 +339,16 @@ export async function getTaxReadinessInTransaction(
     db.qboTaxCode.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
     db.qboTaxRate.findMany({ where: { companyId }, orderBy: { qboId: 'asc' } }),
   ]);
-  const ratesById = new Map(rateRows.map((rate) => [rate.qboId, {
-    qboId: rate.qboId,
-    name: rate.name,
-    description: rate.description,
-    active: rate.active,
-    rateValue: Number(rate.rateValue),
-    sourceUpdatedAt: rate.sourceUpdatedAt?.toISOString() ?? null,
-  }]));
+  const ratesById = new Map(rateRows.flatMap((rate) => rate.rateValue === null
+    ? []
+    : [[rate.qboId, {
+        qboId: rate.qboId,
+        name: rate.name,
+        description: rate.description,
+        active: rate.active,
+        rateValue: Number(rate.rateValue),
+        sourceUpdatedAt: rate.sourceUpdatedAt?.toISOString() ?? null,
+      } satisfies QboTaxRateInfo] as const]));
   const codeRows = storedCodeRows.map((row) => {
     const code: QboTaxCodeInfo = {
       qboId: row.qboId,

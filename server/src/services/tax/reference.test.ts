@@ -203,6 +203,23 @@ describe('refreshTaxReference', () => {
     ]);
   });
 
+  it('does not coerce a legacy null cached rate into a zero-rate component', async () => {
+    const composite = {
+      ...code('GST_PST'),
+      purchaseRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const deps = depsWith(cache, [composite]);
+    await refreshTaxReference('company-1', { force: true }, deps);
+    Object.assign(cache.taxRate('company-1', 'RATE7')!, { rateValue: null });
+
+    const readiness = await getTaxReadiness('company-1', deps);
+
+    expect(readiness.taxCodes).toEqual([]);
+  });
+
   it('does not publish a composite code that repeats the same rate component', async () => {
     const duplicate = {
       ...code('DUPLICATE'),

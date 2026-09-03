@@ -1074,6 +1074,8 @@ describe('preparePurchaseRecategorization', () => {
         DetailType: 'AccountBasedExpenseLineDetail',
         AccountBasedExpenseLineDetail: {
           AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          CustomerRef: { value: 'customer-22747', name: 'Customer 22747' },
+          ClassRef: { value: 'class-22747', name: 'Class 22747' },
           BillableStatus: 'NotBillable',
           TaxCodeRef: { value: '7' },
           TaxInclusiveAmt: 31.36,
@@ -1221,6 +1223,8 @@ describe('preparePurchaseRecategorization', () => {
         CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
         AccountBasedExpenseLineDetail: {
           AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          CustomerRef: { value: 'customer-22747', name: 'Customer 22747' },
+          ClassRef: { value: 'class-22747', name: 'Class 22747' },
           BillableStatus: 'NotBillable',
           TaxCodeRef: { value: '5' },
           TaxInclusiveAmt: 31.36,
@@ -1261,6 +1265,8 @@ describe('preparePurchaseRecategorization', () => {
       CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
       AccountBasedExpenseLineDetail: {
         AccountRef: { value: '99' },
+        CustomerRef: { value: 'customer-22747', name: 'Customer 22747' },
+        ClassRef: { value: 'class-22747', name: 'Class 22747' },
         BillableStatus: 'NotBillable',
         TaxCodeRef: { value: '7' },
         TaxAmount: 3.36,

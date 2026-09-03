@@ -1401,6 +1401,12 @@ export function preparePurchaseRecategorization(args: {
           if (sourceDetail.BillableStatus !== undefined) {
             stagedDetail.BillableStatus = sourceDetail.BillableStatus;
           }
+          if (sourceDetail.CustomerRef !== undefined) {
+            stagedDetail.CustomerRef = normalizedClone(sourceDetail.CustomerRef);
+          }
+          if (sourceDetail.ClassRef !== undefined) {
+            stagedDetail.ClassRef = normalizedClone(sourceDetail.ClassRef);
+          }
           return stagedRaw;
         })()]
     : args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
