@@ -49,6 +49,40 @@ const MAX_VENDOR_MERGE_HOPS = 20;
 const MAX_VENDOR_IDENTITY_SUPPORT_CODE_POINTS = 24_000;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
 
+function purchaseTaxSupportCte(companyIds: readonly string[]): Prisma.Sql {
+  return Prisma.sql`"purchase_tax_support" AS MATERIALIZED (
+    SELECT tax."id" AS "taxCodeId",
+           COUNT(component.value)::integer AS "componentCount",
+           COUNT(DISTINCT component.value->>'taxRateQboId')::integer
+             AS "distinctComponentCount",
+           COALESCE(BOOL_AND(
+             jsonb_typeof(component.value) = 'object'
+             AND NULLIF(btrim(component.value->>'taxRateQboId'), '') IS NOT NULL
+             AND COALESCE(
+               component.value->>'taxTypeApplicable' = 'TaxOnAmount',
+               false
+             )
+             AND rate."qboId" IS NOT NULL
+             AND rate."active" IS TRUE
+             AND COALESCE(
+               rate."rateValue" BETWEEN 0::numeric AND 999.999999::numeric,
+               false
+             )
+           ), false) AS "componentsValid",
+           SUM(rate."rateValue") AS "combinedRate"
+    FROM "QboTaxCode" tax
+    LEFT JOIN LATERAL jsonb_array_elements(
+      CASE WHEN jsonb_typeof(tax."purchaseTaxRateList") = 'array'
+        THEN tax."purchaseTaxRateList" ELSE '[]'::jsonb END
+    ) AS component(value) ON true
+    LEFT JOIN "QboTaxRate" rate
+      ON rate."companyId" = tax."companyId"
+     AND rate."qboId" = component.value->>'taxRateQboId'
+    WHERE tax."companyId" IN (${Prisma.join(companyIds)})
+    GROUP BY tax."id"
+  )`;
+}
+
 function purchaseTaxCodeEligibilitySql(
   taxCalculation: Prisma.Sql,
   taxCodeQboId: Prisma.Sql,
@@ -67,29 +101,10 @@ function purchaseTaxCodeEligibilitySql(
             OR (${taxCalculation} = 'TaxExcluded'
                 AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
           )
-          AND (
-            SELECT support."componentsValid"
-              AND support."componentCount" = support."distinctComponentCount"
-              AND support."combinedRate" BETWEEN 0::numeric AND 999.999999::numeric
-            FROM (
-              SELECT COUNT(*)::integer AS "componentCount",
-                     COUNT(DISTINCT component.value->>'taxRateQboId')::integer
-                       AS "distinctComponentCount",
-                     COALESCE(BOOL_AND(
-                       jsonb_typeof(component.value) = 'object'
-                       AND NULLIF(btrim(component.value->>'taxRateQboId'), '') IS NOT NULL
-                       AND component.value->>'taxTypeApplicable' = 'TaxOnAmount'
-                       AND rate."qboId" IS NOT NULL
-                       AND rate."active" IS TRUE
-                       AND rate."rateValue" BETWEEN 0::numeric AND 999.999999::numeric
-                     ), false) AS "componentsValid",
-                     SUM(rate."rateValue") AS "combinedRate"
-              FROM jsonb_array_elements(tax."purchaseTaxRateList") AS component(value)
-              LEFT JOIN "QboTaxRate" rate
-                ON rate."companyId" = tax."companyId"
-               AND rate."qboId" = component.value->>'taxRateQboId'
-            ) support
-          ))
+          AND tax_support."componentsValid"
+          AND tax_support."componentCount" = tax_support."distinctComponentCount"
+          AND tax_support."combinedRate" IS NOT NULL
+          AND tax_support."combinedRate" BETWEEN 0::numeric AND 999.999999::numeric)
          OR (tax."taxable" IS FALSE
              AND jsonb_array_length(tax."purchaseTaxRateList") = 0)
        )
@@ -1205,6 +1220,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
     `;
     const contextFilter = classificationCaseSqlFilter(context);
     return this.db.$queryRaw<ClassificationCaseSearchRow[]>(Prisma.sql`
+      WITH ${purchaseTaxSupportCte(companyIds)}
       SELECT memory."id", memory."companyId", company."nickname" AS "companyName",
              memory."vendorIdentityId", identity."displayName" AS "vendorName", memory."action",
              memory."originIntent", memory."rationale", memory."requiredEvidence", memory."examples",
@@ -1245,6 +1261,8 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
         AND account."qboId" = memory."action"->>'categoryQboId'
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = memory."companyId"
         AND tax."qboId" = memory."action"->>'taxCodeQboId'
+      LEFT JOIN "purchase_tax_support" tax_support
+        ON tax_support."taxCodeId" = tax."id"
       LEFT JOIN "ClassificationCaseInvalidation" invalidation
         ON invalidation."companyId" = memory."companyId"
        AND invalidation."classificationCaseId" = memory."id"
@@ -1280,6 +1298,7 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
       ts_rank_cd(to_tsvector('simple', ${text}), plainto_tsquery('simple', ${query}))::double precision
     `;
     return this.db.$queryRaw<RuleSearchRow[]>(Prisma.sql`
+      WITH ${purchaseTaxSupportCte(companyIds)}
       SELECT rule."id", rule."companyId", company."nickname" AS "companyName",
              revision."matchText", revision."categoryQboId", revision."taxCalculation", revision."taxCodeQboId",
              revision."originIntent", revision."revision", revision."changedBy" AS "updatedById",
@@ -1316,6 +1335,8 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
         AND account."qboId" = revision."categoryQboId"
       LEFT JOIN "QboTaxCode" tax ON tax."companyId" = rule."companyId"
         AND tax."qboId" = revision."taxCodeQboId"
+      LEFT JOIN "purchase_tax_support" tax_support
+        ON tax_support."taxCodeId" = tax."id"
       LEFT JOIN LATERAL (
         SELECT string_agg(tag."name", ' ' ORDER BY relation."ordinal" ASC) AS "names",
                jsonb_agg(tag."name" ORDER BY relation."ordinal" ASC) AS "namesArray"

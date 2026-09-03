@@ -1014,6 +1014,28 @@ describePostgres('classification search on PostgreSQL', () => {
         advisory: false,
       }),
     ]));
+
+    await db.qboTaxRate.update({
+      where: {
+        companyId_qboId: {
+          companyId: data.current.id,
+          qboId: 'rate-pst-7',
+        },
+      },
+      data: { rateValue: null },
+    });
+    const cardsWithNullRate = (await repository.rehydrate(
+      [data.current.id],
+      [`rule:${data.rule.id}`, `classification_case:${data.classificationCase.id}`],
+    )).map((record) => record.hit);
+    expect(cardsWithNullRate).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: `rule:${data.rule.id}`, action: null }),
+      expect.objectContaining({
+        id: `classification_case:${data.classificationCase.id}`,
+        action: null,
+        executable: false,
+      }),
+    ]));
   });
 
   it('gates rule and case actions on current account, tax, tag, lifecycle, and tenant readiness', async () => {

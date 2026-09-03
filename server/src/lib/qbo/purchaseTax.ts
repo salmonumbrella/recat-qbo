@@ -1346,13 +1346,15 @@ export function preparePurchaseRecategorization(args: {
     ? current.lines[holdingLineIndexes[0]!]!
     : null;
   const stagedLine = args.staged.lines.length === 1 ? args.staged.lines[0]! : null;
-  const canPreserveOneToOneSourceExactly =
+  const hasOneToOneSource =
     sourceRawLine !== null
     && sourceSnapshotLine !== null
     && stagedLine !== null
     && sourceRawLine.DetailType === 'AccountBasedExpenseLineDetail'
     && sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef !== undefined
-    && args.staged.taxCalculation === current.globalTaxCalculation
+    && args.staged.taxCalculation === current.globalTaxCalculation;
+  const canPreserveOneToOneSourceExactly =
+    hasOneToOneSource
     && sourceSnapshotLine.amountCents === stagedLine.subtotalCents
     && sourceSnapshotLine.taxCodeQboId === stagedLine.taxCodeQboId
     && (
@@ -1367,12 +1369,7 @@ export function preparePurchaseRecategorization(args: {
       || sourceSnapshotLine.taxInclusiveCents === stagedLine.totalCents
     );
   const canPreserveOneToOneMetadata =
-    sourceRawLine !== null
-    && sourceSnapshotLine !== null
-    && stagedLine !== null
-    && sourceRawLine.DetailType === 'AccountBasedExpenseLineDetail'
-    && sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef !== undefined
-    && args.staged.taxCalculation === current.globalTaxCalculation
+    hasOneToOneSource
     && stagedLine.memo === null
     && (stagedLine.tagIds?.length ?? 0) === 0;
   const newRawLines = canPreserveOneToOneSourceExactly
