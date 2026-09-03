@@ -27,6 +27,8 @@ export interface McpToolLogEvent extends McpToolLogContext {
   durationMs: number;
   count: number;
   outcome: 'success' | 'error';
+  errorClass?: string;
+  errorCode?: string;
 }
 
 export type McpToolLogger = (event: McpToolLogEvent) => void;
@@ -73,6 +75,22 @@ function resultCount(value: unknown): number {
     return Math.min((value as { items: unknown[] }).items.length, 100);
   }
   return 1;
+}
+
+function internalErrorIdentity(error: unknown): {
+  errorClass: string;
+  errorCode?: string;
+} {
+  const errorClass = error instanceof Error && /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u.test(error.name)
+    ? error.name
+    : 'UnknownError';
+  const candidate = typeof error === 'object' && error !== null && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  const errorCode = typeof candidate === 'string' && /^[A-Z][A-Z0-9_:-]{0,63}$/u.test(candidate)
+    ? candidate
+    : undefined;
+  return { errorClass, ...(errorCode === undefined ? {} : { errorCode }) };
 }
 
 function loggedTokenPrefix(
@@ -174,6 +192,7 @@ export async function observeMcpToolCall<T>(
       durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
       count: 0,
       outcome: 'error',
+      ...internalErrorIdentity(error),
     });
     throw error;
   } finally {

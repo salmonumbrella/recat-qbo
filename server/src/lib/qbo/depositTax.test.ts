@@ -105,6 +105,88 @@ function prepare(
 }
 
 describe('prepareDepositRecategorization', () => {
+  it('prepares the live single-line non-taxable GST refund Deposit shape', () => {
+    const raw: RawDeposit = {
+      Id: '22521',
+      SyncToken: '0',
+      TxnDate: '2026-06-17',
+      DepositToAccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 4631.83,
+      HomeTotalAmt: 4631.83,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Deposit from CANADA XXXXXXXXXXXX8746000144 - GA (Delicious Milk Corporation, 4251)',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Deposit from CANADA XXXXXXXXXXXX8746000144 - GA (Delicious Milk Corporation, 4251)',
+        Amount: 4631.83,
+        DetailType: 'DepositLineDetail',
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: '42000 Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+    const before = mapDepositSnapshot(raw);
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '471f9536-52dd-4f69-9cf6-d58271756cdc',
+        revision: 1,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 463_183, taxCents: 0, totalCents: 463_183 },
+        lines: [{
+          idx: 0,
+          subtotalCents: 463_183,
+          taxCents: 0,
+          totalCents: 463_183,
+          categoryQboId: '54',
+          taxCodeQboId: '5',
+          memo: raw.Line![0]!.Description!,
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+      before,
+      requestId: '701b0358-ed24-4ed0-b80e-13608fa0f56f',
+    });
+
+    expect(prepared).toMatchObject({
+      qboType: 'Deposit',
+      qboId: '22521',
+      body: {
+        SyncToken: '0',
+        GlobalTaxCalculation: 'TaxInclusive',
+        Line: [{
+          Id: '1',
+          Amount: 4631.83,
+          Description: raw.Line![0]!.Description,
+          DepositLineDetail: {
+            AccountRef: { value: '54' },
+            TaxCodeRef: { value: '5' },
+            TaxApplicableOn: 'Sales',
+          },
+        }],
+      },
+      expected: {
+        totalCents: 463_183,
+        totalTaxCents: 0,
+        targetLines: [{
+          amountCents: 463_183,
+          accountQboId: '54',
+          taxCodeQboId: '5',
+          taxApplicableOn: 'Sales',
+        }],
+      },
+    });
+  });
+
   it('fingerprints preserved entity metadata and exact raw line fields', () => {
     const raw = completeDeposit();
     const baseline = mapDepositSnapshot(raw);

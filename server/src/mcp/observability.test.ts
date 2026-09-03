@@ -49,6 +49,40 @@ describe('MCP observability', () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain('SECRET_SENTINEL');
   });
 
+  it('logs a bounded internal error identity without logging its message', async () => {
+    const log = vi.fn();
+    class QboDepositPreparationError extends Error {
+      readonly code = 'QBO_DEPOSIT_UNSUPPORTED';
+
+      constructor(message: string) {
+        super(message);
+        this.name = 'QboDepositPreparationError';
+      }
+    }
+    const error = new QboDepositPreparationError('PRIVATE_PROVIDER_DETAIL');
+
+    await expect(observeMcpToolCall(
+      {
+        requestId: 'request-deposit',
+        traceId: 'd'.repeat(32),
+        tokenPrefix: 'rct_SAFE',
+        method: 'tools/call',
+        tool: 'commit_categorization',
+      },
+      log,
+      async () => { throw error; },
+    )).rejects.toBe(error);
+
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'request-deposit',
+      tool: 'commit_categorization',
+      outcome: 'error',
+      errorClass: 'QboDepositPreparationError',
+      errorCode: 'QBO_DEPOSIT_UNSUPPORTED',
+    }));
+    expect(JSON.stringify(log.mock.calls)).not.toContain('PRIVATE_PROVIDER_DETAIL');
+  });
+
   it('creates a server span and propagates only parsed trace context to application reads', async () => {
     const span = {
       setStatus: vi.fn().mockReturnThis(),
