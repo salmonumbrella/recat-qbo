@@ -1346,7 +1346,7 @@ export function preparePurchaseRecategorization(args: {
     ? current.lines[holdingLineIndexes[0]!]!
     : null;
   const stagedLine = args.staged.lines.length === 1 ? args.staged.lines[0]! : null;
-  const canPreserveOneToOneSource =
+  const canPreserveOneToOneSourceExactly =
     sourceRawLine !== null
     && sourceSnapshotLine !== null
     && stagedLine !== null
@@ -1366,7 +1366,16 @@ export function preparePurchaseRecategorization(args: {
       args.staged.taxCalculation !== 'TaxInclusive'
       || sourceSnapshotLine.taxInclusiveCents === stagedLine.totalCents
     );
-  const newRawLines = canPreserveOneToOneSource
+  const canPreserveOneToOneMetadata =
+    sourceRawLine !== null
+    && sourceSnapshotLine !== null
+    && stagedLine !== null
+    && sourceRawLine.DetailType === 'AccountBasedExpenseLineDetail'
+    && sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef !== undefined
+    && args.staged.taxCalculation === current.globalTaxCalculation
+    && stagedLine.memo === null
+    && (stagedLine.tagIds?.length ?? 0) === 0;
+  const newRawLines = canPreserveOneToOneSourceExactly
     ? [(() => {
         const cloned = normalizedClone(sourceRawLine);
         const detail = cloned.AccountBasedExpenseLineDetail!;
@@ -1377,8 +1386,25 @@ export function preparePurchaseRecategorization(args: {
         if (stagedLine.memo !== null) cloned.Description = stagedLine.memo;
         return cloned;
       })()]
+    : canPreserveOneToOneMetadata
+      ? [(() => {
+          const stagedRaw = stagedLineToRaw(stagedLine, args.staged.taxCalculation);
+          const sourceDetail = sourceRawLine.AccountBasedExpenseLineDetail!;
+          const stagedDetail = stagedRaw.AccountBasedExpenseLineDetail!;
+          if (sourceRawLine.Id !== undefined) stagedRaw.Id = sourceRawLine.Id;
+          if (sourceRawLine.Description !== undefined) {
+            stagedRaw.Description = sourceRawLine.Description;
+          }
+          if (sourceRawLine.CustomField !== undefined) {
+            stagedRaw.CustomField = normalizedClone(sourceRawLine.CustomField);
+          }
+          if (sourceDetail.BillableStatus !== undefined) {
+            stagedDetail.BillableStatus = sourceDetail.BillableStatus;
+          }
+          return stagedRaw;
+        })()]
     : args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
-  const newSnapshotLines = canPreserveOneToOneSource
+  const newSnapshotLines = canPreserveOneToOneSourceExactly || canPreserveOneToOneMetadata
     ? [snapshotLine(newRawLines[0]!, purchaseSign(args.current), args.current.GlobalTaxCalculation)]
     : args.staged.lines.map((line) =>
         stagedLineToSnapshot(line, args.staged.taxCalculation));

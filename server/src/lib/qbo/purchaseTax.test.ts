@@ -1193,11 +1193,88 @@ describe('preparePurchaseRecategorization', () => {
       Description: 'DEEPLINE.COM, DEEPLINE.COM, USA',
       CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
       AccountBasedExpenseLineDetail: {
-        AccountRef: { value: '99', name: 'Uncategorized Expense' },
+        AccountRef: { value: '99' },
         BillableStatus: 'NotBillable',
         TaxCodeRef: { value: '5' },
         TaxInclusiveAmt: 36.38,
       },
+    });
+  });
+
+  it('preserves one-to-one source metadata while set changes tax code and amounts', () => {
+    const raw: RawPurchase = {
+      Id: '22747',
+      SyncToken: '0',
+      TxnDate: '2026-07-11',
+      TotalAmt: 31.36,
+      PaymentType: 'Cash',
+      AccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      GlobalTaxCalculation: 'TaxInclusive',
+      PrivateNote: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      Line: [{
+        Id: '1',
+        Description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+        Amount: 31.36,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          BillableStatus: 'NotBillable',
+          TaxCodeRef: { value: '5' },
+          TaxInclusiveAmt: 31.36,
+        },
+      }],
+    };
+    const categorization: StagedCategorization = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -2_800, taxCents: -336, totalCents: -3_136 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -2_800,
+        taxCents: -336,
+        totalCents: -3_136,
+        categoryQboId: '99',
+        taxCodeQboId: '7',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: categorization,
+      before: mapPurchaseTaxSnapshot(raw),
+      requestId: 'REQUEST_22747',
+    });
+
+    expect(prepared.body.Line![0]).toMatchObject({
+      Id: '1',
+      Description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      Amount: 28,
+      CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: '99' },
+        BillableStatus: 'NotBillable',
+        TaxCodeRef: { value: '7' },
+        TaxAmount: 3.36,
+        TaxInclusiveAmt: 31.36,
+      },
+    });
+    expect(prepared.expected.targetLines[0]).toMatchObject({
+      id: '1',
+      description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      amountCents: -2_800,
+      accountQboId: '99',
+      taxCodeQboId: '7',
+      taxAmountCents: -336,
+      taxInclusiveCents: -3_136,
     });
   });
 
