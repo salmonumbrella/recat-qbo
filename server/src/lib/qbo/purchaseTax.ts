@@ -743,7 +743,13 @@ export function calculatePurchaseLine(
     : grossCents;
   const taxCents = input.taxCalculation === 'TaxInclusive'
     ? grossCents - netCents
-    : roundRatio(grossCents * rate.numerator, taxDenominator);
+    : rates.reduce(
+        (sum, component) => sum + roundRatio(
+          grossCents * component.numerator,
+          component.denominator * 100n,
+        ),
+        0n,
+      );
 
   return {
     grossCents: input.grossCents,

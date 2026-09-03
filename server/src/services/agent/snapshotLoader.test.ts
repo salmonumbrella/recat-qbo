@@ -174,6 +174,47 @@ describe('agent snapshot loader', () => {
       .rejects.toMatchObject({ code: 'AGENT_MODEL_INPUT_INVALID' });
   });
 
+  it('advertises both supported modes when every usable code has one component', async () => {
+    const db = {
+      $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({
+        $queryRawUnsafe: async (sql: string) => {
+          if (sql.includes('agent-snapshot:current')) return [{
+            id: TRANSACTION_ID,
+            companyId: COMPANY_ID,
+            revision: 1,
+            status: 'PENDING',
+            date: new Date('2026-07-28T00:00:00.000Z'),
+            amount: '-1.00',
+            currency: 'CAD',
+            sourceAccountQboId: 'source-card',
+            payee: 'Merchant',
+            memo: null,
+            holdingAccountIds: [],
+            taxSupportStatus: 'ready',
+            taxUsingSalesTax: true,
+            configVersion: 'config-v1',
+          }];
+          if (sql.includes('agent-snapshot:accounts')) return [
+            { qboId: 'source-card', fullName: 'Source card', classification: 'Liability', accountType: 'Credit Card', active: true },
+            { qboId: 'expense-a', fullName: 'Expenses · Generic', classification: 'Expenses', accountType: 'Expense', active: true },
+          ];
+          if (sql.includes('agent-snapshot:tax')) return [
+            { qboId: 'tax-a', name: 'GST', active: true, taxable: true, purchaseTaxRateList: [{}], combinedPurchaseRate: '5.000000' },
+          ];
+          return [];
+        },
+      }),
+    } as AgentSnapshotLoaderDb;
+
+    const source = await loadAgentSnapshotSource(COMPANY_ID, TRANSACTION_ID, db);
+
+    expect(source.tax).toEqual({
+      status: 'ready',
+      supportedCalculationModes: ['TaxInclusive', 'TaxExcluded'],
+      eligibleReferences: [{ qboId: 'tax-a', label: 'GST' }],
+    });
+  });
+
   it('caps every model-facing top-level collection at twenty', async () => {
     const db = {
       $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({

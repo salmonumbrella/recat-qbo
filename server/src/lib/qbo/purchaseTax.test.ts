@@ -233,6 +233,15 @@ describe('calculatePurchaseLine', () => {
     ).toEqual({ grossCents, netCents, taxCents });
   });
 
+  it('rounds every composite tax-excluded component like the transaction calculator', () => {
+    expect(
+      calculatePurchaseLine(
+        { grossCents: -1_005, taxCalculation: 'TaxExcluded', taxCodeQboId: 'COMPOUND' },
+        reference,
+      ),
+    ).toEqual({ grossCents: -1_005, netCents: -1_005, taxCents: -120 });
+  });
+
   it('rejects inverse reconstruction for a composite tax-excluded gross with an actionable reason', () => {
     expect(
       reconstructPurchaseTaxExcludedTransaction(
