@@ -509,6 +509,58 @@ describe('Recat MCP mutation tools', () => {
     );
   });
 
+  it('accepts tax-inclusive preserve-current without requiring the source code inventory', async () => {
+    const proposal = {
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -2_800,
+        categoryQboId: '99',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+    const operations = mutations({
+      prepareCategorization: vi.fn().mockResolvedValue({
+        ...preparedCategorization,
+        preview: {
+          ...preparedCategorization.preview,
+          taxDisposition: 'preserve_current',
+          taxCalculation: 'TaxInclusive',
+          totals: { subtotalCents: -2_800, taxCents: 0, totalCents: -2_800 },
+          lines: [{
+            idx: 0,
+            subtotalCents: -2_800,
+            taxCents: 0,
+            totalCents: -2_800,
+            categoryQboId: '99',
+            taxCodeQboId: '7',
+          }],
+          transactionTagCount: 0,
+          lineTagCount: 0,
+        },
+      }),
+    });
+
+    const response = await legacy(handler(operations), 'tools/call', {
+      name: 'prepare_categorization',
+      arguments: {
+        companyId,
+        transactionId,
+        expectedRevision: 0,
+        idempotencyKey: 'preserve-tax-inclusive',
+        proposal,
+      },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareCategorization).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({ proposal }),
+    );
+  });
+
   it('rejects preserve-current proposals that could change anything besides one category', async () => {
     const valid = {
       taxDisposition: 'preserve_current',
@@ -524,7 +576,6 @@ describe('Recat MCP mutation tools', () => {
     const invalidProposals = [
       { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: undefined }] },
       { ...valid, lines: [{ ...valid.lines[0], taxCodeQboId: null }] },
-      { ...valid, taxCalculation: 'TaxExcluded' },
       { ...valid, lines: [...valid.lines, { ...valid.lines[0] }] },
       { ...valid, lines: [{ ...valid.lines[0], memo: 'do not change' }] },
       { ...valid, tagIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'] },

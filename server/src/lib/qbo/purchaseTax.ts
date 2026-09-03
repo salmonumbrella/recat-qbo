@@ -1202,8 +1202,7 @@ export function preparePurchaseRecategorization(args: {
 
   if (args.staged.taxDisposition === 'preserve_current') {
     if (
-      args.staged.taxCalculation !== 'NotApplicable'
-      || current.globalTaxCalculation !== 'NotApplicable'
+      args.staged.taxCalculation !== current.globalTaxCalculation
       || holdingLineIndexes.length !== 1
       || args.staged.lines.length !== 1
       || args.staged.tagIds.length !== 0
@@ -1214,7 +1213,7 @@ export function preparePurchaseRecategorization(args: {
     ) {
       preparationError(
         'QBO_PURCHASE_UNSUPPORTED',
-        'Preserve-current requires one NotApplicable Purchase holding line.',
+        'Preserve-current requires one Purchase holding line with the exact source tax mode.',
       );
     }
     const targetIndex = holdingLineIndexes[0]!;
@@ -1292,9 +1291,49 @@ export function preparePurchaseRecategorization(args: {
       'Purchase tax mode cannot change while untouched tax-bearing lines remain.',
     );
   }
-  const newRawLines = args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
-  const newSnapshotLines = args.staged.lines.map((line) =>
-    stagedLineToSnapshot(line, args.staged.taxCalculation));
+  const sourceRawLine = holdingLineIndexes.length === 1
+    ? args.current.Line![holdingLineIndexes[0]!]!
+    : null;
+  const sourceSnapshotLine = holdingLineIndexes.length === 1
+    ? current.lines[holdingLineIndexes[0]!]!
+    : null;
+  const stagedLine = args.staged.lines.length === 1 ? args.staged.lines[0]! : null;
+  const canPreserveOneToOneSource =
+    sourceRawLine !== null
+    && sourceSnapshotLine !== null
+    && stagedLine !== null
+    && sourceRawLine.DetailType === 'AccountBasedExpenseLineDetail'
+    && sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef !== undefined
+    && args.staged.taxCalculation === current.globalTaxCalculation
+    && sourceSnapshotLine.amountCents === stagedLine.subtotalCents
+    && sourceSnapshotLine.taxCodeQboId === stagedLine.taxCodeQboId
+    && (
+      sourceSnapshotLine.taxAmountCents === stagedLine.taxCents
+      || (
+        zeroOrUnspecifiedTax(sourceSnapshotLine.taxAmountCents)
+        && stagedLine.taxCents === 0
+      )
+    )
+    && (
+      args.staged.taxCalculation !== 'TaxInclusive'
+      || sourceSnapshotLine.taxInclusiveCents === stagedLine.totalCents
+    );
+  const newRawLines = canPreserveOneToOneSource
+    ? [(() => {
+        const cloned = normalizedClone(sourceRawLine);
+        const detail = cloned.AccountBasedExpenseLineDetail!;
+        detail.AccountRef = {
+          ...detail.AccountRef!,
+          value: requiredIdentity(stagedLine.categoryQboId, 'category account reference'),
+        };
+        if (stagedLine.memo !== null) cloned.Description = stagedLine.memo;
+        return cloned;
+      })()]
+    : args.staged.lines.map((line) => stagedLineToRaw(line, args.staged.taxCalculation));
+  const newSnapshotLines = canPreserveOneToOneSource
+    ? [snapshotLine(newRawLines[0]!, purchaseSign(args.current), args.current.GlobalTaxCalculation)]
+    : args.staged.lines.map((line) =>
+        stagedLineToSnapshot(line, args.staged.taxCalculation));
   const provenTaxCents = (
     line: QboPurchaseSnapshot['lines'][number],
   ): number | null =>

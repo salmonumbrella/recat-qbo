@@ -284,13 +284,6 @@ const proposalSchema = z.object({
     .refine((values) => new Set(values).size === values.length, 'Tag IDs must be unique.'),
 }).strict().superRefine((proposal, context) => {
   if (proposal.taxDisposition === 'preserve_current') {
-    if (proposal.taxCalculation !== 'NotApplicable') {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Preserve-current requires NotApplicable tax calculation.',
-        path: ['taxCalculation'],
-      });
-    }
     if (proposal.lines.length !== 1) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -450,11 +443,10 @@ function preserveCurrentSource(
   if (
     purchase.Id !== transaction.qboId
     || purchase.SyncToken !== transaction.qboSyncToken
-    || purchase.GlobalTaxCalculation !== 'NotApplicable'
+    || purchase.GlobalTaxCalculation !== proposal.taxCalculation
     || !Array.isArray(lines)
     || lines.length !== 1
     || totalCents === null
-    || (credit ? Math.abs(totalCents) : -Math.abs(totalCents)) !== transactionCents
   ) {
     throw new CategorizationError(
       'INVALID_INPUT',
@@ -611,10 +603,35 @@ async function validateStage(
   let taxCodesById = new Map<string, TaxCodeRow>();
   let calculatedLines: CalculatedLine[];
 
-  if (proposal.taxCalculation === 'NotApplicable') {
-    if (preservedSource !== null || explicitNon) {
-      const requiredTaxCodeQboId = preservedSource?.taxCodeQboId
-        ?? QBO_NOT_APPLICABLE_TAX_CODE;
+  if (preservedSource !== null) {
+    const taxCodes = await db.qboTaxCode.findMany({
+      where: {
+        companyId: input.companyId,
+        qboId: { in: [preservedSource.taxCodeQboId] },
+      },
+    });
+    const matchingTaxCode = taxCodes.find(
+      (code) => code.qboId === preservedSource.taxCodeQboId,
+    );
+    const preservedTaxCode = matchingTaxCode ?? {
+      qboId: preservedSource.taxCodeQboId,
+      name: preservedSource.taxCodeQboId,
+      active: true,
+      taxable: null,
+      purchaseTaxRateList: [],
+      salesTaxRateList: [],
+      combinedPurchaseRate: null,
+      combinedSalesRate: null,
+    };
+    taxCodesById = new Map([[preservedTaxCode.qboId, preservedTaxCode]]);
+    calculatedLines = proposal.lines.map((line) => ({
+      subtotalCents: line.grossCents,
+      taxCents: 0,
+      totalCents: line.grossCents,
+    }));
+  } else if (proposal.taxCalculation === 'NotApplicable') {
+    if (explicitNon) {
+      const requiredTaxCodeQboId = QBO_NOT_APPLICABLE_TAX_CODE;
       const taxCodes = await db.qboTaxCode.findMany({
         where: {
           companyId: input.companyId,

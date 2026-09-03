@@ -966,6 +966,153 @@ describe('preparePurchaseRecategorization', () => {
     });
   });
 
+  it('changes only the category reference on a tax-inclusive composite-code Purchase', () => {
+    const raw: RawPurchase = {
+      Id: '22746',
+      SyncToken: '1',
+      TxnDate: '2026-06-11',
+      TotalAmt: 31.36,
+      PaymentType: 'Cash',
+      EntityRef: { value: '794', name: 'Anthropic' },
+      AccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      GlobalTaxCalculation: 'TaxInclusive',
+      PrivateNote: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+      Line: [{
+        Id: '1',
+        Description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+        Amount: 28,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          BillableStatus: 'NotBillable',
+          TaxCodeRef: { value: '7' },
+          TaxInclusiveAmt: 31.36,
+        },
+      }],
+      TxnTaxDetail: {
+        TotalTax: 3.36,
+        TaxLine: [
+          { Amount: 1.4, TaxLineDetail: { TaxRateRef: { value: '3' }, TaxPercent: 5, NetAmountTaxable: 28 } },
+          { Amount: 1.96, TaxLineDetail: { TaxRateRef: { value: '15' }, TaxPercent: 7, NetAmountTaxable: 28 } },
+        ],
+      },
+    };
+    const staged: StagedCategorization = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -2_800, taxCents: 0, totalCents: -2_800 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -2_800,
+        taxCents: 0,
+        totalCents: -2_800,
+        categoryQboId: '99',
+        taxCodeQboId: '7',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged,
+      before: mapPurchaseTaxSnapshot(raw),
+      requestId: 'REQUEST_22746',
+    });
+
+    expect(changedPaths(prepared.body, raw)).toEqual([
+      'Line[0].AccountBasedExpenseLineDetail.AccountRef.value',
+    ]);
+    expect(prepared.expected).toMatchObject({
+      globalTaxCalculation: 'TaxInclusive',
+      totalTaxCents: -336,
+      taxDisposition: 'preserve_current',
+      targetLines: [{
+        id: '1',
+        amountCents: -2_800,
+        description: 'ANTHROPIC* CLAUDE SUB, ANTHROPIC.COM, USA',
+        accountQboId: '99',
+        taxCodeQboId: '7',
+        taxInclusiveCents: -3_136,
+      }],
+    });
+  });
+
+  it('preserves one-to-one source line identity and metadata when set omits memo', () => {
+    const raw: RawPurchase = {
+      Id: '22732',
+      SyncToken: '0',
+      TxnDate: '2026-06-14',
+      TotalAmt: 36.38,
+      PaymentType: 'Cash',
+      AccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      GlobalTaxCalculation: 'TaxInclusive',
+      PrivateNote: 'DEEPLINE.COM, DEEPLINE.COM, USA',
+      Line: [{
+        Id: '1',
+        Description: 'DEEPLINE.COM, DEEPLINE.COM, USA',
+        Amount: 36.38,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          BillableStatus: 'NotBillable',
+          TaxCodeRef: { value: '5' },
+          TaxInclusiveAmt: 36.38,
+        },
+      }],
+    };
+    const categorization: StagedCategorization = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -3_638, taxCents: 0, totalCents: -3_638 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -3_638,
+        taxCents: 0,
+        totalCents: -3_638,
+        categoryQboId: '99',
+        taxCodeQboId: '5',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: categorization,
+      before: mapPurchaseTaxSnapshot(raw),
+      requestId: 'REQUEST_22732',
+    });
+
+    expect(changedPaths(prepared.body, raw)).toEqual([
+      'Line[0].AccountBasedExpenseLineDetail.AccountRef.value',
+    ]);
+    expect(prepared.body.Line![0]).toMatchObject({
+      Id: '1',
+      Description: 'DEEPLINE.COM, DEEPLINE.COM, USA',
+      CustomField: [{ Name: 'source', StringValue: 'preserve me' }],
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: '99', name: 'Uncategorized Expense' },
+        BillableStatus: 'NotBillable',
+        TaxCodeRef: { value: '5' },
+        TaxInclusiveAmt: 36.38,
+      },
+    });
+  });
+
   it.each([
     ['a different source tax code', () => {
       const fixture = preserveCurrentFixture();

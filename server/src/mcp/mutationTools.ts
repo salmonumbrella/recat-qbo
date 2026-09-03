@@ -183,13 +183,6 @@ const proposal = z.strictObject({
   tagIds: uniqueTagIds,
 }).superRefine((value, context) => {
   if (value.taxDisposition === 'preserve_current') {
-    if (value.taxCalculation !== 'NotApplicable') {
-      context.addIssue({
-        code: 'custom',
-        message: 'Preserve-current requires NotApplicable tax calculation.',
-        path: ['taxCalculation'],
-      });
-    }
     if (value.lines.length !== 1) {
       context.addIssue({
         code: 'custom',

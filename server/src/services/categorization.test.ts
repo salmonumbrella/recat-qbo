@@ -1154,6 +1154,63 @@ describe('stageCategorization', () => {
     });
   });
 
+  it('stages a tax-inclusive preserve-current category change from exact source facts', async () => {
+    configureValidPreserveSource(db);
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = '22746';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -28;
+    transaction.rawData = {
+      Id: '22746',
+      SyncToken: '1',
+      TxnDate: '2026-06-11',
+      TotalAmt: 31.36,
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: '1',
+        Amount: 28,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '7' },
+          TaxInclusiveAmt: 31.36,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 3.36 },
+    };
+    db.state.taxCodes = [];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -2_800,
+        categoryQboId: '42',
+        taxCodeQboId: '7',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -2_800, taxCents: 0, totalCents: -2_800 },
+      lines: [{
+        subtotalCents: -2_800,
+        taxCents: 0,
+        totalCents: -2_800,
+        categoryQboId: '42',
+        taxCodeQboId: '7',
+      }],
+    });
+    expect(db.state.transactions[0]).toMatchObject({
+      taxCalculation: 'TaxInclusive',
+      taxCode: '7',
+      taxCodeQboId: '7',
+    });
+  });
+
   it('preserves the authoritative NON sentinel when QBO omits it from tax-code inventory', async () => {
     configureValidPreserveSource(db);
     db.state.taxCodes = [];
@@ -1182,7 +1239,7 @@ describe('stageCategorization', () => {
     });
   });
 
-  it('still rejects an unlisted preserved tax code other than NON', async () => {
+  it('preserves an exact source tax code even when it is absent from selectable inventory', async () => {
     configureValidPreserveSource(db);
     db.state.taxCodes = [];
     const raw = db.state.transactions[0]!.rawData as {
@@ -1199,21 +1256,21 @@ describe('stageCategorization', () => {
       }],
     };
 
-    await expectCode(
-      stageCategorization(input(proposal), testDeps(db)),
-      'INVALID_TAX_CODE',
-    );
+    await expect(stageCategorization(input(proposal), testDeps(db))).resolves.toMatchObject({
+      taxDisposition: 'preserve_current',
+      lines: [{ taxCodeQboId: 'UNLISTED' }],
+    });
   });
 
-  it('does not bypass an existing inactive NON inventory row', async () => {
+  it('preserves an exact inactive source tax code without treating it as a new selection', async () => {
     configureValidPreserveSource(db);
     const non = db.state.taxCodes.find((code) => code.qboId === 'NON')!;
     non.active = false;
 
-    await expectCode(
-      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
-      'INVALID_TAX_CODE',
-    );
+    await expect(stageCategorization(input(preserveCurrentProposal), testDeps(db))).resolves.toMatchObject({
+      taxDisposition: 'preserve_current',
+      lines: [{ taxCodeQboId: 'NON' }],
+    });
   });
 
   it('rejects preserve-current before mutation when existing Recat tags would be lost', async () => {
