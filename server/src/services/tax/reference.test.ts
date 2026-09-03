@@ -203,6 +203,46 @@ describe('refreshTaxReference', () => {
     expect(result.readiness).toMatchObject({ status: 'needs_setup', taxCodes: [] });
   });
 
+  it('publishes a composite sales code and rejects duplicate sales components', async () => {
+    const composite = {
+      ...code('SALES_COMPOSITE'),
+      purchaseRates: [],
+      salesRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE7', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const result = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [composite]),
+    );
+
+    expect(result.readiness).toMatchObject({ salesStatus: 'ready' });
+    expect(result.readiness.salesTaxCodes).toEqual([
+      expect.objectContaining({ qboId: 'SALES_COMPOSITE', combinedSalesRate: 12 }),
+    ]);
+
+    const duplicate = {
+      ...composite,
+      qboId: 'SALES_DUPLICATE',
+      salesRates: [
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+        { taxRateQboId: 'RATE5', taxTypeApplicable: 'TaxOnAmount' },
+      ],
+    };
+    const duplicateResult = await refreshTaxReference(
+      'company-1',
+      { force: true },
+      depsWith(cache, [duplicate]),
+    );
+
+    expect(duplicateResult.readiness).toMatchObject({
+      salesStatus: 'needs_setup',
+      salesTaxCodes: [],
+    });
+  });
+
   it.each([
     ['inactive sales rate', { ...code('SALES'), purchaseRates: [], salesRates: [{ taxRateQboId: 'OLD', taxTypeApplicable: 'TaxOnAmount' }] }, [
       ...rates,

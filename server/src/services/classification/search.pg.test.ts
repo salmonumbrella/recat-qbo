@@ -44,7 +44,11 @@ describePostgres('classification search on PostgreSQL', () => {
     return created;
   }
 
-  async function fixtures(transactionDirection: 'in' | 'out' | 'unknown' = 'out') {
+  async function fixtures(
+    transactionDirection: 'in' | 'out' | 'unknown' = 'out',
+    compositeTax = false,
+  ) {
+    const taxCalculation = compositeTax ? 'TaxInclusive' : 'TaxExcluded';
     const current = await company('Delicious Milk');
     const foreign = await company('Amy Canada');
     await db.company.update({
@@ -67,8 +71,13 @@ describePostgres('classification search on PostgreSQL', () => {
         name: 'HST ON 13%',
         active: true,
         taxable: true,
-        purchaseTaxRateList: [{ taxRateQboId: 'rate-hst-13', taxTypeApplicable: 'TaxOnAmount' }],
-        combinedPurchaseRate: 13,
+        purchaseTaxRateList: compositeTax
+          ? [
+              { taxRateQboId: 'rate-gst-5', taxTypeApplicable: 'TaxOnAmount' },
+              { taxRateQboId: 'rate-pst-7', taxTypeApplicable: 'TaxOnAmount' },
+            ]
+          : [{ taxRateQboId: 'rate-hst-13', taxTypeApplicable: 'TaxOnAmount' }],
+        combinedPurchaseRate: compositeTax ? 12 : 13,
       },
     });
     const tag = await db.tag.create({
@@ -112,7 +121,7 @@ describePostgres('classification search on PostgreSQL', () => {
         matchText: 'Coach Ontario Outlet',
         category: account.name,
         categoryQboId: account.qboId,
-        taxCalculation: 'TaxExcluded',
+        taxCalculation,
         taxCode: taxCode.name,
         taxCodeQboId: taxCode.qboId,
         revision: 2,
@@ -124,7 +133,7 @@ describePostgres('classification search on PostgreSQL', () => {
       data: {
         ruleId: rule.id, companyId: current.id, revision: 2, state: 'enabled',
         matchText: rule.matchText, category: account.name, categoryQboId: account.qboId,
-        taxCalculation: 'TaxExcluded', taxCode: taxCode.name, taxCodeQboId: taxCode.qboId,
+        taxCalculation, taxCode: taxCode.name, taxCodeQboId: taxCode.qboId,
         tagIds: [tag.id], priority: 0, autoPost: false, originIntent: 'make_recurring',
       },
     });
@@ -148,7 +157,7 @@ describePostgres('classification search on PostgreSQL', () => {
         state: 'conflict',
         winningActionFingerprint: 'a'.repeat(64),
         categoryQboId: account.qboId,
-        taxCalculation: 'TaxExcluded',
+        taxCalculation,
         taxCodeQboId: taxCode.qboId,
         evidenceCount: 3,
         conflictingEvidenceCount: 1,
@@ -177,7 +186,7 @@ describePostgres('classification search on PostgreSQL', () => {
         bankAccount: 'Synthetic Bank',
         category: account.name,
         categoryQboId: account.qboId,
-        taxCalculation: 'TaxExcluded',
+        taxCalculation,
         taxCode: taxCode.name,
         taxCodeQboId: taxCode.qboId,
       },
@@ -203,7 +212,7 @@ describePostgres('classification search on PostgreSQL', () => {
         qboMutationAttemptId: attempt.id,
         action: {
           categoryQboId: account.qboId,
-          taxCalculation: 'TaxExcluded',
+          taxCalculation,
           taxCodeQboId: taxCode.qboId,
           tagIds: [tag.id],
         },
@@ -950,6 +959,29 @@ describePostgres('classification search on PostgreSQL', () => {
       [data.current.id],
       [`classification_case:${data.classificationCase.id}`],
     )).resolves.toEqual([]);
+  });
+
+  it('keeps composite tax-inclusive rule and case actions executable', async () => {
+    const data = await fixtures('out', true);
+    const repository = new PrismaClassificationSearchRepository(db);
+
+    const cards = (await repository.rehydrate(
+      [data.current.id],
+      [`rule:${data.rule.id}`, `classification_case:${data.classificationCase.id}`],
+    )).map((record) => record.hit);
+
+    expect(cards).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: `rule:${data.rule.id}`,
+        action: expect.objectContaining({ taxCalculation: 'TaxInclusive' }),
+      }),
+      expect.objectContaining({
+        id: `classification_case:${data.classificationCase.id}`,
+        action: expect.objectContaining({ taxCalculation: 'TaxInclusive' }),
+        executable: true,
+        advisory: false,
+      }),
+    ]));
   });
 
   it('gates rule and case actions on current account, tax, tag, lifecycle, and tenant readiness', async () => {

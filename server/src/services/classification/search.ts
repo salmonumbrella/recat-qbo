@@ -1177,7 +1177,12 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                   AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
                   AND (
                     (tax."taxable" IS TRUE
-                     AND jsonb_array_length(tax."purchaseTaxRateList") = 1
+                     AND (
+                       (memory."action"->>'taxCalculation' = 'TaxInclusive'
+                        AND jsonb_array_length(tax."purchaseTaxRateList") > 0)
+                       OR (memory."action"->>'taxCalculation' = 'TaxExcluded'
+                           AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
+                     )
                      AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
                     OR (tax."taxable" IS FALSE
                         AND jsonb_array_length(tax."purchaseTaxRateList") = 0
@@ -1259,7 +1264,12 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
                   AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
                   AND (
                     (tax."taxable" IS TRUE
-                     AND jsonb_array_length(tax."purchaseTaxRateList") = 1
+                     AND (
+                       (revision."taxCalculation" = 'TaxInclusive'
+                        AND jsonb_array_length(tax."purchaseTaxRateList") > 0)
+                       OR (revision."taxCalculation" = 'TaxExcluded'
+                           AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
+                     )
                      AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
                     OR (tax."taxable" IS FALSE
                         AND jsonb_array_length(tax."purchaseTaxRateList") = 0
