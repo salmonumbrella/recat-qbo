@@ -49,6 +49,54 @@ const MAX_VENDOR_MERGE_HOPS = 20;
 const MAX_VENDOR_IDENTITY_SUPPORT_CODE_POINTS = 24_000;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
 
+function purchaseTaxCodeEligibilitySql(
+  taxCalculation: Prisma.Sql,
+  taxCodeQboId: Prisma.Sql,
+): Prisma.Sql {
+  return Prisma.sql`CASE
+    WHEN ${taxCalculation} = 'NotApplicable'
+      THEN ${taxCodeQboId} IS NULL
+    WHEN ${taxCalculation} IN ('TaxInclusive', 'TaxExcluded')
+      THEN tax."active" IS TRUE
+       AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
+       AND (
+         (tax."taxable" IS TRUE
+          AND (
+            (${taxCalculation} = 'TaxInclusive'
+             AND jsonb_array_length(tax."purchaseTaxRateList") > 0)
+            OR (${taxCalculation} = 'TaxExcluded'
+                AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
+          )
+          AND (
+            SELECT support."componentsValid"
+              AND support."componentCount" = support."distinctComponentCount"
+              AND support."combinedRate" BETWEEN 0::numeric AND 999.999999::numeric
+            FROM (
+              SELECT COUNT(*)::integer AS "componentCount",
+                     COUNT(DISTINCT component.value->>'taxRateQboId')::integer
+                       AS "distinctComponentCount",
+                     COALESCE(BOOL_AND(
+                       jsonb_typeof(component.value) = 'object'
+                       AND NULLIF(btrim(component.value->>'taxRateQboId'), '') IS NOT NULL
+                       AND component.value->>'taxTypeApplicable' = 'TaxOnAmount'
+                       AND rate."qboId" IS NOT NULL
+                       AND rate."active" IS TRUE
+                       AND rate."rateValue" BETWEEN 0::numeric AND 999.999999::numeric
+                     ), false) AS "componentsValid",
+                     SUM(rate."rateValue") AS "combinedRate"
+              FROM jsonb_array_elements(tax."purchaseTaxRateList") AS component(value)
+              LEFT JOIN "QboTaxRate" rate
+                ON rate."companyId" = tax."companyId"
+               AND rate."qboId" = component.value->>'taxRateQboId'
+            ) support
+          ))
+         OR (tax."taxable" IS FALSE
+             AND jsonb_array_length(tax."purchaseTaxRateList") = 0)
+       )
+    ELSE false
+  END`;
+}
+
 export interface ClassificationSearchRecord {
   hit: ClassificationSearchHit;
   revisedAt: string;
@@ -1169,27 +1217,11 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              COALESCE(tax."name", transaction."taxCode") AS "taxCodeName",
              account."active" IS TRUE AS "categoryActive",
              company."taxSupportStatus" = 'ready' AS "taxReady",
-             CASE
-               WHEN memory."action"->>'taxCalculation' = 'NotApplicable'
-                 THEN memory."action"->>'taxCodeQboId' IS NULL
-               WHEN memory."action"->>'taxCalculation' IN ('TaxInclusive', 'TaxExcluded')
-                 THEN tax."active" IS TRUE
-                  AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
-                  AND (
-                    (tax."taxable" IS TRUE
-                     AND (
-                       (memory."action"->>'taxCalculation' = 'TaxInclusive'
-                        AND jsonb_array_length(tax."purchaseTaxRateList") > 0)
-                       OR (memory."action"->>'taxCalculation' = 'TaxExcluded'
-                           AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
-                     )
-                     AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
-                    OR (tax."taxable" IS FALSE
-                        AND jsonb_array_length(tax."purchaseTaxRateList") = 0
-                        AND tax."combinedPurchaseRate" IS NULL)
-                  )
-               ELSE false
-             END AS "taxCodeEligible",
+             ${purchaseTaxCodeEligibilitySql(
+               Prisma.sql`memory."action"->>'taxCalculation'`,
+               Prisma.sql`memory."action"->>'taxCodeQboId'`,
+             )}
+               AS "taxCodeEligible",
              NOT EXISTS (
                SELECT 1
                FROM jsonb_array_elements_text(
@@ -1257,26 +1289,11 @@ export class PrismaClassificationSearchRepository implements ClassificationSearc
              COALESCE(tax."name", revision."taxCode") AS "taxCodeName",
              account."active" IS TRUE AS "categoryActive",
              company."taxSupportStatus" = 'ready' AS "taxReady",
-             CASE
-               WHEN revision."taxCalculation" = 'NotApplicable' THEN revision."taxCodeQboId" IS NULL
-               WHEN revision."taxCalculation" IN ('TaxInclusive', 'TaxExcluded')
-                 THEN tax."active" IS TRUE
-                  AND jsonb_typeof(tax."purchaseTaxRateList") = 'array'
-                  AND (
-                    (tax."taxable" IS TRUE
-                     AND (
-                       (revision."taxCalculation" = 'TaxInclusive'
-                        AND jsonb_array_length(tax."purchaseTaxRateList") > 0)
-                       OR (revision."taxCalculation" = 'TaxExcluded'
-                           AND jsonb_array_length(tax."purchaseTaxRateList") = 1)
-                     )
-                     AND tax."combinedPurchaseRate" BETWEEN 0 AND 999.999999)
-                    OR (tax."taxable" IS FALSE
-                        AND jsonb_array_length(tax."purchaseTaxRateList") = 0
-                        AND tax."combinedPurchaseRate" IS NULL)
-                  )
-               ELSE false
-             END AS "taxCodeEligible",
+             ${purchaseTaxCodeEligibilitySql(
+               Prisma.sql`revision."taxCalculation"`,
+               Prisma.sql`revision."taxCodeQboId"`,
+             )}
+               AS "taxCodeEligible",
              NOT EXISTS (
                SELECT 1
                FROM jsonb_array_elements(CASE WHEN jsonb_typeof(revision."tagIds") = 'array'

@@ -64,6 +64,29 @@ describePostgres('classification search on PostgreSQL', () => {
         classification: 'COGS',
       },
     });
+    await db.qboTaxRate.createMany({
+      data: compositeTax
+        ? [
+            {
+              companyId: current.id,
+              qboId: 'rate-gst-5',
+              name: 'GST 5%',
+              rateValue: 5,
+            },
+            {
+              companyId: current.id,
+              qboId: 'rate-pst-7',
+              name: 'PST 7%',
+              rateValue: 7,
+            },
+          ]
+        : [{
+            companyId: current.id,
+            qboId: 'rate-hst-13',
+            name: 'HST 13%',
+            rateValue: 13,
+          }],
+    });
     const taxCode = await db.qboTaxCode.create({
       data: {
         companyId: current.id,
@@ -964,6 +987,15 @@ describePostgres('classification search on PostgreSQL', () => {
   it('keeps composite tax-inclusive rule and case actions executable', async () => {
     const data = await fixtures('out', true);
     const repository = new PrismaClassificationSearchRepository(db);
+    await db.qboTaxCode.update({
+      where: {
+        companyId_qboId: {
+          companyId: data.current.id,
+          qboId: data.taxCode.qboId,
+        },
+      },
+      data: { combinedPurchaseRate: null },
+    });
 
     const cards = (await repository.rehydrate(
       [data.current.id],
