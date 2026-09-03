@@ -607,6 +607,7 @@ function validTaxReference(
 ): boolean {
   if (calculation === 'NotApplicable') return taxCodeQboId === null;
   if (tax.status !== 'ready') return false;
+  if (!tax.supportedCalculationModes.includes(calculation)) return false;
   if (transactionLevel && (taxCodeQboId === null || taxCodeQboId === undefined)) return true;
   return isReference(taxCodeQboId) && taxIds.has(taxCodeQboId);
 }

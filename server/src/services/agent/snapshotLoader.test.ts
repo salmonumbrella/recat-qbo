@@ -3,6 +3,7 @@ import {
   loadAgentSnapshotSource,
   type AgentSnapshotLoaderDb,
 } from './snapshotLoader.js';
+import { buildAgentSnapshot } from './core/snapshot.js';
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TRANSACTION_ID = '11111111-1111-4111-8111-111111111111';
@@ -104,35 +105,12 @@ describe('agent snapshot loader', () => {
         ],
       },
       tags: [{ id: TAG_ID, name: 'Generic tag' }],
-      rules: [{
-        id: RULE_ID,
-        priority: 1,
-        matchField: 'payee',
-        matchText: 'merchant',
-        categoryQboId: 'expense-a',
-        taxCalculation: 'TaxExcluded',
-        taxCodeQboId: 'tax-a',
-        tagIds: [TAG_ID],
-      }],
-      similarVerifiedTransactions: [{
-        transactionId: HISTORY_ID,
-        date: '2026-07-20',
-        signedAmountCents: -12_345,
-        currency: 'CAD',
-        payee: 'Earlier merchant',
-        taxCalculation: 'TaxExcluded',
-        lines: [{
-          signedGrossCents: -12_345,
-          categoryQboId: 'expense-a',
-          taxCodeQboId: 'tax-a',
-          tagIds: [],
-        }],
-        tagIds: [TAG_ID],
-        verifiedAt: '2026-07-21T00:00:00.000Z',
-      }],
+      rules: [],
+      similarVerifiedTransactions: [],
       featureVersion: 'shadow-core.1',
       configurationVersion: 'config-v7',
     });
+    expect(() => buildAgentSnapshot(source)).not.toThrow();
     expect(JSON.stringify(source)).not.toContain('123456789');
     const taxSql = query.mock.calls
       .map(([sql]) => sql)
