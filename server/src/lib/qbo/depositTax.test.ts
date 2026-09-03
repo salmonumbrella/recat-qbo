@@ -123,6 +123,7 @@ describe('prepareDepositRecategorization', () => {
         Description: 'Deposit from CANADA XXXXXXXXXXXX8746000144 - GA (Delicious Milk Corporation, 4251)',
         Amount: 4631.83,
         DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
         DepositLineDetail: {
           AccountRef: { value: '1', name: '42000 Uncategorized Income' },
           TaxCodeRef: { value: '5' },

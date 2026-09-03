@@ -278,6 +278,7 @@ const RESTORABLE_LINE_FIELDS = new Set([
   'Description',
   'DetailType',
   'DepositLineDetail',
+  'CustomExtensions',
 ]);
 
 const RESTORABLE_DETAIL_FIELDS = new Set([
@@ -306,6 +307,8 @@ function assertRestorableHoldingLine(line: RawDepositLine): void {
   const unsupportedLineField = Object.keys(line).find(
     (field) => !RESTORABLE_LINE_FIELDS.has(field),
   );
+  const unsupportedCustomExtensions = line.CustomExtensions !== undefined &&
+    (!Array.isArray(line.CustomExtensions) || line.CustomExtensions.length !== 0);
   const detail = line.DepositLineDetail;
   const unsupportedDetailField = detail === undefined
     ? undefined
@@ -315,6 +318,7 @@ function assertRestorableHoldingLine(line: RawDepositLine): void {
     : DETAIL_REFERENCE_FIELDS.find((field) => hasUnsupportedReferenceField(detail[field]));
   if (
     unsupportedLineField === undefined &&
+    !unsupportedCustomExtensions &&
     unsupportedDetailField === undefined &&
     unsupportedReferenceField === undefined
   ) return;
