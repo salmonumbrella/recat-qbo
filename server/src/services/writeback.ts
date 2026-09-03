@@ -42,6 +42,7 @@ import {
 } from '../lib/qbo/purchaseTax.js';
 import { verifyPreparedResult } from './tax/verify.js';
 import { cachedSalesTaxReadiness } from './tax/reference.js';
+import { cachedTaxRates, deriveCachedTaxCodeRates } from './tax/cache.js';
 import { lockCompanyMutationScope } from './companyMutationScope.js';
 import { legacyStagingRequired } from './legacyWriteLifecycle.js';
 import {
@@ -444,15 +445,21 @@ async function legacyNeedsStaging(
   });
   if (durableAttempt !== null) return true;
   const cachedCodes = txn.qboType === 'Deposit'
-    ? await db.qboTaxCode.findMany({
-        where: { companyId: txn.companyId },
-        select: {
-          active: true,
-          taxable: true,
-          salesTaxRateList: true,
-          combinedSalesRate: true,
-        },
-      })
+    ? await Promise.all([
+        db.qboTaxCode.findMany({
+          where: { companyId: txn.companyId },
+          select: {
+            active: true,
+            taxable: true,
+            purchaseTaxRateList: true,
+            salesTaxRateList: true,
+          },
+        }),
+        db.qboTaxRate.findMany({
+          where: { companyId: txn.companyId, active: true, rateValue: { not: null } },
+          select: { qboId: true, active: true, rateValue: true },
+        }),
+      ]).then(([codes, rates]) => deriveCachedTaxCodeRates(codes, rates))
     : [];
   return legacyStagingRequired({
     ...baseState,
@@ -1595,11 +1602,12 @@ async function loadAuthorizedStage(
     ) {
       lifecycleError('TAX_CODE_UNAVAILABLE', 'A prepared tax code is no longer available.');
     }
+    const derivedTaxCodes = deriveCachedTaxCodeRates(taxCodes, taxRates);
     const taxReady =
       txn.qboType === 'Deposit'
         ? cachedSalesTaxReadiness(
             txn.company.taxUsingSalesTax,
-            taxCodes,
+            derivedTaxCodes,
             txn.company.taxSupportReason,
           ).status === 'ready'
         : txn.company.taxSupportStatus === 'ready' &&
@@ -1623,14 +1631,7 @@ async function loadAuthorizedStage(
         salesRates: asPurchaseRates(code.salesTaxRateList),
         sourceUpdatedAt: null,
       })),
-      rates: taxRates.filter((rate) => rate.rateValue !== null).map((rate) => ({
-        qboId: rate.qboId,
-        name: rate.name,
-        description: null,
-        active: rate.active,
-        rateValue: Number(rate.rateValue),
-        sourceUpdatedAt: null,
-      })),
+      rates: cachedTaxRates(taxRates),
     };
     const calculate = (
       mode: 'TaxInclusive' | 'TaxExcluded',

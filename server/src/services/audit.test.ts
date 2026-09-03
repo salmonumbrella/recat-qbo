@@ -5,6 +5,7 @@ const prismaMock = vi.hoisted(() => ({
   transaction: { findMany: vi.fn() },
   auditEntry: { findMany: vi.fn() },
   qboTaxCode: { findMany: vi.fn() },
+  qboTaxRate: { findMany: vi.fn() },
 }));
 
 vi.mock('../lib/prisma.js', () => ({ prisma: prismaMock }));
@@ -88,6 +89,7 @@ describe('decorateAuditEntriesWithUndo', () => {
     prismaMock.transaction.findMany.mockReset();
     prismaMock.auditEntry.findMany.mockReset();
     prismaMock.qboTaxCode.findMany.mockReset();
+    prismaMock.qboTaxRate.findMany.mockReset();
   });
 
   it('offers durable undo only on the latest current verified categorization write', () => {
@@ -292,6 +294,36 @@ describe('decorateAuditEntriesWithUndo', () => {
 
     expect(page.entries[0]?.undo).toBeUndefined();
     expect(prismaMock.qboTaxCode.findMany).not.toHaveBeenCalled();
+  });
+
+  it('does not offer legacy Deposit undo when sales readiness is derivable from rate rows', async () => {
+    prismaMock.auditEntry.findMany
+      .mockResolvedValueOnce([{
+        id: 'audit-deposit', companyId: 'c1', at: new Date(), actorId: null,
+        actorLabel: 'Josh', txnId: 'transaction-deposit', payee: 'Deposit', amount: 107,
+        action: 'posted', before: 'Uncategorized Income', after: 'Sales', payload: null,
+      }])
+      .mockResolvedValueOnce([{ id: 'audit-deposit', txnId: 'transaction-deposit', payload: null }]);
+    prismaMock.transaction.findMany.mockResolvedValueOnce([{
+      id: 'transaction-deposit', status: 'POSTED', postedAt: new Date(), qboType: 'Deposit',
+      taxCalculation: null, taxCodeQboId: null, splitLines: [], qboMutationAttempts: [],
+      _count: { qboMutationAttempts: 0 },
+      company: { taxSupportStatus: 'needs_setup', taxUsingSalesTax: true, taxSupportReason: null },
+    }]);
+    prismaMock.qboTaxCode.findMany.mockResolvedValueOnce([{
+      active: true,
+      taxable: true,
+      salesTaxRateList: [{ taxRateQboId: 'sales-rate', taxTypeApplicable: 'TaxOnAmount' }],
+      combinedSalesRate: null,
+    }]);
+    prismaMock.qboTaxRate.findMany.mockResolvedValueOnce([{
+      qboId: 'sales-rate', name: 'Sales tax', description: null, active: true,
+      rateValue: 5, sourceUpdatedAt: null,
+    }]);
+
+    const page = await listAudit('c1');
+
+    expect(page.entries[0]?.undo).toBeUndefined();
   });
 });
 

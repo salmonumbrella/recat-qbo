@@ -16,7 +16,7 @@ import {
   reconstructSalesTaxExcludedTransaction,
 } from '../lib/qbo/purchaseTax.js';
 import { cachedSalesTaxReadiness } from './tax/reference.js';
-import { cachedTaxCodeSupport, cachedTaxRates } from './tax/cache.js';
+import { cachedTaxRates, deriveCachedTaxCodeRates } from './tax/cache.js';
 import {
   EntityLeaseError,
   fenceEntityLeaseOwnership,
@@ -702,10 +702,7 @@ async function validateStage(
       throw new CategorizationError('TRANSACTION_NOT_FOUND', 'Transaction company was not found.');
     }
     const cachedRates = cachedTaxRates(taxRates);
-    const derivedTaxCodes = taxCodes.map((code) => ({
-      ...code,
-      combinedSalesRate: cachedTaxCodeSupport(code, cachedRates, 'sales').combinedRate,
-    }));
+    const derivedTaxCodes = deriveCachedTaxCodeRates(taxCodes, taxRates);
     const ready = transaction.qboType === 'Deposit'
       ? cachedSalesTaxReadiness(
           company.taxUsingSalesTax,

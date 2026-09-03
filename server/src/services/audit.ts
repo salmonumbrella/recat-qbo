@@ -11,6 +11,7 @@ import {
 } from '@recat/shared';
 import { prisma } from '../lib/prisma.js';
 import { legacyStagingRequired } from './legacyWriteLifecycle.js';
+import { deriveCachedTaxCodeRates } from './tax/cache.js';
 import { ACTIVE_ATTEMPT_STATUSES } from './writeback.js';
 
 /** Either the root client or an interactive-transaction client. */
@@ -372,20 +373,27 @@ async function decoratePageWithUndo(
     ...txn,
     hasActiveAttempt: txn.qboMutationAttempts.length > 0,
   }));
-  const cachedSalesTaxCodes = auditPageNeedsSalesTaxCodes(
+  const needsSalesTaxCodes = auditPageNeedsSalesTaxCodes(
     entries,
     transactionsWithAttemptState,
     postedEntries,
-  )
-    ? await prisma.qboTaxCode.findMany({
-      where: { companyId },
-      select: {
-        active: true,
-        taxable: true,
-        salesTaxRateList: true,
-        combinedSalesRate: true,
-      },
-    })
+  );
+  const cachedSalesTaxCodes = needsSalesTaxCodes
+    ? await Promise.all([
+        prisma.qboTaxCode.findMany({
+          where: { companyId },
+          select: {
+            active: true,
+            taxable: true,
+            purchaseTaxRateList: true,
+            salesTaxRateList: true,
+          },
+        }),
+        prisma.qboTaxRate.findMany({
+          where: { companyId, active: true, rateValue: { not: null } },
+          select: { qboId: true, active: true, rateValue: true },
+        }),
+      ]).then(([codes, rates]) => deriveCachedTaxCodeRates(codes, rates))
     : [];
   return decorateAuditEntriesWithUndo(
     entries,

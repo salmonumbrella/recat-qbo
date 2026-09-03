@@ -253,6 +253,16 @@ function makeFakeDb(row: FakeTxnRow) {
     qboTaxCode: {
       findMany: vi.fn(async () => row.company.cachedSalesCodes ?? []),
     },
+    qboTaxRate: {
+      findMany: vi.fn(async () => [{
+        qboId: 'sales-rate-generic',
+        name: 'Generic sales rate',
+        description: null,
+        active: true,
+        rateValue: 5,
+        sourceUpdatedAt: null,
+      }]),
+    },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db)),
   };
   return db;
@@ -611,7 +621,7 @@ describe('undoPost', () => {
             taxRateQboId: 'sales-rate-generic',
             taxTypeApplicable: 'TaxOnAmount',
           }],
-          combinedSalesRate: 5,
+          combinedSalesRate: null,
         }],
       },
     });
@@ -799,7 +809,7 @@ describe('postTransaction guards', () => {
             taxRateQboId: 'sales-rate-generic',
             taxTypeApplicable: 'TaxOnAmount',
           }],
-          combinedSalesRate: 5,
+          combinedSalesRate: null,
         }],
       },
     });
@@ -5061,6 +5071,21 @@ function depositDurableFixture() {
 
 it('filters legacy null tax rates before a durable Deposit commit', async () => {
   const fixture = depositDurableFixture();
+  fixture.db.qboTaxCode.findMany.mockImplementation(async () => [{
+    qboId: 'tax-generic',
+    name: 'Generic tax',
+    active: true,
+    taxable: true,
+    purchaseTaxRateList: [{
+      taxRateQboId: 'rate-generic',
+      taxTypeApplicable: 'TaxOnAmount',
+    }],
+    salesTaxRateList: [{
+      taxRateQboId: 'rate-generic',
+      taxTypeApplicable: 'TaxOnAmount',
+    }],
+    combinedSalesRate: null,
+  }]);
   fixture.db.qboTaxRate.findMany.mockImplementation(async (args) => {
     expect(args).toEqual({
       where: {

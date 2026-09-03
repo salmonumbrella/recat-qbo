@@ -1,7 +1,7 @@
 import type { QboTaxRateInfo } from '../../lib/qbo/types.js';
 import { isSupportedTaxRateValue } from '../../lib/qbo/purchaseTax.js';
 
-interface CachedTaxRateRow {
+export interface CachedTaxRateRow {
   qboId: unknown;
   name?: unknown;
   description?: unknown;
@@ -10,7 +10,7 @@ interface CachedTaxRateRow {
   sourceUpdatedAt?: unknown;
 }
 
-interface CachedTaxCodeRow {
+export interface CachedTaxCodeRow {
   active: unknown;
   taxable: unknown;
   purchaseTaxRateList?: unknown;
@@ -119,4 +119,16 @@ export function cachedTaxCodeSupport(
     }
   }
   return { supported: true, combinedRate, componentCount: parsed.length };
+}
+
+export function deriveCachedTaxCodeRates<T extends CachedTaxCodeRow>(
+  codes: readonly T[],
+  rateRows: readonly CachedTaxRateRow[],
+): Array<T & { combinedPurchaseRate: number | null; combinedSalesRate: number | null }> {
+  const rates = cachedTaxRates(rateRows);
+  return codes.map((code) => ({
+    ...code,
+    combinedPurchaseRate: cachedTaxCodeSupport(code, rates, 'purchase').combinedRate,
+    combinedSalesRate: cachedTaxCodeSupport(code, rates, 'sales').combinedRate,
+  }));
 }
