@@ -5455,6 +5455,55 @@ describe.each(['Purchase', 'Deposit'] as const)(
   },
 );
 
+describe('fresh prepared snapshot source', () => {
+  it('derives the Purchase before-image from the same live entity used to prepare the write', async () => {
+    const fixture = durableDeps();
+    const fresh = currentQboTxn();
+    fresh.raw = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 10.5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+        },
+      }],
+    };
+    fixture.client.fetchTxn = vi.fn(async () => fresh);
+    fixture.fetchPreparedSnapshot.mockReset().mockResolvedValue(
+      structuredClone(verifiedPurchase),
+    );
+
+    await expect(
+      commitStagedCategorization(commitInput(), fixture.deps),
+    ).resolves.toMatchObject({ ok: true, status: 'POSTED', outcome: 'VERIFIED' });
+
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      fresh,
+      expect.objectContaining({
+        transactionId: stagedPurchase.transactionId,
+        revision: stagedPurchase.revision,
+        taxCalculation: stagedPurchase.taxCalculation,
+        totals: stagedPurchase.totals,
+      }),
+      expect.objectContaining({
+        qboId: 'purchase-generic',
+        syncToken: '7',
+        preservedHash: expect.any(String),
+        lines: [expect.objectContaining({ rawHash: expect.any(String) })],
+      }),
+      'request-generic',
+    );
+    expect(fixture.fetchPreparedSnapshot).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('Deposit durable lifecycle matrix', () => {
   it('persists the Deposit union member before send and fences the Deposit entity', async () => {
     const fixture = depositDurableFixture();

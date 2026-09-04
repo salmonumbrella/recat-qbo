@@ -33,6 +33,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTxn,
   type QboWriteResult,
+  type RawDeposit,
   type RawPurchase,
 } from '../lib/qbo/types.js';
 import {
@@ -43,6 +44,7 @@ import {
   reconstructPurchaseTaxExcludedTransaction,
   reconstructSalesTaxExcludedTransaction,
 } from '../lib/qbo/purchaseTax.js';
+import { mapDepositSnapshot } from '../lib/qbo/depositTax.js';
 import { verifyPreparedResult } from './tax/verify.js';
 import { cachedSalesTaxReadiness } from './tax/reference.js';
 import { cachedTaxRates, deriveCachedTaxCodeRates } from './tax/cache.js';
@@ -1446,6 +1448,23 @@ function purchaseStageBalanceCents(txn: DurableTransaction): number {
     return holdingGrossCents;
   }
   return transactionCents;
+}
+
+function preparedSnapshotFromFreshTxn(
+  txn: QboTxn,
+): QboPurchaseSnapshot | QboDepositSnapshot | null {
+  try {
+    if (txn.qboType === 'Purchase') {
+      return mapPurchaseTaxSnapshot(txn.raw as RawPurchase);
+    }
+    if (txn.qboType === 'Deposit') {
+      return mapDepositSnapshot(txn.raw as RawDeposit);
+    }
+  } catch {
+    // Compatibility clients and older test doubles may not expose a complete
+    // raw entity. Their explicit prepared-snapshot read remains the fallback.
+  }
+  return null;
 }
 
 function asPurchaseRates(value: unknown): {
@@ -4163,11 +4182,13 @@ async function commitStagedCategorizationInternal(
     await d.renewLease(leaseKey(txn), invocationOwner);
     const client = await d.getClient(input.companyId);
     const qboType = txn.qboType as 'Purchase' | 'Deposit';
-    const [freshTxn, before] = await Promise.all([
-      client.fetchTxn(qboType, txn.qboId),
-      client.fetchPreparedSnapshot(qboType, txn.qboId),
-    ]);
-    if (!freshTxn || !before) {
+    const freshTxn = await client.fetchTxn(qboType, txn.qboId);
+    if (!freshTxn) {
+      lifecycleError('QBO_STATE_DRIFT', `${qboType} no longer exists in QuickBooks.`);
+    }
+    const before = preparedSnapshotFromFreshTxn(freshTxn)
+      ?? await client.fetchPreparedSnapshot(qboType, txn.qboId);
+    if (!before) {
       lifecycleError('QBO_STATE_DRIFT', `${qboType} no longer exists in QuickBooks.`);
     }
     if (
