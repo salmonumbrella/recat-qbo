@@ -269,7 +269,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly seventeen core reads and twenty-two conservatively annotated action tools', async () => {
+  it('registers exactly seventeen core reads and twenty-three conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -280,6 +280,7 @@ describe('Recat MCP read tools', () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       ...READ_TOOL_NAMES,
       'prepare_categorization',
+      'get_prepared_categorization',
       'commit_categorization',
       'get_operation',
       'retry_operation',
@@ -302,7 +303,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(39);
+    expect(tools).toHaveLength(40);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -322,6 +323,15 @@ describe('Recat MCP read tools', () => {
           readOnlyHint: false,
           destructiveHint: true,
           idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'get_prepared_categorization',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
           openWorldHint: false,
         },
       },
