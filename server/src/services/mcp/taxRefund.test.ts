@@ -212,6 +212,10 @@ describe('prepareMcpTaxRefund', () => {
       qboId: 'TEST-DEPOSIT-1',
       qboSyncToken: '0',
     }), expect.anything());
+    const operationDependencies = deps.createOperation.mock.calls[0]![1];
+    expect(operationDependencies.expiresAt()).toEqual(
+      new Date('9999-12-31T23:59:59.999Z'),
+    );
   });
 
   it.each([
@@ -381,5 +385,23 @@ describe('prepareMcpTaxRefund', () => {
     expect(caught).toBeInstanceOf(McpTaxRefundError);
     expect(caught).toMatchObject({ code: 'SOURCE_ALREADY_PREPARED' });
     expect(deps.loadTransaction).not.toHaveBeenCalled();
+  });
+
+  it('maps a concurrent source-reservation loss to an actionable conflict', async () => {
+    const deps = dependencies();
+    deps.loadSourcePreparation
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(replayOperation());
+    deps.createOperation.mockRejectedValue(new McpOperationError('OPERATION_CONFLICT'));
+
+    const caught = await prepareMcpTaxRefund(
+      principal,
+      input(),
+      deps,
+    ).catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(McpTaxRefundError);
+    expect(caught).toMatchObject({ code: 'SOURCE_ALREADY_PREPARED' });
+    expect(deps.loadSourcePreparation).toHaveBeenCalledTimes(2);
   });
 });

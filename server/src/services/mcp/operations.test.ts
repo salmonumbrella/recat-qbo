@@ -155,6 +155,19 @@ describe('createPreparedOperation', () => {
     expect(MCP_OPERATION_EXPIRY_MS).toBe(15 * 60 * 1000);
   });
 
+  it('accepts an explicit later expiry for governed manual operations', async () => {
+    const { store } = createStore();
+    const expiresAt = new Date('9999-12-31T23:59:59.999Z');
+
+    const operation = await createPreparedOperation(input(), {
+      store,
+      now: () => NOW,
+      expiresAt: () => expiresAt,
+    });
+
+    expect(operation.expiresAt).toEqual(expiresAt);
+  });
+
   it('accepts transfer envelopes and detects any private second-leg binding change', async () => {
     const { store } = createStore();
     const operation = await createPreparedOperation(input({

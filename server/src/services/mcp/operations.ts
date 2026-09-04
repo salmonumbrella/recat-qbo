@@ -227,6 +227,7 @@ export type McpOperationPersistence =
 export interface McpOperationDependencies {
   store?: McpOperationPersistence;
   now?: () => Date;
+  expiresAt?: () => Date;
 }
 
 export interface CreatePreparedOperationInput {
@@ -340,8 +341,9 @@ export async function createPreparedOperation(
     qboSyncToken,
     retryOfId,
   });
-  const expiresAt = new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
-  if (!isValidDate(expiresAt)) invalidInput();
+  const expiresAt = dependencies.expiresAt?.()
+    ?? new Date(now.getTime() + MCP_OPERATION_EXPIRY_MS);
+  if (!isValidDate(expiresAt) || expiresAt.getTime() <= now.getTime()) invalidInput();
 
   const data: McpOperationCreateData = {
     tokenId,

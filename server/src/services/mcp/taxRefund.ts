@@ -24,6 +24,7 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const MAX_REFERENCE = 120;
 const MAX_WARNINGS = 8;
 const MAX_WARNING = 500;
+const MANUAL_REFUND_EXPIRY = '9999-12-31T23:59:59.999Z';
 
 export interface PrepareMcpTaxRefundInput {
   companyId: string;
@@ -165,7 +166,7 @@ export interface McpTaxRefundDeps {
   getClient?: (companyId: string) => Promise<QboClient>;
   createOperation?: (
     input: CreatePreparedOperationInput,
-    dependencies?: { now?: () => Date },
+    dependencies?: { now?: () => Date; expiresAt?: () => Date },
   ) => Promise<McpOperationRecord>;
   now?: () => Date;
 }
@@ -307,21 +308,33 @@ export async function prepareMcpTaxRefund(
     'The existing Deposit must be replaced or matched before verification so cash is not duplicated.',
   ];
   const createOperation = dependencies.createOperation ?? createPreparedOperation;
-  const operation = await createOperation({
-    principal,
-    companyId: input.companyId,
-    transactionId: source.id,
-    toolName: TOOL_NAME,
-    kind: 'tax_refund',
-    idempotencyKey,
-    payload: { capability: capability.mode, preview, warnings },
-    sourceRevision: source.revision,
-    preparedRevision: source.revision,
-    qboType: source.qboType,
-    qboId: source.qboId,
-    qboSyncToken: source.qboSyncToken,
-    retryOfId: null,
-  }, { now: () => now });
+  let operation: McpOperationRecord;
+  try {
+    operation = await createOperation({
+      principal,
+      companyId: input.companyId,
+      transactionId: source.id,
+      toolName: TOOL_NAME,
+      kind: 'tax_refund',
+      idempotencyKey,
+      payload: { capability: capability.mode, preview, warnings },
+      sourceRevision: source.revision,
+      preparedRevision: source.revision,
+      qboType: source.qboType,
+      qboId: source.qboId,
+      qboSyncToken: source.qboSyncToken,
+      retryOfId: null,
+    }, {
+      now: () => now,
+      expiresAt: () => new Date(MANUAL_REFUND_EXPIRY),
+    });
+  } catch (error) {
+    if (error instanceof McpOperationError && error.code === 'OPERATION_CONFLICT') {
+      const winner = await loadSourcePreparation(input.companyId, input.transactionId);
+      if (winner !== null) throw new McpTaxRefundError('SOURCE_ALREADY_PREPARED');
+    }
+    throw error;
+  }
 
   return {
     operationId: operation.id,
