@@ -236,6 +236,7 @@ describe('MCP tool results', () => {
       'TAX_RATE_UNAVAILABLE',
       'TAX_RATE_UNSUPPORTED',
       'TAX_TREATMENT_AMBIGUOUS',
+      'QBO_DEPOSIT_UNSUPPORTED',
     ].map((code) => [
       new WritebackLifecycleError(code, 'PRIVATE_WRITE_TAX_SENTINEL'),
       'INVALID_INPUT',

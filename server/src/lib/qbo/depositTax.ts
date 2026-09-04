@@ -495,7 +495,10 @@ export function prepareDepositRecategorization(args: {
   if (holdingLineIndexes.length === 0) {
     preparationError('QBO_STATE_DRIFT', 'Transaction no longer has an eligible holding-account line.');
   }
-  if (args.staged.lines.length !== holdingRawLines.length) {
+  if (
+    args.staged.lines.length !== holdingRawLines.length
+    && holdingRawLines.length !== 1
+  ) {
     preparationError(
       'QBO_DEPOSIT_UNSUPPORTED',
       'Prepared transaction must update every holding-account line in place.',
@@ -540,7 +543,7 @@ export function prepareDepositRecategorization(args: {
       line,
       args.staged.taxCalculation,
       preserved,
-      holdingRawLines[index],
+      holdingRawLines[holdingRawLines.length === 1 ? 0 : index],
     ));
   const newSnapshotLines = newRawLines.map(snapshotLine);
   const totalTaxCents = safeCentSum([keptTaxCents, args.staged.totals.taxCents]);

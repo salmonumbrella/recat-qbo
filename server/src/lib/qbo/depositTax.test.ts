@@ -188,6 +188,58 @@ describe('prepareDepositRecategorization', () => {
     });
   });
 
+  it('splits one holding Deposit line into reviewed zero-rate lines', () => {
+    const raw: RawDeposit = {
+      Id: '22529',
+      SyncToken: '0',
+      TxnDate: '2026-06-16',
+      DepositToAccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 6248.91,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Deposit from CANADA XXXXXXXXXXXX5746000249 - GA (Delicious Milk Corporation, 4251)',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Deposit from CANADA XXXXXXXXXXXX5746000249 - GA (Delicious Milk Corporation, 4251)',
+        Amount: 6248.91,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: '42000 Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '7b8d71be-83b4-4a5d-bf64-f409709ccb36',
+        revision: 2,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 624_891, taxCents: 0, totalCents: 624_891 },
+        lines: [
+          { idx: 0, subtotalCents: 624_634, taxCents: 0, totalCents: 624_634, categoryQboId: '54', taxCodeQboId: '5', memo: null, tagIds: [] },
+          { idx: 1, subtotalCents: 257, taxCents: 0, totalCents: 257, categoryQboId: '46', taxCodeQboId: '5', memo: null, tagIds: [] },
+        ],
+        tagIds: [],
+      },
+      before: mapDepositSnapshot(raw),
+      requestId: '9cd3a196-bf3f-45c8-95ef-f87663432fc1',
+    });
+
+    expect(prepared.body.Line).toMatchObject([
+      { Id: '1', Amount: 6246.34, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: '54' }, TaxCodeRef: { value: '5' } } },
+      { Amount: 2.57, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: '46' }, TaxCodeRef: { value: '5' } } },
+    ]);
+    expect(prepared.expected.targetLines).toHaveLength(2);
+  });
+
   it('preserves a replaced Deposit line description when the proposal memo is null', () => {
     const raw: RawDeposit = {
       Id: '22518',
@@ -497,7 +549,7 @@ describe('prepareDepositRecategorization', () => {
     );
   });
 
-  it('rejects staged lines that would append beyond the existing holding lines', () => {
+  it('rejects expanding multiple holding lines beyond the existing in-place shape', () => {
     const splitStage: StagedCategorization = {
       ...staged(),
       lines: [
@@ -515,10 +567,27 @@ describe('prepareDepositRecategorization', () => {
           totalCents: 4_280,
           categoryQboId: 'income-second',
         },
+        {
+          ...staged().lines[0]!,
+          idx: 2,
+          subtotalCents: 0,
+          taxCents: 0,
+          totalCents: 0,
+          categoryQboId: 'income-third',
+        },
       ],
     };
 
-    expect(() => prepare(completeDeposit(), splitStage)).toThrowError(
+    const base = completeDeposit();
+    const raw = completeDeposit({
+      Line: [
+        { ...base.Line![0]!, Id: 'holding-line-a', Amount: 64.2 },
+        { ...base.Line![0]!, Id: 'holding-line-b', Amount: 42.8 },
+        base.Line![1]!,
+      ],
+    });
+
+    expect(() => prepare(raw, splitStage)).toThrowError(
       expect.objectContaining<QboDepositPreparationError>({ code: 'QBO_DEPOSIT_UNSUPPORTED' }),
     );
   });
