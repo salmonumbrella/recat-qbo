@@ -1337,6 +1337,17 @@ describe('stageCategorization', () => {
     });
   });
 
+  it('reports a bounded preserve-source diagnostic when the stored header is not authoritative', async () => {
+    configureValidPreserveSource(db);
+    const raw = db.state.transactions[0]!.rawData as { SyncToken: string };
+    raw.SyncToken = 'stale';
+
+    await expectCode(
+      stageCategorization(input(preserveCurrentProposal), testDeps(db)),
+      'PRESERVE_SOURCE_HEADER_INVALID',
+    );
+  });
+
   it('stages a tax correction against the tax-inclusive holding gross instead of its old net', async () => {
     const transaction = db.state.transactions[0]!;
     transaction.qboId = '22557';
@@ -1500,8 +1511,10 @@ describe('stageCategorization', () => {
       };
     }],
     ['an unchanged target category', () => {
-      db.state.transactions[0]!.categoryQboId = '42';
-      return preserveCurrentProposal;
+      return {
+        ...preserveCurrentProposal,
+        lines: [{ ...preserveCurrentProposal.lines[0]!, categoryQboId: '2' }],
+      };
     }],
     ['a split proposal', () => ({
       ...preserveCurrentProposal,
@@ -1524,13 +1537,7 @@ describe('stageCategorization', () => {
     })],
   ])('rejects preserve-current with %s before replacing staged rows', async (_name, proposal) => {
     db.state.transactions[0]!.amount = -750;
-    db.state.accounts.push({
-      companyId: COMPANY_ID,
-      qboId: '42',
-      name: 'Bank Charges',
-      fullName: 'Expenses · Bank Charges',
-      active: true,
-    });
+    configureValidPreserveSource(db);
     const proposed = proposal();
     const before = structuredClone(db.state);
 

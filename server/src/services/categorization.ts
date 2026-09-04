@@ -456,7 +456,7 @@ function preserveCurrentSource(
     || totalCents === null
   ) {
     throw new CategorizationError(
-      'INVALID_INPUT',
+      'PRESERVE_SOURCE_HEADER_INVALID',
       'Synchronized Purchase identity, amount, tax mode, or single-line shape is not authoritative.',
     );
   }
