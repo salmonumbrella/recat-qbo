@@ -554,6 +554,24 @@ describe('MCP attachment operation dispatch', () => {
     )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
   });
 
+  it('keeps a manual refund visible after the creating MCP token rotates', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      tokenId: 'retired-token',
+      tokenPrefix: 'rct_retired',
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      error: { code: 'MANUAL_QBO_TAX_REFUND_REQUIRED' },
+    });
+  });
+
   it('projects an acknowledged manual refund as awaiting verification, not another QBO action', async () => {
     const value = fixture();
     value.operations.splice(0, 1, taxRefundOperation({

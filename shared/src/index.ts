@@ -361,7 +361,9 @@ export type AuditAction =
   | 'attachment_reconciled'
   | 'attachment_local_copy_deleted'
   | 'attachment_deleted_everywhere'
-  | 'attachment_error';
+  | 'attachment_error'
+  | 'tax-refund-cancelled'
+  | 'tax-refund-recorded';
 
 /** Server-enforced age limit for both Audit undo offers and legacy undo. */
 export const AUDIT_UNDO_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;

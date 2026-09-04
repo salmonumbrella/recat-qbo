@@ -6,6 +6,7 @@ import type { QboClient } from '../../lib/qbo/types.js';
 import { assertQboWriteAllowed } from '../../lib/qbo/writeSafety.js';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import { moneyToCents } from '../tax/model.js';
+import { writeAudit } from '../audit.js';
 import {
   createPreparedOperation,
   hasValidMcpOperationIntegrity,
@@ -248,21 +249,34 @@ export async function cancelMcpTaxRefund(
   });
   await authorizeRefundManagement(authorize, principal, operation.companyId, now);
   assertCanManageRefund(principal, operation);
-  validateMcpTaxRefundEnvelope(operation);
+  const payload = validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
   if (operation.manualRecordedAt != null) {
     throw new McpTaxRefundError('SOURCE_ALREADY_RECORDED');
   }
 
   const cancelOperation = dependencies.cancelOperation ?? (async (operationId, cancelledAt) => (
-    prisma.mcpOperation.updateMany({
-      where: {
-        id: operationId,
-        kind: 'tax_refund',
-        cancelledAt: null,
-        manualRecordedAt: null,
-      },
-      data: { cancelledAt },
+    prisma.$transaction(async (transaction) => {
+      const updated = await transaction.mcpOperation.updateMany({
+        where: {
+          id: operationId,
+          kind: 'tax_refund',
+          cancelledAt: null,
+          manualRecordedAt: null,
+        },
+        data: { cancelledAt },
+      });
+      if (updated.count === 1) {
+        await writeAudit(transaction, refundAuditEntry(
+          principal,
+          operation,
+          payload,
+          'tax-refund-cancelled',
+          'tax_refund_prepared',
+          'tax_refund_cancelled',
+        ));
+      }
+      return updated;
     })
   ));
   const updated = await cancelOperation(operation.id, now);
@@ -318,7 +332,7 @@ export async function acknowledgeMcpTaxRefundRecorded(
   });
   await authorizeRefundManagement(authorize, principal, operation.companyId, now);
   assertCanManageRefund(principal, operation);
-  validateMcpTaxRefundEnvelope(operation);
+  const payload = validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) {
     throw new McpTaxRefundError('SOURCE_PREPARATION_CANCELLED');
   }
@@ -327,14 +341,27 @@ export async function acknowledgeMcpTaxRefundRecorded(
   }
 
   const recordOperation = dependencies.recordOperation ?? (async (operationId, recordedAt) => (
-    prisma.mcpOperation.updateMany({
-      where: {
-        id: operationId,
-        kind: 'tax_refund',
-        cancelledAt: null,
-        manualRecordedAt: null,
-      },
-      data: { manualRecordedAt: recordedAt },
+    prisma.$transaction(async (transaction) => {
+      const updated = await transaction.mcpOperation.updateMany({
+        where: {
+          id: operationId,
+          kind: 'tax_refund',
+          cancelledAt: null,
+          manualRecordedAt: null,
+        },
+        data: { manualRecordedAt: recordedAt },
+      });
+      if (updated.count === 1) {
+        await writeAudit(transaction, refundAuditEntry(
+          principal,
+          operation,
+          payload,
+          'tax-refund-recorded',
+          'tax_refund_prepared',
+          'tax_refund_recorded_unverified',
+        ));
+      }
+      return updated;
     })
   ));
   const updated = await recordOperation(operation.id, now);
@@ -345,20 +372,51 @@ export async function acknowledgeMcpTaxRefundRecorded(
   throw new McpOperationError('OPERATION_CONFLICT');
 }
 
+export function canManageMcpTaxRefund(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+): boolean {
+  const companyAdmin = principal.memberships.some((membership) => (
+    membership.companyId === operation.companyId && membership.role === 'admin'
+  ));
+  return operation.userId === principal.userId
+    || principal.isInstanceAdmin === true
+    || companyAdmin;
+}
+
 function assertCanManageRefund(
   principal: McpPrincipal,
   operation: McpOperationRecord,
 ): void {
-  const companyAdmin = principal.memberships.some((membership) => (
-    membership.companyId === operation.companyId && membership.role === 'admin'
-  ));
-  if (
-    operation.userId !== principal.userId
-    && principal.isInstanceAdmin !== true
-    && !companyAdmin
-  ) {
+  if (!canManageMcpTaxRefund(principal, operation)) {
     throw new McpOperationError('OPERATION_NOT_FOUND');
   }
+}
+
+function refundAuditEntry(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+  payload: StoredMcpTaxRefundPayload,
+  action: 'tax-refund-cancelled' | 'tax-refund-recorded',
+  before: string,
+  after: string,
+) {
+  return {
+    companyId: operation.companyId,
+    actorId: principal.userId,
+    actorLabel: `MCP ${principal.tokenPrefix}`,
+    txnId: operation.transactionId,
+    payee: 'Government of Canada GST/HST refund',
+    amount: payload.preview.totalBankCreditCents / 100,
+    action,
+    before,
+    after,
+    payload: {
+      operationId: operation.id,
+      transition: action,
+      tokenPrefix: principal.tokenPrefix,
+    },
+  } as const;
 }
 
 async function authorizeRefundManagement(

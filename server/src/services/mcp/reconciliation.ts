@@ -31,7 +31,10 @@ import {
   parseStoredMcpUndoPayload,
   type StoredMcpUndoPayload,
 } from './undo.js';
-import { validateMcpTaxRefundEnvelope } from './taxRefund.js';
+import {
+  canManageMcpTaxRefund,
+  validateMcpTaxRefundEnvelope,
+} from './taxRefund.js';
 import {
   getMcpTransferOperation,
   retryMcpTransferOperation,
@@ -270,6 +273,15 @@ export async function getMcpOperation(
       error instanceof McpOperationError
       && error.code === 'OPERATION_NOT_FOUND'
     ) {
+      const candidate = await storeFrom(dependencies).mcpOperation.findFirst({
+        where: { id: input.operationId },
+      });
+      if (candidate?.kind === 'tax_refund') {
+        if (!canManageMcpTaxRefund(principal, candidate)) {
+          throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+        }
+        return projectManualTaxRefund(principal, candidate, dependencies);
+      }
       return getOwnedAttachmentOperation(
         principal,
         input.operationId,
@@ -755,12 +767,16 @@ async function projectManualTaxRefund(
   dependencies: McpOperationExecutionDeps,
 ): Promise<McpOperationDto> {
   const now = nowFrom(dependencies);
-  await assertCurrentMcpCategorizationAuthorization(
-    storeFrom(dependencies),
-    principal,
-    operation.companyId,
-    now,
-  );
+  try {
+    await assertCurrentMcpCategorizationAuthorization(
+      storeFrom(dependencies),
+      principal,
+      operation.companyId,
+      now,
+    );
+  } catch {
+    throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+  }
   try {
     validateMcpTaxRefundEnvelope(operation);
   } catch {
