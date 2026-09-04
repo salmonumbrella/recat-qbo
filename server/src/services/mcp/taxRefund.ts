@@ -8,7 +8,6 @@ import { moneyToCents } from '../tax/model.js';
 import {
   createPreparedOperation,
   hasValidMcpOperationIntegrity,
-  loadOwnedOperation,
   McpOperationError,
   normalizeMcpOperationIdempotencyKey,
   type CreatePreparedOperationInput,
@@ -192,11 +191,11 @@ export interface McpTaxRefundCancellationDeps {
   ) => Promise<void>;
   loadOperation?: (
     operationId: string,
-    principal: McpPrincipal,
+    userId: string,
   ) => Promise<McpOperationRecord>;
   cancelOperation?: (
     operationId: string,
-    principal: McpPrincipal,
+    userId: string,
     cancelledAt: Date,
   ) => Promise<{ count: number }>;
   now?: () => Date;
@@ -218,10 +217,12 @@ export async function cancelMcpTaxRefund(
     throw new McpTaxRefundError('INVALID_INPUT');
   }
 
-  const loadOperation = dependencies.loadOperation ?? (async (operationId, actor) => (
-    loadOwnedOperation(operationId, actor)
-  ));
-  const operation = await loadOperation(input.operationId, principal);
+  const loadOperation = dependencies.loadOperation ?? (async (operationId, userId) => {
+    const found = await prisma.mcpOperation.findFirst({ where: { id: operationId, userId } });
+    if (found === null) throw new McpOperationError('OPERATION_NOT_FOUND');
+    return found as McpOperationRecord;
+  });
+  const operation = await loadOperation(input.operationId, principal.userId);
   if (operation.kind !== 'tax_refund' || operation.toolName !== TOOL_NAME) {
     throw new McpOperationError('OPERATION_NOT_FOUND');
   }
@@ -238,22 +239,21 @@ export async function cancelMcpTaxRefund(
   validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
 
-  const cancelOperation = dependencies.cancelOperation ?? (async (operationId, actor, cancelledAt) => (
+  const cancelOperation = dependencies.cancelOperation ?? (async (operationId, userId, cancelledAt) => (
     prisma.mcpOperation.updateMany({
       where: {
         id: operationId,
-        tokenId: actor.tokenId,
-        userId: actor.userId,
+        userId,
         kind: 'tax_refund',
         cancelledAt: null,
       },
       data: { cancelledAt },
     })
   ));
-  const updated = await cancelOperation(operation.id, principal, now);
+  const updated = await cancelOperation(operation.id, principal.userId, now);
   if (updated.count === 1) return cancelledDto(operation.id, now);
 
-  const raced = await loadOperation(input.operationId, principal);
+  const raced = await loadOperation(input.operationId, principal.userId);
   if (raced.cancelledAt !== null) return cancelledDto(raced.id, raced.cancelledAt);
   throw new McpOperationError('OPERATION_CONFLICT');
 }

@@ -428,10 +428,30 @@ describe('cancelMcpTaxRefund', () => {
 
   it('cancels an intact manual preparation after current authorization', async () => {
     const operation = replayOperation();
+    operation.tokenId = '99999999-9999-4999-8999-999999999999';
+    operation.tokenPrefix = 'rct_rotated';
+    operation.inputHash = hashOperationPayload({
+      tokenId: operation.tokenId,
+      tokenPrefix: operation.tokenPrefix,
+      userId: operation.userId,
+      companyId: operation.companyId,
+      transactionId: operation.transactionId,
+      toolName: operation.toolName,
+      kind: operation.kind,
+      idempotencyKey: operation.idempotencyKey,
+      payloadHash: operation.payloadHash,
+      sourceRevision: operation.sourceRevision,
+      preparedRevision: operation.preparedRevision,
+      qboType: operation.qboType,
+      qboId: operation.qboId,
+      qboSyncToken: operation.qboSyncToken,
+      retryOfId: operation.retryOfId,
+    });
     const cancelOperation = vi.fn().mockResolvedValue({ count: 1 });
+    const loadOperation = vi.fn().mockResolvedValue(operation);
     const result = await cancelMcpTaxRefund(principal, request, {
       authorize: vi.fn().mockResolvedValue(undefined),
-      loadOperation: vi.fn().mockResolvedValue(operation),
+      loadOperation,
       cancelOperation,
       now: () => new Date('2026-09-04T22:05:00.000Z'),
     });
@@ -441,9 +461,10 @@ describe('cancelMcpTaxRefund', () => {
       state: 'cancelled',
       cancelledAt: '2026-09-04T22:05:00.000Z',
     });
+    expect(loadOperation).toHaveBeenCalledWith(operation.id, principal.userId);
     expect(cancelOperation).toHaveBeenCalledWith(
       operation.id,
-      principal,
+      principal.userId,
       new Date('2026-09-04T22:05:00.000Z'),
     );
   });
