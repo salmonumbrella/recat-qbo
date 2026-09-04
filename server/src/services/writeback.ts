@@ -1757,7 +1757,7 @@ async function loadAuthorizedStage(
     }),
     { subtotalCents: 0, taxCents: 0, totalCents: 0 },
   );
-  const expectedTotalCents = txn.qboType === 'Purchase' && expectedTaxDisposition === 'set'
+  const expectedTotalCents = txn.qboType === 'Purchase'
     ? purchaseStageBalanceCents(txn)
     : exactMoneyCents(txn.amount);
   if (totals.totalCents !== expectedTotalCents) {

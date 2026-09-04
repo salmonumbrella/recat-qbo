@@ -2393,6 +2393,64 @@ describe('commitStagedCategorization durable lifecycle', () => {
     );
   });
 
+  it('commits a tax-inclusive preserve-current stage at the source gross when the ledger amount is net', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.amount = -9.29;
+    fixture.db.transactionRow.taxCalculation = 'TaxInclusive';
+    fixture.db.transactionRow.rawData = {
+      ...fixture.db.transactionRow.rawData,
+      TotalAmt: 10.5,
+      Line: [{
+        Id: 'line-holding',
+        Amount: 9.29,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxInclusiveAmt: 10.5,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 1.21 },
+    };
+    fixture.db.transactionRow.splitLines = [{
+      idx: 0,
+      amount: -10.5,
+      category: 'Prepared purchase',
+      categoryQboId: 'expense-generic',
+      taxCode: 'Preserved source code',
+      taxCodeQboId: 'tax-generic',
+      memo: null,
+      tags: [],
+    }];
+    fixture.db.transactionRow.txnTags = [];
+    const preserved: StagedCategorization = {
+      transactionId: DURABLE_TRANSACTION_ID,
+      revision: 1,
+      taxDisposition: 'preserve_current',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -1050,
+        taxCents: 0,
+        totalCents: -1050,
+        categoryQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-inclusive-preserve-net-ledger'),
+      expectedTaxDisposition: 'preserve_current',
+      expectedStageHash: hashStagedCategorization(preserved),
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+  });
+
   it('commits a tax change whose staged gross differs from the source holding net', async () => {
     const fixture = durableDeps();
     fixture.db.transactionRow.amount = -12.62;
