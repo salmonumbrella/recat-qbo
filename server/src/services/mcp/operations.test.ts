@@ -199,7 +199,7 @@ describe('createPreparedOperation', () => {
         capability: 'manual_required',
         preview: {
           action: 'record_gst_hst_refund',
-          refundPrincipalCents: 1076070,
+          refundPrincipalCents: 123456,
           suspenseAccountQboId: '55',
         },
       },

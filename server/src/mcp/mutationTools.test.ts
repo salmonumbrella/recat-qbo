@@ -108,17 +108,17 @@ const preparedTaxRefund = {
   preview: {
     action: 'record_gst_hst_refund' as const,
     operatorPath: 'Sales Tax > Filed > Record refund' as const,
-    sourceDepositQboId: '22519',
+    sourceDepositQboId: 'TEST-DEPOSIT-1',
     taxAgencyQboId: 'CRA',
     filedReturnRef: '2025-Q4',
     filingEvidenceSha256: 'a'.repeat(64),
     suspenseAccountQboId: '55',
     bankAccountQboId: 'BANK-1',
     refundDate: '2026-01-15',
-    principalCents: 1_076_070,
+    principalCents: 123_456,
     interestCents: 0,
     interestAccountQboId: null,
-    totalBankCreditCents: 1_076_070,
+    totalBankCreditCents: 123_456,
     existingDepositTreatment: 'replace_or_match_before_verification' as const,
   },
   warnings: [
@@ -478,14 +478,14 @@ describe('Recat MCP mutation tools', () => {
       companyId,
       transactionId,
       expectedRevision: 0,
-      idempotencyKey: 'gst-refund-22519',
+      idempotencyKey: 'gst-refund-test-deposit-1',
       taxAgencyQboId: 'CRA',
       filedReturnRef: '2025-Q4',
       filingEvidenceSha256: 'a'.repeat(64),
       suspenseAccountQboId: '55',
       bankAccountQboId: 'BANK-1',
       refundDate: '2026-01-15',
-      principalCents: 1_076_070,
+      principalCents: 123_456,
     };
 
     const response = await legacy(server, 'tools/call', {

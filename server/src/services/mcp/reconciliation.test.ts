@@ -124,9 +124,9 @@ function taxRefundOperation(): McpOperationRecord {
   return operation({
     toolName: 'prepare_tax_refund',
     kind: 'tax_refund',
-    idempotencyKey: 'gst-refund-22519',
+    idempotencyKey: 'gst-refund-test-deposit-1',
     qboType: 'Deposit',
-    qboId: '22519',
+    qboId: 'TEST-DEPOSIT-1',
     qboSyncToken: '0',
     sourceRevision: 0,
     preparedRevision: 0,

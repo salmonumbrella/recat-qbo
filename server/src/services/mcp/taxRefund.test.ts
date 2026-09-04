@@ -22,14 +22,14 @@ function input(overrides: Partial<PrepareMcpTaxRefundInput> = {}): PrepareMcpTax
     companyId: COMPANY_ID,
     transactionId: TRANSACTION_ID,
     expectedRevision: 0,
-    idempotencyKey: 'gst-refund-22519',
+    idempotencyKey: 'gst-refund-test-deposit-1',
     taxAgencyQboId: 'CRA',
     filedReturnRef: '2025-Q4',
     filingEvidenceSha256: 'a'.repeat(64),
     suspenseAccountQboId: '55',
     bankAccountQboId: 'BANK-1',
     refundDate: '2026-01-15',
-    principalCents: 1_076_070,
+    principalCents: 123_456,
     ...overrides,
   };
 }
@@ -38,12 +38,12 @@ function transaction(overrides: Record<string, unknown> = {}) {
   return {
     id: TRANSACTION_ID,
     companyId: COMPANY_ID,
-    qboId: '22519',
+    qboId: 'TEST-DEPOSIT-1',
     qboType: 'Deposit',
     qboSyncToken: '0',
     revision: 0,
     status: 'PENDING',
-    amount: 10_760.70,
+    amount: 1_234.56,
     date: new Date('2026-01-15T00:00:00.000Z'),
     ...overrides,
   };
@@ -79,9 +79,9 @@ function qboClient(overrides: Partial<QboClient> = {}): QboClient {
       },
     ]),
     fetchPreparedSnapshot: vi.fn().mockResolvedValue({
-      qboId: '22519',
+      qboId: 'TEST-DEPOSIT-1',
       syncToken: '0',
-      totalCents: 1_076_070,
+      totalCents: 123_456,
       depositToAccountQboId: 'BANK-1',
       date: '2026-01-15',
       globalTaxCalculation: 'NotApplicable',
@@ -121,11 +121,11 @@ describe('prepareMcpTaxRefund', () => {
       preview: {
         action: 'record_gst_hst_refund',
         operatorPath: 'Sales Tax > Filed > Record refund',
-        sourceDepositQboId: '22519',
+        sourceDepositQboId: 'TEST-DEPOSIT-1',
         suspenseAccountQboId: '55',
         bankAccountQboId: 'BANK-1',
-        principalCents: 1_076_070,
-        totalBankCreditCents: 1_076_070,
+        principalCents: 123_456,
+        totalBankCreditCents: 123_456,
         existingDepositTreatment: 'replace_or_match_before_verification',
       },
     });
@@ -133,7 +133,7 @@ describe('prepareMcpTaxRefund', () => {
       toolName: 'prepare_tax_refund',
       kind: 'tax_refund',
       qboType: 'Deposit',
-      qboId: '22519',
+      qboId: 'TEST-DEPOSIT-1',
       qboSyncToken: '0',
     }), expect.anything());
   });
@@ -141,7 +141,7 @@ describe('prepareMcpTaxRefund', () => {
   it.each([
     ['non-Deposit source', transaction({ qboType: 'Purchase' }), input(), 'SOURCE_NOT_DEPOSIT'],
     ['stale revision', transaction({ revision: 1 }), input(), 'STALE_SOURCE'],
-    ['amount mismatch', transaction(), input({ principalCents: 1_076_069 }), 'AMOUNT_MISMATCH'],
+    ['amount mismatch', transaction(), input({ principalCents: 123_455 }), 'AMOUNT_MISMATCH'],
   ])('rejects %s', async (_label, txn, request, code) => {
     const caught = await prepareMcpTaxRefund(
       principal,
