@@ -20,6 +20,10 @@ import {
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
 import {
+  prepareMcpTaxRefund,
+  type PrepareMcpTaxRefundInput,
+} from '../services/mcp/taxRefund.js';
+import {
   commitMcpTransfer,
   prepareMcpTransfer,
   type PrepareMcpTransferInput,
@@ -57,6 +61,7 @@ const CORE_MUTATION_TOOL_NAMES = [
   'commit_undo',
   'prepare_transfer',
   'commit_transfer',
+  'prepare_tax_refund',
   'prepare_rule_change',
   'commit_rule_change',
 ] as const;
@@ -101,6 +106,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: { operationId: string; idempotencyKey?: string },
   ): ReturnType<typeof commitMcpTransfer>;
+  prepareTaxRefund(
+    principal: McpPrincipal,
+    input: PrepareMcpTaxRefundInput,
+  ): ReturnType<typeof prepareMcpTaxRefund>;
   prepareRuleChange(
     principal: McpPrincipal,
     input: PrepareMcpRuleChangeInput,
@@ -122,6 +131,7 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   commitUndo: commitMcpUndo,
   prepareTransfer: prepareMcpTransfer,
   commitTransfer: commitMcpTransfer,
+  prepareTaxRefund: prepareMcpTaxRefund,
   prepareRuleChange: prepareMcpRuleChange,
   commitRuleChange: commitMcpRuleChange,
 });
@@ -291,6 +301,30 @@ const prepareTransferInput = z.strictObject({
   expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
   counterpartExpectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
   idempotencyKey: idempotencyKey.optional(),
+});
+const prepareTaxRefundInput = z.strictObject({
+  companyId: uuid,
+  transactionId: uuid,
+  expectedRevision: z.number().int().min(0).max(MAX_EXPECTED_REVISION),
+  idempotencyKey,
+  taxAgencyQboId: qboReference,
+  filedReturnRef: qboReference,
+  filingEvidenceSha256: z.string().regex(SHA256),
+  suspenseAccountQboId: qboReference,
+  bankAccountQboId: qboReference,
+  refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+  principalCents: safeInteger.refine((value) => value > 0),
+  interestCents: safeInteger.refine((value) => value >= 0).optional(),
+  interestAccountQboId: qboReference.optional(),
+}).superRefine((value, context) => {
+  const interestCents = value.interestCents ?? 0;
+  if ((interestCents > 0) !== (value.interestAccountQboId !== undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['interestAccountQboId'],
+      message: 'An interest account is required exactly when CRA interest is present.',
+    });
+  }
 });
 const ruleMutation = z.enum([
   'create', 'update', 'enable', 'disable', 'reorder', 'retire',
@@ -596,6 +630,28 @@ const preparedTransferOutput = z.strictObject({
     preparationDigest: z.string().regex(SHA256),
   }),
 });
+const preparedTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  expiresAt: z.iso.datetime(),
+  capability: z.literal('manual_required'),
+  preview: z.strictObject({
+    action: z.literal('record_gst_hst_refund'),
+    operatorPath: z.literal('Sales Tax > Filed > Record refund'),
+    sourceDepositQboId: qboReference,
+    taxAgencyQboId: qboReference,
+    filedReturnRef: qboReference,
+    filingEvidenceSha256: z.string().regex(SHA256),
+    suspenseAccountQboId: qboReference,
+    bankAccountQboId: qboReference,
+    refundDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+    principalCents: safeInteger,
+    interestCents: safeInteger,
+    interestAccountQboId: qboReference.nullable(),
+    totalBankCreditCents: safeInteger,
+    existingDepositTreatment: z.literal('replace_or_match_before_verification'),
+  }),
+  warnings,
+});
 const ruleActionOutput = z.strictObject({
   categoryQboId: qboReference,
   taxCalculation,
@@ -811,6 +867,18 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.commitTransfer(
         principal,
         input as { operationId: string; idempotencyKey?: string },
+      ),
+  },
+  {
+    name: 'prepare_tax_refund',
+    description: 'Prepare a reviewed Canadian GST/HST refund. Returns the exact manual QuickBooks Tax Centre action when the public API cannot post it; it never recategorizes the source Deposit.',
+    inputSchema: prepareTaxRefundInput,
+    outputSchema: preparedTaxRefundOutput,
+    annotations: prepareTransferAnnotations,
+    invoke: (operations, principal, input) =>
+      operations.prepareTaxRefund(
+        principal,
+        input as PrepareMcpTaxRefundInput,
       ),
   },
   {

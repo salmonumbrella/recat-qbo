@@ -22,6 +22,7 @@ const OPERATION_KINDS = new Set<McpOperationKind>([
   'categorization',
   'transfer',
   'undo',
+  'tax_refund',
 ]);
 const RULE_RESOURCE_TYPES = new Set<McpRuleResourceType>([
   'rule',
@@ -40,7 +41,7 @@ const RULE_MUTATION_KINDS = new Set<RuleMutationKind>([
 ]);
 const SHA256 = /^[0-9a-f]{64}$/u;
 
-export type McpOperationKind = 'categorization' | 'transfer' | 'undo';
+export type McpOperationKind = 'categorization' | 'transfer' | 'undo' | 'tax_refund';
 
 export type McpOperationJsonValue =
   | null

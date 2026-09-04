@@ -101,6 +101,31 @@ const preparedTransfer = {
   },
 };
 
+const preparedTaxRefund = {
+  operationId: '77777777-7777-4777-8777-777777777777',
+  expiresAt: '2026-09-04T22:15:00.000Z',
+  capability: 'manual_required' as const,
+  preview: {
+    action: 'record_gst_hst_refund' as const,
+    operatorPath: 'Sales Tax > Filed > Record refund' as const,
+    sourceDepositQboId: '22519',
+    taxAgencyQboId: 'CRA',
+    filedReturnRef: '2025-Q4',
+    filingEvidenceSha256: 'a'.repeat(64),
+    suspenseAccountQboId: '55',
+    bankAccountQboId: 'BANK-1',
+    refundDate: '2026-01-15',
+    principalCents: 1_076_070,
+    interestCents: 0,
+    interestAccountQboId: null,
+    totalBankCreditCents: 1_076_070,
+    existingDepositTreatment: 'replace_or_match_before_verification' as const,
+  },
+  warnings: [
+    'Manual QuickBooks Tax Centre action required; preparation does not post the refund.',
+  ],
+};
+
 const transferOperation = {
   operationId: transferOperationId,
   kind: 'transfer' as const,
@@ -204,6 +229,7 @@ function mutations(
     }),
     prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
     commitTransfer: vi.fn().mockResolvedValue(transferOperation),
+    prepareTaxRefund: vi.fn().mockResolvedValue(preparedTaxRefund),
     prepareRuleChange: vi.fn().mockResolvedValue(preparedRuleChange),
     commitRuleChange: vi.fn().mockResolvedValue(committedRuleChange),
     ...overrides,
@@ -443,6 +469,33 @@ describe('Recat MCP mutation tools', () => {
     expect(operations.commitTransfer).toHaveBeenCalledWith(principal, calls[7][1]);
     expect(operations.prepareRuleChange).toHaveBeenCalledWith(principal, calls[8][1]);
     expect(operations.commitRuleChange).toHaveBeenCalledWith(principal, calls[9][1]);
+  });
+
+  it('exposes a strict manual-required GST/HST refund preparation', async () => {
+    const operations = mutations();
+    const server = handler(operations);
+    const request = {
+      companyId,
+      transactionId,
+      expectedRevision: 0,
+      idempotencyKey: 'gst-refund-22519',
+      taxAgencyQboId: 'CRA',
+      filedReturnRef: '2025-Q4',
+      filingEvidenceSha256: 'a'.repeat(64),
+      suspenseAccountQboId: '55',
+      bankAccountQboId: 'BANK-1',
+      refundDate: '2026-01-15',
+      principalCents: 1_076_070,
+    };
+
+    const response = await legacy(server, 'tools/call', {
+      name: 'prepare_tax_refund',
+      arguments: request,
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(operations.prepareTaxRefund).toHaveBeenCalledWith(principal, request);
+    expect(MUTATION_TOOL_NAMES).toContain('prepare_tax_refund');
   });
 
   it('accepts one exact preserve-current proposal and returns its reviewable references', async () => {

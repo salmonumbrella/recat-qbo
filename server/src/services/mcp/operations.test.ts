@@ -189,6 +189,26 @@ describe('createPreparedOperation', () => {
     expect(hasValidMcpOperationIntegrity(tampered)).toBe(false);
   });
 
+  it('accepts a distinct tax-refund preparation envelope', async () => {
+    const { store } = createStore();
+    const operation = await createPreparedOperation(input({
+      toolName: 'prepare_tax_refund',
+      kind: 'tax_refund' as never,
+      qboType: 'Deposit',
+      payload: {
+        capability: 'manual_required',
+        preview: {
+          action: 'record_gst_hst_refund',
+          refundPrincipalCents: 1076070,
+          suspenseAccountQboId: '55',
+        },
+      },
+    }), { store, now: () => NOW });
+
+    expect(operation.kind).toBe('tax_refund');
+    expect(hasValidMcpOperationIntegrity(operation)).toBe(true);
+  });
+
   it('uses the caller-supplied transaction/store instead of the default client', async () => {
     const { store } = createStore();
     const createMany = vi.spyOn(store.mcpOperation, 'createMany');
