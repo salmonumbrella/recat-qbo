@@ -420,6 +420,9 @@ function decimalToCents(value: TransactionRow['amount']): number {
 interface PreserveCurrentSource {
   accountQboId: string;
   taxCodeQboId: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
 }
 
 function exactRawMoneyCents(value: unknown): number | null {
@@ -481,6 +484,7 @@ function preserveCurrentSource(
   const signedLineCents = lineCents === null
     ? null
     : credit ? Math.abs(lineCents) : -Math.abs(lineCents);
+  const signedTotalCents = credit ? Math.abs(totalCents) : -Math.abs(totalCents);
   if (
     typeof rawLine.Id !== 'string'
     || rawLine.Id.trim() === ''
@@ -488,7 +492,7 @@ function preserveCurrentSource(
     || accountQboId.trim() === ''
     || taxCodeQboId.trim() === ''
     || signedLineCents !== transactionCents
-    || signedLineCents !== proposal.lines[0]!.grossCents
+    || signedTotalCents !== proposal.lines[0]!.grossCents
     || accountQboId === proposal.lines[0]!.categoryQboId
     || taxCodeQboId !== proposal.lines[0]!.taxCodeQboId
   ) {
@@ -497,7 +501,13 @@ function preserveCurrentSource(
       'Synchronized Purchase line does not prove the exact source account, amount, identity, and tax code.',
     );
   }
-  return { accountQboId, taxCodeQboId };
+  return {
+    accountQboId,
+    taxCodeQboId,
+    subtotalCents: signedLineCents,
+    taxCents: signedTotalCents - signedLineCents,
+    totalCents: signedTotalCents,
+  };
 }
 
 function assertSignedLines(
@@ -666,11 +676,12 @@ async function validateStage(
       combinedSalesRate: null,
     };
     taxCodesById = new Map([[preservedTaxCode.qboId, preservedTaxCode]]);
-    calculatedLines = proposal.lines.map((line) => ({
-      subtotalCents: line.grossCents,
-      taxCents: 0,
-      totalCents: line.grossCents,
-    }));
+    balanceTargetCents = preservedSource.totalCents;
+    calculatedLines = [{
+      subtotalCents: preservedSource.subtotalCents,
+      taxCents: preservedSource.taxCents,
+      totalCents: preservedSource.totalCents,
+    }];
   } else if (proposal.taxCalculation === 'NotApplicable') {
     if (transaction.qboType === 'Purchase' && proposal.taxDisposition === 'set') {
       const company = await db.company.findUnique({ where: { id: input.companyId } });

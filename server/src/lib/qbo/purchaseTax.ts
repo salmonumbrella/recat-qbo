@@ -1243,8 +1243,15 @@ function assertStagedAmounts(
   if (canonicalJson(totals) !== canonicalJson(staged.totals)) {
     preparationError('QBO_STATE_DRIFT', 'Prepared Purchase totals do not match its split lines.');
   }
+  const holdingGross = purchaseHoldingGrossCents(current, holdingLineIndexes);
   const holdingTotal = staged.taxDisposition === 'set'
-    ? purchaseHoldingGrossCents(current, holdingLineIndexes)
+    || (
+      staged.taxDisposition === 'preserve_current'
+      && staged.taxCalculation === current.globalTaxCalculation
+      && current.globalTaxCalculation === 'TaxInclusive'
+      && holdingGross !== null
+    )
+    ? holdingGross
     : safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
   if (holdingTotal === null) {
     preparationError('QBO_STATE_DRIFT', 'Purchase holding-account gross could not be proven.');
@@ -1326,11 +1333,16 @@ export function preparePurchaseRecategorization(args: {
       'source tax code reference',
     );
     requiredIdentity(sourceRawLine.Id, 'holding line identity');
+    const sourceGrossCents = current.globalTaxCalculation === 'TaxInclusive'
+      ? sourceSnapshotLine.taxInclusiveCents ?? sourceSnapshotLine.amountCents
+      : current.globalTaxCalculation === 'TaxExcluded' && sourceSnapshotLine.taxAmountCents !== null
+        ? safeCentSum([sourceSnapshotLine.amountCents, sourceSnapshotLine.taxAmountCents])
+        : sourceSnapshotLine.amountCents;
     if (
       sourceRawLine.DetailType !== 'AccountBasedExpenseLineDetail'
       || sourceRawLine.AccountBasedExpenseLineDetail?.AccountRef === undefined
       || sourceSnapshotLine.taxCodeQboId !== expectedTaxCodeQboId
-      || sourceSnapshotLine.amountCents !== stagedLine.totalCents
+      || sourceGrossCents !== stagedLine.totalCents
       || stagedLine.memo !== null
       || (stagedLine.tagIds?.length ?? 0) !== 0
     ) {

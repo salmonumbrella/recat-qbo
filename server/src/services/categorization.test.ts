@@ -1310,7 +1310,7 @@ describe('stageCategorization', () => {
       taxDisposition: 'preserve_current',
       taxCalculation: 'TaxInclusive',
       lines: [{
-        grossCents: -2_800,
+        grossCents: -3_136,
         categoryQboId: '42',
         taxCodeQboId: '7',
         tagIds: [],
@@ -1321,11 +1321,11 @@ describe('stageCategorization', () => {
     expect(staged).toMatchObject({
       taxDisposition: 'preserve_current',
       taxCalculation: 'TaxInclusive',
-      totals: { subtotalCents: -2_800, taxCents: 0, totalCents: -2_800 },
+      totals: { subtotalCents: -2_800, taxCents: -336, totalCents: -3_136 },
       lines: [{
         subtotalCents: -2_800,
-        taxCents: 0,
-        totalCents: -2_800,
+        taxCents: -336,
+        totalCents: -3_136,
         categoryQboId: '42',
         taxCodeQboId: '7',
       }],
