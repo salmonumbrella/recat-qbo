@@ -12,6 +12,8 @@ import { z } from 'zod';
 import {
   calculatePurchaseTransaction,
   calculateSalesTransaction,
+  mapPurchaseTaxSnapshot,
+  purchaseHoldingGrossCents,
   reconstructPurchaseTaxExcludedTransaction,
   reconstructSalesTaxExcludedTransaction,
 } from '../lib/qbo/purchaseTax.js';
@@ -81,6 +83,7 @@ interface TaxRateRow {
 
 interface CompanyTaxRow {
   id: string;
+  holdingAccountIds: unknown;
   taxSupportStatus: string;
   taxSupportReason: string | null;
   taxUsingSalesTax: boolean | null;
@@ -531,6 +534,12 @@ function taxReadiness(company: CompanyTaxRow, codes: TaxCodeRow[]): Pick<TaxRead
   };
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+    : [];
+}
+
 async function validateStage(
   untrustedInput: StageCategorizationInput,
   db: CategorizationDb,
@@ -603,6 +612,7 @@ async function validateStage(
   const accountsById = new Map(accounts.map((account) => [account.qboId, account]));
   let taxCodesById = new Map<string, TaxCodeRow>();
   let calculatedLines: CalculatedLine[];
+  let balanceTargetCents = transactionCents;
 
   if (preservedSource !== null) {
     const taxCodes = await db.qboTaxCode.findMany({
@@ -717,6 +727,31 @@ async function validateStage(
       );
     }
 
+    if (transaction.qboType === 'Purchase') {
+      const holdingIds = new Set(stringArray(company.holdingAccountIds));
+      if (holdingIds.size === 0) {
+        throw new CategorizationError('UNBALANCED_TOTAL', 'Purchase holding accounts are not configured.');
+      }
+      let snapshot;
+      try {
+        snapshot = mapPurchaseTaxSnapshot(transaction.rawData as Parameters<typeof mapPurchaseTaxSnapshot>[0]);
+      } catch {
+        throw new CategorizationError('UNBALANCED_TOTAL', 'Purchase source gross could not be proven.');
+      }
+      const holdingLineIndexes = snapshot.lines.flatMap((line, index) =>
+        line.accountQboId !== null && holdingIds.has(line.accountQboId) ? [index] : []
+      );
+      const holdingNet = safeSum(
+        holdingLineIndexes.map((index) => snapshot.lines[index]!.amountCents),
+        'TAX_AMOUNT_INVALID',
+      );
+      const holdingGross = purchaseHoldingGrossCents(snapshot, holdingLineIndexes);
+      if (holdingNet !== transactionCents || holdingGross === null) {
+        throw new CategorizationError('UNBALANCED_TOTAL', 'Purchase source gross could not be proven.');
+      }
+      balanceTargetCents = holdingGross;
+    }
+
     const taxReference = {
       companyId: input.companyId,
       codes: taxCodes.map((code) => ({
@@ -802,7 +837,7 @@ async function validateStage(
       'TAX_AMOUNT_INVALID',
     ),
   };
-  if (totals.totalCents !== transactionCents) {
+  if (totals.totalCents !== balanceTargetCents) {
     throw new CategorizationError(
       'UNBALANCED_TOTAL',
       'Line totals must be nonzero, match the transaction direction, and balance exactly.',

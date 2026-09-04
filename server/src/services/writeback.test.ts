@@ -1376,6 +1376,24 @@ function durableTransaction(qboType: PreparedEntity = 'Purchase') {
     revision: 1,
     status: 'PENDING',
     amount: deposit ? 10.5 : -10.5,
+    rawData: deposit ? {} : {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 10.5,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 10.5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxInclusiveAmt: 10.5,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 0 },
+    },
     payee: deposit ? 'Generic Customer' : 'Generic Supplier',
     postedAt: null as Date | null,
     postedByUserId: null as string | null,
@@ -2373,6 +2391,136 @@ describe('commitStagedCategorization durable lifecycle', () => {
       expect.anything(),
       'request-tax-inclusive-preserve',
     );
+  });
+
+  it('commits a tax change whose staged gross differs from the source holding net', async () => {
+    const fixture = durableDeps();
+    fixture.db.transactionRow.amount = -12.62;
+    fixture.db.transactionRow.rawData = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 14.14,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 12.62,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'holding-generic' },
+          TaxCodeRef: { value: 'old-tax' },
+          TaxInclusiveAmt: 14.14,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 1.52 },
+    };
+    fixture.db.transactionRow.splitLines[0]!.amount = -14.14;
+    fixture.db.qboTaxRate.findMany.mockResolvedValue([{
+      qboId: 'rate-generic',
+      name: 'Generic rate',
+      active: true,
+      rateValue: 13,
+    }]);
+    const before: QboPurchaseSnapshot = {
+      qboId: 'purchase-generic',
+      syncToken: '7',
+      totalCents: -1_414,
+      accountQboId: 'payment-generic',
+      date: '2026-07-28',
+      direction: 'purchase',
+      globalTaxCalculation: 'TaxInclusive',
+      totalTaxCents: -152,
+      lines: [{
+        id: 'line-holding',
+        amountCents: -1_262,
+        description: null,
+        accountQboId: 'holding-generic',
+        customerQboId: null,
+        classQboId: null,
+        taxCodeQboId: 'old-tax',
+        taxAmountCents: -152,
+        taxInclusiveCents: -1_414,
+      }],
+    };
+    const after: QboPurchaseSnapshot = {
+      ...before,
+      syncToken: '8',
+      totalTaxCents: -163,
+      lines: [{
+        ...before.lines[0]!,
+        amountCents: -1_251,
+        accountQboId: 'expense-generic',
+        taxCodeQboId: 'tax-generic',
+        taxAmountCents: -163,
+      }],
+    };
+    const body: QboPurchasePreparedWrite['body'] = {
+      Id: 'purchase-generic',
+      SyncToken: '7',
+      TxnDate: '2026-07-28',
+      TotalAmt: 14.14,
+      AccountRef: { value: 'payment-generic' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      Line: [{
+        Id: 'line-holding',
+        Amount: 12.51,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: 'expense-generic' },
+          TaxCodeRef: { value: 'tax-generic' },
+          TaxAmount: 1.63,
+          TaxInclusiveAmt: 14.14,
+        },
+      }],
+    };
+    const prepared: QboPurchasePreparedWrite = {
+      operation: 'recategorize',
+      qboType: 'Purchase',
+      qboId: 'purchase-generic',
+      requestId: 'request-tax-gross',
+      requestHash: hashPreparedWriteBody(body),
+      body,
+      before,
+      expected: {
+        qboId: 'purchase-generic',
+        totalCents: -1_414,
+        accountQboId: 'payment-generic',
+        date: '2026-07-28',
+        direction: 'purchase',
+        globalTaxCalculation: 'TaxInclusive',
+        totalTaxCents: -163,
+        targetLines: after.lines,
+        untouchedLineHashes: [],
+      },
+    };
+    fixture.fetchPurchaseSnapshot
+      .mockReset()
+      .mockResolvedValueOnce(before)
+      .mockResolvedValue(after);
+    fixture.prepareRecategorization.mockResolvedValueOnce(prepared);
+    fixture.client.fetchTxn = vi.fn(async () => ({
+      ...currentQboTxn('7'),
+      amount: -12.62,
+    }));
+
+    await expect(commitStagedCategorization({
+      ...commitInput('request-tax-gross'),
+      expectedTaxDisposition: 'set',
+    }, fixture.deps)).resolves.toMatchObject({
+      outcome: 'VERIFIED',
+      status: 'POSTED',
+    });
+
+    expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        totals: { subtotalCents: -1_251, taxCents: -163, totalCents: -1_414 },
+      }),
+      before,
+      'request-tax-gross',
+    );
+    expect(fixture.sendPreparedWrite).toHaveBeenCalledWith(prepared);
   });
 
   it('reconstructs an exact set NotApplicable Purchase stage with NON on every split', async () => {

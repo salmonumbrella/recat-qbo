@@ -997,6 +997,41 @@ export function mapPurchaseTaxSnapshot(raw: RawPurchase): QboPurchaseSnapshot {
   };
 }
 
+/**
+ * Returns the signed gross represented by the selected holding lines.
+ * QBO stores TaxInclusive Purchase line Amount as net, so callers must not
+ * use amountCents alone when proving that a tax correction preserves cash.
+ */
+export function purchaseHoldingGrossCents(
+  snapshot: QboPurchaseSnapshot,
+  holdingLineIndexes: readonly number[],
+): number | null {
+  if (holdingLineIndexes.length === 0) return null;
+  const gross: number[] = [];
+  for (const index of holdingLineIndexes) {
+    const line = snapshot.lines[index];
+    if (!line) return null;
+    if (snapshot.globalTaxCalculation === 'TaxInclusive') {
+      if (line.taxInclusiveCents === null) return null;
+      gross.push(line.taxInclusiveCents);
+      continue;
+    }
+    if (snapshot.globalTaxCalculation === 'TaxExcluded') {
+      if (line.taxAmountCents === null) return null;
+      const total = line.amountCents + line.taxAmountCents;
+      if (!Number.isSafeInteger(total)) return null;
+      gross.push(total);
+      continue;
+    }
+    gross.push(line.amountCents);
+  }
+  try {
+    return safeCentSum(gross);
+  } catch {
+    return null;
+  }
+}
+
 const snapshotFromRaw = mapPurchaseTaxSnapshot;
 
 function canonicalSnapshotLine(line: QboPurchaseSnapshot['lines'][number]): string {
@@ -1199,7 +1234,12 @@ function assertStagedAmounts(
   if (canonicalJson(totals) !== canonicalJson(staged.totals)) {
     preparationError('QBO_STATE_DRIFT', 'Prepared Purchase totals do not match its split lines.');
   }
-  const holdingTotal = safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
+  const holdingTotal = staged.taxDisposition === 'set'
+    ? purchaseHoldingGrossCents(current, holdingLineIndexes)
+    : safeCentSum(holdingLineIndexes.map((index) => current.lines[index]!.amountCents));
+  if (holdingTotal === null) {
+    preparationError('QBO_STATE_DRIFT', 'Purchase holding-account gross could not be proven.');
+  }
   if (holdingTotal !== staged.totals.totalCents) {
     preparationError('QBO_STATE_DRIFT', 'Prepared Purchase total changed from the holding-account amount.');
   }

@@ -33,10 +33,13 @@ import {
   type QboPurchaseSnapshot,
   type QboTxn,
   type QboWriteResult,
+  type RawPurchase,
 } from '../lib/qbo/types.js';
 import {
   calculatePurchaseTransaction,
   calculateSalesTransaction,
+  mapPurchaseTaxSnapshot,
+  purchaseHoldingGrossCents,
   reconstructPurchaseTaxExcludedTransaction,
   reconstructSalesTaxExcludedTransaction,
 } from '../lib/qbo/purchaseTax.js';
@@ -991,6 +994,7 @@ interface DurableTransaction {
   revision: number;
   status: string;
   amount: number | string | { toString(): string };
+  rawData: unknown;
   payee: string;
   postedAt: Date | null;
   postedByUserId: string | null;
@@ -1411,6 +1415,39 @@ function uniqueStrings(values: (string | null)[]): string[] {
   return [...new Set(values.filter((value): value is string => value !== null && value.trim() !== ''))];
 }
 
+function purchaseStageBalanceCents(txn: DurableTransaction): number {
+  const transactionCents = exactMoneyCents(txn.amount);
+  let snapshot: QboPurchaseSnapshot;
+  try {
+    snapshot = mapPurchaseTaxSnapshot(txn.rawData as RawPurchase);
+  } catch {
+    return transactionCents;
+  }
+  if (snapshot.qboId !== txn.qboId) {
+    return lifecycleError('STALE_QBO_BINDING', 'The QuickBooks transaction binding changed.');
+  }
+  const holdingIds = new Set(jsonStringArray(txn.company.holdingAccountIds));
+  const holdingLineIndexes = snapshot.lines.flatMap((line, index) =>
+    line.accountQboId !== null && holdingIds.has(line.accountQboId) ? [index] : [],
+  );
+  let holdingNetCents = 0;
+  for (const index of holdingLineIndexes) {
+    holdingNetCents += snapshot.lines[index]!.amountCents;
+    if (!Number.isSafeInteger(holdingNetCents)) {
+      return lifecycleError('STALE_REVISION', 'The Purchase source amount is no longer exact.');
+    }
+  }
+  const holdingGrossCents = purchaseHoldingGrossCents(snapshot, holdingLineIndexes);
+  if (
+    holdingGrossCents !== null
+    && holdingGrossCents !== holdingNetCents
+    && holdingNetCents === transactionCents
+  ) {
+    return holdingGrossCents;
+  }
+  return transactionCents;
+}
+
 function asPurchaseRates(value: unknown): {
   taxRateQboId: string;
   taxTypeApplicable: string;
@@ -1701,7 +1738,10 @@ async function loadAuthorizedStage(
     }),
     { subtotalCents: 0, taxCents: 0, totalCents: 0 },
   );
-  if (totals.totalCents !== exactMoneyCents(txn.amount)) {
+  const expectedTotalCents = txn.qboType === 'Purchase' && expectedTaxDisposition === 'set'
+    ? purchaseStageBalanceCents(txn)
+    : exactMoneyCents(txn.amount);
+  if (totals.totalCents !== expectedTotalCents) {
     lifecycleError(
       'STALE_REVISION',
       `The staged ${txn.qboType} total no longer matches the transaction.`,

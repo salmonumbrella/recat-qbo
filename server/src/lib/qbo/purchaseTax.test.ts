@@ -1284,6 +1284,72 @@ describe('preparePurchaseRecategorization', () => {
     });
   });
 
+  it('preserves an already-taxed holding line gross while changing its tax code and net', () => {
+    const raw: RawPurchase = {
+      Id: '22557',
+      SyncToken: '1',
+      TxnDate: '2026-06-11',
+      TotalAmt: 1_413.91,
+      PaymentType: 'Cash',
+      AccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      GlobalTaxCalculation: 'TaxInclusive',
+      PrivateNote: 'MAJE VANCOUVER OUTLET, Richmond, CAN',
+      Line: [{
+        Id: '1',
+        Description: 'MAJE VANCOUVER OUTLET, Richmond, CAN',
+        Amount: 1_262.42,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2', name: 'Uncategorized Expense' },
+          BillableStatus: 'NotBillable',
+          TaxCodeRef: { value: '18' },
+          TaxInclusiveAmt: 1_413.91,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 151.49 },
+    };
+    const categorization: StagedCategorization = {
+      transactionId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -125_125, taxCents: -16_266, totalCents: -141_391 },
+      lines: [{
+        idx: 0,
+        subtotalCents: -125_125,
+        taxCents: -16_266,
+        totalCents: -141_391,
+        categoryQboId: '1150040000',
+        taxCodeQboId: '19',
+        memo: null,
+        tagIds: [],
+      }],
+      tagIds: [],
+    };
+
+    const prepared = preparePurchaseRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['2'],
+      staged: categorization,
+      before: mapPurchaseTaxSnapshot(raw),
+      requestId: 'REQUEST_22557',
+    });
+
+    expect(prepared.body.TotalAmt).toBe(1_413.91);
+    expect(prepared.body.Line![0]).toMatchObject({
+      Id: '1',
+      Amount: 1_251.25,
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: '1150040000' },
+        TaxCodeRef: { value: '19' },
+        TaxAmount: 162.66,
+        TaxInclusiveAmt: 1_413.91,
+      },
+    });
+  });
+
   it.each([
     ['a different source tax code', () => {
       const fixture = preserveCurrentFixture();

@@ -95,6 +95,7 @@ interface FakeState {
   }[];
   companies: {
     id: string;
+    holdingAccountIds: string[];
     taxSupportStatus: string;
     taxSupportReason: string | null;
     taxUsingSalesTax: boolean | null;
@@ -315,7 +316,25 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
       taxCalculation: null,
       taxCode: null,
       taxCodeQboId: null,
-      rawData: null,
+      rawData: {
+        Id: 'QBO_PURCHASE_30',
+        SyncToken: '7',
+        TxnDate: '2026-07-29',
+        TotalAmt: 10.5,
+        GlobalTaxCalculation: 'TaxInclusive',
+        AccountRef: { value: 'BANK_ACCOUNT' },
+        Line: [{
+          Id: '1',
+          Amount: 10.5,
+          DetailType: 'AccountBasedExpenseLineDetail',
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: '2' },
+            TaxCodeRef: { value: 'SOURCE_TAX_CODE' },
+            TaxInclusiveAmt: 10.5,
+          },
+        }],
+        TxnTaxDetail: { TotalTax: 0 },
+      },
     }],
     accounts: [{
       companyId: COMPANY_ID,
@@ -359,6 +378,7 @@ function initialState(overrides: Partial<FakeState> = {}): FakeState {
     }],
     companies: [{
       id: COMPANY_ID,
+      holdingAccountIds: ['2'],
       taxSupportStatus: 'ready',
       taxSupportReason: null,
       taxUsingSalesTax: true,
@@ -932,6 +952,13 @@ describe('stageCategorization', () => {
 
   it('stages balanced signed splits and per-line totals', async () => {
     db.state.transactions[0]!.amount = -21;
+    const raw = db.state.transactions[0]!.rawData as {
+      TotalAmt: number;
+      Line: { Amount: number; AccountBasedExpenseLineDetail: { TaxInclusiveAmt: number } }[];
+    };
+    raw.TotalAmt = 21;
+    raw.Line[0]!.Amount = 21;
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxInclusiveAmt = 21;
     const staged = await stageCategorization(input({
       ...standardProposal,
       lines: [
@@ -1028,6 +1055,13 @@ describe('stageCategorization', () => {
 
   it('stages a receipt-proven tax-inclusive composite purchase code', async () => {
     db.state.transactions[0]!.amount = -31.36;
+    const raw = db.state.transactions[0]!.rawData as {
+      TotalAmt: number;
+      Line: { Amount: number; AccountBasedExpenseLineDetail: { TaxInclusiveAmt: number } }[];
+    };
+    raw.TotalAmt = 31.36;
+    raw.Line[0]!.Amount = 31.36;
+    raw.Line[0]!.AccountBasedExpenseLineDetail.TaxInclusiveAmt = 31.36;
     db.state.taxCodes[0]!.qboId = '7';
     db.state.taxCodes[0]!.name = 'GST/PST BC';
     db.state.taxCodes[0]!.purchaseTaxRateList = [
@@ -1256,6 +1290,84 @@ describe('stageCategorization', () => {
       taxCalculation: 'TaxInclusive',
       taxCode: '7',
       taxCodeQboId: '7',
+    });
+  });
+
+  it('stages a tax correction against the tax-inclusive holding gross instead of its old net', async () => {
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = '22557';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -1_262.42;
+    transaction.rawData = {
+      Id: '22557',
+      SyncToken: '1',
+      TxnDate: '2026-06-11',
+      TotalAmt: 1_413.91,
+      GlobalTaxCalculation: 'TaxInclusive',
+      AccountRef: { value: '61' },
+      Line: [{
+        Id: '1',
+        Amount: 1_262.42,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '18' },
+          TaxInclusiveAmt: 1_413.91,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 151.49 },
+    };
+    db.state.accounts.push({
+      companyId: COMPANY_ID,
+      qboId: '1150040000',
+      name: 'Cost of Goods Sold - GST/PST Refundable',
+      fullName: 'Cost of Goods Sold - GST/PST Refundable',
+      active: true,
+    });
+    db.state.taxCodes = [{
+      companyId: COMPANY_ID,
+      qboId: '19',
+      name: 'HST ON',
+      active: true,
+      taxable: true,
+      purchaseTaxRateList: [{
+        taxRateQboId: 'HST_ON_13',
+        taxTypeApplicable: 'TaxOnAmount',
+      }],
+      salesTaxRateList: [],
+      combinedSalesRate: null,
+    }];
+    db.state.taxRates = [{
+      companyId: COMPANY_ID,
+      qboId: 'HST_ON_13',
+      name: 'HST ON 13%',
+      active: true,
+      rateValue: 13,
+    }];
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      lines: [{
+        grossCents: -141_391,
+        categoryQboId: '1150040000',
+        taxCodeQboId: '19',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged).toMatchObject({
+      taxDisposition: 'set',
+      taxCalculation: 'TaxInclusive',
+      totals: { subtotalCents: -125_125, taxCents: -16_266, totalCents: -141_391 },
+      lines: [{
+        subtotalCents: -125_125,
+        taxCents: -16_266,
+        totalCents: -141_391,
+        categoryQboId: '1150040000',
+        taxCodeQboId: '19',
+      }],
     });
   });
 
