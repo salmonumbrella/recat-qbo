@@ -1,10 +1,12 @@
 import { prisma } from '../../lib/prisma.js';
+import { QboDepositPreparationError } from '../../lib/qbo/depositTax.js';
 import { qboFactory } from '../../lib/qbo/factory.js';
 import type { QboClient } from '../../lib/qbo/types.js';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import { moneyToCents } from '../tax/model.js';
 import {
   createPreparedOperation,
+  McpOperationError,
   normalizeMcpOperationIdempotencyKey,
   type CreatePreparedOperationInput,
   type McpOperationRecord,
@@ -96,6 +98,11 @@ export interface McpTaxRefundDeps {
     checkedAt: Date,
   ) => Promise<void>;
   loadTransaction?: (companyId: string, transactionId: string) => Promise<TaxRefundTransaction | null>;
+  loadReplay?: (
+    principal: McpPrincipal,
+    transactionId: string,
+    idempotencyKey: string,
+  ) => Promise<McpOperationRecord | null>;
   getClient?: (companyId: string) => Promise<QboClient>;
   createOperation?: (
     input: CreatePreparedOperationInput,
@@ -124,6 +131,20 @@ export async function prepareMcpTaxRefund(
   });
   await authorize(principal, input.companyId, now);
 
+  const loadReplay = dependencies.loadReplay ?? (async (actor, transactionId, key) => (
+    prisma.mcpOperation.findFirst({
+      where: {
+        tokenId: actor.tokenId,
+        userId: actor.userId,
+        toolName: TOOL_NAME,
+        transactionId,
+        idempotencyKey: key,
+      },
+    }) as Promise<McpOperationRecord | null>
+  ));
+  const replay = await loadReplay(principal, input.transactionId, idempotencyKey);
+  if (replay !== null) return preparedReplayDto(replay, principal, input, idempotencyKey);
+
   const loadTransaction = dependencies.loadTransaction ?? (async (companyId, transactionId) => (
     prisma.transaction.findFirst({ where: { id: transactionId, companyId } })
   ));
@@ -134,11 +155,21 @@ export async function prepareMcpTaxRefund(
   if (source.revision !== input.expectedRevision) throw new McpTaxRefundError('STALE_SOURCE');
 
   const client = await (dependencies.getClient ?? qboFactory.forCompany)(input.companyId);
-  const [capability, accounts, snapshot] = await Promise.all([
-    client.probeTaxRefundCapability(),
-    client.listAccounts(),
-    client.fetchPreparedSnapshot('Deposit', source.qboId),
-  ]);
+  let capability;
+  let accounts;
+  let snapshot;
+  try {
+    [capability, accounts, snapshot] = await Promise.all([
+      client.probeTaxRefundCapability(),
+      client.listAccounts(),
+      client.fetchPreparedSnapshot('Deposit', source.qboId),
+    ]);
+  } catch (error) {
+    if (error instanceof QboDepositPreparationError) {
+      throw new McpTaxRefundError('QBO_SOURCE_CHANGED');
+    }
+    throw error;
+  }
   if (
     snapshot === null
     || !('depositToAccountQboId' in snapshot)
@@ -222,6 +253,68 @@ export async function prepareMcpTaxRefund(
     preview,
     warnings,
   };
+}
+
+function preparedReplayDto(
+  operation: McpOperationRecord,
+  principal: McpPrincipal,
+  input: PrepareMcpTaxRefundInput,
+  idempotencyKey: string,
+): PreparedMcpTaxRefundDto {
+  const payload = record(operation.payload);
+  const preview = record(payload?.preview);
+  const warnings = payload?.warnings;
+  const interestCents = input.interestCents ?? 0;
+  const interestAccountQboId = input.interestAccountQboId ?? null;
+  if (
+    operation.tokenId !== principal.tokenId
+    || operation.tokenPrefix !== principal.tokenPrefix
+    || operation.userId !== principal.userId
+    || operation.companyId !== input.companyId
+    || operation.transactionId !== input.transactionId
+    || operation.toolName !== TOOL_NAME
+    || operation.kind !== 'tax_refund'
+    || operation.idempotencyKey !== idempotencyKey
+    || operation.sourceRevision !== input.expectedRevision
+    || operation.preparedRevision !== input.expectedRevision
+    || operation.qboType !== 'Deposit'
+    || operation.retryOfId !== null
+    || payload?.capability !== 'manual_required'
+    || preview?.action !== 'record_gst_hst_refund'
+    || preview.operatorPath !== 'Sales Tax > Filed > Record refund'
+    || preview.sourceDepositQboId !== operation.qboId
+    || preview.taxAgencyQboId !== input.taxAgencyQboId
+    || preview.filedReturnRef !== input.filedReturnRef
+    || preview.filingEvidenceSha256 !== input.filingEvidenceSha256
+    || preview.suspenseAccountQboId !== input.suspenseAccountQboId
+    || preview.bankAccountQboId !== input.bankAccountQboId
+    || preview.refundDate !== input.refundDate
+    || preview.principalCents !== input.principalCents
+    || preview.interestCents !== interestCents
+    || preview.interestAccountQboId !== interestAccountQboId
+    || preview.totalBankCreditCents !== input.principalCents + interestCents
+    || preview.existingDepositTreatment !== 'replace_or_match_before_verification'
+    || !Array.isArray(warnings)
+    || warnings.some((warning) => typeof warning !== 'string')
+  ) {
+    throw new McpOperationError('IDEMPOTENCY_CONFLICT');
+  }
+  if (!Number.isFinite(operation.expiresAt.getTime())) {
+    throw new McpOperationError('OPERATION_CONFLICT');
+  }
+  return {
+    operationId: operation.id,
+    expiresAt: operation.expiresAt.toISOString(),
+    capability: 'manual_required',
+    preview: preview as unknown as PreparedMcpTaxRefundDto['preview'],
+    warnings,
+  };
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function validateInput(input: PrepareMcpTaxRefundInput, now: Date): void {
