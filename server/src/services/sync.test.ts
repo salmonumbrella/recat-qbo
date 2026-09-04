@@ -185,6 +185,54 @@ describe('syncCompany', () => {
     }));
   });
 
+  it('does not refresh a transaction owned by another company', async () => {
+    mocks.transactionFindUnique.mockResolvedValue({
+      id: 'txn-generic', companyId: 'company-2', qboType: 'Purchase',
+      qboId: 'qbo-purchase-generic', qboSyncToken: '7', revision: 4,
+    });
+
+    await expect(refreshMirroredTransaction('company-1', 'txn-generic', mutationDeps()))
+      .resolves.toEqual({ transactionId: 'txn-generic', outcome: 'not_found' });
+    expect(mocks.fetchTxn).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite a mirror with an older QBO snapshot', async () => {
+    const current = {
+      id: 'txn-generic', companyId: 'company-1', qboType: 'Purchase',
+      qboId: 'qbo-purchase-generic', qboSyncToken: '7', revision: 4,
+    };
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1', holdingAccountIds: ['holding-generic'], lastSyncedAt: null,
+    });
+    mocks.transactionFindUnique.mockResolvedValue(current);
+    mocks.fetchTxn.mockResolvedValue(qboTxn({ syncToken: '6' }));
+
+    await expect(refreshMirroredTransaction('company-1', 'txn-generic', mutationDeps()))
+      .resolves.toEqual({ transactionId: 'txn-generic', outcome: 'stale' });
+    expect(mocks.transactionUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('reports contention and leases without writing a stale mirror', async () => {
+    const current = {
+      id: 'txn-generic', companyId: 'company-1', qboType: 'Purchase',
+      qboId: 'qbo-purchase-generic', qboSyncToken: '7', revision: 4,
+    };
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1', holdingAccountIds: ['holding-generic'], lastSyncedAt: null,
+    });
+    mocks.transactionFindUnique.mockResolvedValue(current);
+    mocks.fetchTxn.mockResolvedValue(qboTxn({ syncToken: '8' }));
+    mocks.transactionUpdateMany.mockResolvedValue({ count: 0 });
+
+    await expect(refreshMirroredTransaction('company-1', 'txn-generic', mutationDeps()))
+      .resolves.toEqual({ transactionId: 'txn-generic', outcome: 'contended' });
+    const busy = Object.assign(new Error('busy'), { code: 'ENTITY_BUSY' });
+    await expect(refreshMirroredTransaction('company-1', 'txn-generic', mutationDeps({
+      lease: async () => { throw busy; },
+    }))).resolves.toEqual({ transactionId: 'txn-generic', outcome: 'busy' });
+  });
+
   it('reports a newly mirrored holding transaction as created', async () => {
     mocks.companyFindUnique.mockResolvedValue({
       id: 'company-1',
