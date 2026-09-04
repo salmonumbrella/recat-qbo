@@ -1676,7 +1676,7 @@ async function loadAuthorizedStage(
     }));
   } else {
     const taxCodeIds = uniqueStrings(txn.splitLines.map((line) => line.taxCodeQboId));
-    if (taxCodeIds.length !== txn.splitLines.length) {
+    if (txn.splitLines.some((line) => line.taxCodeQboId === null || line.taxCodeQboId.trim() === '')) {
       lifecycleError('TAX_CODE_UNAVAILABLE', 'Every taxed line requires an available tax code.');
     }
     const [taxCodes, taxRates] = await Promise.all([

@@ -5411,6 +5411,52 @@ describe.each(['Purchase', 'Deposit'] as const)(
       );
     });
 
+    it('allows two prepared lines to reuse the same active tax code', async () => {
+      const db = new FakeDurableDb(qboType);
+      const deposit = qboType === 'Deposit';
+      db.transactionRow.amount = 210;
+      db.transactionRow.taxCalculation = 'TaxExcluded';
+      db.transactionRow.splitLines = [
+        {
+          idx: 0,
+          amount: 105,
+          category: 'Prepared first line',
+          categoryQboId: deposit ? 'income-generic-a' : 'expense-generic-a',
+          taxCode: 'Shared tax',
+          taxCodeQboId: 'tax-shared',
+          memo: 'Prepared first line',
+        },
+        {
+          idx: 1,
+          amount: 105,
+          category: 'Prepared second line',
+          categoryQboId: deposit ? 'income-generic-b' : 'expense-generic-b',
+          taxCode: 'Shared tax',
+          taxCodeQboId: 'tax-shared',
+          memo: 'Prepared second line',
+        },
+      ];
+      const fixture = durableDeps(db);
+      fixture.db.qboAccount.findMany.mockResolvedValue([
+        { qboId: deposit ? 'income-generic-a' : 'expense-generic-a', active: true },
+        { qboId: deposit ? 'income-generic-b' : 'expense-generic-b', active: true },
+      ]);
+      fixture.db.qboTaxCode.findMany.mockResolvedValue([{
+        qboId: 'tax-shared',
+        name: 'Shared tax',
+        active: true,
+        taxable: true,
+        purchaseTaxRateList: [{ taxRateQboId: 'rate-generic', taxTypeApplicable: 'TaxOnAmount' }],
+        salesTaxRateList: [{ taxRateQboId: 'rate-generic', taxTypeApplicable: 'TaxOnAmount' }],
+        combinedSalesRate: 5,
+      }]);
+
+      await expect(commitStagedCategorization(commitInput(), fixture.deps)).resolves.toMatchObject({
+        ok: true,
+        outcome: 'VERIFIED',
+      });
+    });
+
     it('fails closed when no exact tax-exclusive inverse exists', async () => {
       const db = new FakeDurableDb(qboType);
       db.transactionRow.amount = 0.01;
