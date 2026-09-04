@@ -35,6 +35,7 @@ import {
   type QboPurchaseSnapshot,
   type QboTaxCodeInfo,
   type QboTaxProfile,
+  type QboTaxRefundCapability,
   type QboTaxRateInfo,
   type QboTokenSet,
   type QboTxn,
@@ -1339,6 +1340,15 @@ export class MockQboClient implements QboClient {
   async getTaxProfile(): Promise<QboTaxProfile> {
     await ensureMockRealmsHydrated();
     return { ...this.realm.taxProfile };
+  }
+
+  async probeTaxRefundCapability(): Promise<QboTaxRefundCapability> {
+    return {
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: '75',
+    };
   }
 
   async fetchWriteSafety(

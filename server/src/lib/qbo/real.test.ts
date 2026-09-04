@@ -161,6 +161,21 @@ describe('OAuth token revocation', () => {
   });
 });
 
+describe('Canadian tax-refund capability', () => {
+  it('fails closed without probing an undocumented production endpoint', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(realClient().client.probeTaxRefundCapability()).resolves.toEqual({
+      mode: 'manual_required',
+      reason: 'UNSUPPORTED_PUBLIC_API',
+      api: 'intuit-accounting-v3',
+      minorVersion: '75',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 function realClient(
   onTokensRefreshed = vi.fn(async () => undefined),
   holdingAccountQboIds: string[] = [],
