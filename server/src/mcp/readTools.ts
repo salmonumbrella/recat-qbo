@@ -213,6 +213,7 @@ export interface CompanySyncOperations {
     ok: boolean;
     message: string;
     mirror?: {
+      created: number;
       refreshed: number;
       stale: number;
       busy: number;
@@ -756,6 +757,7 @@ const syncCompanyOutput = z.strictObject({
     ok: z.boolean(),
     message: text,
     mirror: z.strictObject({
+      created: z.number().int().nonnegative(),
       refreshed: z.number().int().nonnegative(),
       stale: z.number().int().nonnegative(),
       busy: z.number().int().nonnegative(),

@@ -35,6 +35,7 @@ export interface SyncResult {
   ok: boolean;
   message: string;
   mirror?: {
+    created: number;
     refreshed: number;
     stale: number;
     busy: number;
@@ -332,7 +333,7 @@ async function runSyncCompany(
       ).map((t) => `${t.qboType}:${t.qboId}`),
     );
     let created = 0;
-    const mirrorStats = { refreshed: 0, stale: 0, busy: 0, contended: 0 };
+    const mirrorStats = { created: 0, refreshed: 0, stale: 0, busy: 0, contended: 0 };
     for (const t of holdingTxns) {
       // Refresh the QBO mirror on every sync (fresh SyncToken + raw JSON);
       // local categorization state (status/category/splits/tags) is untouched.
@@ -436,6 +437,7 @@ async function runSyncCompany(
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
+      if (mutation.outcome === 'created') mirrorStats.created += 1;
       if (mutation.outcome === 'refreshed') mirrorStats.refreshed += 1;
       if (mutation.outcome === 'stale') mirrorStats.stale += 1;
       if (mutation.outcome === 'contended') mirrorStats.contended += 1;

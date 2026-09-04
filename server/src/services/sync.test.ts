@@ -165,7 +165,7 @@ describe('syncCompany', () => {
 
     expect(result).toMatchObject({
       ok: true,
-      mirror: { refreshed: 0, stale: 0, busy: 0, contended: 1 },
+      mirror: { created: 0, refreshed: 0, stale: 0, busy: 0, contended: 1 },
     });
   });
 
