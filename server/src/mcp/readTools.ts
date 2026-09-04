@@ -209,7 +209,16 @@ export interface RecatMcpContext {
 
 /** A Recat mirror refresh reads QBO and writes only Recat's local mirror. */
 export interface CompanySyncOperations {
-  syncCompany(companyId: string, kind: 'manual'): Promise<{ ok: boolean; message: string }>;
+  syncCompany(companyId: string, kind: 'manual'): Promise<{
+    ok: boolean;
+    message: string;
+    mirror?: {
+      refreshed: number;
+      stale: number;
+      busy: number;
+      contended: number;
+    };
+  }>;
 }
 
 const ID_MAX = 128;

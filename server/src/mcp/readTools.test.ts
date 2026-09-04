@@ -176,6 +176,7 @@ describe('Recat MCP read tools', () => {
     const syncCompany = vi.fn().mockResolvedValue({
       ok: true,
       message: 'Synced 1 transaction.',
+      mirror: { refreshed: 1, stale: 2, busy: 3, contended: 4 },
     });
     const sync: CompanySyncOperations = { syncCompany };
     const handler = createMcpHandler(
@@ -198,6 +199,7 @@ describe('Recat MCP read tools', () => {
       companyId: 'company-a',
       ok: true,
       message: 'Synced 1 transaction.',
+      mirror: { refreshed: 1, stale: 2, busy: 3, contended: 4 },
     });
     expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
   });
