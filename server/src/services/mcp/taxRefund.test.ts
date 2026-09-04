@@ -15,6 +15,7 @@ import {
   type CancelMcpTaxRefundInput,
   type PrepareMcpTaxRefundInput,
 } from './taxRefund.js';
+import { McpCategorizationError } from './categorization.js';
 
 const COMPANY_ID = '11111111-1111-4111-8111-111111111111';
 const TRANSACTION_ID = '22222222-2222-4222-8222-222222222222';
@@ -520,6 +521,44 @@ describe('cancelMcpTaxRefund', () => {
     expect(cancelOperation).not.toHaveBeenCalled();
   });
 
+  it('requires a company or instance admin to correct a recorded attestation', async () => {
+    const operation = replayOperation();
+    operation.manualRecordedAt = new Date('2026-09-04T22:04:00.000Z');
+    const cancelOperation = vi.fn();
+
+    await expect(cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation,
+    })).rejects.toMatchObject({ code: 'SOURCE_ALREADY_RECORDED' });
+    expect(cancelOperation).not.toHaveBeenCalled();
+  });
+
+  it('lets an admin cancel a mistaken recorded attestation after confirming no QBO action', async () => {
+    const operation = replayOperation();
+    operation.manualRecordedAt = new Date('2026-09-04T22:04:00.000Z');
+    const admin = {
+      ...principal,
+      memberships: [{ companyId: COMPANY_ID, role: 'admin' as const }],
+    };
+    const cancelOperation = vi.fn().mockResolvedValue({ count: 1 });
+
+    await expect(cancelMcpTaxRefund(admin, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation,
+      now: () => new Date('2026-09-04T22:05:00.000Z'),
+    })).resolves.toEqual({
+      operationId: operation.id,
+      state: 'cancelled',
+      cancelledAt: '2026-09-04T22:05:00.000Z',
+    });
+    expect(cancelOperation).toHaveBeenCalledWith(
+      operation.id,
+      new Date('2026-09-04T22:05:00.000Z'),
+    );
+  });
+
   it('requires an explicit assertion that no QuickBooks action occurred', async () => {
     await expect(cancelMcpTaxRefund(principal, {
       ...request,
@@ -531,11 +570,27 @@ describe('cancelMcpTaxRefund', () => {
 
   it('hides a foreign company operation behind not found', async () => {
     await expect(cancelMcpTaxRefund(principal, request, {
-      authorize: vi.fn().mockRejectedValue(new Error('foreign company')),
+      authorize: vi.fn().mockRejectedValue(new McpCategorizationError('MCP_FORBIDDEN')),
       loadOperation: vi.fn().mockResolvedValue(replayOperation()),
       cancelOperation: vi.fn(),
       now: () => new Date('2026-09-04T22:05:00.000Z'),
     })).rejects.toMatchObject({ code: 'OPERATION_NOT_FOUND' });
+  });
+
+  it('preserves disconnected-company and infrastructure authorization failures', async () => {
+    const operation = replayOperation();
+    await expect(cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockRejectedValue(new McpCategorizationError('COMPANY_DISCONNECTED')),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation: vi.fn(),
+    })).rejects.toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+
+    const databaseFailure = new Error('database unavailable');
+    await expect(cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockRejectedValue(databaseFailure),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation: vi.fn(),
+    })).rejects.toBe(databaseFailure);
   });
 
   it('lets a current company admin recover another user\'s preparation', async () => {

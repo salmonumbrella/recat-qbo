@@ -17,6 +17,7 @@ import {
 } from './operations.js';
 import {
   assertCurrentMcpCategorizationAuthorization,
+  McpCategorizationError,
   type McpCategorizationAuthorizationStore,
 } from './categorization.js';
 
@@ -251,7 +252,8 @@ export async function cancelMcpTaxRefund(
   assertCanManageRefund(principal, operation);
   const payload = validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
-  if (operation.manualRecordedAt != null) {
+  const correctingRecordedAttestation = operation.manualRecordedAt != null;
+  if (correctingRecordedAttestation && !isRefundAdmin(principal, operation.companyId)) {
     throw new McpTaxRefundError('SOURCE_ALREADY_RECORDED');
   }
 
@@ -262,7 +264,7 @@ export async function cancelMcpTaxRefund(
           id: operationId,
           kind: 'tax_refund',
           cancelledAt: null,
-          manualRecordedAt: null,
+          manualRecordedAt: operation.manualRecordedAt ?? null,
         },
         data: { cancelledAt },
       });
@@ -271,8 +273,12 @@ export async function cancelMcpTaxRefund(
           principal,
           operation,
           payload,
-          'tax-refund-cancelled',
-          'tax_refund_prepared',
+          correctingRecordedAttestation
+            ? 'tax-refund-recording-corrected'
+            : 'tax-refund-cancelled',
+          correctingRecordedAttestation
+            ? 'tax_refund_recorded_unverified'
+            : 'tax_refund_prepared',
           'tax_refund_cancelled',
         ));
       }
@@ -384,6 +390,12 @@ export function canManageMcpTaxRefund(
     || companyAdmin;
 }
 
+function isRefundAdmin(principal: McpPrincipal, companyId: string): boolean {
+  return principal.isInstanceAdmin === true || principal.memberships.some((membership) => (
+    membership.companyId === companyId && membership.role === 'admin'
+  ));
+}
+
 function assertCanManageRefund(
   principal: McpPrincipal,
   operation: McpOperationRecord,
@@ -397,7 +409,7 @@ function refundAuditEntry(
   principal: McpPrincipal,
   operation: McpOperationRecord,
   payload: StoredMcpTaxRefundPayload,
-  action: 'tax-refund-cancelled' | 'tax-refund-recorded',
+  action: 'tax-refund-cancelled' | 'tax-refund-recorded' | 'tax-refund-recording-corrected',
   before: string,
   after: string,
 ) {
@@ -427,8 +439,14 @@ async function authorizeRefundManagement(
 ): Promise<void> {
   try {
     await authorize(principal, companyId, now);
-  } catch {
-    throw new McpOperationError('OPERATION_NOT_FOUND');
+  } catch (error) {
+    if (
+      error instanceof McpCategorizationError
+      && (error.code === 'MCP_UNAUTHORIZED' || error.code === 'MCP_FORBIDDEN')
+    ) {
+      throw new McpOperationError('OPERATION_NOT_FOUND');
+    }
+    throw error;
   }
 }
 

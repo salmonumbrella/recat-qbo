@@ -572,6 +572,20 @@ describe('MCP attachment operation dispatch', () => {
     });
   });
 
+  it('preserves a disconnected-company error when reading a manual refund', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+    vi.mocked(value.deps.store!.company.findUnique).mockResolvedValue({
+      disconnectedAt: new Date('2026-09-04T22:00:00.000Z'),
+    });
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'COMPANY_DISCONNECTED' });
+  });
+
   it('projects an acknowledged manual refund as awaiting verification, not another QBO action', async () => {
     const value = fixture();
     value.operations.splice(0, 1, taxRefundOperation({

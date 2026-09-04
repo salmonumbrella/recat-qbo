@@ -22,8 +22,7 @@ BEGIN
            (
                OLD."cancelledAt" IS NULL
                AND NEW."cancelledAt" IS NOT NULL
-               AND OLD."manualRecordedAt" IS NULL
-               AND NEW."manualRecordedAt" IS NULL
+               AND OLD."manualRecordedAt" IS NOT DISTINCT FROM NEW."manualRecordedAt"
            )
            OR (
                OLD."manualRecordedAt" IS NULL

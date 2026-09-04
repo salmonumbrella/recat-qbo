@@ -24,6 +24,7 @@ import {
 } from './operations.js';
 import {
   assertCurrentMcpCategorizationAuthorization,
+  McpCategorizationError,
   parseStoredMcpCategorizationPayload,
   type McpCategorizationAuthorizationStore,
 } from './categorization.js';
@@ -774,8 +775,14 @@ async function projectManualTaxRefund(
       operation.companyId,
       now,
     );
-  } catch {
-    throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+  } catch (error) {
+    if (
+      error instanceof McpCategorizationError
+      && (error.code === 'MCP_UNAUTHORIZED' || error.code === 'MCP_FORBIDDEN')
+    ) {
+      throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+    }
+    throw error;
   }
   try {
     validateMcpTaxRefundEnvelope(operation);

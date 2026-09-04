@@ -204,7 +204,7 @@ describePostgres('MCP operation PostgreSQL durability', () => {
     })).rejects.toThrow('McpOperation immutable fields cannot be changed');
   });
 
-  it('allows one manual-recorded transition and then keeps lifecycle fields immutable', async () => {
+  it('allows one manual-recorded transition and a later corrective cancellation', async () => {
     const operation = await createPreparedOperation(operationInput({
       kind: 'tax_refund',
       toolName: 'prepare_tax_refund',
@@ -227,6 +227,13 @@ describePostgres('MCP operation PostgreSQL durability', () => {
     await expect(firstClient.mcpOperation.update({
       where: { id: operation.id },
       data: { cancelledAt: new Date(manualRecordedAt.getTime() + 1_000) },
+    })).resolves.toMatchObject({
+      manualRecordedAt,
+      cancelledAt: new Date(manualRecordedAt.getTime() + 1_000),
+    });
+    await expect(firstClient.mcpOperation.update({
+      where: { id: operation.id },
+      data: { cancelledAt: new Date(manualRecordedAt.getTime() + 2_000) },
     })).rejects.toThrow('McpOperation immutable fields cannot be changed');
   });
 
