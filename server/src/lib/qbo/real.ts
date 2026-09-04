@@ -197,6 +197,7 @@ interface RawAccount {
   FullyQualifiedName?: string;
   Classification?: string; // Asset | Liability | Equity | Revenue | Expense
   AccountType?: string; // Bank | Credit Card | Cost of Goods Sold | Expense | Income | ...
+  AccountSubType?: string;
   Active?: boolean;
 }
 
@@ -632,6 +633,7 @@ function mapAccount(raw: RawAccount): QboAccountInfo {
     fullName: raw.FullyQualifiedName ?? raw.Name,
     classification: normalizeClassification(raw.AccountType, raw.Classification),
     accountType: raw.AccountType ?? '',
+    accountSubType: firstNonEmpty(raw.AccountSubType) ?? null,
     active: raw.Active !== false,
   };
 }

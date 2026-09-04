@@ -1333,6 +1333,7 @@ export class MockQboClient implements QboClient {
       fullName: a.fullName,
       classification: a.classification,
       accountType: a.accountType,
+      accountSubType: null,
       active: true,
     }));
   }

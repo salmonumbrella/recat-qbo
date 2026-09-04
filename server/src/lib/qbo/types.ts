@@ -24,6 +24,8 @@ export interface QboAccountInfo {
   /** normalized bucket: Income | COGS | Expenses | Asset | Liability | Equity | Bank | CreditCard | Other */
   classification: string;
   accountType: string;
+  /** QBO system subtype, such as GlobalTaxSuspense, when the API returns it. */
+  accountSubType?: string | null;
   active: boolean;
 }
 
