@@ -10,6 +10,7 @@ import {
   READ_TOOL_NAMES,
   createRecatMcpServer,
   type CompanyReadOperations,
+  type CompanySyncOperations,
 } from './readTools.js';
 import type { WriteSafetyReadOperations } from '../services/writeSafetyReads.js';
 
@@ -171,6 +172,59 @@ async function legacy(handler: ReturnType<typeof createMcpHandler>, method: stri
 }
 
 describe('Recat MCP read tools', () => {
+  it('runs an authorized Recat mirror sync without writing QuickBooks', async () => {
+    const syncCompany = vi.fn().mockResolvedValue({
+      ok: true,
+      message: 'Synced 1 transaction.',
+    });
+    const sync: CompanySyncOperations = { syncCompany };
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, memberships: [{ companyId: 'company-a', role: 'categorizer' as const }] },
+        era: 'legacy',
+        reads: reads(),
+        sync,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.sync).toEqual({
+      companyId: 'company-a',
+      ok: true,
+      message: 'Synced 1 transaction.',
+    });
+    expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
+  });
+
+  it('requires categorizer access before a Recat mirror sync', async () => {
+    const syncCompany = vi.fn();
+    const sync: CompanySyncOperations = { syncCompany };
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal,
+        era: 'legacy',
+        reads: reads(),
+        sync,
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).toBe(true);
+    expect(response.result.structuredContent.error.code).toBe('FORBIDDEN');
+    expect(syncCompany).not.toHaveBeenCalled();
+  });
+
   it('returns the complete tax-code DTO instead of rejecting its sales rate', async () => {
     const operations = reads();
     vi.mocked(operations.listTaxCodes).mockResolvedValue({
@@ -269,7 +323,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly seventeen core reads and twenty-three conservatively annotated action tools', async () => {
+  it('registers eighteen core reads and twenty-three conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -303,8 +357,17 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(40);
+    expect(tools).toHaveLength(41);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
+      if (tool.name === 'sync_company') {
+        expect(tool.annotations).toMatchObject({
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        });
+        continue;
+      }
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
         destructiveHint: false,

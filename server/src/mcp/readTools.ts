@@ -7,6 +7,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import type { Tracer } from '@opentelemetry/api';
 import { z } from 'zod-v4';
+import { HttpError } from '../lib/http.js';
 import type { McpPrincipal } from './auth.js';
 import {
   DEFAULT_READ_LIMIT,
@@ -52,6 +53,7 @@ import {
   refreshProviderActionability,
   type ProviderActionabilityRefreshResult,
 } from '../services/providerActionabilityRefresh.js';
+import { syncCompany } from '../services/sync.js';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
 import {
@@ -78,6 +80,7 @@ export const READ_TOOL_NAMES = [
   'list_transactions',
   'get_transaction',
   'get_write_safety',
+  'sync_company',
   'refresh_provider_actionability',
   'list_categories',
   'list_tax_codes',
@@ -194,6 +197,7 @@ export interface RecatMcpContext {
   era: 'legacy' | 'modern';
   reads?: CompanyReadOperations;
   writeSafetyReads?: WriteSafetyReadOperations;
+  sync?: CompanySyncOperations;
   actionabilityRefresh?: ProviderActionabilityRefreshOperations;
   mutations?: McpMutationOperations;
   requestId?: string;
@@ -203,6 +207,11 @@ export interface RecatMcpContext {
   log?: McpToolLogger;
 }
 
+/** A Recat mirror refresh reads QBO and writes only Recat's local mirror. */
+export interface CompanySyncOperations {
+  syncCompany(companyId: string, kind: 'manual'): Promise<{ ok: boolean; message: string }>;
+}
+
 const ID_MAX = 128;
 const CURSOR_MAX = 2_048;
 const SEARCH_MAX = 200;
@@ -210,6 +219,12 @@ const ACCOUNT_MAX = 120;
 const ACTIONABILITY_CURSOR_MAX = 128;
 const annotations: ToolAnnotations = Object.freeze({
   readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+const syncAnnotations: ToolAnnotations = Object.freeze({
+  readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: true,
   openWorldHint: false,
@@ -725,6 +740,14 @@ const actionabilityRefreshInput = z.strictObject({
   limit: z.number().int().min(1).max(MAX_ACTIONABILITY_REFRESH_LIMIT)
     .default(DEFAULT_ACTIONABILITY_REFRESH_LIMIT).optional(),
 });
+const syncCompanyInput = z.strictObject({ companyId: id });
+const syncCompanyOutput = z.strictObject({
+  sync: z.strictObject({
+    companyId: id,
+    ok: z.boolean(),
+    message: text,
+  }),
+});
 const actionabilityRefreshOutput = z.strictObject({
   refresh: z.strictObject({
     companyId: id,
@@ -793,6 +816,7 @@ const authoredToolSchemas: ReadonlyArray<readonly [z.ZodType, z.ZodType]> = [
   [listTransactionsInput, transactionPageOutput],
   [getTransactionInput, transactionOutput],
   [getTransactionInput, writeSafetyOutput],
+  [syncCompanyInput, syncCompanyOutput],
   [actionabilityRefreshInput, actionabilityRefreshOutput],
   [companyPageInput, categoryListOutput],
   [companyPageInput, taxPageOutput],
@@ -828,6 +852,7 @@ function inputWithoutCompany<T extends { companyId: string }>(
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
   const safetyReads = context.writeSafetyReads ?? writeSafetyReads;
+  const sync = context.sync ?? { syncCompany } satisfies CompanySyncOperations;
   const actionabilityRefresh = context.actionabilityRefresh ?? {
     refreshProviderActionability,
   } satisfies ProviderActionabilityRefreshOperations;
@@ -965,6 +990,23 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
         input.transactionId,
       ),
     }),
+  );
+  register(
+    'sync_company',
+    'Refresh one company\'s Recat mirror from QuickBooks. This reads QuickBooks and updates only Recat\'s local mirror; it never writes QuickBooks.',
+    syncCompanyInput,
+    syncCompanyOutput,
+    async (input) => {
+      const membership = context.principal.memberships.find(
+        (candidate) => candidate.companyId === input.companyId,
+      );
+      if (membership?.role !== 'admin' && membership?.role !== 'categorizer') {
+        throw new HttpError(403, 'Company categorizer access is required.', 'FORBIDDEN');
+      }
+      const result = await sync.syncCompany(input.companyId, 'manual');
+      return { sync: { companyId: input.companyId, ...result } };
+    },
+    syncAnnotations,
   );
   register(
     'refresh_provider_actionability',
