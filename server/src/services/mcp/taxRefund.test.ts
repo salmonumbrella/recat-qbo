@@ -406,6 +406,18 @@ describe('prepareMcpTaxRefund', () => {
     expect(deps.loadTransaction).not.toHaveBeenCalled();
   });
 
+  it('does not present a manually recorded refund as merely prepared on replay', async () => {
+    const deps = dependencies();
+    const replay = replayOperation();
+    replay.manualRecordedAt = new Date('2026-09-04T22:06:00.000Z');
+    deps.loadReplay.mockResolvedValue(replay);
+
+    await expect(prepareMcpTaxRefund(principal, input(), deps)).rejects.toMatchObject({
+      code: 'SOURCE_ALREADY_RECORDED',
+    });
+    expect(deps.loadTransaction).not.toHaveBeenCalled();
+  });
+
   it('rejects a second preparation for the same source transaction', async () => {
     const deps = {
       ...dependencies(),

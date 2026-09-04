@@ -654,6 +654,9 @@ function preparedReplayDto(
   if (operation.cancelledAt !== null) {
     throw new McpTaxRefundError('SOURCE_PREPARATION_CANCELLED');
   }
+  if (operation.manualRecordedAt != null) {
+    throw new McpTaxRefundError('SOURCE_ALREADY_RECORDED');
+  }
   const preview = payload.preview;
   const warnings = payload.warnings;
   const interestCents = input.interestCents ?? 0;
