@@ -188,6 +188,90 @@ describe('prepareDepositRecategorization', () => {
     });
   });
 
+  it('preserves a replaced Deposit line description when the proposal memo is null', () => {
+    const raw: RawDeposit = {
+      Id: '22518',
+      SyncToken: '0',
+      TxnDate: '2026-06-16',
+      DepositToAccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 1081.97,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Adjust CAD 1081.97 - Invoice number: AWXCAXXXXXX0179, rebate',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Description: 'Adjust CAD 1081.97 - Invoice number: AWXCAXXXXXX0179, rebate',
+        Amount: 1081.97,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '1', name: '42000 Uncategorized Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    };
+
+    const prepared = prepareDepositRecategorization({
+      current: raw,
+      holdingAccountQboIds: ['1'],
+      staged: {
+        transactionId: '039f358d-722d-4fc8-aacb-a7833340a2ea',
+        revision: 1,
+        taxCalculation: 'TaxInclusive',
+        totals: { subtotalCents: 108_197, taxCents: 0, totalCents: 108_197 },
+        lines: [{
+          idx: 0,
+          subtotalCents: 108_197,
+          taxCents: 0,
+          totalCents: 108_197,
+          categoryQboId: '133',
+          taxCodeQboId: '5',
+          memo: null,
+          tagIds: [],
+        }],
+        tagIds: [],
+      },
+      before: mapDepositSnapshot(raw),
+      requestId: 'e878cf8a-0864-4976-a7cc-eb4200f90852',
+    });
+
+    expect(prepared.body.Line![0]!.Description).toBe(raw.Line![0]!.Description);
+    expect(prepared.expected.targetLines[0]!.description).toBe(raw.Line![0]!.Description);
+  });
+
+  it('derives zero Deposit tax when QBO omits TotalTax for an explicit zero-rate code', () => {
+    const snapshot = mapDepositSnapshot({
+      Id: '22518',
+      SyncToken: '1',
+      TxnDate: '2026-06-16',
+      DepositToAccountRef: { value: '61', name: 'Airwallex (CAD)' },
+      GlobalTaxCalculation: 'TaxInclusive',
+      TotalAmt: 1081.97,
+      CurrencyRef: { value: 'CAD', name: 'Canadian Dollar' },
+      ExchangeRate: 1,
+      PrivateNote: 'Adjust CAD 1081.97 - Invoice number: AWXCAXXXXXX0179, rebate',
+      Line: [{
+        Id: '1',
+        LineNum: 1,
+        Amount: 1081.97,
+        DetailType: 'DepositLineDetail',
+        CustomExtensions: [],
+        DepositLineDetail: {
+          AccountRef: { value: '133', name: '80000 Other Income' },
+          TaxCodeRef: { value: '5' },
+          TaxApplicableOn: 'Sales',
+        },
+      }],
+      TxnTaxDetail: {},
+    });
+
+    expect(snapshot.totalTaxCents).toBe(0);
+  });
+
   it('fingerprints preserved entity metadata and exact raw line fields', () => {
     const raw = completeDeposit();
     const baseline = mapDepositSnapshot(raw);

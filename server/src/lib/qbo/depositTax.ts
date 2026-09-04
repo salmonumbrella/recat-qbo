@@ -188,16 +188,18 @@ export function mapDepositSnapshot(raw: RawDeposit): QboDepositSnapshot {
     'deposit account reference',
   );
   const lines = raw.Line.map(snapshotLine);
+  const totalCents = exactCents(raw.TotalAmt);
   const derivedTotalTaxCents =
     raw.GlobalTaxCalculation === undefined
       ? null
-      : lines.some((line) => line.taxCodeQboId !== null)
-        ? null
-        : 0;
+      : safeCentSum([
+          totalCents,
+          -safeCentSum(lines.map((line) => line.amountCents)),
+        ]);
   return {
     qboId: raw.Id,
     syncToken: raw.SyncToken,
-    totalCents: exactCents(raw.TotalAmt),
+    totalCents,
     depositToAccountQboId,
     date: raw.TxnDate,
     globalTaxCalculation: raw.GlobalTaxCalculation ?? null,
@@ -348,6 +350,7 @@ function stagedLineToRaw(
   replacedLine?: RawDepositLine,
 ): RawDepositLine {
   const accountQboId = requiredIdentity(line.categoryQboId, 'category account reference');
+  const description = line.memo ?? replacedLine?.Description;
   if (line.idx < 0 || !Number.isSafeInteger(line.idx)) {
     preparationError('QBO_DEPOSIT_UNSUPPORTED', 'Transaction split indexes must be non-negative integers.');
   }
@@ -375,7 +378,7 @@ function stagedLineToRaw(
     // TaxInclusive; QBO computes and adds the selected sales tax separately.
     Amount: moneyFromCents(line.subtotalCents),
     DetailType: 'DepositLineDetail',
-    ...(line.memo === null ? {} : { Description: line.memo }),
+    ...(description === undefined ? {} : { Description: description }),
     DepositLineDetail: detail,
   };
 }
