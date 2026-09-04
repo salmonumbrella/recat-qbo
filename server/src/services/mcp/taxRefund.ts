@@ -67,7 +67,8 @@ export type McpTaxRefundErrorCode =
   | 'QBO_SOURCE_CHANGED'
   | 'AMOUNT_MISMATCH'
   | 'SYSTEM_SUSPENSE_REQUIRED'
-  | 'BANK_ACCOUNT_REQUIRED';
+  | 'BANK_ACCOUNT_REQUIRED'
+  | 'INTEREST_ACCOUNT_REQUIRED';
 
 export class McpTaxRefundError extends Error {
   constructor(readonly code: McpTaxRefundErrorCode) {
@@ -161,6 +162,14 @@ export async function prepareMcpTaxRefund(
   }
 
   const interestCents = input.interestCents ?? 0;
+  if (interestCents > 0) {
+    const interestAccount = accounts.find(
+      (account) => account.qboId === input.interestAccountQboId,
+    );
+    if (interestAccount?.active !== true) {
+      throw new McpTaxRefundError('INTEREST_ACCOUNT_REQUIRED');
+    }
+  }
   const totalBankCreditCents = input.principalCents + interestCents;
   if (
     moneyToCents(Number(source.amount)) !== totalBankCreditCents

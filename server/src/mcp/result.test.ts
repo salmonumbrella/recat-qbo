@@ -7,6 +7,7 @@ import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
 import { McpRuleChangeError } from '../services/mcp/rules.js';
+import { McpTaxRefundError } from '../services/mcp/taxRefund.js';
 import { McpUndoError } from '../services/mcp/undo.js';
 import { RuleCandidateError } from '../services/ruleCandidates.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
@@ -155,6 +156,9 @@ describe('MCP tool results', () => {
     [new McpTransferExecutionError('OPERATION_NOT_FOUND'), 'NOT_FOUND'],
     [new McpTransferExecutionError('IDEMPOTENCY_CONFLICT'), 'INVALID_INPUT'],
     [new McpTransferExecutionError('OPERATION_CORRUPT'), 'COMPANY_UNAVAILABLE'],
+    [new McpTaxRefundError('SOURCE_NOT_FOUND'), 'NOT_FOUND'],
+    [new McpTaxRefundError('STALE_SOURCE'), 'INVALID_INPUT'],
+    [new McpTaxRefundError('INTEREST_ACCOUNT_REQUIRED'), 'INVALID_INPUT'],
     [new TransferOperationError('FORBIDDEN'), 'FORBIDDEN'],
     [new TransferOperationError('TRANSACTION_NOT_FOUND'), 'NOT_FOUND'],
     [new TransferOperationError('COMPANY_DISCONNECTED'), 'QBO_DISCONNECTED'],

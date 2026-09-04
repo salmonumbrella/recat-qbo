@@ -174,4 +174,30 @@ describe('prepareMcpTaxRefund', () => {
 
     expect(caught).toMatchObject({ code: 'SYSTEM_SUSPENSE_REQUIRED' });
   });
+
+  it.each([
+    ['missing', []],
+    ['inactive', [{
+      qboId: 'INTEREST-1',
+      name: 'Interest income',
+      fullName: 'Interest income',
+      classification: 'Revenue',
+      accountType: 'Other Income',
+      accountSubType: 'InterestEarned',
+      active: false,
+    }]],
+  ])('rejects a %s CRA interest account', async (_label, interestAccounts) => {
+    const baseAccounts = await qboClient().listAccounts();
+    const client = qboClient({
+      listAccounts: vi.fn().mockResolvedValue([...baseAccounts, ...interestAccounts]),
+    });
+
+    const caught = await prepareMcpTaxRefund(
+      principal,
+      input({ interestCents: 100, interestAccountQboId: 'INTEREST-1', principalCents: 123_356 }),
+      dependencies(client),
+    ).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({ code: 'INTEREST_ACCOUNT_REQUIRED' });
+  });
 });
