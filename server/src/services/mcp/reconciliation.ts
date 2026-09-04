@@ -285,6 +285,13 @@ export async function getMcpOperation(
       store: storeFrom(dependencies) as never,
     });
   }
+  if (owned.kind === 'tax_refund') {
+    return projectManualTaxRefund(
+      principal,
+      owned,
+      dependencies,
+    );
+  }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   return project(loaded, nowFrom(dependencies));
 }
@@ -474,6 +481,9 @@ export async function retryMcpOperation(
       ...dependencies.transfer,
       store: storeFrom(dependencies) as never,
     });
+  }
+  if (owned.kind === 'tax_refund') {
+    throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   const current = project(loaded, nowFrom(dependencies));
@@ -736,6 +746,51 @@ function project(
         message: ERROR_MESSAGES.OPERATION_CORRUPT,
       });
   }
+}
+
+async function projectManualTaxRefund(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+  dependencies: McpOperationExecutionDeps,
+): Promise<McpOperationDto> {
+  const now = nowFrom(dependencies);
+  await assertCurrentMcpCategorizationAuthorization(
+    storeFrom(dependencies),
+    principal,
+    operation.companyId,
+    now,
+  );
+  const payload = operation.payload as Record<string, unknown>;
+  const preview = payload?.preview as Record<string, unknown> | undefined;
+  if (
+    !isValidDate(operation.expiresAt)
+    || !hasValidMcpOperationIntegrity(operation)
+    || operation.toolName !== 'prepare_tax_refund'
+    || payload?.capability !== 'manual_required'
+    || preview?.action !== 'record_gst_hst_refund'
+    || preview?.operatorPath !== 'Sales Tax > Filed > Record refund'
+  ) {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  if (operation.cancelledAt !== null) {
+    return base(operation, 'cancelled', 'awaiting_commit');
+  }
+  if (operation.expiresAt.getTime() <= now.getTime()) {
+    return base(operation, 'expired', 'awaiting_commit');
+  }
+  return base(
+    operation,
+    'reconciliation_required',
+    'awaiting_commit',
+    false,
+    false,
+    true,
+    null,
+    {
+      code: 'MANUAL_QBO_TAX_REFUND_REQUIRED',
+      message: 'Complete Sales Tax > Filed > Record refund in QuickBooks, then verify the result.',
+    },
+  );
 }
 
 function base(

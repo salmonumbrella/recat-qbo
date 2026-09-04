@@ -120,6 +120,27 @@ function undoOperation(
   });
 }
 
+function taxRefundOperation(): McpOperationRecord {
+  return operation({
+    toolName: 'prepare_tax_refund',
+    kind: 'tax_refund',
+    idempotencyKey: 'gst-refund-22519',
+    qboType: 'Deposit',
+    qboId: '22519',
+    qboSyncToken: '0',
+    sourceRevision: 0,
+    preparedRevision: 0,
+    payload: {
+      capability: 'manual_required',
+      preview: {
+        action: 'record_gst_hst_refund',
+        operatorPath: 'Sales Tax > Filed > Record refund',
+      },
+      warnings: [],
+    },
+  });
+}
+
 function fixture(status: string | null = null) {
   const operations = [operation()];
   const attempts: Array<{
@@ -488,6 +509,34 @@ describe('MCP attachment operation dispatch', () => {
       'attachment-operation-1',
       `mcp:${principal.tokenId}`,
     );
+  });
+
+  it('projects a manual tax refund without offering commit or retry', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation());
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'awaiting_commit',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+    await expect(retryMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
   });
 
   it('reconciles uncertain attachment operations before any retry dispatch', async () => {

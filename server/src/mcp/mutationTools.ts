@@ -459,7 +459,7 @@ const attachmentOperationResult = z.strictObject({
 });
 const operationOutput = z.strictObject({
   operationId: uuid,
-  kind: z.enum(['categorization', 'transfer', 'undo', 'attachment']),
+  kind: z.enum(['categorization', 'transfer', 'undo', 'tax_refund', 'attachment']),
   companyId: uuid.optional(),
   transactionId: uuid.optional(),
   sourceRevision: revision.optional(),
