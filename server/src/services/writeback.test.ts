@@ -2515,6 +2515,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
     expect(fixture.prepareRecategorization).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
+        taxDisposition: 'set',
         totals: { subtotalCents: -1_251, taxCents: -163, totalCents: -1_414 },
       }),
       before,

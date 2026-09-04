@@ -4211,10 +4211,19 @@ async function commitStagedCategorizationInternal(
       proposedCategorizationLabel(txn, 'recategorize'),
     );
 
+    // loadAuthorizedStage omits the default `set` disposition from the staged
+    // object so its persisted hash stays backward-compatible. The provider
+    // boundary must still receive the caller-bound disposition explicitly;
+    // otherwise tax-inclusive Purchase preparation mistakes the staged gross
+    // for the legacy net amount and rejects an otherwise exact tax change.
+    const preparedStage = {
+      ...staged,
+      taxDisposition: input.expectedTaxDisposition,
+    };
     const prepared = validateFreshPrepared(
       await client.prepareRecategorization(
         freshTxn,
-        staged,
+        preparedStage,
         before,
         input.requestId,
       ),
@@ -4226,7 +4235,7 @@ async function commitStagedCategorizationInternal(
       },
     );
     assertExplicitNotApplicableNonPreparedBinding(
-      explicitNotApplicableNonIntent(staged),
+      explicitNotApplicableNonIntent(preparedStage),
       prepared,
       'QBO_STATE_DRIFT',
     );
@@ -4237,7 +4246,7 @@ async function commitStagedCategorizationInternal(
       input.expectedRevision,
       prepared,
       before,
-      staged,
+      preparedStage,
       {
         payee: freshTxn.payee,
         source: autopilot === undefined ? 'user' : 'autopilot',
