@@ -138,6 +138,37 @@ beforeEach(() => {
 });
 
 describe('syncCompany', () => {
+  it('reports a mirror write contention instead of claiming an existing snapshot refreshed', async () => {
+    const current = {
+      id: 'txn-generic',
+      companyId: 'company-1',
+      qboType: 'Purchase',
+      qboId: 'qbo-purchase-generic',
+      qboSyncToken: '7',
+      revision: 4,
+    };
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1',
+      holdingAccountIds: ['holding-generic'],
+      lastSyncedAt: null,
+    });
+    mocks.listAccounts.mockResolvedValue([{
+      qboId: 'holding-generic', name: 'Generic holding', fullName: 'Generic holding',
+      classification: 'Asset', accountType: 'Bank', active: true,
+    }]);
+    mocks.listTxnsInAccounts.mockResolvedValue([qboTxn()]);
+    mocks.transactionFindMany.mockResolvedValue([]);
+    mocks.transactionFindUnique.mockResolvedValue(current);
+    mocks.transactionUpdateMany.mockResolvedValue({ count: 0 });
+
+    const result = await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(result).toMatchObject({
+      ok: true,
+      mirror: { refreshed: 0, stale: 0, busy: 0, contended: 1 },
+    });
+  });
+
   it('succeeds with a recorded tax diagnostic when the tax refresh fails', async () => {
     mocks.refreshTaxReference.mockRejectedValue(new Error('upstream payload should not leak'));
 

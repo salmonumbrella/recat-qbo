@@ -746,6 +746,12 @@ const syncCompanyOutput = z.strictObject({
     companyId: id,
     ok: z.boolean(),
     message: text,
+    mirror: z.strictObject({
+      refreshed: z.number().int().nonnegative(),
+      stale: z.number().int().nonnegative(),
+      busy: z.number().int().nonnegative(),
+      contended: z.number().int().nonnegative(),
+    }).optional(),
   }),
 });
 const actionabilityRefreshOutput = z.strictObject({

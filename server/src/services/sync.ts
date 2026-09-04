@@ -34,6 +34,12 @@ export type SyncKind = 'poll' | 'webhook' | 'manual' | 'nightly' | 'initial';
 export interface SyncResult {
   ok: boolean;
   message: string;
+  mirror?: {
+    refreshed: number;
+    stale: number;
+    busy: number;
+    contended: number;
+  };
 }
 
 function jsonStringArray(v: unknown): string[] {
@@ -326,6 +332,7 @@ async function runSyncCompany(
       ).map((t) => `${t.qboType}:${t.qboId}`),
     );
     let created = 0;
+    const mirrorStats = { refreshed: 0, stale: 0, busy: 0, contended: 0 };
     for (const t of holdingTxns) {
       // Refresh the QBO mirror on every sync (fresh SyncToken + raw JSON);
       // local categorization state (status/category/splits/tags) is untouched.
@@ -389,10 +396,10 @@ async function runSyncCompany(
               mirrored,
               tx as unknown as ProviderActionabilityDb,
             );
-            return { created: true };
+            return { created: true, outcome: 'created' as const };
           }
           if (isStaleProviderToken(t.syncToken, current.qboSyncToken)) {
-            return { created: false };
+            return { created: false, outcome: 'stale' as const };
           }
           const updated = await tx.transaction.updateMany({
             where: {
@@ -419,12 +426,19 @@ async function runSyncCompany(
               tx as unknown as ProviderActionabilityDb,
             );
           }
-          return { created: false };
+          return { created: false, outcome: updated.count === 1 ? 'refreshed' as const : 'contended' as const };
         }),
       );
+      if (mutation === null) {
+        mirrorStats.busy += 1;
+        continue;
+      }
       if (mutation?.created && !existingKeys.has(`${t.qboType}:${t.qboId}`)) {
         created += 1;
       }
+      if (mutation.outcome === 'refreshed') mirrorStats.refreshed += 1;
+      if (mutation.outcome === 'stale') mirrorStats.stale += 1;
+      if (mutation.outcome === 'contended') mirrorStats.contended += 1;
     }
 
     // ---- 4. superseded detection: fixed (or deleted) inside QuickBooks ----
@@ -563,7 +577,7 @@ async function runSyncCompany(
       message += ` — ${plural(autoPostFailures.length, 'auto-post failure')} (${autoPostFailures[0]})`;
     }
     await prisma.syncLog.create({ data: { companyId, kind, ok: true, message } });
-    return { ok: true, message };
+    return { ok: true, message, mirror: mirrorStats };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await prisma.syncLog
