@@ -237,6 +237,7 @@ describe('prepareDepositRecategorization', () => {
       { Id: '1', Amount: 6246.34, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: '54' }, TaxCodeRef: { value: '5' } } },
       { Amount: 2.57, Description: raw.Line![0]!.Description, DepositLineDetail: { AccountRef: { value: '46' }, TaxCodeRef: { value: '5' } } },
     ]);
+    expect(prepared.body.Line![1]).not.toHaveProperty('Id');
     expect(prepared.expected.targetLines).toHaveLength(2);
   });
 

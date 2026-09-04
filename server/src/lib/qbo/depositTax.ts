@@ -348,6 +348,7 @@ function stagedLineToRaw(
   taxCalculation: StagedCategorization['taxCalculation'],
   preserved: PreservedLineFields,
   replacedLine?: RawDepositLine,
+  preserveReplacedLineId = true,
 ): RawDepositLine {
   const accountQboId = requiredIdentity(line.categoryQboId, 'category account reference');
   const description = line.memo ?? replacedLine?.Description;
@@ -371,7 +372,7 @@ function stagedLineToRaw(
     preparationError('QBO_DEPOSIT_UNSUPPORTED', 'NotApplicable transaction lines cannot carry a tax code.');
   }
   return {
-    ...(replacedLine?.Id === undefined
+    ...(replacedLine?.Id === undefined || !preserveReplacedLineId
       ? {}
       : { Id: requiredIdentity(replacedLine.Id, 'holding line id') }),
     // QBO Deposit lines are net amounts even when GlobalTaxCalculation says
@@ -544,6 +545,7 @@ export function prepareDepositRecategorization(args: {
       args.staged.taxCalculation,
       preserved,
       holdingRawLines[holdingRawLines.length === 1 ? 0 : index],
+      holdingRawLines.length !== 1 || index === 0,
     ));
   const newSnapshotLines = newRawLines.map(snapshotLine);
   const totalTaxCents = safeCentSum([keptTaxCents, args.staged.totals.taxCents]);
