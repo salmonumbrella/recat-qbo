@@ -609,5 +609,19 @@ describe('Prisma durability contract', () => {
     );
     expect(transferKindMigration)
       .toMatch(/CHECK \("kind" IN \('categorization', 'transfer', 'undo'\)\)/);
+
+    const taxRefundMigration = '20260904223000_allow_mcp_tax_refund_operations';
+    expect(migrations.indexOf(taxRefundMigration))
+      .toBeGreaterThan(migrations.indexOf(transferMigration));
+    const taxRefundKindMigration = await readFile(
+      new URL(`${taxRefundMigration}/migration.sql`, migrationDirectory),
+      'utf8',
+    );
+    expect(taxRefundKindMigration).toMatch(
+      /CHECK \("kind" IN \('categorization', 'transfer', 'undo', 'tax_refund'\)\)/,
+    );
+    expect(taxRefundKindMigration).toMatch(
+      /CREATE UNIQUE INDEX "McpOperation_tax_refund_source_key"[\s\S]*WHERE "kind" = 'tax_refund'/,
+    );
   });
 });

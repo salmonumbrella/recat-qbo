@@ -1,4 +1,5 @@
 import { prisma } from '../../lib/prisma.js';
+import { z } from 'zod';
 import { QboDepositPreparationError } from '../../lib/qbo/depositTax.js';
 import { qboFactory } from '../../lib/qbo/factory.js';
 import type { QboClient } from '../../lib/qbo/types.js';
@@ -6,6 +7,7 @@ import type { McpPrincipal } from '../../mcp/auth.js';
 import { moneyToCents } from '../tax/model.js';
 import {
   createPreparedOperation,
+  hasValidMcpOperationIntegrity,
   McpOperationError,
   normalizeMcpOperationIdempotencyKey,
   type CreatePreparedOperationInput,
@@ -20,6 +22,8 @@ const TOOL_NAME = 'prepare_tax_refund';
 const SHA256 = /^[0-9a-f]{64}$/u;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const MAX_REFERENCE = 120;
+const MAX_WARNINGS = 8;
+const MAX_WARNING = 500;
 
 export interface PrepareMcpTaxRefundInput {
   companyId: string;
@@ -60,11 +64,62 @@ export interface PreparedMcpTaxRefundDto {
   warnings: string[];
 }
 
+const taxRefundPreviewSchema = z.object({
+  action: z.literal('record_gst_hst_refund'),
+  operatorPath: z.literal('Sales Tax > Filed > Record refund'),
+  sourceDepositQboId: z.string().min(1).max(MAX_REFERENCE),
+  taxAgencyQboId: z.string().min(1).max(MAX_REFERENCE),
+  filedReturnRef: z.string().min(1).max(MAX_REFERENCE),
+  filingEvidenceSha256: z.string().regex(SHA256),
+  suspenseAccountQboId: z.string().min(1).max(MAX_REFERENCE),
+  bankAccountQboId: z.string().min(1).max(MAX_REFERENCE),
+  refundDate: z.string().refine(isCalendarDate),
+  principalCents: z.number().int().positive().refine(Number.isSafeInteger),
+  interestCents: z.number().int().nonnegative().refine(Number.isSafeInteger),
+  interestAccountQboId: z.string().min(1).max(MAX_REFERENCE).nullable(),
+  totalBankCreditCents: z.number().int().positive().refine(Number.isSafeInteger),
+  existingDepositTreatment: z.literal('replace_or_match_before_verification'),
+}).strict().superRefine((preview, context) => {
+  if (preview.totalBankCreditCents !== preview.principalCents + preview.interestCents) {
+    context.addIssue({ code: 'custom', message: 'Refund total does not match its components.' });
+  }
+  if ((preview.interestCents > 0) !== (preview.interestAccountQboId !== null)) {
+    context.addIssue({ code: 'custom', message: 'Interest account does not match interest amount.' });
+  }
+});
+
+const taxRefundPayloadSchema = z.object({
+  capability: z.literal('manual_required'),
+  preview: taxRefundPreviewSchema,
+  warnings: z.array(z.string().max(MAX_WARNING)).max(MAX_WARNINGS),
+}).strict();
+
+export type StoredMcpTaxRefundPayload = z.infer<typeof taxRefundPayloadSchema>;
+
+export function validateMcpTaxRefundEnvelope(
+  operation: McpOperationRecord,
+): StoredMcpTaxRefundPayload {
+  const parsed = taxRefundPayloadSchema.safeParse(operation.payload);
+  if (
+    !parsed.success
+    || !hasValidMcpOperationIntegrity(operation)
+    || operation.toolName !== TOOL_NAME
+    || operation.kind !== 'tax_refund'
+    || operation.qboType !== 'Deposit'
+    || operation.sourceRevision !== operation.preparedRevision
+    || parsed.data.preview.sourceDepositQboId !== operation.qboId
+  ) {
+    throw new McpOperationError('OPERATION_CONFLICT');
+  }
+  return parsed.data;
+}
+
 export type McpTaxRefundErrorCode =
   | 'INVALID_INPUT'
   | 'SOURCE_NOT_FOUND'
   | 'SOURCE_NOT_DEPOSIT'
   | 'SOURCE_NOT_PENDING'
+  | 'SOURCE_ALREADY_PREPARED'
   | 'STALE_SOURCE'
   | 'QBO_SOURCE_CHANGED'
   | 'AMOUNT_MISMATCH'
@@ -102,6 +157,10 @@ export interface McpTaxRefundDeps {
     principal: McpPrincipal,
     transactionId: string,
     idempotencyKey: string,
+  ) => Promise<McpOperationRecord | null>;
+  loadSourcePreparation?: (
+    companyId: string,
+    transactionId: string,
   ) => Promise<McpOperationRecord | null>;
   getClient?: (companyId: string) => Promise<QboClient>;
   createOperation?: (
@@ -145,6 +204,17 @@ export async function prepareMcpTaxRefund(
   const replay = await loadReplay(principal, input.transactionId, idempotencyKey);
   if (replay !== null) return preparedReplayDto(replay, principal, input, idempotencyKey);
 
+  const loadSourcePreparation = dependencies.loadSourcePreparation
+    ?? (async (companyId, transactionId) => (
+      prisma.mcpOperation.findFirst({
+        where: { companyId, transactionId, kind: 'tax_refund' },
+      }) as Promise<McpOperationRecord | null>
+    ));
+  const sourcePreparation = await loadSourcePreparation(input.companyId, input.transactionId);
+  if (sourcePreparation !== null) {
+    throw new McpTaxRefundError('SOURCE_ALREADY_PREPARED');
+  }
+
   const loadTransaction = dependencies.loadTransaction ?? (async (companyId, transactionId) => (
     prisma.transaction.findFirst({ where: { id: transactionId, companyId } })
   ));
@@ -153,6 +223,12 @@ export async function prepareMcpTaxRefund(
   if (source.qboType !== 'Deposit') throw new McpTaxRefundError('SOURCE_NOT_DEPOSIT');
   if (source.status !== 'PENDING') throw new McpTaxRefundError('SOURCE_NOT_PENDING');
   if (source.revision !== input.expectedRevision) throw new McpTaxRefundError('STALE_SOURCE');
+  if (
+    !Number.isFinite(source.date.getTime())
+    || source.date.toISOString().slice(0, 10) !== input.refundDate
+  ) {
+    throw new McpTaxRefundError('QBO_SOURCE_CHANGED');
+  }
 
   const client = await (dependencies.getClient ?? qboFactory.forCompany)(input.companyId);
   let capability;
@@ -173,6 +249,7 @@ export async function prepareMcpTaxRefund(
   if (
     snapshot === null
     || !('depositToAccountQboId' in snapshot)
+    || snapshot.qboId !== source.qboId
     || snapshot.syncToken !== source.qboSyncToken
     || snapshot.date !== input.refundDate
     || snapshot.depositToAccountQboId !== input.bankAccountQboId
@@ -261,9 +338,9 @@ function preparedReplayDto(
   input: PrepareMcpTaxRefundInput,
   idempotencyKey: string,
 ): PreparedMcpTaxRefundDto {
-  const payload = record(operation.payload);
-  const preview = record(payload?.preview);
-  const warnings = payload?.warnings;
+  const payload = validateMcpTaxRefundEnvelope(operation);
+  const preview = payload.preview;
+  const warnings = payload.warnings;
   const interestCents = input.interestCents ?? 0;
   const interestAccountQboId = input.interestAccountQboId ?? null;
   if (
@@ -279,10 +356,6 @@ function preparedReplayDto(
     || operation.preparedRevision !== input.expectedRevision
     || operation.qboType !== 'Deposit'
     || operation.retryOfId !== null
-    || payload?.capability !== 'manual_required'
-    || preview?.action !== 'record_gst_hst_refund'
-    || preview.operatorPath !== 'Sales Tax > Filed > Record refund'
-    || preview.sourceDepositQboId !== operation.qboId
     || preview.taxAgencyQboId !== input.taxAgencyQboId
     || preview.filedReturnRef !== input.filedReturnRef
     || preview.filingEvidenceSha256 !== input.filingEvidenceSha256
@@ -294,8 +367,6 @@ function preparedReplayDto(
     || preview.interestAccountQboId !== interestAccountQboId
     || preview.totalBankCreditCents !== input.principalCents + interestCents
     || preview.existingDepositTreatment !== 'replace_or_match_before_verification'
-    || !Array.isArray(warnings)
-    || warnings.some((warning) => typeof warning !== 'string')
   ) {
     throw new McpOperationError('IDEMPOTENCY_CONFLICT');
   }
@@ -305,16 +376,10 @@ function preparedReplayDto(
   return {
     operationId: operation.id,
     expiresAt: operation.expiresAt.toISOString(),
-    capability: 'manual_required',
-    preview: preview as unknown as PreparedMcpTaxRefundDto['preview'],
+    capability: payload.capability,
+    preview,
     warnings,
   };
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
 }
 
 function validateInput(input: PrepareMcpTaxRefundInput, now: Date): void {
@@ -337,7 +402,7 @@ function validateInput(input: PrepareMcpTaxRefundInput, now: Date): void {
     || !SHA256.test(input.filingEvidenceSha256)
     || !bounded(input.suspenseAccountQboId)
     || !bounded(input.bankAccountQboId)
-    || !DATE.test(input.refundDate)
+    || !isCalendarDate(input.refundDate)
     || !safePositive(input.principalCents)
     || !safeNonNegative(interestCents)
     || (interestCents > 0 && !bounded(input.interestAccountQboId))
@@ -345,4 +410,11 @@ function validateInput(input: PrepareMcpTaxRefundInput, now: Date): void {
   ) {
     throw new McpTaxRefundError('INVALID_INPUT');
   }
+}
+
+function isCalendarDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !DATE.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime())
+    && parsed.toISOString().slice(0, 10) === value;
 }

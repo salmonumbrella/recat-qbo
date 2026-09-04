@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import { QboDepositPreparationError } from '../../lib/qbo/depositTax.js';
 import type { QboClient } from '../../lib/qbo/types.js';
-import { McpOperationError, type McpOperationRecord } from './operations.js';
+import {
+  hashOperationPayload,
+  McpOperationError,
+  type McpOperationRecord,
+} from './operations.js';
 import {
   McpTaxRefundError,
   prepareMcpTaxRefund,
@@ -105,6 +109,7 @@ function dependencies(client = qboClient(), txn = transaction()) {
   return {
     authorize: vi.fn().mockResolvedValue(undefined),
     loadReplay: vi.fn().mockResolvedValue(null),
+    loadSourcePreparation: vi.fn().mockResolvedValue(null),
     loadTransaction: vi.fn().mockResolvedValue(txn),
     getClient: vi.fn().mockResolvedValue(client),
     createOperation,
@@ -113,7 +118,7 @@ function dependencies(client = qboClient(), txn = transaction()) {
 }
 
 function replayOperation(): McpOperationRecord {
-  return {
+  const operation: McpOperationRecord = {
     id: '66666666-6666-4666-8666-666666666666',
     tokenId: principal.tokenId,
     tokenPrefix: principal.tokenPrefix,
@@ -123,8 +128,8 @@ function replayOperation(): McpOperationRecord {
     toolName: 'prepare_tax_refund',
     kind: 'tax_refund',
     idempotencyKey: 'gst-refund-test-deposit-1',
-    inputHash: 'c'.repeat(64),
-    payloadHash: 'd'.repeat(64),
+    inputHash: '',
+    payloadHash: '',
     sourceRevision: 0,
     preparedRevision: 0,
     qboType: 'Deposit',
@@ -159,6 +164,25 @@ function replayOperation(): McpOperationRecord {
       ],
     },
   };
+  operation.payloadHash = hashOperationPayload(operation.payload);
+  operation.inputHash = hashOperationPayload({
+    tokenId: operation.tokenId,
+    tokenPrefix: operation.tokenPrefix,
+    userId: operation.userId,
+    companyId: operation.companyId,
+    transactionId: operation.transactionId,
+    toolName: operation.toolName,
+    kind: operation.kind,
+    idempotencyKey: operation.idempotencyKey,
+    payloadHash: operation.payloadHash,
+    sourceRevision: operation.sourceRevision,
+    preparedRevision: operation.preparedRevision,
+    qboType: operation.qboType,
+    qboId: operation.qboId,
+    qboSyncToken: operation.qboSyncToken,
+    retryOfId: operation.retryOfId,
+  });
+  return operation;
 }
 
 describe('prepareMcpTaxRefund', () => {
@@ -194,6 +218,7 @@ describe('prepareMcpTaxRefund', () => {
     ['non-Deposit source', transaction({ qboType: 'Purchase' }), input(), 'SOURCE_NOT_DEPOSIT'],
     ['non-pending source', transaction({ status: 'POSTED' }), input(), 'SOURCE_NOT_PENDING'],
     ['stale revision', transaction({ revision: 1 }), input(), 'STALE_SOURCE'],
+    ['local date mismatch', transaction({ date: new Date('2026-01-16T00:00:00.000Z') }), input(), 'QBO_SOURCE_CHANGED'],
     ['amount mismatch', transaction(), input({ principalCents: 123_455 }), 'AMOUNT_MISMATCH'],
   ])('rejects %s', async (_label, txn, request, code) => {
     const caught = await prepareMcpTaxRefund(
@@ -256,6 +281,7 @@ describe('prepareMcpTaxRefund', () => {
 
   it.each([
     ['sync token', { syncToken: 'changed' }],
+    ['QBO id', { qboId: 'OTHER-DEPOSIT' }],
     ['date', { date: '2026-01-16' }],
     ['bank account', { depositToAccountQboId: 'BANK-2' }],
   ])('rejects QBO %s drift', async (_label, snapshotOverride) => {
@@ -288,6 +314,19 @@ describe('prepareMcpTaxRefund', () => {
     ).catch((error: unknown) => error);
 
     expect(caught).toMatchObject({ code: 'QBO_SOURCE_CHANGED' });
+  });
+
+  it('rejects a calendar-invalid refund date before any reads', async () => {
+    const deps = dependencies();
+
+    const caught = await prepareMcpTaxRefund(
+      principal,
+      input({ refundDate: '2026-02-31' }),
+      deps,
+    ).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({ code: 'INVALID_INPUT' });
+    expect(deps.loadReplay).not.toHaveBeenCalled();
   });
 
   it('returns a byte-identical replay before reading QBO again', async () => {
@@ -324,6 +363,23 @@ describe('prepareMcpTaxRefund', () => {
 
     expect(caught).toBeInstanceOf(McpOperationError);
     expect(caught).toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    expect(deps.loadTransaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects a second preparation for the same source transaction', async () => {
+    const deps = {
+      ...dependencies(),
+      loadSourcePreparation: vi.fn().mockResolvedValue(replayOperation()),
+    };
+
+    const caught = await prepareMcpTaxRefund(
+      principal,
+      input({ idempotencyKey: 'different-refund-key' }),
+      deps,
+    ).catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(McpTaxRefundError);
+    expect(caught).toMatchObject({ code: 'SOURCE_ALREADY_PREPARED' });
     expect(deps.loadTransaction).not.toHaveBeenCalled();
   });
 });

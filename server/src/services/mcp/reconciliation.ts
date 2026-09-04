@@ -31,6 +31,7 @@ import {
   parseStoredMcpUndoPayload,
   type StoredMcpUndoPayload,
 } from './undo.js';
+import { validateMcpTaxRefundEnvelope } from './taxRefund.js';
 import {
   getMcpTransferOperation,
   retryMcpTransferOperation,
@@ -760,16 +761,12 @@ async function projectManualTaxRefund(
     operation.companyId,
     now,
   );
-  const payload = operation.payload as Record<string, unknown>;
-  const preview = payload?.preview as Record<string, unknown> | undefined;
-  if (
-    !isValidDate(operation.expiresAt)
-    || !hasValidMcpOperationIntegrity(operation)
-    || operation.toolName !== 'prepare_tax_refund'
-    || payload?.capability !== 'manual_required'
-    || preview?.action !== 'record_gst_hst_refund'
-    || preview?.operatorPath !== 'Sales Tax > Filed > Record refund'
-  ) {
+  try {
+    validateMcpTaxRefundEnvelope(operation);
+  } catch {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  if (!isValidDate(operation.expiresAt)) {
     throw new McpOperationExecutionError('OPERATION_CORRUPT');
   }
   if (operation.cancelledAt !== null) {

@@ -120,7 +120,9 @@ function undoOperation(
   });
 }
 
-function taxRefundOperation(): McpOperationRecord {
+function taxRefundOperation(
+  overrides: Partial<McpOperationRecord> = {},
+): McpOperationRecord {
   return operation({
     toolName: 'prepare_tax_refund',
     kind: 'tax_refund',
@@ -135,9 +137,22 @@ function taxRefundOperation(): McpOperationRecord {
       preview: {
         action: 'record_gst_hst_refund',
         operatorPath: 'Sales Tax > Filed > Record refund',
+        sourceDepositQboId: 'TEST-DEPOSIT-1',
+        taxAgencyQboId: 'CRA',
+        filedReturnRef: '2025-Q4',
+        filingEvidenceSha256: 'a'.repeat(64),
+        suspenseAccountQboId: '55',
+        bankAccountQboId: 'BANK-1',
+        refundDate: '2026-01-15',
+        principalCents: 123_456,
+        interestCents: 0,
+        interestAccountQboId: null,
+        totalBankCreditCents: 123_456,
+        existingDepositTreatment: 'replace_or_match_before_verification',
       },
       warnings: [],
     },
+    ...overrides,
   });
 }
 
@@ -537,6 +552,19 @@ describe('MCP attachment operation dispatch', () => {
       { operationId: 'operation-1' },
       value.deps,
     )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
+  });
+
+  it('rejects a hash-valid but incomplete tax refund envelope', async () => {
+    const value = fixture();
+    const payload = structuredClone(taxRefundOperation().payload) as Record<string, any>;
+    delete payload.preview.filingEvidenceSha256;
+    value.operations.splice(0, 1, taxRefundOperation({ payload }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).rejects.toMatchObject({ code: 'OPERATION_CORRUPT' });
   });
 
   it('reconciles uncertain attachment operations before any retry dispatch', async () => {
