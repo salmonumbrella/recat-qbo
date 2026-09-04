@@ -1000,7 +1000,11 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
       const membership = context.principal.memberships.find(
         (candidate) => candidate.companyId === input.companyId,
       );
-      if (membership?.role !== 'admin' && membership?.role !== 'categorizer') {
+      if (
+        !context.principal.isInstanceAdmin
+        && membership?.role !== 'admin'
+        && membership?.role !== 'categorizer'
+      ) {
         throw new HttpError(403, 'Company categorizer access is required.', 'FORBIDDEN');
       }
       const result = await sync.syncCompany(input.companyId, 'manual');

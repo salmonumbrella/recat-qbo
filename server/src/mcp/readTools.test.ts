@@ -202,6 +202,27 @@ describe('Recat MCP read tools', () => {
     expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
   });
 
+  it('allows an instance admin to sync a visible company without an explicit membership', async () => {
+    const syncCompany = vi.fn().mockResolvedValue({ ok: true, message: 'Synced 1 transaction.' });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, isInstanceAdmin: true, memberships: [] },
+        era: 'legacy',
+        reads: reads(),
+        sync: { syncCompany },
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'sync_company',
+      arguments: { companyId: 'company-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(syncCompany).toHaveBeenCalledWith('company-a', 'manual');
+  });
+
   it('requires categorizer access before a Recat mirror sync', async () => {
     const syncCompany = vi.fn();
     const sync: CompanySyncOperations = { syncCompany };
