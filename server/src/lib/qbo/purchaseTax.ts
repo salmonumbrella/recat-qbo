@@ -1012,9 +1012,18 @@ export function purchaseHoldingGrossCents(
     const line = snapshot.lines[index];
     if (!line) return null;
     if (snapshot.globalTaxCalculation === 'TaxInclusive') {
-      if (line.taxInclusiveCents === null) return null;
-      gross.push(line.taxInclusiveCents);
-      continue;
+      if (line.taxInclusiveCents !== null) {
+        gross.push(line.taxInclusiveCents);
+        continue;
+      }
+      if (
+        line.taxCodeQboId === null
+        && (line.taxAmountCents === null || line.taxAmountCents === 0)
+      ) {
+        gross.push(line.amountCents);
+        continue;
+      }
+      return null;
     }
     if (snapshot.globalTaxCalculation === 'TaxExcluded') {
       if (line.taxAmountCents === null) return null;

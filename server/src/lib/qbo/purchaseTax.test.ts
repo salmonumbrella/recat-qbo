@@ -8,6 +8,7 @@ import {
   mapPurchaseTaxSnapshot,
   preparePurchaseRecategorization,
   preparePurchaseRestore,
+  purchaseHoldingGrossCents,
   purchaseTargetLineMatches,
   reconstructPurchaseTaxExcludedTransaction,
 } from './purchaseTax.js';
@@ -1348,6 +1349,27 @@ describe('preparePurchaseRecategorization', () => {
         TaxInclusiveAmt: 1_413.91,
       },
     });
+  });
+
+  it('uses the signed net when a TaxInclusive holding line is provably untaxed without TaxInclusiveAmt', () => {
+    const snapshot = mapPurchaseTaxSnapshot({
+      Id: 'UNTAXED_PURCHASE',
+      SyncToken: '0',
+      TxnDate: '2026-01-01',
+      TotalAmt: 10.5,
+      GlobalTaxCalculation: 'TaxInclusive',
+      AccountRef: { value: '61' },
+      Line: [{
+        Id: '1',
+        Amount: 10.5,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+        },
+      }],
+    });
+
+    expect(purchaseHoldingGrossCents(snapshot, [0])).toBe(-1_050);
   });
 
   it.each([

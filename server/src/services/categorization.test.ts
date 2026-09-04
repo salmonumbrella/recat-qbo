@@ -1176,6 +1176,50 @@ describe('stageCategorization', () => {
     expect(db.state.splits.map((line) => line.taxCodeQboId)).toEqual(['NON', 'NON']);
   });
 
+  it('stages explicit NON against the source gross when removing tax from a TaxInclusive Purchase', async () => {
+    const transaction = db.state.transactions[0]!;
+    transaction.qboId = '22557';
+    transaction.qboSyncToken = '1';
+    transaction.amount = -1_262.42;
+    transaction.rawData = {
+      Id: '22557',
+      SyncToken: '1',
+      TxnDate: '2026-06-11',
+      TotalAmt: 1_413.91,
+      GlobalTaxCalculation: 'TaxInclusive',
+      AccountRef: { value: '61' },
+      Line: [{
+        Id: '1',
+        Amount: 1_262.42,
+        DetailType: 'AccountBasedExpenseLineDetail',
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: '2' },
+          TaxCodeRef: { value: '18' },
+          TaxInclusiveAmt: 1_413.91,
+        },
+      }],
+      TxnTaxDetail: { TotalTax: 151.49 },
+    };
+
+    const staged = await stageCategorization(input({
+      taxDisposition: 'set',
+      taxCalculation: 'NotApplicable',
+      lines: [{
+        grossCents: -141_391,
+        categoryQboId: 'EXPENSE_ACCOUNT',
+        taxCodeQboId: 'NON',
+        tagIds: [],
+      }],
+      tagIds: [],
+    }), testDeps(db));
+
+    expect(staged.totals).toEqual({
+      subtotalCents: -141_391,
+      taxCents: 0,
+      totalCents: -141_391,
+    });
+  });
+
   it('rejects explicit NON staging for a non-Purchase transaction', async () => {
     db.state.transactions[0]!.qboType = 'Deposit';
     db.state.transactions[0]!.amount = 10.5;
