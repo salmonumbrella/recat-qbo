@@ -213,6 +213,40 @@ describe('verifyPurchaseResult', () => {
     });
   });
 
+  it('accepts only a one-cent QBO TaxInclusive transaction-tax rounding residual', () => {
+    const roundedExpected: ExpectedPurchaseResult = {
+      ...expected,
+      totalCents: -20_667,
+      totalTaxCents: -2_214,
+      targetLines: [{
+        ...targetLine,
+        amountCents: -18_452,
+        taxAmountCents: -2_214,
+        taxInclusiveCents: -20_666,
+      }],
+      untouchedLineHashes: [],
+    };
+    const qboRoundedReadback = {
+      ...actual,
+      totalCents: -20_667,
+      totalTaxCents: -2_215,
+      lines: [{
+        ...roundedExpected.targetLines[0],
+        id: 'provider-target',
+      }],
+    };
+
+    expect(verifyPurchaseResult(roundedExpected, qboRoundedReadback)).toEqual({ ok: true });
+    expect(verifyPurchaseResult(roundedExpected, {
+      ...qboRoundedReadback,
+      totalTaxCents: -2_216,
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+    expect(verifyPurchaseResult(roundedExpected, {
+      ...qboRoundedReadback,
+      lines: [{ ...qboRoundedReadback.lines[0], taxInclusiveCents: -20_665 }],
+    })).toMatchObject({ ok: false, code: 'QBO_STATE_DRIFT' });
+  });
+
   it.each([
     ['Purchase ID', { qboId: 'purchase-2' }],
     ['total', { totalCents: -10_49 }],

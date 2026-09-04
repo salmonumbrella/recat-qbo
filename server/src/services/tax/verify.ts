@@ -78,6 +78,33 @@ function omittedInclusiveTotalTaxMatches(
   }
   return derivedTotalTaxCents === expectedTotalTaxCents;
 }
+
+/**
+ * QBO can round TxnTaxDetail.TotalTax one cent away from the sum proven by
+ * TaxInclusiveAmt lines (notably on foreign-currency purchases).  The target
+ * lines are still verified exactly below, so this exception cannot mask a
+ * changed category, tax code, line gross, or transaction gross.
+ */
+function providerInclusiveTaxRoundingResidualMatches(
+  expected: ExpectedPurchaseResult,
+  actual: QboPurchaseSnapshot,
+): boolean {
+  if (
+    expected.globalTaxCalculation !== 'TaxInclusive'
+    || actual.globalTaxCalculation !== 'TaxInclusive'
+    || expected.totalTaxCents === null
+    || actual.totalTaxCents === null
+    || expected.totalCents !== actual.totalCents
+    || Math.abs(expected.totalTaxCents - actual.totalTaxCents) !== 1
+    || expected.targetLines.length !== 1
+    || expected.untouchedLineHashes.length !== 0
+    || expected.targetLines[0]?.taxInclusiveCents === null
+    || expected.totalCents === expected.targetLines[0]?.taxInclusiveCents
+  ) {
+    return false;
+  }
+  return true;
+}
 export function canonicalDepositLineHash(line: DepositLine): string {
   return JSON.stringify([
     line.rawHash,
@@ -137,6 +164,7 @@ export function verifyPurchaseResult(
       actual.totalTaxCents,
     )
     && !omittedInclusiveTotalTaxMatches(expected.totalTaxCents, actual)
+    && !providerInclusiveTaxRoundingResidualMatches(expected, actual)
   ) {
     return drift('Purchase total tax changed.');
   }
