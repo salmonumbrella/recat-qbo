@@ -613,7 +613,9 @@ function filterRowsForProviderQueue(
     if (role === 'viewer' || !QUEUE_STATUSES.includes(row.status as (typeof QUEUE_STATUSES)[number])) {
       return true;
     }
-    return disposition === 'WRITABLE';
+    // The interactive queue is the complete pending-work surface. Cached
+    // actionability is advisory metadata; commits still obtain fresh safety.
+    return true;
   });
 }
 

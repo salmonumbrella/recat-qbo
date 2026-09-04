@@ -1164,6 +1164,64 @@ describe('company read services', () => {
     });
   });
 
+  it('returns unknown pending rows in the default interactive queue', async () => {
+    const db = makeDb();
+    const now = new Date();
+    const rows = [
+      transaction({
+        id: 'writable',
+        qboId: 'writable',
+        qboSyncToken: '1',
+        providerActionability: {
+          companyId: COMPANY_ID,
+          transactionId: 'writable',
+          disposition: 'WRITABLE',
+          checkedAt: now,
+          revision: 2,
+          qboSyncToken: '1',
+          qboType: 'Purchase',
+          qboId: 'writable',
+          txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        },
+      }),
+      transaction({
+        id: 'unknown',
+        qboId: 'unknown',
+        qboSyncToken: '1',
+        providerActionability: {
+          companyId: COMPANY_ID,
+          transactionId: 'unknown',
+          disposition: 'WRITABLE',
+          checkedAt: now,
+          revision: 2,
+          qboSyncToken: 'stale-token',
+          qboType: 'Purchase',
+          qboId: 'unknown',
+          txnDate: new Date('2026-01-03T00:00:00.000Z'),
+        },
+      }),
+    ];
+    Object.assign(db, { transactionActionability: {} });
+    db.transaction.findMany.mockImplementation(async (args: Record<string, unknown>) => {
+      if ('select' in args && !('include' in args)) return rows;
+      return rows;
+    });
+    const service = createCompanyReadService(db as unknown as CompanyReadDb, SECRET, {
+      transferCandidates: async () => new Map(),
+      suggestForMany: async (_companyId, txns) => txns.map(() => null),
+    });
+
+    await expect(service.listTransactions(USER_ID, COMPANY_ID)).resolves.toMatchObject({
+      items: [
+        { id: 'writable', providerActionability: { disposition: 'WRITABLE' } },
+        { id: 'unknown', providerActionability: { disposition: 'UNKNOWN' } },
+      ],
+      pendingCount: 2,
+      actionableCount: 1,
+      unknownCount: 1,
+    });
+  });
+
   it('returns scoped not-found for direct SUPERSEDED gets for viewers and admins', async () => {
     const db = makeDb();
     db.transaction.findUnique.mockResolvedValue(
