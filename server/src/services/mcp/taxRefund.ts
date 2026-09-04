@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { QboDepositPreparationError } from '../../lib/qbo/depositTax.js';
 import { qboFactory } from '../../lib/qbo/factory.js';
 import type { QboClient } from '../../lib/qbo/types.js';
+import { assertQboWriteAllowed } from '../../lib/qbo/writeSafety.js';
 import type { McpPrincipal } from '../../mcp/auth.js';
 import { moneyToCents } from '../tax/model.js';
 import {
@@ -245,7 +246,7 @@ export async function cancelMcpTaxRefund(
       checkedAt,
     );
   });
-  await authorize(principal, operation.companyId, now);
+  await authorizeRefundManagement(authorize, principal, operation.companyId, now);
   assertCanManageRefund(principal, operation);
   validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
@@ -315,7 +316,7 @@ export async function acknowledgeMcpTaxRefundRecorded(
       checkedAt,
     );
   });
-  await authorize(principal, operation.companyId, now);
+  await authorizeRefundManagement(authorize, principal, operation.companyId, now);
   assertCanManageRefund(principal, operation);
   validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) {
@@ -356,6 +357,19 @@ function assertCanManageRefund(
     && principal.isInstanceAdmin !== true
     && !companyAdmin
   ) {
+    throw new McpOperationError('OPERATION_NOT_FOUND');
+  }
+}
+
+async function authorizeRefundManagement(
+  authorize: NonNullable<McpTaxRefundCancellationDeps['authorize']>,
+  principal: McpPrincipal,
+  companyId: string,
+  now: Date,
+): Promise<void> {
+  try {
+    await authorize(principal, companyId, now);
+  } catch {
     throw new McpOperationError('OPERATION_NOT_FOUND');
   }
 }
@@ -449,11 +463,18 @@ export async function prepareMcpTaxRefund(
   let capability;
   let accounts;
   let snapshot;
+  let writeSafety;
   try {
-    [capability, accounts, snapshot] = await Promise.all([
+    [capability, accounts, snapshot, writeSafety] = await Promise.all([
       client.probeTaxRefundCapability(),
       client.listAccounts(),
       client.fetchPreparedSnapshot('Deposit', source.qboId),
+      client.fetchWriteSafety({
+        qboType: 'Deposit',
+        qboId: source.qboId,
+        txnDate: input.refundDate,
+        bankAccountQboId: input.bankAccountQboId,
+      }),
     ]);
   } catch (error) {
     if (error instanceof QboDepositPreparationError) {
@@ -471,6 +492,12 @@ export async function prepareMcpTaxRefund(
   ) {
     throw new McpTaxRefundError('QBO_SOURCE_CHANGED');
   }
+  assertQboWriteAllowed({
+    qboType: 'Deposit',
+    qboId: source.qboId,
+    txnDate: input.refundDate,
+    bankAccountQboId: input.bankAccountQboId,
+  }, writeSafety);
 
   const suspense = accounts.find((account) => account.qboId === input.suspenseAccountQboId);
   if (

@@ -98,6 +98,11 @@ function qboClient(overrides: Partial<QboClient> = {}): QboClient {
       preservedHash: 'b'.repeat(64),
       lines: [],
     }),
+    fetchWriteSafety: vi.fn().mockResolvedValue({
+      bookCloseDate: null,
+      cleared: false,
+      reconciled: false,
+    }),
     ...overrides,
   } as unknown as QboClient;
 }
@@ -236,6 +241,22 @@ describe('prepareMcpTaxRefund', () => {
 
     expect(caught).toBeInstanceOf(McpTaxRefundError);
     expect(caught).toMatchObject({ code });
+  });
+
+  it('rejects a refund dated in a closed accounting period', async () => {
+    const client = qboClient({
+      fetchWriteSafety: vi.fn().mockResolvedValue({
+        bookCloseDate: '2026-01-31',
+        cleared: false,
+        reconciled: false,
+      }),
+    });
+    const deps = dependencies(client);
+
+    await expect(prepareMcpTaxRefund(principal, input(), deps)).rejects.toMatchObject({
+      code: 'QBO_PERIOD_CLOSED',
+    });
+    expect(deps.createOperation).not.toHaveBeenCalled();
   });
 
   it('rejects a lookalike liability account instead of creating generic suspense', async () => {
@@ -494,6 +515,15 @@ describe('cancelMcpTaxRefund', () => {
     } as unknown as CancelMcpTaxRefundInput)).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });
+  });
+
+  it('hides a foreign company operation behind not found', async () => {
+    await expect(cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockRejectedValue(new Error('foreign company')),
+      loadOperation: vi.fn().mockResolvedValue(replayOperation()),
+      cancelOperation: vi.fn(),
+      now: () => new Date('2026-09-04T22:05:00.000Z'),
+    })).rejects.toMatchObject({ code: 'OPERATION_NOT_FOUND' });
   });
 
   it('lets a current company admin recover another user\'s preparation', async () => {
