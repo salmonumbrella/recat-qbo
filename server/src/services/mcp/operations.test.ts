@@ -148,6 +148,7 @@ describe('createPreparedOperation', () => {
       qboSyncToken: 'sync-7',
       retryOfId: null,
       cancelledAt: null,
+      manualRecordedAt: null,
     });
     expect(operation.payloadHash).toBe(hashOperationPayload(operation.payload));
     expect(operation.inputHash).toMatch(/^[0-9a-f]{64}$/);
@@ -569,6 +570,7 @@ describe('Prisma durability contract', () => {
       'expiresAt',
       'retryOfId',
       'cancelledAt',
+      'manualRecordedAt',
     ]) {
       expect(model).toMatch(new RegExp(`${field}\\s+`));
     }

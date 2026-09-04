@@ -20,8 +20,10 @@ import {
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
 import {
+  acknowledgeMcpTaxRefundRecorded,
   cancelMcpTaxRefund,
   prepareMcpTaxRefund,
+  type AcknowledgeMcpTaxRefundRecordedInput,
   type CancelMcpTaxRefundInput,
   type PrepareMcpTaxRefundInput,
 } from '../services/mcp/taxRefund.js';
@@ -65,6 +67,7 @@ const CORE_MUTATION_TOOL_NAMES = [
   'commit_transfer',
   'prepare_tax_refund',
   'cancel_tax_refund',
+  'acknowledge_tax_refund_recorded',
   'prepare_rule_change',
   'commit_rule_change',
 ] as const;
@@ -117,6 +120,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: CancelMcpTaxRefundInput,
   ): ReturnType<typeof cancelMcpTaxRefund>;
+  acknowledgeTaxRefundRecorded(
+    principal: McpPrincipal,
+    input: AcknowledgeMcpTaxRefundRecordedInput,
+  ): ReturnType<typeof acknowledgeMcpTaxRefundRecorded>;
   prepareRuleChange(
     principal: McpPrincipal,
     input: PrepareMcpRuleChangeInput,
@@ -140,6 +147,7 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   commitTransfer: commitMcpTransfer,
   prepareTaxRefund: prepareMcpTaxRefund,
   cancelTaxRefund: cancelMcpTaxRefund,
+  acknowledgeTaxRefundRecorded: acknowledgeMcpTaxRefundRecorded,
   prepareRuleChange: prepareMcpRuleChange,
   commitRuleChange: commitMcpRuleChange,
 });
@@ -337,6 +345,10 @@ const prepareTaxRefundInput = z.strictObject({
 const cancelTaxRefundInput = z.strictObject({
   operationId: uuid,
   confirmNoQuickBooksAction: z.literal(true),
+});
+const acknowledgeTaxRefundRecordedInput = z.strictObject({
+  operationId: uuid,
+  confirmQuickBooksActionPerformed: z.literal(true),
 });
 const ruleMutation = z.enum([
   'create', 'update', 'enable', 'disable', 'reorder', 'retire',
@@ -669,6 +681,11 @@ const cancelledTaxRefundOutput = z.strictObject({
   state: z.literal('cancelled'),
   cancelledAt: z.iso.datetime(),
 });
+const acknowledgedTaxRefundRecordedOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('reconciliation_required'),
+  manualRecordedAt: z.iso.datetime(),
+});
 const ruleActionOutput = z.strictObject({
   categoryQboId: qboReference,
   taxCalculation,
@@ -913,6 +930,23 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.cancelTaxRefund(
         principal,
         input as CancelMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'acknowledge_tax_refund_recorded',
+    description: 'Record that the manual QuickBooks Tax Centre refund action was performed. The operation remains reconciliation-required until exact readback is available.',
+    inputSchema: acknowledgeTaxRefundRecordedInput,
+    outputSchema: acknowledgedTaxRefundRecordedOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.acknowledgeTaxRefundRecorded(
+        principal,
+        input as AcknowledgeMcpTaxRefundRecordedInput,
       ),
   },
   {

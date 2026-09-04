@@ -8,6 +8,7 @@ import {
   type McpOperationRecord,
 } from './operations.js';
 import {
+  acknowledgeMcpTaxRefundRecorded,
   cancelMcpTaxRefund,
   McpTaxRefundError,
   prepareMcpTaxRefund,
@@ -461,10 +462,9 @@ describe('cancelMcpTaxRefund', () => {
       state: 'cancelled',
       cancelledAt: '2026-09-04T22:05:00.000Z',
     });
-    expect(loadOperation).toHaveBeenCalledWith(operation.id, principal.userId);
+    expect(loadOperation).toHaveBeenCalledWith(operation.id);
     expect(cancelOperation).toHaveBeenCalledWith(
       operation.id,
-      principal.userId,
       new Date('2026-09-04T22:05:00.000Z'),
     );
   });
@@ -494,5 +494,77 @@ describe('cancelMcpTaxRefund', () => {
     } as unknown as CancelMcpTaxRefundInput)).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });
+  });
+
+  it('lets a current company admin recover another user\'s preparation', async () => {
+    const operation = replayOperation();
+    operation.userId = '99999999-9999-4999-8999-999999999999';
+    operation.inputHash = hashOperationPayload({
+      tokenId: operation.tokenId,
+      tokenPrefix: operation.tokenPrefix,
+      userId: operation.userId,
+      companyId: operation.companyId,
+      transactionId: operation.transactionId,
+      toolName: operation.toolName,
+      kind: operation.kind,
+      idempotencyKey: operation.idempotencyKey,
+      payloadHash: operation.payloadHash,
+      sourceRevision: operation.sourceRevision,
+      preparedRevision: operation.preparedRevision,
+      qboType: operation.qboType,
+      qboId: operation.qboId,
+      qboSyncToken: operation.qboSyncToken,
+      retryOfId: operation.retryOfId,
+    });
+    const admin = {
+      ...principal,
+      memberships: [{ companyId: COMPANY_ID, role: 'admin' }],
+    };
+
+    await expect(cancelMcpTaxRefund(admin, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation: vi.fn().mockResolvedValue({ count: 1 }),
+      now: () => new Date('2026-09-04T22:05:00.000Z'),
+    })).resolves.toMatchObject({ state: 'cancelled' });
+  });
+});
+
+describe('acknowledgeMcpTaxRefundRecorded', () => {
+  const request = {
+    operationId: '66666666-6666-4666-8666-666666666666',
+    confirmQuickBooksActionPerformed: true as const,
+  };
+
+  it('records the manual QBO action without claiming verification', async () => {
+    const operation = replayOperation();
+    const recordOperation = vi.fn().mockResolvedValue({ count: 1 });
+
+    await expect(acknowledgeMcpTaxRefundRecorded(principal, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      recordOperation,
+      now: () => new Date('2026-09-04T22:06:00.000Z'),
+    })).resolves.toEqual({
+      operationId: operation.id,
+      state: 'reconciliation_required',
+      manualRecordedAt: '2026-09-04T22:06:00.000Z',
+    });
+    expect(recordOperation).toHaveBeenCalledWith(
+      operation.id,
+      new Date('2026-09-04T22:06:00.000Z'),
+    );
+  });
+
+  it('rejects acknowledgement of a cancelled preparation', async () => {
+    const operation = replayOperation();
+    operation.cancelledAt = new Date('2026-09-04T22:04:00.000Z');
+
+    await expect(acknowledgeMcpTaxRefundRecorded(principal, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      recordOperation: vi.fn(),
+      now: () => new Date('2026-09-04T22:06:00.000Z'),
+    })).rejects.toMatchObject({ code: 'SOURCE_PREPARATION_CANCELLED' });
   });
 });

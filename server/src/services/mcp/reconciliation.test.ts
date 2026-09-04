@@ -554,6 +554,31 @@ describe('MCP attachment operation dispatch', () => {
     )).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
   });
 
+  it('projects an acknowledged manual refund as awaiting verification, not another QBO action', async () => {
+    const value = fixture();
+    value.operations.splice(0, 1, taxRefundOperation({
+      manualRecordedAt: new Date('2026-09-04T22:06:00.000Z'),
+    }));
+
+    await expect(getMcpOperation(
+      principal,
+      { operationId: 'operation-1' },
+      value.deps,
+    )).resolves.toMatchObject({
+      kind: 'tax_refund',
+      state: 'reconciliation_required',
+      phase: 'write_uncertain',
+      error: {
+        code: 'MANUAL_QBO_TAX_REFUND_VERIFICATION_REQUIRED',
+      },
+      actions: {
+        canCommit: false,
+        canRetry: false,
+        requiresReconciliation: true,
+      },
+    });
+  });
+
   it('rejects a hash-valid but incomplete tax refund envelope', async () => {
     const value = fixture();
     const payload = structuredClone(taxRefundOperation().payload) as Record<string, any>;

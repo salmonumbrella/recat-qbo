@@ -76,6 +76,17 @@ export interface CancelledMcpTaxRefundDto {
   cancelledAt: string;
 }
 
+export interface AcknowledgeMcpTaxRefundRecordedInput {
+  operationId: string;
+  confirmQuickBooksActionPerformed: true;
+}
+
+export interface AcknowledgedMcpTaxRefundRecordedDto {
+  operationId: string;
+  state: 'reconciliation_required';
+  manualRecordedAt: string;
+}
+
 const taxRefundPreviewSchema = z.object({
   action: z.literal('record_gst_hst_refund'),
   operatorPath: z.literal('Sales Tax > Filed > Record refund'),
@@ -133,6 +144,7 @@ export type McpTaxRefundErrorCode =
   | 'SOURCE_NOT_PENDING'
   | 'SOURCE_ALREADY_PREPARED'
   | 'SOURCE_PREPARATION_CANCELLED'
+  | 'SOURCE_ALREADY_RECORDED'
   | 'STALE_SOURCE'
   | 'QBO_SOURCE_CHANGED'
   | 'AMOUNT_MISMATCH'
@@ -191,11 +203,9 @@ export interface McpTaxRefundCancellationDeps {
   ) => Promise<void>;
   loadOperation?: (
     operationId: string,
-    userId: string,
   ) => Promise<McpOperationRecord>;
   cancelOperation?: (
     operationId: string,
-    userId: string,
     cancelledAt: Date,
   ) => Promise<{ count: number }>;
   now?: () => Date;
@@ -217,12 +227,12 @@ export async function cancelMcpTaxRefund(
     throw new McpTaxRefundError('INVALID_INPUT');
   }
 
-  const loadOperation = dependencies.loadOperation ?? (async (operationId, userId) => {
-    const found = await prisma.mcpOperation.findFirst({ where: { id: operationId, userId } });
+  const loadOperation = dependencies.loadOperation ?? (async (operationId) => {
+    const found = await prisma.mcpOperation.findFirst({ where: { id: operationId } });
     if (found === null) throw new McpOperationError('OPERATION_NOT_FOUND');
     return found as McpOperationRecord;
   });
-  const operation = await loadOperation(input.operationId, principal.userId);
+  const operation = await loadOperation(input.operationId);
   if (operation.kind !== 'tax_refund' || operation.toolName !== TOOL_NAME) {
     throw new McpOperationError('OPERATION_NOT_FOUND');
   }
@@ -236,26 +246,118 @@ export async function cancelMcpTaxRefund(
     );
   });
   await authorize(principal, operation.companyId, now);
+  assertCanManageRefund(principal, operation);
   validateMcpTaxRefundEnvelope(operation);
   if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
+  if (operation.manualRecordedAt != null) {
+    throw new McpTaxRefundError('SOURCE_ALREADY_RECORDED');
+  }
 
-  const cancelOperation = dependencies.cancelOperation ?? (async (operationId, userId, cancelledAt) => (
+  const cancelOperation = dependencies.cancelOperation ?? (async (operationId, cancelledAt) => (
     prisma.mcpOperation.updateMany({
       where: {
         id: operationId,
-        userId,
         kind: 'tax_refund',
         cancelledAt: null,
+        manualRecordedAt: null,
       },
       data: { cancelledAt },
     })
   ));
-  const updated = await cancelOperation(operation.id, principal.userId, now);
+  const updated = await cancelOperation(operation.id, now);
   if (updated.count === 1) return cancelledDto(operation.id, now);
 
-  const raced = await loadOperation(input.operationId, principal.userId);
+  const raced = await loadOperation(input.operationId);
   if (raced.cancelledAt !== null) return cancelledDto(raced.id, raced.cancelledAt);
   throw new McpOperationError('OPERATION_CONFLICT');
+}
+
+export interface McpTaxRefundAcknowledgementDeps {
+  authorize?: McpTaxRefundCancellationDeps['authorize'];
+  loadOperation?: McpTaxRefundCancellationDeps['loadOperation'];
+  recordOperation?: (
+    operationId: string,
+    manualRecordedAt: Date,
+  ) => Promise<{ count: number }>;
+  now?: () => Date;
+}
+
+export async function acknowledgeMcpTaxRefundRecorded(
+  principal: McpPrincipal,
+  input: AcknowledgeMcpTaxRefundRecordedInput,
+  dependencies: McpTaxRefundAcknowledgementDeps = {},
+): Promise<AcknowledgedMcpTaxRefundRecordedDto> {
+  const now = dependencies.now?.() ?? new Date();
+  if (
+    !Number.isFinite(now.getTime())
+    || typeof input?.operationId !== 'string'
+    || input.operationId.trim().length === 0
+    || input.operationId.length > MAX_REFERENCE
+    || input.confirmQuickBooksActionPerformed !== true
+  ) {
+    throw new McpTaxRefundError('INVALID_INPUT');
+  }
+
+  const loadOperation = dependencies.loadOperation ?? (async (operationId) => {
+    const found = await prisma.mcpOperation.findFirst({ where: { id: operationId } });
+    if (found === null) throw new McpOperationError('OPERATION_NOT_FOUND');
+    return found as McpOperationRecord;
+  });
+  const operation = await loadOperation(input.operationId);
+  if (operation.kind !== 'tax_refund' || operation.toolName !== TOOL_NAME) {
+    throw new McpOperationError('OPERATION_NOT_FOUND');
+  }
+  const authorize = dependencies.authorize ?? (async (actor, companyId, checkedAt) => {
+    await assertCurrentMcpCategorizationAuthorization(
+      prisma as unknown as McpCategorizationAuthorizationStore,
+      actor,
+      companyId,
+      checkedAt,
+    );
+  });
+  await authorize(principal, operation.companyId, now);
+  assertCanManageRefund(principal, operation);
+  validateMcpTaxRefundEnvelope(operation);
+  if (operation.cancelledAt !== null) {
+    throw new McpTaxRefundError('SOURCE_PREPARATION_CANCELLED');
+  }
+  if (operation.manualRecordedAt != null) {
+    return acknowledgedDto(operation.id, operation.manualRecordedAt);
+  }
+
+  const recordOperation = dependencies.recordOperation ?? (async (operationId, recordedAt) => (
+    prisma.mcpOperation.updateMany({
+      where: {
+        id: operationId,
+        kind: 'tax_refund',
+        cancelledAt: null,
+        manualRecordedAt: null,
+      },
+      data: { manualRecordedAt: recordedAt },
+    })
+  ));
+  const updated = await recordOperation(operation.id, now);
+  if (updated.count === 1) return acknowledgedDto(operation.id, now);
+
+  const raced = await loadOperation(input.operationId);
+  if (raced.manualRecordedAt != null) return acknowledgedDto(raced.id, raced.manualRecordedAt);
+  throw new McpOperationError('OPERATION_CONFLICT');
+}
+
+function assertCanManageRefund(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+): void {
+  const companyAdmin = principal.memberships.some((membership) => (
+    membership.companyId === operation.companyId && membership.role === 'admin'
+  ));
+  if (
+    operation.userId !== principal.userId
+    && principal.isInstanceAdmin !== true
+    && !companyAdmin
+  ) {
+    throw new McpOperationError('OPERATION_NOT_FOUND');
+  }
 }
 
 function cancelledDto(operationId: string, cancelledAt: Date): CancelledMcpTaxRefundDto {
@@ -266,6 +368,20 @@ function cancelledDto(operationId: string, cancelledAt: Date): CancelledMcpTaxRe
     operationId,
     state: 'cancelled',
     cancelledAt: cancelledAt.toISOString(),
+  };
+}
+
+function acknowledgedDto(
+  operationId: string,
+  manualRecordedAt: Date,
+): AcknowledgedMcpTaxRefundRecordedDto {
+  if (!Number.isFinite(manualRecordedAt.getTime())) {
+    throw new McpOperationError('OPERATION_CONFLICT');
+  }
+  return {
+    operationId,
+    state: 'reconciliation_required',
+    manualRecordedAt: manualRecordedAt.toISOString(),
   };
 }
 

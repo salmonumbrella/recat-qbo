@@ -269,7 +269,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers exactly seventeen core reads and twenty-four conservatively annotated action tools', async () => {
+  it('registers exactly seventeen core reads and twenty-five conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -289,6 +289,7 @@ describe('Recat MCP read tools', () => {
       'commit_transfer',
       'prepare_tax_refund',
       'cancel_tax_refund',
+      'acknowledge_tax_refund_recorded',
       'prepare_rule_change',
       'commit_rule_change',
       'create_attachment_upload',
@@ -304,7 +305,7 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(41);
+    expect(tools).toHaveLength(42);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
       expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
@@ -404,6 +405,15 @@ describe('Recat MCP read tools', () => {
         annotations: {
           readOnlyHint: false,
           destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      {
+        name: 'acknowledge_tax_refund_recorded',
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
           idempotentHint: true,
           openWorldHint: false,
         },

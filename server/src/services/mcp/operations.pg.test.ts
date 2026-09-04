@@ -204,6 +204,32 @@ describePostgres('MCP operation PostgreSQL durability', () => {
     })).rejects.toThrow('McpOperation immutable fields cannot be changed');
   });
 
+  it('allows one manual-recorded transition and then keeps lifecycle fields immutable', async () => {
+    const operation = await createPreparedOperation(operationInput({
+      kind: 'tax_refund',
+      toolName: 'prepare_tax_refund',
+      qboType: 'Deposit',
+    }), {
+      store: firstClient,
+      now: () => NOW,
+      expiresAt: () => new Date('9999-12-31T23:59:59.999Z'),
+    });
+    const manualRecordedAt = new Date(NOW.getTime() + 1_000);
+
+    await expect(firstClient.mcpOperation.update({
+      where: { id: operation.id },
+      data: { manualRecordedAt },
+    })).resolves.toMatchObject({ manualRecordedAt });
+    await expect(firstClient.mcpOperation.update({
+      where: { id: operation.id },
+      data: { manualRecordedAt: new Date(manualRecordedAt.getTime() + 1_000) },
+    })).rejects.toThrow('McpOperation immutable fields cannot be changed');
+    await expect(firstClient.mcpOperation.update({
+      where: { id: operation.id },
+      data: { cancelledAt: new Date(manualRecordedAt.getTime() + 1_000) },
+    })).rejects.toThrow('McpOperation immutable fields cannot be changed');
+  });
+
   it('releases a tax-refund source reservation only after cancellation', async () => {
     const source = {
       companyId: randomUUID(),

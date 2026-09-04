@@ -76,6 +76,7 @@ export interface McpOperationRecord {
   expiresAt: Date;
   retryOfId: string | null;
   cancelledAt: Date | null;
+  manualRecordedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -365,6 +366,7 @@ export async function createPreparedOperation(
     expiresAt,
     retryOfId,
     cancelledAt: null,
+    manualRecordedAt: null,
   };
 
   await assertValidRetryParent(store, data);

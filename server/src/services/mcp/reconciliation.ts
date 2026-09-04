@@ -775,6 +775,24 @@ async function projectManualTaxRefund(
   if (operation.expiresAt.getTime() <= now.getTime()) {
     return base(operation, 'expired', 'awaiting_commit');
   }
+  if (operation.manualRecordedAt != null) {
+    if (!isValidDate(operation.manualRecordedAt)) {
+      throw new McpOperationExecutionError('OPERATION_CORRUPT');
+    }
+    return base(
+      operation,
+      'reconciliation_required',
+      'write_uncertain',
+      false,
+      false,
+      true,
+      null,
+      {
+        code: 'MANUAL_QBO_TAX_REFUND_VERIFICATION_REQUIRED',
+        message: 'The Tax Centre refund was recorded manually; verify the tax-control and bank results before migrating more refunds.',
+      },
+    );
+  }
   return base(
     operation,
     'reconciliation_required',
