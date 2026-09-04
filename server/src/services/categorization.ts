@@ -447,17 +447,28 @@ function preserveCurrentSource(
   const lines = purchase.Line;
   const totalCents = exactRawMoneyCents(purchase.TotalAmt);
   const credit = purchase.Credit === true;
-  if (
-    purchase.Id !== transaction.qboId
-    || purchase.SyncToken !== transaction.qboSyncToken
-    || purchase.GlobalTaxCalculation !== proposal.taxCalculation
-    || !Array.isArray(lines)
-    || lines.length !== 1
-    || totalCents === null
-  ) {
+  const headerErrorCode = purchase.Id !== transaction.qboId
+    ? 'PRESERVE_SOURCE_ID_INVALID'
+    : purchase.SyncToken !== transaction.qboSyncToken
+      ? 'PRESERVE_SOURCE_SYNC_TOKEN_INVALID'
+      : purchase.GlobalTaxCalculation !== proposal.taxCalculation
+        ? 'PRESERVE_SOURCE_TAX_CALCULATION_INVALID'
+        : !Array.isArray(lines) || lines.length !== 1
+          ? 'PRESERVE_SOURCE_SHAPE_INVALID'
+          : totalCents === null
+            ? 'PRESERVE_SOURCE_TOTAL_INVALID'
+            : null;
+  if (headerErrorCode !== null) {
     throw new CategorizationError(
-      'PRESERVE_SOURCE_HEADER_INVALID',
+      headerErrorCode,
       'Synchronized Purchase identity, amount, tax mode, or single-line shape is not authoritative.',
+    );
+  }
+  // Keep TypeScript's narrowing aligned with the diagnostic branch above.
+  if (!Array.isArray(lines) || lines.length !== 1 || totalCents === null) {
+    throw new CategorizationError(
+      'PRESERVE_SOURCE_SHAPE_INVALID',
+      'Synchronized Purchase line shape or amount is not authoritative.',
     );
   }
   const line = lines[0];

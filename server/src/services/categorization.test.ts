@@ -1337,14 +1337,14 @@ describe('stageCategorization', () => {
     });
   });
 
-  it('reports a bounded preserve-source diagnostic when the stored header is not authoritative', async () => {
+  it('reports a bounded preserve-source diagnostic when the stored sync token is stale', async () => {
     configureValidPreserveSource(db);
     const raw = db.state.transactions[0]!.rawData as { SyncToken: string };
     raw.SyncToken = 'stale';
 
     await expectCode(
       stageCategorization(input(preserveCurrentProposal), testDeps(db)),
-      'PRESERVE_SOURCE_HEADER_INVALID',
+      'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
     );
   });
 

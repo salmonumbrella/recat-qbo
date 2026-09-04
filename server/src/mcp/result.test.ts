@@ -178,13 +178,16 @@ describe('MCP tool results', () => {
       ),
       'INVALID_INPUT',
     ],
-    [
-      new CategorizationError(
-        'PRESERVE_SOURCE_HEADER_INVALID',
-        'PRIVATE_CATEGORY_INPUT_SENTINEL',
-      ),
+    ...[
+      'PRESERVE_SOURCE_ID_INVALID',
+      'PRESERVE_SOURCE_SHAPE_INVALID',
+      'PRESERVE_SOURCE_SYNC_TOKEN_INVALID',
+      'PRESERVE_SOURCE_TAX_CALCULATION_INVALID',
+      'PRESERVE_SOURCE_TOTAL_INVALID',
+    ].map((code) => [
+      new CategorizationError(code, 'PRIVATE_CATEGORY_INPUT_SENTINEL'),
       'INVALID_INPUT',
-    ],
+    ]),
     [
       new CategorizationError(
         'TAX_RATE_UNSUPPORTED',
