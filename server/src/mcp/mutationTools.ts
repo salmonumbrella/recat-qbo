@@ -20,7 +20,9 @@ import {
   type PrepareMcpUndoInput,
 } from '../services/mcp/undo.js';
 import {
+  cancelMcpTaxRefund,
   prepareMcpTaxRefund,
+  type CancelMcpTaxRefundInput,
   type PrepareMcpTaxRefundInput,
 } from '../services/mcp/taxRefund.js';
 import {
@@ -62,6 +64,7 @@ const CORE_MUTATION_TOOL_NAMES = [
   'prepare_transfer',
   'commit_transfer',
   'prepare_tax_refund',
+  'cancel_tax_refund',
   'prepare_rule_change',
   'commit_rule_change',
 ] as const;
@@ -110,6 +113,10 @@ export interface McpMutationOperations
     principal: McpPrincipal,
     input: PrepareMcpTaxRefundInput,
   ): ReturnType<typeof prepareMcpTaxRefund>;
+  cancelTaxRefund(
+    principal: McpPrincipal,
+    input: CancelMcpTaxRefundInput,
+  ): ReturnType<typeof cancelMcpTaxRefund>;
   prepareRuleChange(
     principal: McpPrincipal,
     input: PrepareMcpRuleChangeInput,
@@ -132,6 +139,7 @@ export const mcpMutationOperations: McpMutationOperations = Object.freeze({
   prepareTransfer: prepareMcpTransfer,
   commitTransfer: commitMcpTransfer,
   prepareTaxRefund: prepareMcpTaxRefund,
+  cancelTaxRefund: cancelMcpTaxRefund,
   prepareRuleChange: prepareMcpRuleChange,
   commitRuleChange: commitMcpRuleChange,
 });
@@ -325,6 +333,10 @@ const prepareTaxRefundInput = z.strictObject({
       message: 'An interest account is required exactly when CRA interest is present.',
     });
   }
+});
+const cancelTaxRefundInput = z.strictObject({
+  operationId: uuid,
+  confirmNoQuickBooksAction: z.literal(true),
 });
 const ruleMutation = z.enum([
   'create', 'update', 'enable', 'disable', 'reorder', 'retire',
@@ -652,6 +664,11 @@ const preparedTaxRefundOutput = z.strictObject({
   }),
   warnings,
 });
+const cancelledTaxRefundOutput = z.strictObject({
+  operationId: uuid,
+  state: z.literal('cancelled'),
+  cancelledAt: z.iso.datetime(),
+});
 const ruleActionOutput = z.strictObject({
   categoryQboId: qboReference,
   taxCalculation,
@@ -879,6 +896,23 @@ export const mutationToolDefinitions: readonly McpMutationToolDefinition[] = [
       operations.prepareTaxRefund(
         principal,
         input as PrepareMcpTaxRefundInput,
+      ),
+  },
+  {
+    name: 'cancel_tax_refund',
+    description: 'Cancel an unposted GST/HST refund preparation so corrected inputs can be prepared. Requires confirmation that no QuickBooks Tax Centre action occurred.',
+    inputSchema: cancelTaxRefundInput,
+    outputSchema: cancelledTaxRefundOutput,
+    annotations: Object.freeze({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    invoke: (operations, principal, input) =>
+      operations.cancelTaxRefund(
+        principal,
+        input as CancelMcpTaxRefundInput,
       ),
   },
   {

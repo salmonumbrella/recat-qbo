@@ -8,6 +8,7 @@ import { moneyToCents } from '../tax/model.js';
 import {
   createPreparedOperation,
   hasValidMcpOperationIntegrity,
+  loadOwnedOperation,
   McpOperationError,
   normalizeMcpOperationIdempotencyKey,
   type CreatePreparedOperationInput,
@@ -63,6 +64,17 @@ export interface PreparedMcpTaxRefundDto {
     existingDepositTreatment: 'replace_or_match_before_verification';
   };
   warnings: string[];
+}
+
+export interface CancelMcpTaxRefundInput {
+  operationId: string;
+  confirmNoQuickBooksAction: true;
+}
+
+export interface CancelledMcpTaxRefundDto {
+  operationId: string;
+  state: 'cancelled';
+  cancelledAt: string;
 }
 
 const taxRefundPreviewSchema = z.object({
@@ -121,6 +133,7 @@ export type McpTaxRefundErrorCode =
   | 'SOURCE_NOT_DEPOSIT'
   | 'SOURCE_NOT_PENDING'
   | 'SOURCE_ALREADY_PREPARED'
+  | 'SOURCE_PREPARATION_CANCELLED'
   | 'STALE_SOURCE'
   | 'QBO_SOURCE_CHANGED'
   | 'AMOUNT_MISMATCH'
@@ -171,6 +184,91 @@ export interface McpTaxRefundDeps {
   now?: () => Date;
 }
 
+export interface McpTaxRefundCancellationDeps {
+  authorize?: (
+    principal: McpPrincipal,
+    companyId: string,
+    checkedAt: Date,
+  ) => Promise<void>;
+  loadOperation?: (
+    operationId: string,
+    principal: McpPrincipal,
+  ) => Promise<McpOperationRecord>;
+  cancelOperation?: (
+    operationId: string,
+    principal: McpPrincipal,
+    cancelledAt: Date,
+  ) => Promise<{ count: number }>;
+  now?: () => Date;
+}
+
+export async function cancelMcpTaxRefund(
+  principal: McpPrincipal,
+  input: CancelMcpTaxRefundInput,
+  dependencies: McpTaxRefundCancellationDeps = {},
+): Promise<CancelledMcpTaxRefundDto> {
+  const now = dependencies.now?.() ?? new Date();
+  if (
+    !Number.isFinite(now.getTime())
+    || typeof input?.operationId !== 'string'
+    || input.operationId.trim().length === 0
+    || input.operationId.length > MAX_REFERENCE
+    || input.confirmNoQuickBooksAction !== true
+  ) {
+    throw new McpTaxRefundError('INVALID_INPUT');
+  }
+
+  const loadOperation = dependencies.loadOperation ?? (async (operationId, actor) => (
+    loadOwnedOperation(operationId, actor)
+  ));
+  const operation = await loadOperation(input.operationId, principal);
+  if (operation.kind !== 'tax_refund' || operation.toolName !== TOOL_NAME) {
+    throw new McpOperationError('OPERATION_NOT_FOUND');
+  }
+
+  const authorize = dependencies.authorize ?? (async (actor, companyId, checkedAt) => {
+    await assertCurrentMcpCategorizationAuthorization(
+      prisma as unknown as McpCategorizationAuthorizationStore,
+      actor,
+      companyId,
+      checkedAt,
+    );
+  });
+  await authorize(principal, operation.companyId, now);
+  validateMcpTaxRefundEnvelope(operation);
+  if (operation.cancelledAt !== null) return cancelledDto(operation.id, operation.cancelledAt);
+
+  const cancelOperation = dependencies.cancelOperation ?? (async (operationId, actor, cancelledAt) => (
+    prisma.mcpOperation.updateMany({
+      where: {
+        id: operationId,
+        tokenId: actor.tokenId,
+        userId: actor.userId,
+        kind: 'tax_refund',
+        cancelledAt: null,
+      },
+      data: { cancelledAt },
+    })
+  ));
+  const updated = await cancelOperation(operation.id, principal, now);
+  if (updated.count === 1) return cancelledDto(operation.id, now);
+
+  const raced = await loadOperation(input.operationId, principal);
+  if (raced.cancelledAt !== null) return cancelledDto(raced.id, raced.cancelledAt);
+  throw new McpOperationError('OPERATION_CONFLICT');
+}
+
+function cancelledDto(operationId: string, cancelledAt: Date): CancelledMcpTaxRefundDto {
+  if (!Number.isFinite(cancelledAt.getTime())) {
+    throw new McpOperationError('OPERATION_CONFLICT');
+  }
+  return {
+    operationId,
+    state: 'cancelled',
+    cancelledAt: cancelledAt.toISOString(),
+  };
+}
+
 export async function prepareMcpTaxRefund(
   principal: McpPrincipal,
   input: PrepareMcpTaxRefundInput,
@@ -208,7 +306,7 @@ export async function prepareMcpTaxRefund(
   const loadSourcePreparation = dependencies.loadSourcePreparation
     ?? (async (companyId, transactionId) => (
       prisma.mcpOperation.findFirst({
-        where: { companyId, transactionId, kind: 'tax_refund' },
+        where: { companyId, transactionId, kind: 'tax_refund', cancelledAt: null },
       }) as Promise<McpOperationRecord | null>
     ));
   const sourcePreparation = await loadSourcePreparation(input.companyId, input.transactionId);
@@ -352,6 +450,9 @@ function preparedReplayDto(
   idempotencyKey: string,
 ): PreparedMcpTaxRefundDto {
   const payload = validateMcpTaxRefundEnvelope(operation);
+  if (operation.cancelledAt !== null) {
+    throw new McpTaxRefundError('SOURCE_PREPARATION_CANCELLED');
+  }
   const preview = payload.preview;
   const warnings = payload.warnings;
   const interestCents = input.interestCents ?? 0;

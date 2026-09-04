@@ -7,4 +7,4 @@ ALTER TABLE "McpOperation"
 
 CREATE UNIQUE INDEX "McpOperation_tax_refund_source_key"
     ON "McpOperation" ("companyId", "transactionId")
-    WHERE "kind" = 'tax_refund';
+    WHERE "kind" = 'tax_refund' AND "cancelledAt" IS NULL;

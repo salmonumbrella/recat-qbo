@@ -8,8 +8,10 @@ import {
   type McpOperationRecord,
 } from './operations.js';
 import {
+  cancelMcpTaxRefund,
   McpTaxRefundError,
   prepareMcpTaxRefund,
+  type CancelMcpTaxRefundInput,
   type PrepareMcpTaxRefundInput,
 } from './taxRefund.js';
 
@@ -370,6 +372,18 @@ describe('prepareMcpTaxRefund', () => {
     expect(deps.loadTransaction).not.toHaveBeenCalled();
   });
 
+  it('does not present a cancelled preparation as active on replay', async () => {
+    const deps = dependencies();
+    const replay = replayOperation();
+    replay.cancelledAt = new Date('2026-09-04T22:04:00.000Z');
+    deps.loadReplay.mockResolvedValue(replay);
+
+    await expect(prepareMcpTaxRefund(principal, input(), deps)).rejects.toMatchObject({
+      code: 'SOURCE_PREPARATION_CANCELLED',
+    });
+    expect(deps.loadTransaction).not.toHaveBeenCalled();
+  });
+
   it('rejects a second preparation for the same source transaction', async () => {
     const deps = {
       ...dependencies(),
@@ -403,5 +417,61 @@ describe('prepareMcpTaxRefund', () => {
     expect(caught).toBeInstanceOf(McpTaxRefundError);
     expect(caught).toMatchObject({ code: 'SOURCE_ALREADY_PREPARED' });
     expect(deps.loadSourcePreparation).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('cancelMcpTaxRefund', () => {
+  const request: CancelMcpTaxRefundInput = {
+    operationId: '66666666-6666-4666-8666-666666666666',
+    confirmNoQuickBooksAction: true,
+  };
+
+  it('cancels an intact manual preparation after current authorization', async () => {
+    const operation = replayOperation();
+    const cancelOperation = vi.fn().mockResolvedValue({ count: 1 });
+    const result = await cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation,
+      now: () => new Date('2026-09-04T22:05:00.000Z'),
+    });
+
+    expect(result).toEqual({
+      operationId: operation.id,
+      state: 'cancelled',
+      cancelledAt: '2026-09-04T22:05:00.000Z',
+    });
+    expect(cancelOperation).toHaveBeenCalledWith(
+      operation.id,
+      principal,
+      new Date('2026-09-04T22:05:00.000Z'),
+    );
+  });
+
+  it('is idempotent for an already-cancelled preparation', async () => {
+    const operation = replayOperation();
+    operation.cancelledAt = new Date('2026-09-04T22:04:00.000Z');
+    const cancelOperation = vi.fn();
+
+    await expect(cancelMcpTaxRefund(principal, request, {
+      authorize: vi.fn().mockResolvedValue(undefined),
+      loadOperation: vi.fn().mockResolvedValue(operation),
+      cancelOperation,
+      now: () => new Date('2026-09-04T22:05:00.000Z'),
+    })).resolves.toEqual({
+      operationId: operation.id,
+      state: 'cancelled',
+      cancelledAt: '2026-09-04T22:04:00.000Z',
+    });
+    expect(cancelOperation).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit assertion that no QuickBooks action occurred', async () => {
+    await expect(cancelMcpTaxRefund(principal, {
+      ...request,
+      confirmNoQuickBooksAction: false,
+    } as unknown as CancelMcpTaxRefundInput)).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+    });
   });
 });

@@ -203,4 +203,47 @@ describePostgres('MCP operation PostgreSQL durability', () => {
       where: { id: operation.id },
     })).rejects.toThrow('McpOperation immutable fields cannot be changed');
   });
+
+  it('releases a tax-refund source reservation only after cancellation', async () => {
+    const source = {
+      companyId: randomUUID(),
+      transactionId: randomUUID(),
+      kind: 'tax_refund' as const,
+      toolName: 'prepare_tax_refund',
+      qboType: 'Deposit',
+    };
+    const firstInput = operationInput(source);
+    const first = await createPreparedOperation(firstInput, {
+      store: firstClient,
+      now: () => NOW,
+      expiresAt: () => new Date('9999-12-31T23:59:59.999Z'),
+    });
+    const correctedInput = operationInput({
+      ...source,
+      principal: firstInput.principal,
+      idempotencyKey: `corrected-${randomUUID()}`,
+      payload: { corrected: true },
+    });
+
+    await expect(createPreparedOperation(correctedInput, {
+      store: firstClient,
+      now: () => NOW,
+      expiresAt: () => new Date('9999-12-31T23:59:59.999Z'),
+    })).rejects.toMatchObject({ code: 'OPERATION_CONFLICT' });
+
+    await firstClient.mcpOperation.update({
+      where: { id: first.id },
+      data: { cancelledAt: new Date(NOW.getTime() + 1_000) },
+    });
+
+    await expect(createPreparedOperation(correctedInput, {
+      store: firstClient,
+      now: () => NOW,
+      expiresAt: () => new Date('9999-12-31T23:59:59.999Z'),
+    })).resolves.toMatchObject({
+      companyId: source.companyId,
+      transactionId: source.transactionId,
+      kind: 'tax_refund',
+    });
+  });
 });

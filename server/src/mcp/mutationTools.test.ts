@@ -126,6 +126,12 @@ const preparedTaxRefund = {
   ],
 };
 
+const cancelledTaxRefund = {
+  operationId: preparedTaxRefund.operationId,
+  state: 'cancelled' as const,
+  cancelledAt: '2026-09-04T22:05:00.000Z',
+};
+
 const transferOperation = {
   operationId: transferOperationId,
   kind: 'transfer' as const,
@@ -230,6 +236,7 @@ function mutations(
     prepareTransfer: vi.fn().mockResolvedValue(preparedTransfer),
     commitTransfer: vi.fn().mockResolvedValue(transferOperation),
     prepareTaxRefund: vi.fn().mockResolvedValue(preparedTaxRefund),
+    cancelTaxRefund: vi.fn().mockResolvedValue(cancelledTaxRefund),
     prepareRuleChange: vi.fn().mockResolvedValue(preparedRuleChange),
     commitRuleChange: vi.fn().mockResolvedValue(committedRuleChange),
     ...overrides,
@@ -496,6 +503,18 @@ describe('Recat MCP mutation tools', () => {
     expect(response.result.isError).not.toBe(true);
     expect(operations.prepareTaxRefund).toHaveBeenCalledWith(principal, request);
     expect(MUTATION_TOOL_NAMES).toContain('prepare_tax_refund');
+
+    const cancelRequest = {
+      operationId: preparedTaxRefund.operationId,
+      confirmNoQuickBooksAction: true,
+    } as const;
+    const cancelled = await legacy(server, 'tools/call', {
+      name: 'cancel_tax_refund',
+      arguments: cancelRequest,
+    });
+    expect(cancelled.result.isError).not.toBe(true);
+    expect(operations.cancelTaxRefund).toHaveBeenCalledWith(principal, cancelRequest);
+    expect(MUTATION_TOOL_NAMES).toContain('cancel_tax_refund');
   });
 
   it('accepts one exact preserve-current proposal and returns its reviewable references', async () => {
