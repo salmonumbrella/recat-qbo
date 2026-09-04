@@ -53,7 +53,11 @@ import {
   refreshProviderActionability,
   type ProviderActionabilityRefreshResult,
 } from '../services/providerActionabilityRefresh.js';
-import { syncCompany } from '../services/sync.js';
+import {
+  refreshMirroredTransaction,
+  syncCompany,
+  type MirroredTransactionRefreshResult,
+} from '../services/sync.js';
 import type { McpToolLogger } from './observability.js';
 import { observeMcpToolCall } from './observability.js';
 import {
@@ -81,6 +85,7 @@ export const READ_TOOL_NAMES = [
   'get_transaction',
   'get_write_safety',
   'sync_company',
+  'refresh_transaction_mirror',
   'refresh_provider_actionability',
   'list_categories',
   'list_tax_codes',
@@ -220,6 +225,10 @@ export interface CompanySyncOperations {
       contended: number;
     };
   }>;
+  refreshTransaction(
+    companyId: string,
+    transactionId: string,
+  ): Promise<MirroredTransactionRefreshResult>;
 }
 
 const ID_MAX = 128;
@@ -751,6 +760,10 @@ const actionabilityRefreshInput = z.strictObject({
     .default(DEFAULT_ACTIONABILITY_REFRESH_LIMIT).optional(),
 });
 const syncCompanyInput = z.strictObject({ companyId: id });
+const refreshTransactionMirrorInput = z.strictObject({
+  companyId: id,
+  transactionId: id,
+});
 const syncCompanyOutput = z.strictObject({
   sync: z.strictObject({
     companyId: id,
@@ -763,6 +776,20 @@ const syncCompanyOutput = z.strictObject({
       busy: z.number().int().nonnegative(),
       contended: z.number().int().nonnegative(),
     }).optional(),
+  }),
+});
+const refreshTransactionMirrorOutput = z.strictObject({
+  refresh: z.strictObject({
+    transactionId: id,
+    outcome: z.enum([
+      'refreshed',
+      'stale',
+      'busy',
+      'contended',
+      'not_found',
+      'missing_in_qbo',
+      'not_in_holding',
+    ]),
   }),
 });
 const actionabilityRefreshOutput = z.strictObject({
@@ -869,7 +896,10 @@ function inputWithoutCompany<T extends { companyId: string }>(
 export function createRecatMcpServer(context: RecatMcpContext): McpServer {
   const reads = context.reads ?? companyReads;
   const safetyReads = context.writeSafetyReads ?? writeSafetyReads;
-  const sync = context.sync ?? { syncCompany } satisfies CompanySyncOperations;
+  const sync = context.sync ?? {
+    syncCompany,
+    refreshTransaction: refreshMirroredTransaction,
+  } satisfies CompanySyncOperations;
   const actionabilityRefresh = context.actionabilityRefresh ?? {
     refreshProviderActionability,
   } satisfies ProviderActionabilityRefreshOperations;
@@ -1026,6 +1056,26 @@ export function createRecatMcpServer(context: RecatMcpContext): McpServer {
       }
       const result = await sync.syncCompany(input.companyId, 'manual');
       return { sync: { companyId: input.companyId, ...result } };
+    },
+    syncAnnotations,
+  );
+  register(
+    'refresh_transaction_mirror',
+    'Refresh one existing Recat transaction from QuickBooks without a company-wide sweep. This updates only Recat’s local source mirror; it never writes QuickBooks.',
+    refreshTransactionMirrorInput,
+    refreshTransactionMirrorOutput,
+    async (input) => {
+      const membership = context.principal.memberships.find(
+        (candidate) => candidate.companyId === input.companyId,
+      );
+      if (
+        !context.principal.isInstanceAdmin
+        && membership?.role !== 'admin'
+        && membership?.role !== 'categorizer'
+      ) {
+        throw new HttpError(403, 'Company categorizer access is required.', 'FORBIDDEN');
+      }
+      return { refresh: await sync.refreshTransaction(input.companyId, input.transactionId) };
     },
     syncAnnotations,
   );

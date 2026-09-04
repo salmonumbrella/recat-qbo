@@ -172,6 +172,37 @@ async function legacy(handler: ReturnType<typeof createMcpHandler>, method: stri
 }
 
 describe('Recat MCP read tools', () => {
+  it('refreshes one visible mirror transaction without starting a company sweep', async () => {
+    const refreshTransaction = vi.fn().mockResolvedValue({
+      transactionId: 'transaction-a',
+      outcome: 'refreshed',
+    });
+    const handler = createMcpHandler(
+      () => createRecatMcpServer({
+        principal: { ...principal, memberships: [{ companyId: 'company-a', role: 'categorizer' as const }] },
+        era: 'legacy',
+        reads: reads(),
+        sync: {
+          syncCompany: vi.fn(),
+          refreshTransaction,
+        },
+      }),
+      { legacy: 'stateless' },
+    );
+
+    const response = await legacy(handler, 'tools/call', {
+      name: 'refresh_transaction_mirror',
+      arguments: { companyId: 'company-a', transactionId: 'transaction-a' },
+    });
+
+    expect(response.result.isError).not.toBe(true);
+    expect(response.result.structuredContent.refresh).toEqual({
+      transactionId: 'transaction-a',
+      outcome: 'refreshed',
+    });
+    expect(refreshTransaction).toHaveBeenCalledWith('company-a', 'transaction-a');
+  });
+
   it('runs an authorized Recat mirror sync without writing QuickBooks', async () => {
     const syncCompany = vi.fn().mockResolvedValue({
       ok: true,
@@ -346,7 +377,7 @@ describe('Recat MCP read tools', () => {
     }
   });
 
-  it('registers eighteen core reads and twenty-three conservatively annotated action tools', async () => {
+  it('registers core reads and twenty-three conservatively annotated action tools', async () => {
     const handler = createMcpHandler(
       () => createRecatMcpServer({ principal, era: 'legacy', reads: reads() }),
       { legacy: 'stateless' },
@@ -380,9 +411,9 @@ describe('Recat MCP read tools', () => {
       'confirm_receipt_match',
       'attach_receipt',
     ]);
-    expect(tools).toHaveLength(41);
+    expect(tools).toHaveLength(READ_TOOL_NAMES.length + 23);
     for (const tool of tools.slice(0, READ_TOOL_NAMES.length)) {
-      if (tool.name === 'sync_company') {
+      if (tool.name === 'sync_company' || tool.name === 'refresh_transaction_mirror') {
         expect(tool.annotations).toMatchObject({
           readOnlyHint: false,
           destructiveHint: false,

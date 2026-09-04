@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   refreshSuggestions: vi.fn(),
   listAccounts: vi.fn(),
   listTxnsInAccounts: vi.fn(),
+  fetchTxn: vi.fn(),
   companyFindUnique: vi.fn(),
   companyUpdate: vi.fn(),
   postTransaction: vi.fn(),
@@ -56,6 +57,7 @@ vi.mock('../lib/qbo/factory.js', () => ({
     forCompany: vi.fn(async () => ({
       listAccounts: mocks.listAccounts,
       listTxnsInAccounts: mocks.listTxnsInAccounts,
+      fetchTxn: mocks.fetchTxn,
     })),
   },
 }));
@@ -64,7 +66,7 @@ vi.mock('./tax/reference.js', () => ({ refreshTaxReference: mocks.refreshTaxRefe
 vi.mock('./audit.js', () => ({ writeAudit: mocks.audit }));
 vi.mock('./writeback.js', () => ({ postTransaction: mocks.postTransaction }));
 
-import { syncCompany } from './sync.js';
+import { refreshMirroredTransaction, syncCompany } from './sync.js';
 
 interface TestMutationDeps {
   lease(
@@ -123,6 +125,7 @@ beforeEach(() => {
   mocks.companyFindUnique.mockResolvedValue({ id: 'company-1', holdingAccountIds: [], lastSyncedAt: null });
   mocks.listAccounts.mockResolvedValue([]);
   mocks.listTxnsInAccounts.mockResolvedValue([]);
+  mocks.fetchTxn.mockResolvedValue(null);
   mocks.transactionFindMany.mockResolvedValue([]);
   mocks.ruleFindMany.mockResolvedValue([]);
   mocks.refreshSuggestions.mockResolvedValue(undefined);
@@ -138,6 +141,50 @@ beforeEach(() => {
 });
 
 describe('syncCompany', () => {
+  it('refreshes one mirrored transaction without running a company sweep', async () => {
+    const current = {
+      id: 'txn-generic',
+      companyId: 'company-1',
+      qboType: 'Purchase',
+      qboId: 'qbo-purchase-generic',
+      qboSyncToken: '7',
+      revision: 4,
+    };
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1',
+      holdingAccountIds: ['holding-generic'],
+      lastSyncedAt: null,
+    });
+    mocks.transactionFindUnique.mockResolvedValue(current);
+    mocks.fetchTxn.mockResolvedValue(qboTxn({
+      syncToken: '8',
+      raw: {
+        Id: 'qbo-purchase-generic',
+        SyncToken: '8',
+        GlobalTaxCalculation: 'TaxInclusive',
+        TotalAmt: 10.44,
+        Line: [{
+          Amount: 9.32,
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: '2' },
+            TaxCodeRef: { value: '7' },
+            TaxInclusiveAmt: 10.44,
+          },
+        }],
+      },
+    }));
+
+    const result = await refreshMirroredTransaction('company-1', 'txn-generic', mutationDeps());
+
+    expect(result).toEqual({ transactionId: 'txn-generic', outcome: 'refreshed' });
+    expect(mocks.listAccounts).not.toHaveBeenCalled();
+    expect(mocks.listTxnsInAccounts).not.toHaveBeenCalled();
+    expect(mocks.transactionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'txn-generic', revision: 4, qboSyncToken: '7' }),
+      data: expect.objectContaining({ qboSyncToken: '8', rawData: expect.objectContaining({ Id: 'qbo-purchase-generic' }) }),
+    }));
+  });
+
   it('reports a newly mirrored holding transaction as created', async () => {
     mocks.companyFindUnique.mockResolvedValue({
       id: 'company-1',

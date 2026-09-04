@@ -127,6 +127,98 @@ async function withSyncEntityLease<T>(
   }
 }
 
+export type MirroredTransactionRefreshOutcome =
+  | 'refreshed'
+  | 'stale'
+  | 'busy'
+  | 'contended'
+  | 'not_found'
+  | 'missing_in_qbo'
+  | 'not_in_holding';
+
+export interface MirroredTransactionRefreshResult {
+  transactionId: string;
+  outcome: MirroredTransactionRefreshOutcome;
+}
+
+/**
+ * Refresh one already-mirrored holding transaction from QBO.
+ *
+ * This is intentionally narrower than syncCompany: it does not enumerate the
+ * chart, tax references, or every holding transaction. It is the safe refresh
+ * path immediately before a governed categorization prepare when a stored QBO
+ * source snapshot needs to be current.
+ */
+export async function refreshMirroredTransaction(
+  companyId: string,
+  transactionId: string,
+  mutationDependencies: SyncMutationDeps = defaultSyncMutationDeps,
+): Promise<MirroredTransactionRefreshResult> {
+  const [company, current] = await Promise.all([
+    prisma.company.findUnique({ where: { id: companyId } }),
+    prisma.transaction.findUnique({ where: { id: transactionId } }),
+  ]);
+  if (company === null || current === null || current.companyId !== companyId) {
+    return { transactionId, outcome: 'not_found' };
+  }
+
+  const { qboFactory } = await import('../lib/qbo/factory.js');
+  const client = await qboFactory.forCompany(companyId);
+  const fresh = await client.fetchTxn(current.qboType as QboTxn['qboType'], current.qboId);
+  if (fresh === null) return { transactionId, outcome: 'missing_in_qbo' };
+
+  const holdingIds = jsonStringArray(company.holdingAccountIds);
+  if (!fresh.lines.some((line) => holdingIds.includes(line.accountQboId))) {
+    return { transactionId, outcome: 'not_in_holding' };
+  }
+  if (isStaleProviderToken(fresh.syncToken, current.qboSyncToken)) {
+    return { transactionId, outcome: 'stale' };
+  }
+
+  const key = entityKey(companyId, current);
+  const mutation = await withSyncEntityLease(
+    key,
+    mutationDependencies,
+    async (owner) => prisma.$transaction(async (tx) => {
+      await mutationDependencies.fence(key, owner, tx);
+      const updated = await tx.transaction.updateMany({
+        where: {
+          id: current.id,
+          companyId,
+          revision: current.revision,
+          qboSyncToken: current.qboSyncToken,
+          qboMutationAttempts: { none: { status: { in: [...ACTIVE_MUTATION_STATUSES] } } },
+        },
+        data: {
+          qboSyncToken: fresh.syncToken,
+          date: new Date(fresh.date),
+          payee: fresh.payee,
+          memo: fresh.memo ?? null,
+          amount: fresh.amount,
+          bankAccount: fresh.bankAccount,
+          rawData: fresh.raw as Prisma.InputJsonValue,
+        },
+      });
+      if (updated.count === 1) {
+        await ensureUnknownProviderActionability(
+          {
+            id: current.id,
+            companyId,
+            revision: current.revision,
+            qboSyncToken: fresh.syncToken,
+            qboType: fresh.qboType,
+            qboId: fresh.qboId,
+            date: new Date(fresh.date),
+          },
+          tx as unknown as ProviderActionabilityDb,
+        );
+      }
+      return updated.count === 1 ? 'refreshed' as const : 'contended' as const;
+    }),
+  );
+  return { transactionId, outcome: mutation ?? 'busy' };
+}
+
 function syncTokenOrder(
   left: string,
   right: string,
