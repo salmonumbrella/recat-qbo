@@ -138,6 +138,28 @@ beforeEach(() => {
 });
 
 describe('syncCompany', () => {
+  it('reports a newly mirrored holding transaction as created', async () => {
+    mocks.companyFindUnique.mockResolvedValue({
+      id: 'company-1',
+      holdingAccountIds: ['holding-generic'],
+      lastSyncedAt: null,
+    });
+    mocks.listAccounts.mockResolvedValue([{
+      qboId: 'holding-generic', name: 'Generic holding', fullName: 'Generic holding',
+      classification: 'Asset', accountType: 'Bank', active: true,
+    }]);
+    mocks.listTxnsInAccounts.mockResolvedValue([qboTxn()]);
+    mocks.transactionFindMany.mockResolvedValue([]);
+    mocks.transactionFindUnique.mockResolvedValue(null);
+
+    const result = await syncWithMutations('company-1', 'manual', mutationDeps());
+
+    expect(result).toMatchObject({
+      ok: true,
+      mirror: { created: 1, refreshed: 0, stale: 0, busy: 0, contended: 0 },
+    });
+  });
+
   it('reports a mirror write contention instead of claiming an existing snapshot refreshed', async () => {
     const current = {
       id: 'txn-generic',
