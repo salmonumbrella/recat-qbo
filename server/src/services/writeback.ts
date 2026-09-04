@@ -1450,6 +1450,38 @@ function purchaseStageBalanceCents(txn: DurableTransaction): number {
   return transactionCents;
 }
 
+function preservedPurchaseStageAmounts(txn: DurableTransaction): {
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+} | null {
+  const transactionCents = exactMoneyCents(txn.amount);
+  let snapshot: QboPurchaseSnapshot;
+  try {
+    snapshot = mapPurchaseTaxSnapshot(txn.rawData as RawPurchase);
+  } catch {
+    return null;
+  }
+  if (
+    snapshot.qboId !== txn.qboId
+    || snapshot.syncToken !== txn.qboSyncToken
+    || snapshot.lines.length !== 1
+    || snapshot.globalTaxCalculation !== txn.taxCalculation
+  ) {
+    return null;
+  }
+  const line = snapshot.lines[0]!;
+  const totalCents = purchaseHoldingGrossCents(snapshot, [0]);
+  if (line.amountCents !== transactionCents || totalCents === null) {
+    return null;
+  }
+  return {
+    subtotalCents: line.amountCents,
+    taxCents: totalCents - line.amountCents,
+    totalCents,
+  };
+}
+
 function preparedSnapshotFromFreshTxn(
   txn: QboTxn,
 ): QboPurchaseSnapshot | QboDepositSnapshot | null {
@@ -1620,11 +1652,14 @@ async function loadAuthorizedStage(
         'Preserved Purchase tax requires one untagged, memo-free line with an explicit tax code.',
       );
     }
-    calculatedLines = grossCents.map((totalCents) => ({
-      subtotalCents: totalCents,
-      taxCents: 0,
-      totalCents,
-    }));
+    const preservedSource = preservedPurchaseStageAmounts(txn);
+    calculatedLines = preservedSource === null
+      ? grossCents.map((totalCents) => ({
+          subtotalCents: totalCents,
+          taxCents: 0,
+          totalCents,
+        }))
+      : [preservedSource];
   } else if (taxCalculation === 'NotApplicable') {
     if (txn.splitLines.some((line) => line.taxCodeQboId !== null)) {
       const explicitNon = txn.splitLines.every(

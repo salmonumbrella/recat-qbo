@@ -2406,6 +2406,7 @@ describe('commitStagedCategorization durable lifecycle', () => {
         DetailType: 'AccountBasedExpenseLineDetail',
         AccountBasedExpenseLineDetail: {
           AccountRef: { value: 'holding-generic' },
+          TaxCodeRef: { value: 'tax-generic' },
           TaxInclusiveAmt: 10.5,
         },
       }],
@@ -2427,11 +2428,11 @@ describe('commitStagedCategorization durable lifecycle', () => {
       revision: 1,
       taxDisposition: 'preserve_current',
       taxCalculation: 'TaxInclusive',
-      totals: { subtotalCents: -1050, taxCents: 0, totalCents: -1050 },
+      totals: { subtotalCents: -929, taxCents: -121, totalCents: -1050 },
       lines: [{
         idx: 0,
-        subtotalCents: -1050,
-        taxCents: 0,
+        subtotalCents: -929,
+        taxCents: -121,
         totalCents: -1050,
         categoryQboId: 'expense-generic',
         taxCodeQboId: 'tax-generic',
