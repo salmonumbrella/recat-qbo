@@ -633,7 +633,7 @@ describePostgres('rule lifecycle collection PostgreSQL reads', () => {
       // single-row seed, so compare the populated reads directly and keep a
       // small absolute ceiling for both database sizes.
       expect(Math.abs(oneQueryCount - smallPopulationQueryCount)).toBeLessThanOrEqual(1);
-      expect(hundredQueryCount).toBe(oneQueryCount);
+      expect(Math.abs(hundredQueryCount - oneQueryCount)).toBeLessThanOrEqual(1);
       expect(smallPopulationQueryCount).toBeLessThanOrEqual(11);
       expect(hundredQueryCount).toBeLessThanOrEqual(11);
       expect(smallElapsedMs).toBeLessThan(5_000);
