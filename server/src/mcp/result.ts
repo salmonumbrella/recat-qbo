@@ -7,6 +7,7 @@ import { McpCategorizationError } from '../services/mcp/categorization.js';
 import { McpOperationError } from '../services/mcp/operations.js';
 import { McpOperationExecutionError } from '../services/mcp/reconciliation.js';
 import { McpRuleChangeError } from '../services/mcp/rules.js';
+import { McpTaxRefundError } from '../services/mcp/taxRefund.js';
 import { McpUndoError } from '../services/mcp/undo.js';
 import { McpTransferExecutionError } from '../services/mcp/transfers.js';
 import { TransferExecutionError } from '../services/transferExecution.js';
@@ -90,6 +91,9 @@ const WRITEBACK_INVALID_CODES = new Set([
 ]);
 
 function safeMutationCode(error: unknown): SafeToolErrorCode | null {
+  if (error instanceof McpTaxRefundError) {
+    return error.code === 'SOURCE_NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
+  }
   if (error instanceof McpRuleChangeError) {
     return error.code === 'NOT_FOUND' ? 'NOT_FOUND' : 'INVALID_INPUT';
   }

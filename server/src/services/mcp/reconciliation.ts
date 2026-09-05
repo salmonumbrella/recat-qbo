@@ -24,6 +24,7 @@ import {
 } from './operations.js';
 import {
   assertCurrentMcpCategorizationAuthorization,
+  McpCategorizationError,
   parseStoredMcpCategorizationPayload,
   type McpCategorizationAuthorizationStore,
 } from './categorization.js';
@@ -31,6 +32,10 @@ import {
   parseStoredMcpUndoPayload,
   type StoredMcpUndoPayload,
 } from './undo.js';
+import {
+  canManageMcpTaxRefund,
+  validateMcpTaxRefundEnvelope,
+} from './taxRefund.js';
 import {
   getMcpTransferOperation,
   retryMcpTransferOperation,
@@ -269,6 +274,15 @@ export async function getMcpOperation(
       error instanceof McpOperationError
       && error.code === 'OPERATION_NOT_FOUND'
     ) {
+      const candidate = await storeFrom(dependencies).mcpOperation.findFirst({
+        where: { id: input.operationId },
+      });
+      if (candidate?.kind === 'tax_refund') {
+        if (!canManageMcpTaxRefund(principal, candidate)) {
+          throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+        }
+        return projectManualTaxRefund(principal, candidate, dependencies);
+      }
       return getOwnedAttachmentOperation(
         principal,
         input.operationId,
@@ -284,6 +298,13 @@ export async function getMcpOperation(
       ...dependencies.transfer,
       store: storeFrom(dependencies) as never,
     });
+  }
+  if (owned.kind === 'tax_refund') {
+    return projectManualTaxRefund(
+      principal,
+      owned,
+      dependencies,
+    );
   }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   return project(loaded, nowFrom(dependencies));
@@ -474,6 +495,9 @@ export async function retryMcpOperation(
       ...dependencies.transfer,
       store: storeFrom(dependencies) as never,
     });
+  }
+  if (owned.kind === 'tax_refund') {
+    throw new McpOperationExecutionError('RETRY_NOT_ALLOWED');
   }
   const loaded = await loadExecution(principal, input.operationId, dependencies);
   const current = project(loaded, nowFrom(dependencies));
@@ -736,6 +760,75 @@ function project(
         message: ERROR_MESSAGES.OPERATION_CORRUPT,
       });
   }
+}
+
+async function projectManualTaxRefund(
+  principal: McpPrincipal,
+  operation: McpOperationRecord,
+  dependencies: McpOperationExecutionDeps,
+): Promise<McpOperationDto> {
+  const now = nowFrom(dependencies);
+  try {
+    await assertCurrentMcpCategorizationAuthorization(
+      storeFrom(dependencies),
+      principal,
+      operation.companyId,
+      now,
+    );
+  } catch (error) {
+    if (
+      error instanceof McpCategorizationError
+      && (error.code === 'MCP_UNAUTHORIZED' || error.code === 'MCP_FORBIDDEN')
+    ) {
+      throw new McpOperationExecutionError('OPERATION_NOT_FOUND');
+    }
+    throw error;
+  }
+  try {
+    validateMcpTaxRefundEnvelope(operation);
+  } catch {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  if (!isValidDate(operation.expiresAt)) {
+    throw new McpOperationExecutionError('OPERATION_CORRUPT');
+  }
+  if (operation.cancelledAt !== null) {
+    return base(operation, 'cancelled', 'awaiting_commit');
+  }
+  if (operation.expiresAt.getTime() <= now.getTime()) {
+    return base(operation, 'expired', 'awaiting_commit');
+  }
+  if (operation.manualRecordedAt != null) {
+    if (!isValidDate(operation.manualRecordedAt)) {
+      throw new McpOperationExecutionError('OPERATION_CORRUPT');
+    }
+    return base(
+      operation,
+      'reconciliation_required',
+      'write_uncertain',
+      false,
+      false,
+      true,
+      null,
+      {
+        code: 'MANUAL_QBO_TAX_REFUND_VERIFICATION_REQUIRED',
+        message: 'The Tax Centre refund was recorded manually; verify the tax-control and bank results before migrating more refunds.',
+      },
+    );
+  }
+  return base(
+    operation,
+    'reconciliation_required',
+    'awaiting_commit',
+    false,
+    false,
+    true,
+    null,
+    {
+      code: 'MANUAL_QBO_TAX_REFUND_REQUIRED',
+      message: 'Complete Sales Tax > Filed > Record refund in QuickBooks, then verify the result.',
+    },
+  );
 }
 
 function base(

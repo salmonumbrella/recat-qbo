@@ -148,11 +148,25 @@ describe('createPreparedOperation', () => {
       qboSyncToken: 'sync-7',
       retryOfId: null,
       cancelledAt: null,
+      manualRecordedAt: null,
     });
     expect(operation.payloadHash).toBe(hashOperationPayload(operation.payload));
     expect(operation.inputHash).toMatch(/^[0-9a-f]{64}$/);
     expect(operation.expiresAt.getTime() - NOW.getTime()).toBe(MCP_OPERATION_EXPIRY_MS);
     expect(MCP_OPERATION_EXPIRY_MS).toBe(15 * 60 * 1000);
+  });
+
+  it('accepts an explicit later expiry for governed manual operations', async () => {
+    const { store } = createStore();
+    const expiresAt = new Date('9999-12-31T23:59:59.999Z');
+
+    const operation = await createPreparedOperation(input(), {
+      store,
+      now: () => NOW,
+      expiresAt: () => expiresAt,
+    });
+
+    expect(operation.expiresAt).toEqual(expiresAt);
   });
 
   it('accepts transfer envelopes and detects any private second-leg binding change', async () => {
@@ -187,6 +201,26 @@ describe('createPreparedOperation', () => {
     const tampered = structuredClone(operation);
     (tampered.payload as Record<string, any>).second.qboId = 'changed';
     expect(hasValidMcpOperationIntegrity(tampered)).toBe(false);
+  });
+
+  it('accepts a distinct tax-refund preparation envelope', async () => {
+    const { store } = createStore();
+    const operation = await createPreparedOperation(input({
+      toolName: 'prepare_tax_refund',
+      kind: 'tax_refund' as never,
+      qboType: 'Deposit',
+      payload: {
+        capability: 'manual_required',
+        preview: {
+          action: 'record_gst_hst_refund',
+          refundPrincipalCents: 123456,
+          suspenseAccountQboId: '55',
+        },
+      },
+    }), { store, now: () => NOW });
+
+    expect(operation.kind).toBe('tax_refund');
+    expect(hasValidMcpOperationIntegrity(operation)).toBe(true);
   });
 
   it('uses the caller-supplied transaction/store instead of the default client', async () => {
@@ -536,6 +570,7 @@ describe('Prisma durability contract', () => {
       'expiresAt',
       'retryOfId',
       'cancelledAt',
+      'manualRecordedAt',
     ]) {
       expect(model).toMatch(new RegExp(`${field}\\s+`));
     }
@@ -589,5 +624,19 @@ describe('Prisma durability contract', () => {
     );
     expect(transferKindMigration)
       .toMatch(/CHECK \("kind" IN \('categorization', 'transfer', 'undo'\)\)/);
+
+    const taxRefundMigration = '20260904223000_allow_mcp_tax_refund_operations';
+    expect(migrations.indexOf(taxRefundMigration))
+      .toBeGreaterThan(migrations.indexOf(transferMigration));
+    const taxRefundKindMigration = await readFile(
+      new URL(`${taxRefundMigration}/migration.sql`, migrationDirectory),
+      'utf8',
+    );
+    expect(taxRefundKindMigration).toMatch(
+      /CHECK \("kind" IN \('categorization', 'transfer', 'undo', 'tax_refund'\)\)/,
+    );
+    expect(taxRefundKindMigration).toMatch(
+      /CREATE UNIQUE INDEX "McpOperation_tax_refund_source_key"[\s\S]*WHERE "kind" = 'tax_refund'/,
+    );
   });
 });
